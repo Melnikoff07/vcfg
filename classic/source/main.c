@@ -1582,7 +1582,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     uint32_t mi1 = (uint32_t)g_ngame + (g_flips % (uint32_t)g_nmid);
                     uint32_t mi2 = (uint32_t)g_ngame + ((g_flips + 1u) % (uint32_t)g_nmid);
                     uint32_t t1_q16 = 32768u, t2_q16 = 43690u;
-                    int two_mids = 0;
+                    int two_mids = 0, fast_skip = 0;
                     int force_repeat = (raw_dt_us > 66667ull) ? 1 : 0; // >66.7 ms (<15 fps hitch) -> repeat frame
 
                     if (g_cfg.preset == 1 && !g_fg_off) {
@@ -1592,16 +1592,19 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                             t1_q16 = 0;
                         } else {
                             uint32_t dt_clamped = g_ema_frame_us;
-                            if (dt_clamped < 25000u) dt_clamped = 25000u; // 40 fps
+                            if (dt_clamped < 16683u) dt_clamped = 16683u; // up to 60 fps: M = 1 shows a frame without a mid
                             if (dt_clamped > 50000u) dt_clamped = 50000u; // 20 fps
                             int32_t r_q16 = (int32_t)(((uint64_t)dt_clamped << 16) / 16683ull);
                             int32_t acc_prev = g_fast_acc_q16;
                             int32_t acc_new = acc_prev + r_q16;
                             int m_out = (int)((acc_new + 32768) >> 16);
-                            if (m_out < 2) m_out = 2;
+                            // VCFG: M = 1 (no mid for this frame) lets games above 30 fps through: at 40 fps every other frame
+                            // gets one mid, ~20 generated frames per second; the old minimum of 2 capped every game at 30.
+                            if (m_out < 1) m_out = 1;
                             if (m_out > 3) m_out = 3;
-                            // Queue backpressure guard: drop to M=2 if flip queue has >=3 pending flips
-                            if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= 3u) m_out = 2;
+                            // Queue backpressure guard: at most M=2 if the flip queue has >=3 pending flips
+                            if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= 3u && m_out > 2) m_out = 2;
+                            if (m_out == 1) fast_skip = 1;
                             g_fast_acc_q16 = acc_new - (m_out << 16);
                             if (g_fast_acc_q16 < -49152) g_fast_acc_q16 = -49152;
                             if (g_fast_acc_q16 >  49152) g_fast_acc_q16 =  49152;
@@ -1653,12 +1656,14 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                         }
                     }
 
+                    if (fast_skip) goto fast_native;   // FAST, M = 1: this frame is shown as is (post + overlay only)
                     n = build_dcb_flow8(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi1], g_buf[mi2], g_pitch,
                                         tidx, px * 4, slot, g_flips, tail, (int32_t)handle, mi1, mi2,
                                         t1_q16, t2_q16, two_mids, force_repeat);
                     flip_idx = mi1;
                     second_flip = 1;
                 } else if (g_inject_on == 8 && g_sh8_ok && g_fmt_supported && g_bw >= 640 && g_bh >= 360) {
+                fast_native: ;
                     // 1.4: Native / Post-only path (FG off in menu, or 720p/900p/60fps game): draw OSD menu/overlay + RCAS/Enhance on cur
                     uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
                     uint32_t tidx = (g_attr.tilingMode == 0) ? 10u : 8u;
