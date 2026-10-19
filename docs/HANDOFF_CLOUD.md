@@ -40,6 +40,13 @@ Log line reference: `HANDOFF_LOCAL.md` section 5.
 
 ## 3. Tasks, in order
 
+0. **Benchmark and tuning (`docs/BENCHMARK.md`).** `tools/bench/metrics.py` exists (self-test:
+   `tools/bench/selftest.py`). Write `tools/bench/vcfg_ref.py`: a NumPy port of classic mode 8 (pyr8, me3/me2/me1,
+   gm8/fgs8/mf8, phase8, warp8 from `classic/shaders/*.ll`) with every tunable constant in one dict, plus a tuner
+   (random search / CMA-ES) that scores against ground-truth triplets. Test it on synthetic clips now; real clips
+   come from the console capture mode later. Context: an independent PS4 model reported higher PSNR/SSIM/LPIPS than
+   VCFG classic on motion, while VCFG classic led on HUD, static pixels and HUD flicker; the target is to gain on
+   motion without losing those.
 1. **Log analyzer -> compatibility table.** Extend `tools/analyze.py` (or a new tool) to read `trace-*.txt` /
    `probe*.log` and print per title: format, buffers, resolution, FG on/off and inert reason, real fps with and
    without FG, CADENCE quality (share of mid 1 / real 1), latency, queue depth, HOOK breakdown. Run it on

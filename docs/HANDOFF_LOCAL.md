@@ -110,6 +110,9 @@ feel laggy (latency).
 
 ## 6. Tasks, in order
 
+0. **Benchmark first (`docs/BENCHMARK.md`).** Build the bench capture mode in the classic engine (test build, one
+   60 fps title, e.g. CUSA00557 or CUSA09171), `tools/bench/fetch.py`, and a first clip set; score `vcfg_classic` and
+   the cross-fade baseline with `tools/bench/metrics.py`. From then on every warp / motion change needs a score.
 1. **Two-buffer games (CUSA05571, CUSA08809).** Present copy + buffer rings are in place (`g_pcopy_*` in
    `classic/source/main.c`). Remaining cause: the game waits for its own previous flip, and the real frame reaches
    the screen one refresh after its mid. Try, as separate builds:
