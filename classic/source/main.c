@@ -1358,6 +1358,29 @@ static void pace_vblank(int prev2_real, int prev_real, int cur_real)
     g_rel_t = sceKernelGetProcessTime();
 }
 
+// VCFG: pacing for FG pairs that does not wait for the display. pace_vblank released the game only after its
+// previous real frame was on screen, so the game could not render while that frame was shown: a CPU-heavy game
+// (26 ms per frame) fell from 37-42 to 22-24 fps. This releases the game once per pair period (2 refreshes at the
+// measured rate) counted from the previous release; if the flip queue grows (timer vs display drift), the next
+// release moves 2 ms later.
+static uint64_t g_pair_next;
+static void pace_pair(void)
+{
+    if (!g_freq) return;
+    uint32_t hz10 = g_last_hz_x10 > 400u && g_last_hz_x10 < 800u ? g_last_hz_x10 : 599u;
+    uint64_t period = g_freq * 20ull / hz10;                  // 2 refreshes
+    uint64_t now = sceKernelGetProcessTimeCounter();
+    if (!g_pair_next || now > g_pair_next + period * 3) { g_pair_next = now + period; g_rel_t = sceKernelGetProcessTime(); return; }
+    if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= 3u) g_pair_next += g_freq / 500u;   // drain: +2 ms
+    if (now < g_pair_next) {
+        uint64_t us = (g_pair_next - now) * 1000000ull / g_freq;
+        if (us > 1500) sceKernelUsleep((uint32_t)(us - 1000));
+        while (sceKernelGetProcessTimeCounter() < g_pair_next) { }
+    }
+    g_pair_next += period;
+    g_rel_t = sceKernelGetProcessTime();
+}
+
 static uint32_t med3_u32(uint32_t a, uint32_t b, uint32_t c)
 {
     if (a > b) { uint32_t t = a; a = b; b = t; }
@@ -1774,6 +1797,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                 }
                 if (g_cfg.fps_lock == 20) pace_hz(20);
                 else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
+                else if (g_inject_on == 8 && second_flip) { (void)pace_p2; (void)pace_p1; pace_pair(); }
                 else if (g_inject_on >= 7 && second_flip) pace_vblank(pace_p2, pace_p1, (int)index);
                 else if (second_flip) pace_30();
                 return rc;
