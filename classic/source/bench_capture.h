@@ -232,6 +232,9 @@ static int32_t bench_flip(uint32_t count, void **dcb, uint32_t *sizes, void **cc
     uint32_t ncount = count;
     if (nd == 64) { ds[last] = mine; dz[last] = bytes; }
     else { dz[last] -= 256; ds[count] = mine; dz[count] = bytes; cs[count] = NULL; cz[count] = 0; ncount++; }
+    // Drain the CPU's WC clear of motion history and publish descriptors/DCBs
+    // before handing them to the GPU. This does not wait for GPU execution.
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     int32_t r = HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
         int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
         ncount, ds, dz, ccb ? cs : NULL, csizes ? cz : NULL, handle, index, mode, arg);
