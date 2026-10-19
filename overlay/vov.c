@@ -9,6 +9,8 @@ static const uint32_t k_rgb[C_N] = { 0, 0xefeee8, 0x0b0b0b, 0xf5d23a, 0xf2502e, 
 typedef struct { uint8_t *pix; uint32_t *pal; unsigned w, h; int npairs; uint8_t pf[15], pb[15]; } Canvas;
 
 static uint8_t *g_mem;
+static size_t g_buf_sz = VOV_BUF_SZ;   // bytes per buffer
+static unsigned g_nbuf = 2, g_max_h = VOV_MAX_H;
 static int g_cur;                 // buffer drawn last
 static uint32_t g_hash[2];        // content hash per buffer
 
@@ -30,7 +32,7 @@ static uint32_t mix(uint32_t a, uint32_t b, unsigned t) // t 0..15
 
 static void canvas_begin(Canvas *c, int buf, unsigned w, unsigned h)
 {
-    uint8_t *base = g_mem + (size_t)buf * VOV_BUF_SZ;
+    uint8_t *base = g_mem + (size_t)buf * g_buf_sz;
     c->pal = (uint32_t *)base; c->pix = base + VOV_PAL_SZ; c->w = w; c->h = h; c->npairs = 0;
     bset(c->pal, 0, VOV_PAL_SZ);
     for (int i = 1; i < C_N; i++) c->pal[i] = pack(k_rgb[i], 255);
@@ -131,14 +133,23 @@ static uint32_t hash(const void *p, size_t n)
 }
 
 static const uint8_t *g_last;
-void vov_init(uint8_t *mem) { g_mem = mem; g_cur = 0; g_hash[0] = g_hash[1] = 0; g_last = 0; }
+void vov_init(uint8_t *mem) { g_mem = mem; g_buf_sz = VOV_BUF_SZ; g_nbuf = 2; g_max_h = VOV_MAX_H; g_cur = 0; g_hash[0] = g_hash[1] = 0; g_last = 0; }
+void vov_init_size(uint8_t *mem, size_t size)
+{
+    if (size >= VOV_MEM_SZ) { vov_init(mem); return; }
+    vov_init(mem);
+    g_nbuf = 1; g_buf_sz = size;
+    size_t h = (size - VOV_PAL_SZ) / VOV_W;
+    g_max_h = (unsigned)(h > VOV_MAX_H ? VOV_MAX_H : h) & ~15u;
+}
 const uint8_t *vov_pal_ptr(void) { return g_last; }
 const uint8_t *vov_pix_ptr(void) { return g_last ? g_last + VOV_PAL_SZ : 0; }
 
 static int pick(uint32_t h)  // returns buffer to use; draws needed when its hash differs
 {
     if (g_hash[g_cur] == h) return g_cur;
-    g_cur ^= 1; g_hash[g_cur] = 0; return g_cur;
+    if (g_nbuf > 1) g_cur ^= 1;
+    g_hash[g_cur] = 0; return g_cur;
 }
 
 // Small pixel mark from the launcher (top right of the header).
@@ -162,10 +173,14 @@ static void upper(char *d, const char *s, size_t cap)
 int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigned *w, unsigned *h)
 {
     if (!g_mem) return 0;
-    const int W = (int)VOV_W, PAD = 24, HEAD = m->status[0] ? 168 : 152, ROW = 58, FOOT = 56;
-    int nrows = m->nrows > 10 ? 10 : m->nrows;
+    const int W = (int)VOV_W, PAD = 24, HEAD = m->status[0] ? 168 : 152, FOOT = 56;
+    int nrows = m->nrows > 10 ? 10 : m->nrows, ROW = 58;
+    if (nrows && HEAD + nrows * ROW + FOOT > (int)g_max_h) {   // small overlay memory: shorter rows (min 44 px)
+        ROW = ((int)g_max_h - HEAD - FOOT) / nrows;
+        if (ROW < 44) { ROW = 44; nrows = ((int)g_max_h - HEAD - FOOT) / ROW; }
+    }
     unsigned H = (unsigned)(HEAD + nrows * ROW + FOOT);
-    H = (H + 15u) & ~15u; if (H > VOV_MAX_H) H = VOV_MAX_H;
+    H = (H + 15u) & ~15u; if (H > g_max_h) H = g_max_h;
     uint32_t hs = hash(m, sizeof(*m)) ^ 0x4D454E55u;
     int buf = pick(hs);
     Canvas c; c.w = W; c.h = H;
@@ -188,11 +203,12 @@ int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigne
             int y = HEAD + i * ROW, sel = i == m->sel, bg = sel ? C_SEL : C_CREAM;
             rect(&c, 0, y, W, ROW, bg);
             if (sel) rect(&c, 0, y, 6, ROW, C_INK);
-            int bx = text(&c, &vov_text25, PAD, y + 38, sel ? "› " : "", C_INK, bg, 0, 0);
-            text(&c, &vov_text25, bx, y + 38, r->label, C_INK, bg, 0, W / 2 + 40);
+            int ty = y + ROW / 2 + 9;
+            int bx = text(&c, &vov_text25, PAD, ty, sel ? "› " : "", C_INK, bg, 0, 0);
+            text(&c, &vov_text25, bx, ty, r->label, C_INK, bg, 0, W / 2 + 40);
             if (r->kind == VOV_TOGGLE) {
                 const char *v = r->on ? "ON" : "OFF";
-                int tw = text_w(&vov_mono20, v, 1), pw = tw + 28, px = W - PAD - pw, py = y + 14;
+                int tw = text_w(&vov_mono20, v, 1), pw = tw + 28, px = W - PAD - pw, py = y + (ROW - 30) / 2;
                 rect(&c, px, py, pw, 30, r->on ? C_RED : C_GREY); round_corners(&c, px, py, pw, 30, 15);
                 for (int j = py; j < py + 30; j++) for (int k = px; k < px + pw; k++)   // corners show the row colour
                     if (c.pix[(size_t)j * c.w + k] == C_NONE) c.pix[(size_t)j * c.w + k] = (uint8_t)bg;
@@ -206,7 +222,7 @@ int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigne
             } else {
                 char v[28]; upper(v, r->value, sizeof(v));
                 int tw = text_w(&vov_mono20, v, 1);
-                text(&c, &vov_mono20, W - PAD - tw, y + 37, v, C_INK, bg, 1, 0);
+                text(&c, &vov_mono20, W - PAD - tw, ty - 1, v, C_INK, bg, 1, 0);
             }
             if (i + 1 < nrows && !sel && i + 1 != m->sel) rect(&c, PAD, y + ROW - 2, W - 2 * PAD, 2, C_INK);
         }
@@ -217,7 +233,7 @@ int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigne
         round_corners(&c, 0, 0, W, (int)H, 12);
         g_hash[buf] = hs;
     }
-    uint8_t *base = g_mem + (size_t)buf * VOV_BUF_SZ;
+    uint8_t *base = g_mem + (size_t)buf * g_buf_sz;
     g_last = base; *pal = base; *pix = base + VOV_PAL_SZ; *w = (unsigned)W; *h = H;
     return 1;
 }
@@ -243,7 +259,7 @@ int vov_counter(const VovCounter *k, const uint8_t **pal, const uint8_t **pix, u
         round_corners(&c, 0, 0, (int)W, (int)H, 10);
         g_hash[buf] = hs;
     }
-    uint8_t *base = g_mem + (size_t)buf * VOV_BUF_SZ;
+    uint8_t *base = g_mem + (size_t)buf * g_buf_sz;
     g_last = base; *pal = base; *pix = base + VOV_PAL_SZ; *w = W; *h = H;
     return 1;
 }

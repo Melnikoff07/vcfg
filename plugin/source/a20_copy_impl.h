@@ -36,7 +36,8 @@
 // A22: our first mid index = number of game buffers (2 in REF, 3 in RE2). Fixed before a20_init registers it.
 static int a22_mid=2;
 #define A21_IS_MID(i) ((i)>=a22_mid && (i)<a22_mid+(int)A21_NMIDS)
-#define A20_TOTAL_BYTES (A20_GPU_BYTES+A20_IMAGE_BYTES+A20_UPPER_WORK)
+#define A20_OVL_BYTES 0x48000u  // in-game overlay bitmap (overlay/vov.c, one buffer): this profile allows no later allocation
+#define A20_TOTAL_BYTES (A20_GPU_BYTES+A20_IMAGE_BYTES+A20_UPPER_WORK+A20_OVL_BYTES)
 #define A20_SLOTS 8u
 #if A21_FAST540
 // [0x100,0xA800) code (warp540 replaces warp720), font 0xA800, markers 0xAC00, 8 slots x 0x3000 from 0xC000.
@@ -478,9 +479,9 @@ static char a21_vov_title[48];
 static int a21_vov_ready(void)
 {
     if (a21_vov_state) return a21_vov_state>0;
-    void *mem=alloc_dm((VOV_MEM_SZ+0xFFFFu)&~0xFFFFu,0x10000,0 /*WB_ONION*/);
-    if (!mem) { a21_vov_state=-1; lg("A21_OVERLAY no memory, menu disabled\n"); return 0; }
-    vov_init((uint8_t *)mem);
+    if (!a20_gpu) return 0;
+    uint8_t *mem=a20_gpu+A20_GPU_BYTES+A20_IMAGE_BYTES+A20_UPPER_WORK; // tail of the startup allocation
+    vov_init_size(mem,A20_OVL_BYTES);
     vov_read_title(a21_vov_title,sizeof(a21_vov_title));
     if (!a21_vov_title[0]) vov_cpy(a21_vov_title,g_title_id,sizeof(a21_vov_title));
     lg("A21_OVERLAY ready %p title '%s'\n",mem,a21_vov_title);

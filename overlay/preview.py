@@ -7,7 +7,7 @@ out = pathlib.Path(sys.argv[1]); out.mkdir(parents=True, exist_ok=True)
 dll = ctypes.CDLL(str(ROOT / 'build' / 'preview' / 'vov_preview.dll'))
 mem = ctypes.create_string_buffer(4 << 20)
 bg = np.zeros((760, 1100, 3), np.uint8); bg[:] = (59, 69, 55); bg[480:] = (105, 122, 90)
-for scene, name in [(0, 'menu'), (1, 'counter_detail'), (2, 'counter_small'), (3, 'menu_status')]:
+for scene, name in [(0, 'menu'), (1, 'counter_detail'), (2, 'counter_small'), (3, 'menu_status'), (4, 'menu_small_memory')]:
     pal, pix, w, h = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_uint(), ctypes.c_uint()
     dll.vov_preview(mem, scene, ctypes.byref(pal), ctypes.byref(pix), ctypes.byref(w), ctypes.byref(h))
     P = np.frombuffer(ctypes.string_at(pal.value, 1024), np.uint8).reshape(256, 4)

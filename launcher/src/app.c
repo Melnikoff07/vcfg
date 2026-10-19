@@ -98,10 +98,10 @@ static void draw_card(Canvas *c, App *a, Game *g, int idx, int x, int y, int w, 
 {
     Fonts *f = a->f;
     uint32_t bg = g->testing ? CREAM : k_card[idx % 3];
-    if (!g->installed) bg = CREAM;
+    if (!g->installed || (g->experimental && !g->s.fg)) bg = CREAM;
     if (sel) { fill_round(c, x, y, w, h, 22, INK); fill_round(c, x + 8, y + 8, w - 16, h - 16, 15, bg); }
     else fill_round(c, x, y, w, h, 22, bg);
-    if (!sel && (g->testing || !g->installed)) dashed_rect(c, x, y, w, h, 4, 14, INK);
+    if (!sel && (g->testing || !g->installed || g->experimental)) dashed_rect(c, x, y, w, h, 4, 14, INK);
     int p = 22, isz = w - 2 * p;
     if (g->icon) blit_scaled(c, g->icon, g->iw, g->ih, x + p, y + p, isz, isz, 11);
     else hatch(c, x + p, y + p, isz, isz, 11, INK, 0xFF232323u, 34);
@@ -115,6 +115,7 @@ static void draw_card(Canvas *c, App *a, Game *g, int idx, int x, int y, int w, 
     char lab[48] = "";
     if (!g->installed) cat(lab, "NOT INSTALLED");
     else if (g->testing) cat(lab, "UNSTABLE, OFF");
+    else if (g->experimental) cat(lab, g->s.fg ? "EXPERIMENTAL" : "EXPERIMENTAL, OFF");
     else if (!g->s.fg) cat(lab, "FG OFF");
     else cat(lab, mode_name(g->s.preset));
     draw_text(c, &f->mono, x + p, y + h - 30, lab, INK, 1);
@@ -213,7 +214,7 @@ static void draw_install(Canvas *c, App *a, int top)
     draw_text(c, &f->mono, M + 34, y + 60, "PLUGIN ON THIS CONSOLE", INK, 1);
     draw_text(c, &f->big, M + 34, y + 190, states[a->plugin_state % 3], INK, -6);
     int ly = y + 300;
-    draw_text(c, &f->title, M, ly, "Cross copies the plugin from this app to the console. Do it once after installing a new VCFG package.", INK, 0);
+    draw_text(c, &f->title, M, ly, "The app installs and updates the plugin by itself when it starts. Cross repeats that if a file got damaged.", INK, 0);
     draw_text(c, &f->title, M, ly + 52, "Settings do not need it: they save as you change them. Nothing is downloaded. Square turns VCFG off.", INK, 0);
     for (int i = 0; i < a->nlog; i++) draw_text(c, &f->mono, M, ly + 140 + i * 42, a->log[i], DIM, 1);
     if (a->status[0]) draw_text(c, &f->mono, M, c->h - FOOT - 40, a->status, INK, 1);
@@ -301,7 +302,7 @@ int app_input(App *a, uint32_t b)
     }
     if (b & PAD_CIRCLE) { a->detail = 0; return ACT_SAVE; }
     if (a->tab == TAB_DEFAULTS && (b & PAD_CROSS)) {
-        for (int i = 0; i < a->ngames; i++) if (!a->games[i].testing) a->games[i].s = a->defaults;
+        for (int i = 0; i < a->ngames; i++) if (!a->games[i].testing && !a->games[i].experimental) a->games[i].s = a->defaults;
         a->dirty = 1;
     }
     return ACT_NONE;

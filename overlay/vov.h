@@ -36,6 +36,8 @@ typedef struct {
 
 // mem: VOV_MEM_SZ bytes of CPU-writable, GPU-readable memory.
 void vov_init(uint8_t *mem);
+// Smaller memory (at least VOV_PAL_SZ + VOV_W * 128): one buffer, panel height limited, menu rows get shorter.
+void vov_init_size(uint8_t *mem, size_t size);
 // Draw (only when the content changed) and return the buffers for this frame.
 // *pal / *pix: addresses for the V#s, *w / *h: panel size in px (w, h multiples of 16).
 int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigned *w, unsigned *h);

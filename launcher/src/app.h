@@ -9,7 +9,7 @@ typedef struct { int fg, preset, sharp, enhance, overlay; } Settings;   // prese
 
 typedef struct {
     char id[12], title[64];
-    int engine, installed, testing;
+    int engine, installed, testing, experimental;   // experimental: not verified, plugin only when switched on
     const uint8_t *icon; int iw, ih;           // RGBA8, may be 0
     Settings s;
 } Game;
@@ -19,7 +19,7 @@ typedef struct {
 } Fonts;
 
 typedef struct {
-    Game games[24]; int ngames;
+    Game games[48]; int ngames;
     int tab, sel, detail, row;
     Settings defaults;
     int overlay_pos, overlay_detail, overlay_opacity;   // shared overlay style

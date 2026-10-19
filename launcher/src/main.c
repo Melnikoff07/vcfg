@@ -9,6 +9,7 @@
 #include <string.h>
 #include <time.h>
 #include <stdarg.h>
+#include <dirent.h>
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/Pad.h>
@@ -31,13 +32,14 @@
 typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
-    { "CUSA07439", "vcfg4.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic5.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic5.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic5.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA07439", "vcfg5.prx", ENGINE_NEW, 0 },
+    { "CUSA08519", "vcfg_classic6.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic6.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic6.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg4.prx", "vcfg_classic5.prx" };
+static const char *k_files[] = { "vcfg5.prx", "vcfg_classic6.prx" };
+static const char *k_exp_prx = "vcfg_classic6.prx";   // engine for experimental (not verified) titles
 
 static FILE *g_log;
 static void vlog(const char *fmt, ...)
@@ -120,7 +122,7 @@ static void load_settings(App *a)
     a->overlay_pos = ini_int(t, "overlay_pos", 4); a->overlay_opacity = ini_int(t, "overlay_opacity", 80);
     free(l);
     for (int i = 0; i < a->ngames; i++) {
-        Game *g = &a->games[i]; g->s = a->defaults; if (g->testing) g->s.fg = 0;
+        Game *g = &a->games[i]; g->s = a->defaults; if (g->testing || g->experimental) g->s.fg = 0;
         if (g->engine == ENGINE_NEW) {
             unsigned char *b = read_all(CFGDIR "/vcfg.ini", &n); if (!b) continue;
             const char *s = (const char *)b;
@@ -130,7 +132,7 @@ static void load_settings(App *a)
             snprintf(path, sizeof(path), CFGDIR "/config-%s.ini", g->id);
             unsigned char *b = read_all(path, &n); if (!b) continue;
             const char *s = (const char *)b;
-            g->s = (Settings){ ini_int(s, "framegen", 1), ini_int(s, "preset", 0), ini_int(s, "sharpness", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
+            g->s = (Settings){ ini_int(s, "framegen", g->experimental ? 0 : 1), ini_int(s, "preset", 0), ini_int(s, "sharpness", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
             free(b);
         }
     }
@@ -158,43 +160,86 @@ static void save_settings(App *a)
     vlog("settings saved\n");
 }
 
-// ---- plugins.ini: point supported titles at our files; keep foreign lines; [default] stays last ----
-static int ours(const char *l) { return strstr(l, PLUG "vcfg") || strstr(l, PLUG "bb_probe"); }
-// Titles marked testing (crashed on hardware) keep an empty section: no plugin, and [default] plugins stay out too.
-static int mapped(int t) { return !k_sup[t].testing; }
-static void section(char *b, size_t n, int t)
+// ---- plugins.ini: point our titles at our files; keep foreign lines; [default] stays last ----
+// Verified titles always get their plugin. Experimental titles get the classic engine only while switched on;
+// switched off, their section is dropped when nothing else is left in it (an empty section would block [default]).
+typedef struct { char id[12]; const char *prx; int keep_empty; } Map;
+static Map g_map[48]; static int g_nmap;
+static void build_map(const App *a)
 {
-    if (mapped(t)) snprintf(b, n, "[%s]\n" PLUG "%s\n", k_sup[t].id, k_sup[t].prx);
-    else snprintf(b, n, "[%s]\n", k_sup[t].id);
+    g_nmap = 0;
+    for (int t = 0; t < NSUP; t++) {
+        Map *m = &g_map[g_nmap++]; snprintf(m->id, sizeof(m->id), "%s", k_sup[t].id);
+        m->prx = k_sup[t].testing ? NULL : k_sup[t].prx; m->keep_empty = 1;
+    }
+    for (int i = 0; i < a->ngames && g_nmap < 48; i++) {
+        const Game *g = &a->games[i]; if (!g->experimental) continue;
+        Map *m = &g_map[g_nmap++]; snprintf(m->id, sizeof(m->id), "%s", g->id);
+        m->prx = g->s.fg ? k_exp_prx : NULL; m->keep_empty = 0;
+    }
+}
+static int ours(const char *l) { return strstr(l, PLUG "vcfg") || strstr(l, PLUG "bb_probe"); }
+static int map_of(const char *hdr)
+{
+    for (int t = 0; t < g_nmap; t++) { char h[24]; snprintf(h, sizeof(h), "[%s]", g_map[t].id); if (!strncmp(hdr, h, strlen(h))) return t; }
+    return -1;
+}
+typedef struct { char *o; size_t n, cap; int bad; } Out;
+static void emit(Out *w, const char *s)
+{
+    size_t L = strlen(s); if (w->bad || w->n + L + 2 >= w->cap) { w->bad = 1; return; }
+    memcpy(w->o + w->n, s, L); w->n += L;
+}
+static void emit_new(Out *w, int t)
+{
+    char b[128]; if (!g_map[t].prx && !g_map[t].keep_empty) return;
+    if (g_map[t].prx) snprintf(b, sizeof(b), "[%s]\n" PLUG "%s\n", g_map[t].id, g_map[t].prx); else snprintf(b, sizeof(b), "[%s]\n", g_map[t].id);
+    emit(w, b);
+}
+typedef struct { char hdr[512]; char body[8192]; size_t bn; int have, cur; } Section;
+static void sec_add(Section *s, const char *line)
+{
+    size_t l = strlen(line); if (s->bn + l + 1 < sizeof(s->body)) { memcpy(s->body + s->bn, line, l); s->bn += l; s->body[s->bn++] = '\n'; }
+}
+// Writes the buffered section: header + kept lines (+ our line); dropped when it ended up empty and may go.
+static void sec_flush(Out *w, Section *s, int install, int *done)
+{
+    if (s->have) {
+        int dup = s->cur >= 0 && done[s->cur];   // already written before [default]
+        if (s->cur >= 0 && install && g_map[s->cur].prx && !dup) { char b[96]; snprintf(b, sizeof(b), PLUG "%s", g_map[s->cur].prx); sec_add(s, b); }
+        if (!(s->cur >= 0 && !s->bn && (dup || !g_map[s->cur].keep_empty))) { emit(w, s->hdr); emit(w, "\n"); s->body[s->bn] = 0; emit(w, s->body); }
+        if (s->cur >= 0) done[s->cur] = 1;
+    }
+    s->have = 0; s->bn = 0; s->cur = -1;
 }
 static char *ini_update(const char *old, int install, size_t *outn)
 {
-    size_t cap = strlen(old) + 8192; char *o = malloc(cap); size_t n = 0; if (!o) return NULL;
-    int done[NSUP] = {0}, cur = -1; char line[512];
-#define EMIT(s) do { size_t L_ = strlen(s); if (n + L_ + 2 >= cap) { free(o); return NULL; } memcpy(o + n, s, L_); n += L_; } while (0)
+    size_t cap = strlen(old) + 8192;
+    Out w = { malloc(cap), 0, cap, 0 }; if (!w.o) return NULL;
+    static Section sec; memset(&sec, 0, sizeof(sec)); sec.cur = -1;
+    int done[48] = {0}, defaults_seen = 0; char line[512];
     for (const char *p = old; *p; ) {
         size_t L = strcspn(p, "\r\n"); if (L >= sizeof(line)) L = sizeof(line) - 1;
         memcpy(line, p, L); line[L] = 0; p += strcspn(p, "\r\n"); while (*p == '\r' || *p == '\n') p++;
         char *s = line; while (*s == ' ' || *s == '\t') s++;
+        if (!*s) continue;
         if (*s == '[') {
-            if (install && !strncmp(s, "[default]", 9))
-                for (int t = 0; t < NSUP; t++) if (!done[t]) { char b[128]; section(b, sizeof(b), t); EMIT(b); done[t] = 1; }
-            cur = -1;
-            for (int t = 0; t < NSUP; t++) { char h[24]; snprintf(h, sizeof(h), "[%s]", k_sup[t].id); if (!strncmp(s, h, strlen(h))) cur = t; }
-            EMIT(line); EMIT("\n");
-            if (install && cur >= 0 && !done[cur]) {
-                if (mapped(cur)) { char b[96]; snprintf(b, sizeof(b), PLUG "%s\n", k_sup[cur].prx); EMIT(b); }
-                done[cur] = 1;
+            sec_flush(&w, &sec, install, done);
+            if (install && !strncmp(s, "[default]", 9) && !defaults_seen) {
+                defaults_seen = 1;
+                for (int t = 0; t < g_nmap; t++) if (!done[t]) { emit_new(&w, t); done[t] = 1; }
             }
+            snprintf(sec.hdr, sizeof(sec.hdr), "%s", line); sec.have = 1; sec.cur = map_of(s);
             continue;
         }
-        if (cur >= 0 && ours(s)) continue;
-        if (!*s) continue;
-        EMIT(line); EMIT("\n");
+        if (sec.cur >= 0 && ours(s)) continue;
+        if (!sec.have) { emit(&w, line); emit(&w, "\n"); continue; }
+        sec_add(&sec, line);
     }
-    if (install) for (int t = 0; t < NSUP; t++) if (!done[t]) { char b[128]; section(b, sizeof(b), t); EMIT(b); }
-#undef EMIT
-    o[n] = 0; *outn = n; return o;
+    sec_flush(&w, &sec, install, done);
+    if (install) for (int t = 0; t < g_nmap; t++) if (!done[t]) emit_new(&w, t);
+    if (w.bad) { free(w.o); return NULL; }
+    w.o[w.n] = 0; *outn = w.n; return w.o;
 }
 static void addlog(App *a, const char *msg)
 {
@@ -213,7 +258,7 @@ static int plugin_state(void)
         if (!st) break;
     }
     size_t n; unsigned char *ini = read_all(INI, &n);
-    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg4.prx"))) st = 2;
+    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg5.prx"))) st = 2;
     free(ini);
     return st;
 }
@@ -222,6 +267,7 @@ static int do_ini(App *a, int install)
     size_t n = 0; unsigned char *ini = read_all(INI, &n);
     if (!ini) { ini = (unsigned char *)strdup(""); n = 0; }
     else { char bk[128]; snprintf(bk, sizeof(bk), INI ".vcfg_backup_%lld", (long long)time(NULL)); if (write_all(bk, ini, n)) { free(ini); addlog(a, "CANNOT BACK UP PLUGINS.INI"); return -1; } }
+    build_map(a);
     size_t un = 0; char *u = ini_update((char *)ini, install, &un); free(ini);
     if (!u) { addlog(a, "PLUGINS.INI TOO LARGE"); return -1; }
     int rc = write_verified(INI, u, un); vlog("plugins.ini rc=%d\n%s\n", rc, u); free(u);
@@ -242,6 +288,21 @@ static void do_install(App *a)
     }
     do_ini(a, 1);
     a->plugin_state = plugin_state();
+}
+
+// Experimental titles live in plugins.ini only while switched on: rewrite it when a switch changed.
+static uint64_t exp_sig(const App *a)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < a->ngames; i++)
+        if (a->games[i].experimental) { h ^= (uint64_t)(a->games[i].s.fg != 0) + (uint64_t)i * 31u; h *= 1099511628211ull; }
+    return h;
+}
+static uint64_t g_exp_written;
+static void remap_if_changed(App *a)
+{
+    if (exp_sig(a) == g_exp_written) return;
+    if (!do_ini(a, 1)) g_exp_written = exp_sig(a);
 }
 
 // ---- video ----
@@ -302,12 +363,29 @@ int main(void)
         snprintf(g->id, sizeof(g->id), "%s", k_sup[i].id); g->engine = k_sup[i].engine; g->testing = k_sup[i].testing;
         load_meta(g);
     }
+    // Every other installed game is listed as experimental (switched off until the user turns it on).
+    DIR *dir = opendir("/user/app");
+    if (dir) {
+        struct dirent *e;
+        while ((e = readdir(dir)) && a->ngames < (int)(sizeof(a->games) / sizeof(a->games[0]))) {
+            if (strncmp(e->d_name, "CUSA", 4) || strlen(e->d_name) != 9) continue;
+            int known = 0; for (int i = 0; i < NSUP; i++) if (!strcmp(k_sup[i].id, e->d_name)) known = 1;
+            if (known) continue;
+            Game *g = &a->games[a->ngames++]; memset(g, 0, sizeof(*g));
+            snprintf(g->id, sizeof(g->id), "%s", e->d_name); g->engine = ENGINE_CLASSIC; g->experimental = 1;
+            load_meta(g);
+            if (!g->installed) a->ngames--;
+        }
+        closedir(dir);
+    } else vlog("cannot list /user/app\n");
     if (jrc == 0) vlog("unjailbreak rc=%d\n", sys_sdk_unjailbreak(&jb));
     // Installed games first, keep the table order otherwise.
-    for (int i = 1; i < a->ngames; i++) for (int j = i; j > 0 && a->games[j].installed > a->games[j - 1].installed; j--) {
+#define RANK(g) ((g).installed * 2 + !(g).experimental)   // verified first, installed first
+    for (int i = 1; i < a->ngames; i++) for (int j = i; j > 0 && RANK(a->games[j]) > RANK(a->games[j - 1]); j--) {
         Game t = a->games[j]; a->games[j] = a->games[j - 1]; a->games[j - 1] = t;
     }
     load_settings(a);
+    g_exp_written = exp_sig(a);
     a->plugin_state = plugin_state();
     if (a->plugin_state != 1) { addlog(a, a->plugin_state ? "UPDATING PLUGINS" : "INSTALLING PLUGINS"); do_install(a); }
 
@@ -331,9 +409,9 @@ int main(void)
             int act = app_input(a, edge); redraw = 1;
             if (act == ACT_INSTALL) do_install(a);
             else if (act == ACT_REMOVE) { do_ini(a, 0); a->plugin_state = plugin_state(); }
-            else if (act == ACT_SAVE) save_settings(a);
+            else if (act == ACT_SAVE) { save_settings(a); remap_if_changed(a); }
             else if (act == ACT_SAVE_EXIT) {
-                save_settings(a);
+                save_settings(a); remap_if_changed(a);
                 snprintf(a->status, sizeof(a->status), "SAVED. START A GAME, HOLD L3+R3 FOR 3 S FOR THE MENU.");
                 app_draw(&c, a); present(back); sceKernelUsleep(900000); quit();
             }
