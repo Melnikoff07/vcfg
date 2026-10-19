@@ -1869,6 +1869,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
         static uint32_t seen_dfmt;
         if (!dfmt || (seen_dfmt && seen_dfmt != dfmt)) g_fmt_supported = 0;
         else { seen_dfmt = dfmt; g_t_dfmt = dfmt; }
+        vov_set_hdr(attr->format == 0x88740000u);   // HDR10 (BT.2020 PQ): overlay palette re-encoded, passes unchanged
         lg("  attr: fmt=0x%x (supported=%d) tiling=%u aspect=%u %ux%u pitch=%u option=%u\n",
            attr->format, g_fmt_supported, attr->tilingMode, attr->aspectRatio, attr->width, attr->height, attr->pitchInPixel, attr->option);
     }

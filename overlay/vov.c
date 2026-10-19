@@ -18,7 +18,50 @@ static void bset(void *d, int v, size_t n) { uint8_t *p = (uint8_t *)d; while (n
 static size_t slen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
 
 // Scanout buffers are BGRA in memory and osd8 maps byte 0 to component 0, so each entry is stored as B, G, R, A.
-static uint32_t pack(uint32_t rgb, unsigned a) { return (rgb & 0xFFFFFFu) | (uint32_t)a << 24; }
+// ---- HDR10 output (scanout 0x88740000: BT.2020 primaries, PQ): palette colours are re-encoded on the CPU ----
+static int g_hdr;
+static float vf_log2(float x)          // x > 0; ~1e-4 accuracy is plenty for 8-bit palette entries
+{
+    union { float f; uint32_t u; } v = { x };
+    float e = (float)((int)((v.u >> 23) & 255) - 127);
+    v.u = (v.u & 0x007FFFFFu) | 0x3F800000u;                        // mantissa in [1, 2)
+    float m = v.f, t = (m - 1.0f) / (m + 1.0f), t2 = t * t;
+    return e + 2.8853900817779268f * t * (1.0f + t2 * (0.33333333f + t2 * (0.2f + t2 * (0.14285714f + t2 * 0.11111111f))));
+}
+static float vf_exp2(float x)
+{
+    if (x < -126.0f) return 0.0f;
+    if (x > 127.0f) x = 127.0f;
+    int i = (int)x; if ((float)i > x) i--;
+    float f = x - (float)i, p = 1.0f, term = 1.0f;
+    for (int k = 1; k < 9; k++) { term *= f * 0.69314718f / (float)k; p += term; }
+    union { float f; uint32_t u; } v; v.u = (uint32_t)(i + 127) << 23;
+    return p * v.f;
+}
+static float vf_pow(float b, float e) { return b <= 0.0f ? 0.0f : vf_exp2(e * vf_log2(b)); }
+static float srgb_to_lin(float c) { return c <= 0.04045f ? c / 12.92f : vf_pow((c + 0.055f) / 1.055f, 2.4f); }
+static float pq_encode(float nits)
+{
+    float y = vf_pow(nits / 10000.0f, 0.1593017578125f);
+    return vf_pow((0.8359375f + 18.8515625f * y) / (1.0f + 18.6875f * y), 78.84375f);
+}
+static uint32_t to_hdr(uint32_t rgb)   // sRGB (BT.709) -> BT.2020 linear, UI white at 203 nits -> PQ
+{
+    float r = srgb_to_lin((float)(rgb >> 16 & 255) / 255.0f), g = srgb_to_lin((float)(rgb >> 8 & 255) / 255.0f),
+          b = srgb_to_lin((float)(rgb & 255) / 255.0f);
+    float o[3] = { 0.6274f * r + 0.3293f * g + 0.0433f * b, 0.0691f * r + 0.9195f * g + 0.0114f * b,
+                   0.0164f * r + 0.0880f * g + 0.8956f * b };
+    uint32_t out = 0;
+    for (int k = 0; k < 3; k++) {
+        float v = pq_encode(o[k] * 203.0f) * 255.0f + 0.5f;
+        unsigned u = v < 0.0f ? 0u : v > 255.0f ? 255u : (unsigned)v;
+        out |= u << (16 - 8 * k);
+    }
+    return out;
+}
+void vov_set_hdr(int on) { g_hdr = on; g_hash[0] = g_hash[1] = 0; }   // redraw with the other encoding
+
+static uint32_t pack(uint32_t rgb, unsigned a) { return ((g_hdr ? to_hdr(rgb) : rgb) & 0xFFFFFFu) | (uint32_t)a << 24; }
 
 static uint32_t mix(uint32_t a, uint32_t b, unsigned t) // t 0..15
 {

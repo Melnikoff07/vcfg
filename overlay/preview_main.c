@@ -1,11 +1,13 @@
 // PC preview entry points for overlay/preview.py (built as a DLL, see that script).
 #include "vov.h"
+int _fltused = 0;   // MSVC ABI marker for float use (no CRT in the preview DLL)
 void *memset(void *d, int v, size_t n) { volatile uint8_t *p = d; while (n--) *p++ = (uint8_t)v; return d; }
 void *memcpy(void *d, const void *s, size_t n) { volatile uint8_t *p = d; const uint8_t *q = s; while (n--) *p++ = *q++; return d; }
 static void cpy(char *d, const char *s, int n) { int i = 0; for (; s[i] && i < n - 1; i++) d[i] = s[i]; d[i] = 0; }
 __declspec(dllexport) int vov_preview(uint8_t *mem, int scene, const uint8_t **pal, const uint8_t **pix, unsigned *w, unsigned *h)
 {
     if (scene == 4) vov_init_size(mem, 0x48000); else vov_init(mem);
+    vov_set_hdr(scene == 5);
     if (scene == 1) { VovCounter k = { 600, 167, 1 }; return vov_counter(&k, pal, pix, w, h); }
     if (scene == 2) { VovCounter k = { 598, 167, 0 }; return vov_counter(&k, pal, pix, w, h); }
     VovMenu m = {0};

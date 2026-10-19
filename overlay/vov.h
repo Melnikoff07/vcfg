@@ -42,6 +42,8 @@ void vov_init_size(uint8_t *mem, size_t size);
 // *pal / *pix: addresses for the V#s, *w / *h: panel size in px (w, h multiples of 16).
 int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigned *w, unsigned *h);
 int vov_counter(const VovCounter *c, const uint8_t **pal, const uint8_t **pix, unsigned *w, unsigned *h);
+// 1 when the scanout is HDR10 (0x88740000, BT.2020 PQ): palette colours are re-encoded for it.
+void vov_set_hdr(int on);
 // Buffers returned by the last vov_menu / vov_counter call (NULL before the first one).
 const uint8_t *vov_pal_ptr(void);
 const uint8_t *vov_pix_ptr(void);
