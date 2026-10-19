@@ -70,6 +70,9 @@ static volatile int g_fmt_supported = 1;
 static volatile uint32_t g_last_gpu_ms_x100 = 0, g_last_hz_x10 = 600;
 static volatile uint32_t g_osd_real_fps_x10 = 300, g_osd_out_fps_x10 = 600, g_osd_frame_ms_x10 = 333;
 static volatile uint32_t g_cur_pending_flips = 0, g_cur_gcq = 0;
+// Latency of real frames: time the game handed frame <buffer> to the flip hook -> time it was on screen.
+static volatile uint64_t g_sub_t[16];
+static uint64_t g_lat_sum, g_lat_n, g_lat_max;
 static volatile uint32_t g_gv_letters_base = 0;
 static volatile int g_ab_x_flag = 0;   // inject letter 'x' (developer A/B comparison mode: keep 30 fps pacing when FG off)
 
@@ -1243,6 +1246,12 @@ static void *mon_thread(void *arg)
                     if (fs.currentBuffer >= g_ngame && last_buf >= 0 && last_buf < g_ngame) g_mids_shown++;
                 }
             }
+            if (fs.currentBuffer >= 0 && fs.currentBuffer < g_ngame && fs.currentBuffer < 16 && fs.currentBuffer != last_buf) {
+                uint64_t t0 = __atomic_exchange_n(&g_sub_t[fs.currentBuffer], 0ull, __ATOMIC_ACQ_REL);
+                if (t0 && fs.processTime > t0 && fs.processTime - t0 < 500000ull) {
+                    uint64_t l = fs.processTime - t0; g_lat_sum += l; g_lat_n++; if (l > g_lat_max) g_lat_max = l;
+                }
+            }
             if (fs.currentBuffer >= 0 && fs.currentBuffer < g_ngame) g_last_real_buf = fs.currentBuffer;
             last_count = fs.count;
             last_t = fs.processTime;
@@ -1267,6 +1276,10 @@ static void *mon_thread(void *arg)
             uint32_t cn_ = __atomic_exchange_n(&g_cpu_n, 0u, __ATOMIC_ACQ_REL);
             uint32_t csum_ = __atomic_exchange_n(&g_cpu_sum_us, 0u, __ATOMIC_ACQ_REL);
             uint32_t cmax_ = __atomic_exchange_n(&g_cpu_max_us, 0u, __ATOMIC_ACQ_REL);
+            lg("LATENCY real frame hand-over -> on screen: avg %.1f max %.1f ms (%llu frames) | FG %s preset %d | pending max %d\n",
+               g_lat_n ? (double)g_lat_sum / 1000.0 / (double)g_lat_n : 0.0, (double)g_lat_max / 1000.0,
+               (unsigned long long)g_lat_n, (g_cfg.framegen && !g_inert_reason[0]) ? "on" : "off", g_cfg.preset, pend_max);
+            g_lat_sum = g_lat_n = g_lat_max = 0;
             lg("CADENCE (vblanks on screen) mid 1:%u 2:%u 3:%u 4+:%u | real 1:%u 2:%u 3:%u 4+:%u | refresh %.3f Hz | "
                "pending max %d gcq max %d | missed %u (gaps %u) | pace timeouts %u resync %u fix %u | game cpu release->submit avg %.1f max %.1f ms\n",
                g_hist[0][0], g_hist[0][1], g_hist[0][2], g_hist[0][3], g_hist[1][0], g_hist[1][1], g_hist[1][2], g_hist[1][3],
@@ -1416,6 +1429,7 @@ static int dcb_mem_ok(uintptr_t a, size_t n)
 
 static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
 {
+    if (index < 16u) __atomic_store_n(&g_sub_t[index], sceKernelGetProcessTime(), __ATOMIC_RELEASE);
     uint64_t prev_flip_t = g_last;
     g_flips++;
     if (g_flips == 1) lg("first SubmitAndFlip: count=%u flipMode=%u title=%s\n", count, flipMode, g_title_id);
