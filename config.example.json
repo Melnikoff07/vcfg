@@ -5,5 +5,7 @@
   "llc_gfx700": "C:/path/to/llvm-amdgpu/bin/llc.exe",
   "python": "python",
   "ps4_host": "192.168.1.x",
-  "ps4_ftp_port": 2121
+  "ps4_ftp_port": 2121,
+  "classic_prx": "C:/path/to/classic_v116.prx",
+  "classic_bb_prx": "C:/path/to/classic_pre116.prx"
 }

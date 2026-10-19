@@ -8,3 +8,6 @@ config.json
 *.o
 *.token
 __pycache__/
+
+# launcher drawing preview output
+build/preview/
