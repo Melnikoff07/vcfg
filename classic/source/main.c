@@ -160,9 +160,13 @@ static void log_open(void)
     g_log = fopen(LOG_PATH, "w");
 }
 
+#define VCFG_ENGINE "classic"
+#include "vcfg_trace.h"
+
 static void lg_write(const char *buf)
 {
     klog("[bb_probe] %s", buf);
+    vcfg_trace(buf);
     log_open();
     if (g_log) { fputs(buf, g_log); fflush(g_log); }
 }

@@ -32,6 +32,7 @@ $env:OO_PS4_TOOLCHAIN = $tc
 $inc = @('-isysroot', $tc, '-isystem', "$tc\include", "-I$sdk\include", "-I$src\common", "-I$src\source", "-I$root\overlay")
 $def = @('-D_BSD_SOURCE=1', '-D__BSD_VISIBLE=1', '-D__PS4__=1', '-DOO=1', '-D__OPENORBIS__=1', '-D__OOPS4__=1', '-D__FINAL__=1', '-D__USE_PRINTF__')
 foreach ($d in $Defs) { $def += "-D$d" }
+$def += "-DVCFG_VER=$((Get-Content (Join-Path $root 'VERSION') -Raw).Trim())"   # shown in the trace / bug report
 $flags = @('--target=x86_64-pc-freebsd12-elf', '-fPIC', '-funwind-tables', '-Wno-c99-designator', '-Werror=format')
 $objs = @()
 $srcs = @(Get-ChildItem "$src\common\*.c") + @(Get-ChildItem "$src\source\*.c")

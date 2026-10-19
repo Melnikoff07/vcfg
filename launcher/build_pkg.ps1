@@ -1,10 +1,11 @@
 # Builds the VCFG launcher package (settings app + plugin installer): build\launcher\VCFG_v<Version>.pkg
 # Needs both plugins built first: ..\build.ps1 (new engine) and ../classic/build.sh (classic engine, used for
 # CUSA08519, CUSA00411 and CUSA00207). System modules come from the OpenOrbis samples.
-param([string]$Version = '2.00')
+param([string]$Version = '')
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 $cfg = Get-Content (Join-Path $repo 'config.json') -Raw | ConvertFrom-Json
+if (-not $Version) { $Version = (Get-Content (Join-Path $repo 'VERSION') -Raw).Trim() }   # one version for app and plugins
 $tc = $cfg.openorbis_toolchain; $llvm = $cfg.llvm_bin
 $env:OO_PS4_TOOLCHAIN = $tc; $env:DOTNET_ROLL_FORWARD = 'Major'
 $pkgTool = Join-Path $tc 'bin\windows\PkgTool.Core.exe'
@@ -31,8 +32,8 @@ if (-not (Test-Path $prx)) { throw "Build the plugin first: $prx not found" }
 $classic = Join-Path $repo 'build\classic\vcfg_classic.prx'
 if (-not (Test-Path $classic)) { throw "Build the classic engine first (classic/build.sh): $classic not found" }
 # Each release that changes a plugin uses a new file name: a running game keeps the old file mapped.
-Copy-Item $prx "$stage\plugins\vcfg8.prx"
-Copy-Item $classic "$stage\plugins\vcfg_classic10.prx"
+Copy-Item $prx "$stage\plugins\vcfg9.prx"
+Copy-Item $classic "$stage\plugins\vcfg_classic11.prx"
 Copy-Item "$PSScriptRoot\assets\fonts\*" "$stage\assets\fonts\"
 
 # 3. System files from the OpenOrbis samples; our own icon.
@@ -55,7 +56,7 @@ foreach ($e in $entries) { Run $pkgTool @('sfo_setentry', $sfo, $e[0], '--type',
 
 # 5. gp4 project and package.
 $files = @('eboot.bin', 'sce_sys/param.sfo', 'sce_sys/icon0.png', 'sce_sys/about/right.sprx', 'sce_module/libc.prx', 'sce_module/libSceFios2.prx',
-    'plugins/vcfg8.prx', 'plugins/vcfg_classic10.prx')
+    'plugins/vcfg9.prx', 'plugins/vcfg_classic11.prx')
 $files += Get-ChildItem "$stage\assets\fonts" | ForEach-Object { "assets/fonts/$($_.Name)" }
 $fileXml = ($files | ForEach-Object { "  <file targ_path=""$_"" orig_path=""$_"" />" }) -join "`n"
 $gp4 = @"

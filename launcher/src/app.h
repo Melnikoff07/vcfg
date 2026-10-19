@@ -8,7 +8,7 @@ enum { TAB_GAMES, TAB_DEFAULTS, TAB_OVERLAY, TAB_INSTALL, TAB_COUNT };
 typedef struct { int fg, preset, sharp, enhance, overlay; } Settings;   // preset 0 quality 1 fast; overlay 0..8
 
 typedef struct {
-    char id[12], title[64];
+    char id[12], title[64], version[16];   // version: APP_VER of the installed game (with its update)
     int engine, installed, testing, experimental;   // experimental: not verified, plugin only when switched on
     const uint8_t *icon; int iw, ih;           // RGBA8, may be 0
     Settings s;

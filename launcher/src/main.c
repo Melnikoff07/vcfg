@@ -32,14 +32,14 @@
 typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
-    { "CUSA07439", "vcfg8.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic10.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic10.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic10.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA07439", "vcfg9.prx", ENGINE_NEW, 0 },
+    { "CUSA08519", "vcfg_classic11.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic11.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic11.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg8.prx", "vcfg_classic10.prx" };
-static const char *k_exp_prx = "vcfg_classic10.prx";   // engine for experimental (not verified) titles
+static const char *k_files[] = { "vcfg9.prx", "vcfg_classic11.prx" };
+static const char *k_exp_prx = "vcfg_classic11.prx";   // engine for experimental (not verified) titles
 
 static FILE *g_log;
 static void vlog(const char *fmt, ...)
@@ -72,7 +72,7 @@ static int write_verified(const char *path, const void *d, size_t n)
 }
 
 // ---- game metadata from the console (title from param.sfo, icon0.png) ----
-static int sfo_title(const unsigned char *b, size_t n, char *out, size_t on)
+static int sfo_str(const unsigned char *b, size_t n, const char *key, char *out, size_t on)
 {
     if (n < 20 || memcmp(b, "\0PSF", 4)) return 0;
     uint32_t keys = *(const uint32_t *)(b + 8), data = *(const uint32_t *)(b + 12), cnt = *(const uint32_t *)(b + 16);
@@ -80,7 +80,7 @@ static int sfo_title(const unsigned char *b, size_t n, char *out, size_t on)
         const unsigned char *e = b + 20 + i * 16;
         uint16_t ko = *(const uint16_t *)e; uint32_t len = *(const uint32_t *)(e + 4), doff = *(const uint32_t *)(e + 12);
         if (keys + ko >= n || data + doff + len > n) continue;
-        if (!strcmp((const char *)b + keys + ko, "TITLE")) {
+        if (!strcmp((const char *)b + keys + ko, key)) {
             size_t k = 0; for (; k + 1 < on && k < len && b[data + doff + k]; k++) out[k] = (char)b[data + doff + k];
             out[k] = 0; return k > 0;
         }
@@ -94,12 +94,14 @@ static void load_meta(Game *g)
     snprintf(p, sizeof(p), "/system_data/priv/appmeta/%s/param.sfo", g->id);
     unsigned char *b = read_all(p, &n);
     if (!b) { snprintf(p, sizeof(p), "/user/appmeta/%s/param.sfo", g->id); b = read_all(p, &n); }
-    if (b) { g->installed = 1; sfo_title(b, n, g->title, sizeof(g->title)); free(b); }
+    if (b) { g->installed = 1; sfo_str(b, n, "TITLE", g->title, sizeof(g->title)); sfo_str(b, n, "APP_VER", g->version, sizeof(g->version)); free(b); }
+    snprintf(p, sizeof(p), "/user/patch/%s/sce_sys/param.sfo", g->id);   // an installed update has the newer APP_VER
+    if ((b = read_all(p, &n))) { sfo_str(b, n, "APP_VER", g->version, sizeof(g->version)); free(b); }
     snprintf(p, sizeof(p), "/user/appmeta/%s/icon0.png", g->id);
     int w, h, ch; unsigned char *img = stbi_load(p, &w, &h, &ch, 4);
     if (img) { g->icon = img; g->iw = w; g->ih = h; g->installed = 1; }
     if (!g->installed) { snprintf(p, sizeof(p), "/user/app/%s/app.json", g->id); FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; } }
-    vlog("game %s installed=%d title='%s' icon=%dx%d\n", g->id, g->installed, g->title, g->iw, g->ih);
+    vlog("game %s installed=%d version=%s title='%s' icon=%dx%d\n", g->id, g->installed, g->version, g->title, g->iw, g->ih);
 }
 
 // ---- settings files ----
@@ -258,7 +260,7 @@ static int plugin_state(void)
         if (!st) break;
     }
     size_t n; unsigned char *ini = read_all(INI, &n);
-    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg8.prx"))) st = 2;
+    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg9.prx"))) st = 2;
     free(ini);
     return st;
 }
@@ -344,19 +346,63 @@ static void bfile(Buf *r, const char *title, const char *path, size_t tail)
     bput(r, (const char *)d + off, n - off);
     free(d);
 }
+// One paragraph per trace: how far the game start got, whether FG ran, the first refusal / failure lines, the end.
+static const char *find_line(const char *t, const char *key, char *out, size_t on)
+{
+    const char *h = strstr(t, key); if (!h) return NULL;
+    const char *b = h; while (b > t && b[-1] != '\n') b--;
+    size_t l = strcspn(b, "\n"); if (l >= on) l = on - 1;
+    memcpy(out, b, l); out[l] = 0; return out;
+}
+static void summarize(Buf *r, const char *id, const char *which, const char *t)
+{
+    char v[24] = "?", secs[40] = "?", line[208];
+    find_line(t, "version: ", v, sizeof(v)); find_line(t, "seconds since start: ", secs, sizeof(secs));
+    int frame = strstr(t, "first SubmitAndFlip") || strstr(t, "A22_TITLE") || strstr(t, "gnm #1 ");
+    int gpu = strstr(t, "gpu_init: ok") || strstr(t, "A20_ALLOC");
+    int fg = strstr(t, "mode4 #") || strstr(t, "kind=1") || strstr(t, "inject #");
+    int menu = strstr(t, "menu opened") || strstr(t, "A20_MENU open=1");
+    bprintf(r, "%s, %s: %s | %s | first frame %s, GPU memory %s, FG frames %s, menu used %s\n", id, which, v, secs,
+            frame ? "yes" : "NO", gpu ? "yes" : "no", fg ? "yes" : "no", menu ? "yes" : "no");
+    static const char *keys[] = { "inert", "FAIL", "fail", "stop", "NATIVE_ONLY", "refus", "no memory", "dcb_unreadable" };
+    int shown = 0;
+    for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]) && shown < 4; k++)
+        if (find_line(t, keys[k], line, sizeof(line))) { bprintf(r, "    reason? %s\n", line); shown++; }
+    const char *end = strstr(t, "---- end of trace ----");
+    if (end && end > t) {   // last log line before the end marker: where the game start stopped if it crashed
+        const char *e = end - 1, *b = e; while (b > t && b[-1] != '\n') b--;
+        size_t l = (size_t)(e - b); if (l >= sizeof(line)) l = sizeof(line) - 1; memcpy(line, b, l); line[l] = 0;
+        bprintf(r, "    last line: %s\n", line);
+    }
+    if (!frame) bprintf(r, "    => stopped before the first frame was shown (loading): see the first lines of this trace\n");
+}
+
 static void do_report(App *a)
 {
     Buf r = { malloc(4u << 20), 0, 4u << 20 };
     if (!r.b) { addlog(a, "NO MEMORY FOR THE REPORT"); return; }
     r.b[0] = 0;
     time_t now = time(NULL);
-    bprintf(&r, "VCFG bug report\napp version: %s\ntime: %lld\ndebug log: %s\nplugin state: %d\n", VCFG_VERSION,
-            (long long)now, a->debug_log ? "on" : "off", a->plugin_state);
+    OrbisKernelSwVersion sw; memset(&sw, 0, sizeof(sw)); sw.Size = sizeof(sw);
+    int swr = sceKernelGetSystemSwVersion(&sw);
+    bprintf(&r, "VCFG bug report\napp version: %s\nfirmware: %s\ntime: %lld\ndebug log: %s\nplugin state: %d\n", VCFG_VERSION,
+            swr == 0 ? sw.VersionString : "?", (long long)now, a->debug_log ? "on" : "off", a->plugin_state);
+    bprintf(&r, "\n==== summary (flight recorder, trace-<TITLE>.txt) ====\n");
+    for (int i = 0; i < a->ngames; i++) {
+        for (int prev = 0; prev < 2; prev++) {
+            char p[96]; size_t n = 0;
+            snprintf(p, sizeof(p), CFGDIR "/trace-%s%s.txt", a->games[i].id, prev ? ".prev" : "");
+            unsigned char *d = read_all(p, &n); if (!d) continue;
+            summarize(&r, a->games[i].id, prev ? "game start before" : "last game start", (const char *)d);
+            free(d);
+        }
+    }
     bprintf(&r, "\n==== games ====\n");
     for (int i = 0; i < a->ngames; i++) {
         const Game *g = &a->games[i];
-        bprintf(&r, "%s installed=%d experimental=%d fg=%d preset=%d sharp=%d enhance=%d overlay=%d title='%s'\n", g->id,
-                g->installed, g->experimental, g->s.fg, g->s.preset, g->s.sharp, g->s.enhance, g->s.overlay, g->title);
+        bprintf(&r, "%s version=%s installed=%d experimental=%d fg=%d preset=%d sharp=%d enhance=%d overlay=%d title='%s'\n", g->id,
+                g->version[0] ? g->version : "?", g->installed, g->experimental, g->s.fg, g->s.preset, g->s.sharp, g->s.enhance,
+                g->s.overlay, g->title);
     }
     bprintf(&r, "\n==== plugin files ====\n");
     for (int i = 0; i < (int)(sizeof(k_files) / sizeof(k_files[0])); i++) {
@@ -369,6 +415,10 @@ static void do_report(App *a)
     for (int i = 0; i < a->ngames; i++) {
         char p[96]; snprintf(p, sizeof(p), CFGDIR "/config-%s.ini", a->games[i].id);
         if (file_exists(p)) bfile(&r, "game settings", p, 8u << 10);
+    }
+    for (int i = 0; i < a->ngames; i++) for (int prev = 0; prev < 2; prev++) {
+        char p[96]; snprintf(p, sizeof(p), CFGDIR "/trace-%s%s.txt", a->games[i].id, prev ? ".prev" : "");
+        if (file_exists(p)) bfile(&r, prev ? "flight recorder, game start before" : "flight recorder, last game start", p, 64u << 10);
     }
     bfile(&r, "plugin log, last game start", CFGDIR "/probe.log", 1536u << 10);
     bfile(&r, "plugin log, the start before", CFGDIR "/probe.prev.log", 1024u << 10);

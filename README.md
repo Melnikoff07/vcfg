@@ -81,7 +81,9 @@ python -I tools/console.py logs
 In the app: tab **04 PLUGIN** → triangle (**debug log on**) → start the game and reproduce → back in the app,
 circle (**save report**). Attach `vcfg_report.txt` (USB stick, or `/data/vcfg_report.txt` over FTP) to an
 [issue](https://github.com/Melnikoff07/vcfg/issues/new?template=bug_report.md). The report holds the app version,
-`plugins.ini`, settings, plugin files and the plugin logs of the last two game starts.
+`plugins.ini`, firmware and game versions, settings, plugin files, an automatic summary per game and the plugin logs of
+the last two game starts. A small flight recorder (`/data/bb_probe/trace-<TITLE>.txt`: first and last 80 log lines of
+each game start) is always on, so even a report saved with the debug log off shows where a game start stopped.
 
 ## Contributing
 
