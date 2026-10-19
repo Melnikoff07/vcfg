@@ -76,8 +76,12 @@ its `#define *_RSRC1/2 … *_code[] = {…};` block. Never search/replace text i
   our GPU passes cost only 3.4 ms: the classic engine paces inside the game's submit call (pace_30, mid hold sleeps),
   so the game's render thread is blocked and its next frame starts late. Holding the game until the queue drains
   (tried, reverted) made it worse.
-- Fix to do: pace without blocking the game's thread (let the flip FIFO and flip arguments time the pair, or move
-  the second flip to our own thread), then re-measure latency and fps.
+- Tried a release-timer pacer (pace_pair, reverted): no change. The 'game cpu release->submit' counter showed 32-37 ms
+  of the game's own time per frame with FG vs ~25 ms without: the game itself is slower, not blocked by us. Causes:
+  our 3.4 ms of GPU work in a GPU-bound game, and each real frame holding its buffer one refresh longer (3 game
+  buffers, queue up to 4), so the game waits for a free buffer. A frame then needs > 33 ms and QUALITY 2x drops to
+  3 refreshes per frame (20-25 fps). Real fixes: cheaper passes (warp/post are ~2.6 of the 3.4 ms), an extra game
+  buffer at registration, or not delaying the real frame (show it first, mid after: costs phase accuracy).
 
 ## 5. Next steps, in order
 
