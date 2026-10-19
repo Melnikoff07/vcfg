@@ -83,6 +83,16 @@ its `#define *_RSRC1/2 … *_code[] = {…};` block. Never search/replace text i
   3 refreshes per frame (20-25 fps). Real fixes: cheaper passes (warp/post are ~2.6 of the 3.4 ms), an extra game
   buffer at registration, or not delaying the real frame (show it first, mid after: costs phase accuracy).
 
+## 4d. CUSA05571 (2 display buffers) - where it ended (2026-10-20)
+
+- Present copy + rings of 3 mids / 3 copies (kept): the game's own frame time fell from 37 to 20.5 ms (no more GPU
+  stall in WaitFlipDone); with pace_vblank the frame is 20.5 + 16 ms -> 27 fps (was 24).
+- Any faster release (timer pacing) makes the game itself wait again (36-38 ms per frame) and mids get dropped:
+  the game paces on its own previous flip, and with FG the real frame reaches the screen one refresh later (after
+  its mid), so the frame period stays ~36 ms. Not fixable by pacing; ideas: give the game's flip argument to the mid
+  flip so its own wait ends a refresh earlier, or FAST-style 2/3-refresh pulldown for games stuck at 25-29 fps.
+- HOOK timing line (classic): build / submit / hold / flip2 / pace ms per FG frame, game own time, flip queue.
+
 ## 5. Next steps, in order
 
 1. **Confirm v2.11 on hardware** (all four verified titles): menu, counter, AA, no flicker, no artifacts around the
