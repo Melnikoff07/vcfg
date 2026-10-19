@@ -54,7 +54,8 @@ its `#define *_RSRC1/2 … *_code[] = {…};` block. Never search/replace text i
    1080p post costs more than the 720p one.
 3. **EXPERIMENTAL titles**: only one (CUSA10249) has been switched on so far; collect what happens per title.
 4. Classic counter artifacts on fast camera turns (fixed in the warp in v2.07): confirm on CUSA00207.
-5. `discovery/source/main.c` has an uncommitted local change of unknown origin; review before committing.
+5. Code review of v2.11: `docs/REVIEW.md` (fixed launcher autosave and "turn off" leaving empty `plugins.ini`
+   sections; open findings listed there, verify the launcher fixes on the console).
 
 ## 5. Next steps, in order
 

@@ -13,8 +13,8 @@ void NotifyStatic(const char* IconUri, const char* text) {
     Buffer.unk3 = 0;
     Buffer.useIconImageUri = 1;
     Buffer.targetId = -1;
-    strcpy(Buffer.message, text);
-    strcpy(Buffer.iconUri, IconUri);
+    snprintf(Buffer.message, sizeof(Buffer.message), "%s", text);
+    snprintf(Buffer.iconUri, sizeof(Buffer.iconUri), "%s", IconUri);
     sceKernelSendNotificationRequest(0, &Buffer, sizeof(Buffer), 0);
 }
 
@@ -24,13 +24,13 @@ void Notify(const char* IconUri, const char *FMT, ...) {
     memset(&Buffer,0,sizeof(Buffer));
     va_list args;
     va_start(args, FMT);
-    vsprintf(Buffer.message, FMT, args);
+    vsnprintf(Buffer.message, sizeof(Buffer.message), FMT, args);
     va_end(args);
     final_printf("Notify message:\n%s\n", Buffer.message);
     Buffer.type = NotificationRequest;
     Buffer.unk3 = 0;
     Buffer.useIconImageUri = 1;
     Buffer.targetId = -1;
-    strcpy(Buffer.iconUri, IconUri);
+    snprintf(Buffer.iconUri, sizeof(Buffer.iconUri), "%s", IconUri);
     sceKernelSendNotificationRequest(0, &Buffer, sizeof(Buffer), 0);
 }

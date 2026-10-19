@@ -79,7 +79,7 @@ static int sfo_title(const unsigned char *b, size_t n, char *out, size_t on)
     for (uint32_t i = 0; i < cnt && 20 + i * 16 + 16 <= n; i++) {
         const unsigned char *e = b + 20 + i * 16;
         uint16_t ko = *(const uint16_t *)e; uint32_t len = *(const uint32_t *)(e + 4), doff = *(const uint32_t *)(e + 12);
-        if (keys + ko >= n || data + doff + len > n) continue;
+        if ((uint64_t)keys + ko >= n || (uint64_t)data + doff + len > n) continue;   // 64-bit: no wrap on bad offsets
         if (!strcmp((const char *)b + keys + ko, "TITLE")) {
             size_t k = 0; for (; k + 1 < on && k < len && b[data + doff + k]; k++) out[k] = (char)b[data + doff + k];
             out[k] = 0; return k > 0;
@@ -113,13 +113,22 @@ static int ini_int(const char *text, const char *key, int def)
     }
     return def;
 }
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+// Same ranges as the menu (app.c change/app_input) and the plugins' parsers; a hand-edited file cannot leave them.
+static void clamp_settings(Settings *s)
+{
+    s->fg = s->fg != 0; s->preset = s->preset != 0; s->sharp = clampi(s->sharp, 0, 100) / 10 * 10;
+    s->enhance = clampi(s->enhance, 0, 2); s->overlay = clampi(s->overlay, 0, 8);
+}
 static void load_settings(App *a)
 {
     size_t n; char path[96];
     unsigned char *l = read_all(CFGDIR "/vcfg_launcher.ini", &n);
     const char *t = l ? (const char *)l : "";
     a->defaults = (Settings){ ini_int(t, "fg", 1), ini_int(t, "preset", 0), ini_int(t, "sharp", 40), ini_int(t, "enhance", 1), ini_int(t, "overlay", 0) };
-    a->overlay_pos = ini_int(t, "overlay_pos", 4); a->overlay_opacity = ini_int(t, "overlay_opacity", 80);
+    a->overlay_pos = clampi(ini_int(t, "overlay_pos", 4), 1, 8);
+    a->overlay_opacity = clampi(ini_int(t, "overlay_opacity", 80), 20, 100) / 10 * 10;
+    clamp_settings(&a->defaults);
     free(l);
     for (int i = 0; i < a->ngames; i++) {
         Game *g = &a->games[i]; g->s = a->defaults; if (g->testing || g->experimental) g->s.fg = 0;
@@ -135,29 +144,31 @@ static void load_settings(App *a)
             g->s = (Settings){ ini_int(s, "framegen", g->experimental ? 0 : 1), ini_int(s, "preset", 0), ini_int(s, "sharpness", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
             free(b);
         }
+        clamp_settings(&g->s);
     }
 }
 static void save_settings(App *a)
 {
-    char buf[512], path[96];
+    char buf[512], path[96]; int bad = 0;
     sceKernelMkdir(CFGDIR, 0777);
     snprintf(buf, sizeof(buf), "fg=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\noverlay_pos=%d\noverlay_opacity=%d\n",
              a->defaults.fg, a->defaults.preset, a->defaults.sharp, a->defaults.enhance, a->defaults.overlay, a->overlay_pos, a->overlay_opacity);
-    write_all(CFGDIR "/vcfg_launcher.ini", buf, strlen(buf));
+    bad |= write_all(CFGDIR "/vcfg_launcher.ini", buf, strlen(buf));
     for (int i = 0; i < a->ngames; i++) {
         Game *g = &a->games[i]; Settings *s = &g->s;
         if (g->engine == ENGINE_NEW) {
             snprintf(buf, sizeof(buf), "enabled=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\nopacity=%d\n",
                      s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity);
-            write_all(CFGDIR "/vcfg.ini", buf, strlen(buf));
+            bad |= write_all(CFGDIR "/vcfg.ini", buf, strlen(buf));
         } else {
             snprintf(path, sizeof(path), CFGDIR "/config-%s.ini", g->id);
             snprintf(buf, sizeof(buf), "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\n",
                      s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity);
-            write_all(path, buf, strlen(buf));
+            bad |= write_all(path, buf, strlen(buf));
         }
     }
-    vlog("settings saved\n");
+    vlog(bad ? "settings: a file could not be written\n" : "settings saved\n");
+    snprintf(a->status, sizeof(a->status), "%s", bad ? "CANNOT WRITE SETTINGS TO " CFGDIR : "");
 }
 
 // ---- plugins.ini: point our titles at our files; keep foreign lines; [default] stays last ----
@@ -202,12 +213,13 @@ static void sec_add(Section *s, const char *line)
     size_t l = strlen(line); if (s->bn + l + 1 < sizeof(s->body)) { memcpy(s->body + s->bn, line, l); s->bn += l; s->body[s->bn++] = '\n'; }
 }
 // Writes the buffered section: header + kept lines (+ our line); dropped when it ended up empty and may go.
+// On removal every section of ours that ended up empty goes: left behind, it would keep [default] out of that game.
 static void sec_flush(Out *w, Section *s, int install, int *done)
 {
     if (s->have) {
         int dup = s->cur >= 0 && done[s->cur];   // already written before [default]
         if (s->cur >= 0 && install && g_map[s->cur].prx && !dup) { char b[96]; snprintf(b, sizeof(b), PLUG "%s", g_map[s->cur].prx); sec_add(s, b); }
-        if (!(s->cur >= 0 && !s->bn && (dup || !g_map[s->cur].keep_empty))) { emit(w, s->hdr); emit(w, "\n"); s->body[s->bn] = 0; emit(w, s->body); }
+        if (!(s->cur >= 0 && !s->bn && (dup || !install || !g_map[s->cur].keep_empty))) { emit(w, s->hdr); emit(w, "\n"); s->body[s->bn] = 0; emit(w, s->body); }
         if (s->cur >= 0) done[s->cur] = 1;
     }
     s->have = 0; s->bn = 0; s->cur = -1;
@@ -395,7 +407,8 @@ int main(void)
     vlog("pad=%d uid=%d\n", pad, uid);
 
     uint32_t *back = malloc((size_t)W * H * 4); Canvas c = { back, W, H, W };
-    uint32_t prev = 0; uint64_t hold_t = 0; int redraw = 1;
+    if (!back) { vlog("no memory for the back buffer\n"); quit(); }
+    uint32_t prev = 0; uint64_t hold_t = 0, save_t = 0; int redraw = 1;
     for (;;) {
         OrbisPadData d; memset(&d, 0, sizeof(d));
         uint32_t btn = (pad >= 0 && scePadReadState(pad, &d) == 0 && d.connected) ? d.buttons : 0;
@@ -407,15 +420,18 @@ int main(void)
         prev = btn;
         if (edge) {
             int act = app_input(a, edge); redraw = 1;
+            if (a->dirty) save_t = now + 800000;   // settle: key repeat must not write the files on every step
             if (act == ACT_INSTALL) do_install(a);
             else if (act == ACT_REMOVE) { do_ini(a, 0); a->plugin_state = plugin_state(); }
-            else if (act == ACT_SAVE) { save_settings(a); remap_if_changed(a); }
+            else if (act == ACT_SAVE) { save_settings(a); remap_if_changed(a); a->dirty = 0; }
             else if (act == ACT_SAVE_EXIT) {
                 save_settings(a); remap_if_changed(a);
                 snprintf(a->status, sizeof(a->status), "SAVED. START A GAME, HOLD L3+R3 FOR 3 S FOR THE MENU.");
                 app_draw(&c, a); present(back); sceKernelUsleep(900000); quit();
             }
         }
+        // Changes save by themselves (the PLUGIN tab promises it): the PS button leaves without Square/Options.
+        if (a->dirty && !btn && now > save_t) { save_settings(a); remap_if_changed(a); a->dirty = 0; }
         if (redraw) { app_draw(&c, a); present(back); redraw = 0; }
         else sceKernelUsleep(16000);
     }

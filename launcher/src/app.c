@@ -239,14 +239,12 @@ void app_draw(Canvas *c, App *a)
         Hint h[] = { { BTN_UD, "SELECT" }, { BTN_LR, "CHANGE" }, { BTN_CROSS, "APPLY TO ALL" } };
         draw_footer(c, a, h, 3);
     } else if (a->tab == TAB_OVERLAY) {
-        Settings s = a->defaults;
         Row r[3];
-        r[0] = (Row){ "Position", "", 0, 0 }; cat(r[0].value, corner_name(a->overlay_pos ? a->overlay_pos : 0));
+        r[0] = (Row){ "Position", "", 0, 0 }; cat(r[0].value, corner_name(a->overlay_pos));
         r[1] = (Row){ "Opacity", "", 2, a->overlay_opacity / 10 };
         r[2] = (Row){ "Shown in", "", 0, 0 }; cat(r[2].value, "ALL GAMES");
-        (void)s;
         draw_rows(c, a, M + 520, top + 58, c->w - 2 * M - 520, "PERFORMANCE OVERLAY", "60", "GAME 30 / GPU 1.7 MS", r, 3);
-        draw_text(c, a->f->mono.ttf ? &a->f->mono : &a->f->mono, M, top + 120, "SHOWS GAME FPS,", INK, 1);
+        draw_text(c, &a->f->mono, M, top + 120, "SHOWS GAME FPS,", INK, 1);
         draw_text(c, &a->f->mono, M, top + 162, "FRAMES ON SCREEN", INK, 1);
         draw_text(c, &a->f->mono, M, top + 204, "AND GPU TIME", INK, 1);
         Hint h[] = { { BTN_UD, "SELECT" }, { BTN_LR, "CHANGE" } };

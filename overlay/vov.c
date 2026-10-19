@@ -93,12 +93,17 @@ static const VovGlyph *glyph(const VovFont *f, int cp)
     return 0;
 }
 
+// A sequence cut short (a label truncated mid-character) yields an unknown code point and stops at the NUL,
+// never past it.
 static int next_cp(const char **ps)
 {
     const uint8_t *s = (const uint8_t *)*ps; int cp = *s++;
-    if (cp >= 0xF0) { cp = (cp & 7) << 18 | (s[0] & 63) << 12 | (s[1] & 63) << 6 | (s[2] & 63); s += 3; }
-    else if (cp >= 0xE0) { cp = (cp & 15) << 12 | (s[0] & 63) << 6 | (s[1] & 63); s += 2; }
-    else if (cp >= 0xC0) { cp = (cp & 31) << 6 | (s[0] & 63); s += 1; }
+    int n = cp >= 0xF0 ? 3 : cp >= 0xE0 ? 2 : cp >= 0xC0 ? 1 : 0;
+    if (n) cp &= 63 >> n;
+    for (; n; n--) {
+        if ((*s & 0xC0) != 0x80) { cp = -1; break; }
+        cp = cp << 6 | (*s++ & 63);
+    }
     *ps = (const char *)s; return cp;
 }
 
@@ -193,6 +198,7 @@ int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigne
     if (nrows && HEAD + nrows * ROW + FOOT > (int)g_max_h) {   // small overlay memory: shorter rows (min 44 px)
         ROW = ((int)g_max_h - HEAD - FOOT) / nrows;
         if (ROW < 44) { ROW = 44; nrows = ((int)g_max_h - HEAD - FOOT) / ROW; }
+        if (nrows < 0) nrows = 0;   // memory below one header + footer: header and footer only
     }
     unsigned H = (unsigned)(HEAD + nrows * ROW + FOOT);
     H = (H + 15u) & ~15u; if (H > g_max_h) H = g_max_h;

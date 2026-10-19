@@ -20,8 +20,8 @@ static void vov_read_title(char *out, size_t cap)
         const uint8_t *e = b + 20 + i * 16;
         uint32_t ko = e[0] | e[1] << 8, dl = e[4] | e[5] << 8 | e[6] << 16 | (uint32_t)e[7] << 24;
         uint32_t doff = e[12] | e[13] << 8 | e[14] << 16 | (uint32_t)e[15] << 24;
-        if (kt + ko >= n || strcmp((const char *)b + kt + ko, "TITLE")) continue;
-        if (dt + doff + dl > n) return;
+        if ((uint64_t)kt + ko + 6 > n || memcmp(b + kt + ko, "TITLE", 6)) continue;   // key and its NUL in the file
+        if ((uint64_t)dt + doff + dl > n) return;
         size_t l = dl < cap ? dl : cap - 1;
         memcpy(out, b + dt + doff, l); out[l] = 0;
         return;
