@@ -5,6 +5,10 @@
 > [LOCAL_TRACE_REPORT.md](LOCAL_TRACE_REPORT.md) separates current/previous saved starts and archived full logs.
 > No console deployment or new hardware result was obtained in this pass.
 
+> ADDENDUM priority: run the [benchmark capture](BENCHMARK.md#local-capture-v1) first, before tuning presentation
+> experiments. The isolated capture build and PNG16 fetch/metrics pipeline pass local checks; real console triplets
+> and VCFG-vs-ground-truth scores are still pending. Keep motion/warp unchanged until that baseline is measured.
+
 This file is written for whoever (human or AI) continues the work. It says what exists, how to build and deploy it,
 what is broken or unverified, and what to do next, in order.
 
