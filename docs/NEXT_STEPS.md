@@ -63,6 +63,10 @@ its `#define *_RSRC1/2 … *_code[] = {…};` block. Never search/replace text i
   holds, mids look different from real frames). Reverted: FAST is for 20..30 fps games, QUALITY (cap 30, 2x) for
   games between 30 and 60. A smooth path for 40-55 fps would need even pacing at a fixed lower rate (e.g. 40 Hz on
   120 Hz output), which the console's 60 Hz output does not offer.
+  Idea not done yet ("40/60 retiming", preset 3): pace the game at 40 and show a frame every vblank at its own
+  time; per two game frames: odd frame -> only the mid at t = 2/3 (cur not shown), even frame -> mid at t = 1/3,
+  then cur. Needs two mid buffers (allocated when the preset is on at game start), no pace_30, fallback to
+  QUALITY below ~37 fps. Costs ~40 generated frames per second.
 
 ## 5. Next steps, in order
 
