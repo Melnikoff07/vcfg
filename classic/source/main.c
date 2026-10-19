@@ -1702,8 +1702,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                                          int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
                                          count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
                     if (g_cfg.fps_lock == 20) pace_hz(20);
-                    // FAST fills up to 60 from whatever the game renders, so it never caps the game at 30.
-                    else if (g_cfg.fps_lock == 30 && g_cfg.preset != 1 && !g_detected_60fps && want_fg) pace_hz(30);
+                    else if (g_cfg.fps_lock == 30 && !g_detected_60fps && want_fg) pace_hz(30);
                     return rc0;
                 }
 
