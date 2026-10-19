@@ -1358,6 +1358,38 @@ static void pace_vblank(int prev2_real, int prev_real, int cur_real)
     g_rel_t = sceKernelGetProcessTime();
 }
 
+// VCFG timer pacing for FG pairs, per title (LOG_DIR/pace_timer_<TITLE> exists): releases the game once per pair
+// period (2 refreshes at the measured rate) from the previous release, instead of waiting until its previous real
+// frame is on screen (pace_vblank). CUSA05571 needs 25 ms per frame but waited ~13 ms more in pace_vblank behind a
+// 4-deep flip queue and ran at 24-25 fps. +2 ms on the next release while 3+ flips are pending (drift).
+static int g_pace_timer = -1;
+static uint64_t g_pair_next;
+static void pace_pair(void)
+{
+    if (!g_freq) return;
+    uint32_t hz10 = g_last_hz_x10 > 400u && g_last_hz_x10 < 800u ? g_last_hz_x10 : 599u;
+    uint64_t period = g_freq * 20ull / hz10;                  // 2 refreshes
+    uint64_t now = sceKernelGetProcessTimeCounter();
+    if (!g_pair_next || now > g_pair_next + period * 3) { g_pair_next = now + period; g_rel_t = sceKernelGetProcessTime(); return; }
+    if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= 3u) g_pair_next += g_freq / 500u;   // drain: +2 ms
+    if (now < g_pair_next) {
+        uint64_t us = (g_pair_next - now) * 1000000ull / g_freq;
+        if (us > 1500) sceKernelUsleep((uint32_t)(us - 1000));
+        while (sceKernelGetProcessTimeCounter() < g_pair_next) { }
+    }
+    g_pair_next += period;
+    g_rel_t = sceKernelGetProcessTime();
+}
+static int pace_timer_on(void)
+{
+    if (g_pace_timer < 0) {
+        char p[96]; snprintf(p, sizeof(p), LOG_DIR "/pace_timer_%s", g_title_id);
+        FILE *f = fopen(p, "r"); g_pace_timer = f != NULL; if (f) fclose(f);
+        lg("pacing: %s (%s)\n", g_pace_timer ? "timer" : "vblank", p);
+    }
+    return g_pace_timer;
+}
+
 static uint32_t med3_u32(uint32_t a, uint32_t b, uint32_t c)
 {
     if (a > b) { uint32_t t = a; a = b; b = t; }
@@ -1774,6 +1806,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                 }
                 if (g_cfg.fps_lock == 20) pace_hz(20);
                 else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
+                else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair();
                 else if (g_inject_on >= 7 && second_flip) pace_vblank(pace_p2, pace_p1, (int)index);
                 else if (second_flip) pace_30();
                 return rc;
