@@ -33,13 +33,13 @@ typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
     { "CUSA07439", "vcfg7.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic8.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic8.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic8.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA08519", "vcfg_classic9.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic9.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic9.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg7.prx", "vcfg_classic8.prx" };
-static const char *k_exp_prx = "vcfg_classic8.prx";   // engine for experimental (not verified) titles
+static const char *k_files[] = { "vcfg7.prx", "vcfg_classic9.prx" };
+static const char *k_exp_prx = "vcfg_classic9.prx";   // engine for experimental (not verified) titles
 
 static FILE *g_log;
 static void vlog(const char *fmt, ...)

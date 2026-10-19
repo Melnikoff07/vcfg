@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" width="512" height="512">
+  <title>VCFG</title>
+  <rect width="180" height="180" fill="#0b0b0b"/>
+  <rect x="30" y="30" width="90" height="90" fill="#4f86e6"/>
+  <rect x="60" y="60" width="90" height="90" fill="#f2502e"/>
+  <rect x="60" y="60" width="60" height="60" fill="#f5d23a"/>
+</svg>

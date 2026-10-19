@@ -1,4 +1,4 @@
-# VCFG: state and next steps (handoff, 2026-10-19, v2.11)
+# VCFG: state and next steps (handoff, 2026-10-19, v2.12)
 
 This file is written for whoever (human or AI) continues the work. It says what exists, how to build and deploy it,
 what is broken or unverified, and what to do next, in order.
@@ -9,11 +9,11 @@ what is broken or unverified, and what to do next, in order.
 |---|---|---|
 | App (PKG) | `launcher/` | v2.11. Game cards with console titles/icons, per-game settings, defaults, overlay style, plugin tab. Installs/updates the plugins by itself on start. Lists every installed game; unverified ones are EXPERIMENTAL (off by default, classic engine in their own `plugins.ini` section only while on). |
 | New engine | `plugin/` (`source/a20_copy_impl.h`) | Used for CUSA07439 only. A20/A22 runtime: one 1280×720 mid surface, flip I(arg) then N(arg). v2.11: post (AA + sharpening) on mids **and** native frames; FPS counter composited after the warp on C and at 2/3 scale on the mid; warp ignores the counter rectangle in P. Overlay bitmap is the tail of the startup allocation (`A20_OVL_BYTES`, the profile allows no later allocation). |
-| Classic engine | `classic/` | v1.16 line rebuilt from source (unoptimised build, `-O2` crashed CUSA00207). Used for CUSA08519, CUSA00411, CUSA00207 and every EXPERIMENTAL title. GOT pad patch only on CUSA08519/CUSA00411; all others poll the pad. Warp treats the overlay rectangle in P as out of frame. |
+| Classic engine | `classic/` | v1.16 line rebuilt from source (unoptimised build, `-O2` crashed CUSA00207). Used for CUSA08519, CUSA00411, CUSA00207 and every EXPERIMENTAL title. GOT pad patch off for every title (v2.12); the pad is polled. Warp treats the overlay rectangle in P as out of frame. |
 | Overlay | `overlay/` | Menu panel + corner FPS counter in the launcher design. CPU draws an 8-bit palette bitmap (baked Inter / JetBrains Mono atlases, `bake_fonts.py`) off-screen and commits only changed bytes; `osd8.ll` composites it (optional 2/3 downscale). PC preview: `overlay/preview.py`. |
 | Discovery | `discovery/` | Passive logger plugin for unknown games. |
 
-On the console (`/data/GoldHEN/plugins/`): `vcfg7.prx` (new engine), `vcfg_classic8.prx` (classic). Settings:
+On the console (`/data/GoldHEN/plugins/`): `vcfg7.prx` (new engine), `vcfg_classic9.prx` (classic). Settings:
 `/data/bb_probe/vcfg.ini` (new engine), `/data/bb_probe/config-<TITLE>.ini` (classic), `/data/bb_probe/vcfg_launcher.ini`
 (app). Logs: `/data/bb_probe/probe.log`, `/data/vcfg_launcher.log`.
 
@@ -39,7 +39,7 @@ its `#define *_RSRC1/2 … *_code[] = {…};` block. Never search/replace text i
 - Never overwrite a PRX that a running game may have loaded: always a new file name. No hot unload.
 - Back up `plugins.ini` before every change. Never put an engine into `[default]`.
 - Never free memory or unregister surfaces before GPU, command and scanout retirement are proven.
-- No `scePadRead` detours; the GOT pad patch stays limited to the titles it was verified on.
+- No `scePadRead` detours and no GOT pad patching (off since v2.12: crash suspect on CUSA00411, CUSA00207).
 - Do not break the console's role as a Remote Play host (only `CUSA*` processes are touched).
 - No trademarks in repository files: games by title ID only; "PS4" only with the non-affiliation note.
 - Pushes, releases and anything public only after the owner says yes. Never ask for tokens or passwords in chat.

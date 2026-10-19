@@ -2192,8 +2192,9 @@ static void *pad_poll_thread(void *arg)
         if (g_flips < INJECT_AFTER_FLIPS + 60 && g_vo_submit_flips < INJECT_AFTER_FLIPS + 60) continue;
         uint64_t now = sceKernelGetProcessTime();
         // 1.4: Retry GOT patching up to 12 times (every 5 s) in case the game resolves lazy PLT slots after splash screens
-        // VCFG: GOT pad patching crashed CUSA00207; only the titles it was verified on use it, all others poll.
-        int got_ok = !strcmp(g_title_id, "CUSA08519") || !strcmp(g_title_id, "CUSA00411");
+        // VCFG: GOT pad patching is off for every title: it crashed CUSA00207 and is the main suspect for a reported
+        // CUSA00411 crash at load, and it patched nothing on CUSA08519 (the menu works by polling there).
+        int got_ok = 0;
         if (!g_pad_got_patched && got_ok && got_tries < 12 && now >= next_got_try) {
             got_tries++;
             next_got_try = now + 5000000ull;
