@@ -54,13 +54,14 @@ typedef struct {
     int menu_hold_ms;    // hold L3+R3 in ms to open menu (default 3000)
     int menu_opacity;    // 0..100 (default 80)
     int overlay;         // 0 = off, 1..2 = TL (Small/Detail), 3..4 = TR, 5..6 = BR, 7..8 = BL
+    int present_copy;    // 0 = auto, 1 = on, 2 = off; profile setting, not an overlay menu row
 } fg_config_t;
 
 static char g_title_id[16] = "UNKNOWN";
 static int g_known_game = 0;
 static int g_is_game_proc = 1;
-static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0 };
-static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0 };
+static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, 0 };
+static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, 0 };
 static volatile int g_menu_open = 0, g_menu_sel = 0, g_cfg_save_req = 0;
 static volatile uint64_t g_osd_toast_until = 0;
 static char g_osd_toast[32] = "READY";
@@ -275,8 +276,8 @@ static void *g_mbuf_mem = NULL;
 static int g_nmid = 3;
 // Present copy (double-buffered games): the real frame is copied into one of two own buffers (g_ngame + 1, + 2) and
 // that copy is flipped, so the game's buffer is free right after the copy instead of one refresh later. Mid frames
-// use g_ngame. g_pcopy_cfg: 0 auto (games with 2 buffers), 1 on, 2 off (config key present_copy).
-static int g_pcopy_avail = 0, g_pcopy_cfg = 0, g_pcopy_k = 2;   // k mids + k copies
+// use g_ngame. present_copy: 0 auto (games with 2 buffers), 1 on, 2 off.
+static int g_pcopy_avail = 0, g_pcopy_k = 2;   // k mids + k copies
 static volatile int g_pcopy_on = 0;
 // mids: g_ngame .. g_ngame + k - 1, copies: g_ngame + k .. + 2k - 1 (rings, so the buffer the GPU writes has long
 // left the screen and WaitFlipDone does not stall the GPU behind a full flip queue)
@@ -948,6 +949,7 @@ static void cfg_defaults(fg_config_t *c)
     c->menu_hold_ms   = 3000;
     c->menu_opacity   = 80;
     c->overlay        = 0;
+    c->present_copy   = 0;
 }
 
 static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
@@ -978,7 +980,7 @@ static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
                 else if (strcmp(key, "sharpness") == 0) c->sharpness = val < 0 ? 0 : (val > 100 ? 100 : val);
                 else if (strcmp(key, "upscale") == 0 || strcmp(key, "enhance") == 0) c->upscale = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "upscale_factor") == 0) c->upscale_factor = val < 50 ? 50 : (val > 100 ? 100 : val);
-                else if (strcmp(key, "present_copy") == 0) g_pcopy_cfg = val < 0 ? 0 : (val > 2 ? 2 : val);
+                else if (strcmp(key, "present_copy") == 0) c->present_copy = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "hud_protect") == 0) c->hud_protect = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "game_vectors") == 0) c->game_vectors = (val != 0);
                 else if (strcmp(key, "fps_lock") == 0) c->fps_lock = (val == 20 || val == 30 || val == 60) ? val : 0;
@@ -1164,6 +1166,7 @@ static void cfg_save_game_ini(void)
     fprintf(f, "sharpness = %d\n", c.sharpness);
     fprintf(f, "upscale = %d\n", c.upscale);
     fprintf(f, "upscale_factor = %d\n", c.upscale_factor);
+    fprintf(f, "present_copy = %d\n", c.present_copy);
     fprintf(f, "hud_protect = %d\n", c.hud_protect);
     fprintf(f, "game_vectors = %d\n", c.game_vectors);
     fprintf(f, "fps_lock = %d\n", c.fps_lock);
@@ -1668,7 +1671,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     g_inert_reason[0] = 0;
                     uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
                     uint32_t tidx = (g_attr.tilingMode == 0) ? 10u : 8u;
-                    int pcopy = g_pcopy_avail && g_pcopy_cfg != 2;   // auto and on: available only for 2-buffer games
+                    int pcopy = g_pcopy_avail && g_cfg.present_copy != 2;   // auto and on: available only for 2-buffer games
                     g_pcopy_on = pcopy;
                     uint32_t mi1 = pcopy ? (uint32_t)g_ngame + (g_flips % (uint32_t)g_pcopy_k) : (uint32_t)g_ngame + (g_flips % (uint32_t)g_nmid);
                     uint32_t mi2 = (uint32_t)g_ngame + ((g_flips + 1u) % (uint32_t)g_nmid);
@@ -2249,7 +2252,9 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
         snprintf(g_osd_toast, sizeof(g_osd_toast), "APPLIED");
     }
     if (edge & PAD_SQUARE) {
+        int present_copy = g_cfg.present_copy;
         cfg_defaults(&g_menu_edit);
+        g_menu_edit.present_copy = present_copy;  // profile-only option is not reset by the overlay
         cfg_apply_live(&g_menu_edit, "menu-defaults");
         snprintf(g_osd_toast, sizeof(g_osd_toast), "DEFAULTS LOADED");
     }
