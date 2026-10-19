@@ -2,8 +2,10 @@
 ; tgid_y=1
 ; osd8: composites the VCFG overlay panel (8-bit palette bitmap drawn on the CPU by overlay/vov.c) onto the frame.
 ; table: +0x20 T#cur, +0x40 T#out, +0x200 V#palette (256 x BGRA8), +0x210 V#pixels (w * h bytes, row pitch w),
-;        +0x220 {rcas_con, rcas_flags, osd_xy (x0 | y0<<16), osd_wh (w/16 | h/16<<8 | alpha_u8<<16 | flags<<24)}.
-; Dispatch: (w/16)*2 x (h/16)*2 groups of 8x8 px, relative to the panel origin. flags: 1 = write T#out, 2 = write T#cur.
+;        +0x220 {rcas_con, rcas_flags, osd_xy (x0 | y0<<16, 12 bits each; bits 12..15 = s), osd_wh (w/16 | h/16<<8 |
+;        alpha_u8<<16 | flags<<24)}. s scales the panel down: source step (256 + 64 s) / 256 per target px (s = 2: 2/3,
+;        for the 1280x720 generated frame). Dispatch covers the scaled panel in 8x8 groups from the panel origin.
+;        flags: 1 = write T#out, 2 = write T#cur.
 target triple = "amdgcn--"
 declare <4 x float> @llvm.amdgcn.image.load.2d.v4f32.i32(i32 immarg, i32, i32, <8 x i32>, i32 immarg, i32 immarg)
 declare void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float>, i32 immarg, i32, i32, <8 x i32>, i32 immarg, i32 immarg)
@@ -26,8 +28,16 @@ entry:
   %rows = and i32 %rows0, 255
   %pw = shl i32 %cols, 4
   %ph = shl i32 %rows, 4
-  %inx = icmp ult i32 %qx, %pw
-  %iny = icmp ult i32 %qy, %ph
+  %ss0 = lshr i32 %xy, 12
+  %ss = and i32 %ss0, 15
+  %ss6 = shl i32 %ss, 6
+  %step = add i32 %ss6, 256
+  %sx0 = mul i32 %qx, %step
+  %sx = lshr i32 %sx0, 8
+  %sy0 = mul i32 %qy, %step
+  %sy = lshr i32 %sy0, 8
+  %inx = icmp ult i32 %sx, %pw
+  %iny = icmp ult i32 %sy, %ph
   %in = and i1 %inx, %iny
   br i1 %in, label %body, label %done
 
@@ -37,8 +47,8 @@ body:
   %pvx = getelementptr i8, ptr addrspace(4) %tbl, i64 528
   %vpix = load <4 x i32>, ptr addrspace(4) %pvx, align 16, !invariant.load !0
   ; palette index: byte (qy * pw + qx) of V#pixels
-  %rowo = mul i32 %qy, %pw
-  %idx = add i32 %rowo, %qx
+  %rowo = mul i32 %sy, %pw
+  %idx = add i32 %rowo, %sx
   %dwo = and i32 %idx, -4
   %dw = call i32 @llvm.amdgcn.raw.buffer.load.i32(<4 x i32> %vpix, i32 %dwo, i32 0, i32 0)
   %bsel = and i32 %idx, 3
@@ -70,8 +80,9 @@ draw:
   %af = uitofp i32 %au to float
   %ga = fmul float %af, 0x3F70101020000000
   %t = fmul float %pa, %ga
-  %x0 = and i32 %xy, 65535
-  %y0 = lshr i32 %xy, 16
+  %x0 = and i32 %xy, 4095
+  %y00 = lshr i32 %xy, 16
+  %y0 = and i32 %y00, 4095
   %x = add i32 %x0, %qx
   %y = add i32 %y0, %qy
   %ptc = getelementptr i8, ptr addrspace(4) %tbl, i64 32

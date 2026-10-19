@@ -115,9 +115,11 @@ _Static_assert(sizeof(warp540_code)==sizeof(warp720_code),"warp540 must fit the 
 // 0x1d00 OSD text (576 B). A21-best adds:
 #define A21_POST_TB 0x1f40u   // 4 post tables, 0x20 apart (T# copies at +0x20..+0xC0, configs at +0x220..+0x290)
 #define A21_OVL_N_TB 0x21e0u  // overlay table, target = native C (0x230)
-#define A21_OVL_TXT 0x2420u   // overlay text (64 B styles + 3 rows x 32 B used of the grid; 0x180 reserved)
+#define A21_OVL_I_TB 0x1d00u  // overlay table, target = generated mid I (0x230, replaces the old OSD text)
+#define A21_POSTC_TB 0x2420u  // post tables of the native frame C (0x290)
 _Static_assert(A21_POST_TB>=0x1d00u+576u && A21_POST_TB+0x290u<=A21_OVL_N_TB,"post tables");
-_Static_assert(A21_OVL_N_TB+0x230u<=A21_OVL_TXT && A21_OVL_TXT+0x180u<=0x2800u,"overlay exceeds the A20 slot size");
+_Static_assert(A21_OVL_I_TB+0x230u<=A21_POST_TB && A21_OVL_N_TB+0x230u<=A21_POSTC_TB && A21_POSTC_TB+0x290u<=0x2800u,
+    "overlay / post tables exceed the A20 slot size");
 #if A21_FAST540
 #define A21_SECOND_TB 0x2800u // second mid table (0x190)
 #define A21_MID_TAIL 0x2a00u  // replayed flip tail for the second mid (64 dwords; driver patches each flip's copy)
@@ -1032,19 +1034,24 @@ static float a21_rcas_con(unsigned sharp)
 }
 // Four checkerboard post_cb dispatches on one generated surface (in place). Tables k=0..3 are 0x20 apart and share
 // the T# copies at +0x20..+0xC0 (src == dst); each has its own config at +0x220.
-static void a21_emit_post(uint32_t **pp,uint8_t *tables,uint64_t surface,unsigned sharp,unsigned enhance)
+static void a21_emit_post_wh(uint32_t **pp,uint8_t *tables,uint64_t surface,unsigned w,unsigned h,unsigned pitch,
+                             unsigned tmode,unsigned sharp,unsigned enhance)
 {
     uint32_t *tb=(uint32_t *)tables;memset(tb,0,0x290);
-    for (unsigned k=0;k<5;k++) make_t(tb+8+k*8,surface,A21_MID_W,A21_MID_H,A21_MID_W,8);
+    for (unsigned k=0;k<5;k++) make_t(tb+8+k*8,surface,w,h,pitch,tmode);
     float con=a21_rcas_con(sharp);uint32_t conb;memcpy(&conb,&con,4);
     for (unsigned k=0;k<4;k++) {uint32_t *cfg=tb+136+k*8;cfg[0]=conb;cfg[1]=(enhance&3u)<<2;cfg[2]=k;cfg[3]=0;}
     uint32_t *p=*pp;
     for (unsigned k=0;k<4;k++) {
         uint64_t a=(uint64_t)(uintptr_t)(tables+k*0x20u);
         *p++=PKT3(0x76,3,1);*p++=0x240;*p++=(uint32_t)a;*p++=(uint32_t)(a>>32);
-        a20_pass(&p,11,POST_CB_RSRC1,POST_CB_RSRC2,(A21_MID_W/8u+1u)/2u,((A21_MID_H+7u)/8u+1u)/2u);
+        a20_pass(&p,11,POST_CB_RSRC1,POST_CB_RSRC2,((w+7u)/8u+1u)/2u,((h+7u)/8u+1u)/2u);
     }
     *pp=p;
+}
+static void a21_emit_post(uint32_t **pp,uint8_t *tables,uint64_t surface,unsigned sharp,unsigned enhance)
+{
+    a21_emit_post_wh(pp,tables,surface,A21_MID_W,A21_MID_H,A21_MID_W,8,sharp,enhance);
 }
 #endif
 #if A21_MENU
@@ -1066,7 +1073,6 @@ static uint32_t a21_overlay_rect(unsigned ovl,unsigned *x,unsigned *y,unsigned *
 static void a21_emit_overlay(uint32_t **pp,uint8_t *sb,uint64_t target,unsigned ovl,unsigned do_fg,unsigned mids)
 {
     (void)mids;
-    uint32_t *tb=(uint32_t *)(sb+A21_OVL_N_TB);memset(tb,0,0x230);
     if (!a21_vov_ready()) return;
     unsigned x,y,rows;a21_overlay_rect(ovl,&x,&y,&rows);
     unsigned g=__atomic_load_n(&g_osd_real_fps_x10,__ATOMIC_ACQUIRE),d=__atomic_load_n(&a21_disp_x10,__ATOMIC_ACQUIRE);
@@ -1077,16 +1083,24 @@ static void a21_emit_overlay(uint32_t **pp,uint8_t *sb,uint64_t target,unsigned 
     if (w>A21_OVL_W) w=A21_OVL_W;
     unsigned corner=(ovl-1u)/2u;
     if (corner==1 || corner==2) x+=A21_OVL_W-w;
-    make_t(tb+8,target,g_bw,g_bh,g_pitch,g_attr.tilingMode==0?10:8);
-    make_t(tb+16,target,g_bw,g_bh,g_pitch,g_attr.tilingMode==0?10:8);
-    make_v(tb+128,(uint64_t)(uintptr_t)pal,VOV_PAL_SZ);
-    make_v(tb+132,(uint64_t)(uintptr_t)pix,VOV_PIX_SZ);
     unsigned alpha=__atomic_load_n(&a21_opacity,__ATOMIC_ACQUIRE)*255u/100u;
-    tb[136]=tb[137]=0;tb[138]=x|(y<<16);tb[139]=vov_wh(w,h,alpha,2u); // flags 2: write T#cur
-    uint64_t a=(uint64_t)(uintptr_t)tb;uint32_t *p=*pp;
-    *p++=PKT3(0x76,3,1);*p++=0x240;*p++=(uint32_t)a;*p++=(uint32_t)(a>>32);
-    // osd8 groups are 8x8 px relative to the panel origin (osd_xy).
-    a20_pass(&p,10,OSD8_RSRC1,OSD8_RSRC2,(w/16u)*2u,(h/16u)*2u);
+    uint32_t *p=*pp;
+    // Drawn after the FG passes: once on the native frame C (1:1) and, with FG, once on the 1280x720 mid I at 2/3 scale
+    // (s = 2 in osd_xy), so both look the same on screen. The warp ignores this rectangle in P (it was drawn there).
+    for (unsigned pass=0;pass<(do_fg?2u:1u);pass++) {
+        uint32_t *tb=(uint32_t *)(sb+(pass?A21_OVL_I_TB:A21_OVL_N_TB));memset(tb,0,0x230);
+        unsigned tw=w,th=h,tx=x,ty=y,sc=0;
+        if (pass) { tw=(w*2u+2u)/3u;th=(h*2u+2u)/3u;tx=x*2u/3u;ty=y*2u/3u;sc=2u; }
+        uint64_t surf=pass?(uint64_t)(uintptr_t)a20_image:target;
+        if (pass) { make_t(tb+8,surf,A21_MID_W,A21_MID_H,A21_MID_W,8);make_t(tb+16,surf,A21_MID_W,A21_MID_H,A21_MID_W,8); }
+        else { make_t(tb+8,surf,g_bw,g_bh,g_pitch,g_attr.tilingMode==0?10:8);make_t(tb+16,surf,g_bw,g_bh,g_pitch,g_attr.tilingMode==0?10:8); }
+        make_v(tb+128,(uint64_t)(uintptr_t)pal,VOV_PAL_SZ);
+        make_v(tb+132,(uint64_t)(uintptr_t)pix,VOV_PIX_SZ);
+        tb[136]=tb[137]=0;tb[138]=tx|(sc<<12)|(ty<<16);tb[139]=vov_wh(w,h,alpha,2u); // flags 2: write T#cur
+        uint64_t a=(uint64_t)(uintptr_t)tb;
+        *p++=PKT3(0x76,3,1);*p++=0x240;*p++=(uint32_t)a;*p++=(uint32_t)(a>>32);
+        a20_pass(&p,10,OSD8_RSRC1,OSD8_RSRC2,(tw+7u)/8u,(th+7u)/8u);
+    }
     *pp=p;
 }
 #endif
@@ -1283,7 +1297,10 @@ static int a20_try_submit(uint32_t count,void **dcb,uint32_t *sizes,void **ccb,u
 #endif
 #if A21_MENU
     unsigned ovx=0,ovy=0,ovrows=0;
-    if (ovl) table[31]=a21_overlay_rect(ovl,&ovx,&ovy,&ovrows); // HUD protection: mids copy the overlay from C
+    if (ovl) { // the counter is drawn after the FG passes; P carries last frame's copy, so the warp skips its rectangle
+        a21_overlay_rect(ovl,&ovx,&ovy,&ovrows);
+        table[138]=ovx|(ovy<<16);table[139]=vov_wh(A21_OVL_W,A21_OVL_H,255u,0u);
+    }
 #endif
 #if A21_FAST540
     uint32_t *second=(uint32_t *)(sb+A21_SECOND_TB);
@@ -1326,9 +1343,6 @@ static int a20_try_submit(uint32_t count,void **dcb,uint32_t *sizes,void **ccb,u
 #endif
     a20_timestamp(&p,sb,1);
     *p++=PKT3(0x76,4,1);*p++=0x207;*p++=64;*p++=1;*p++=1;
-#if A21_MENU
-    if (ovl) {a21_emit_overlay(&p,sb,current,ovl,(unsigned)do_fg,mids);a21_overlay_jobs++;}
-#endif
     if (do_fg) {
     uint64_t seed_address=(uint64_t)(uintptr_t)seed;
     *p++=PKT3(0x76,3,1);*p++=0x240;*p++=(uint32_t)seed_address;*p++=(uint32_t)(seed_address>>32);
@@ -1366,7 +1380,7 @@ static int a20_try_submit(uint32_t count,void **dcb,uint32_t *sizes,void **ccb,u
     a20_pass(&p,8,WARP720_RSRC1,WARP720_RSRC2,160,90);
 #endif
 #if A21_POST
-    {   // Post only touches generated surfaces; native C stays untouched (it becomes P of the next job).
+    {   // Generated surfaces; the native frame C is post-processed below, after the FG passes have read it.
         unsigned sharp=__atomic_load_n(&a21_sharp,__ATOMIC_ACQUIRE),en=__atomic_load_n(&a21_enhance,__ATOMIC_ACQUIRE);
         if (sharp || en) {
             a21_emit_post(&p,sb+A21_POST_TB,(uint64_t)(uintptr_t)a20_image,sharp,en);
@@ -1377,7 +1391,17 @@ static int a20_try_submit(uint32_t count,void **dcb,uint32_t *sizes,void **ccb,u
         }
     }
 #endif
-    } else if (menu) {
+    }
+#if A21_POST
+    if (!menu) { // native frame C gets the same AA / sharpening as the mids (after the FG passes read it)
+        unsigned sharp=__atomic_load_n(&a21_sharp,__ATOMIC_ACQUIRE),en=__atomic_load_n(&a21_enhance,__ATOMIC_ACQUIRE);
+        if (sharp || en) a21_emit_post_wh(&p,sb+A21_POSTC_TB,current,g_bw,g_bh,g_pitch,g_attr.tilingMode==0?10:8,sharp,en);
+    }
+#endif
+#if A21_MENU
+    if (ovl && !menu) {a21_emit_overlay(&p,sb,current,ovl,(unsigned)do_fg,mids);a21_overlay_jobs++;}
+#endif
+    if (menu && !do_fg) {
         a20_build_menu(table,sb);
         *p++=PKT3(0x76,3,1);*p++=0x240;*p++=(uint32_t)tbl;*p++=(uint32_t)(tbl>>32);
         if (table[139]) a20_pass(&p,10,OSD8_RSRC1,OSD8_RSRC2,(table[139]&255u)*2u,((table[139]>>8)&255u)*2u);

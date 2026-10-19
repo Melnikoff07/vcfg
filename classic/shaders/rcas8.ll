@@ -1,7 +1,7 @@
 ; user_sgprs=2
 ; tgid_y=1
 ; mode 8 post-pass (rcas8): LDS-tiled (12x12 = 8x8 workgroup + 2-px border on all sides) directional anti-aliasing
-; (edge AA L/Z-span + directional AA orientation & sub-pixel blend) + Edge-Gated AMD RCAS sharpening.
+; (edge AA L/Z-span + directional AA orientation & sub-pixel blend) + Edge-Gated RCAS sharpening.
 ; Fixes the in-place neighbour race condition of the previous rcas8 by pre-loading a 12x12 tile (144 texels:
 ; packed RGBA8 + float luma = 1152 B of LDS) and barrier-synchronising the wave before any computation or store.
 ; Supports dynamic screen resolutions (reads width-1 and height-1 directly from T# dword 2).

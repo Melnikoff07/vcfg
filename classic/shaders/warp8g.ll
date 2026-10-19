@@ -318,8 +318,9 @@ entry:
   %orc = load <4 x i32>, ptr addrspace(4) %porc, align 16, !invariant.load !0
   %oxy = extractelement <4 x i32> %orc, i32 2
   %owh = extractelement <4 x i32> %orc, i32 3
-  %ox0i = and i32 %oxy, 65535
-  %oy0i = lshr i32 %oxy, 16
+  %ox0i = and i32 %oxy, 4095
+  %oy0s = lshr i32 %oxy, 16
+  %oy0i = and i32 %oy0s, 4095
   %ocl = and i32 %owh, 255
   %orw0 = lshr i32 %owh, 8
   %orw = and i32 %orw0, 255
