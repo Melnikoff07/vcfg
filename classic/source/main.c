@@ -1352,7 +1352,9 @@ static void pace_vblank(int prev2_real, int prev_real, int cur_real)
     if (!g_mon_on) { pace_30(); return; }
     g_dbl_frames++;
     volatile uint64_t *cnt = g_opt_early ? &g_mids_shown : &g_reals_shown;
-    int64_t target = (int64_t)g_dbl_frames - 1 + g_pace_off;
+    // Present copy (2-buffer games): release the game when the frame before the previous one is on screen, so its CPU
+    // work overlaps the GPU of the previous frame (waiting for the previous one serialised them: 26 + 26 ms, 24 fps).
+    int64_t target = (int64_t)g_dbl_frames - (g_pcopy_on ? 2 : 1) + g_pace_off;
     int64_t have = (int64_t)*cnt;
     if (have > target) {
         g_pace_off = have - ((int64_t)g_dbl_frames - 1);
