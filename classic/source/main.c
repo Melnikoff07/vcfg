@@ -1038,6 +1038,15 @@ static void pace_hz(uint32_t hz)
     g_pace_next += period;
 }
 static void pace_30(void) { pace_hz(30); }
+// VCFG low latency: after an FG pair is queued (mid + cur), do not hand control back to the game while more than
+// <maxp> flips are still pending, so it cannot queue frames ahead (the queue reached 4 = ~66 ms in the logs).
+// g_cur_pending_flips is refreshed every 0.5 ms by the cadence monitor; bounded wait.
+static void wait_queue(uint32_t maxp)
+{
+    uint64_t t0 = sceKernelGetProcessTime();
+    while (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) > maxp && sceKernelGetProcessTime() - t0 < 25000ull)
+        sceKernelUsleep(300);
+}
 
 // ---- flip cadence monitor ----
 static volatile int g_mon_on = 0;
@@ -1776,6 +1785,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                 else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
                 else if (g_inject_on >= 7 && second_flip) pace_vblank(pace_p2, pace_p1, (int)index);
                 else if (second_flip) pace_30();
+                if (second_flip) wait_queue(1);
                 return rc;
             } else if (g_flips == INJECT_AFTER_FLIPS) {
                 snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: NO FLIP TAIL");
