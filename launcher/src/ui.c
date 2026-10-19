@@ -148,35 +148,54 @@ int face_init(Face *f, const uint8_t *ttf, int px, Arena *arena)
     f->ascent = (int)(asc * f->scale + 0.5f); f->descent = (int)(desc * f->scale - 0.5f);
     return 1;
 }
+static void make_glyph(Face *f, Glyph *g, int ch)
+{
+    stbtt_fontinfo *info = (stbtt_fontinfo *)f->info;
+    int adv, lsb; stbtt_GetCodepointHMetrics(info, ch, &adv, &lsb);
+    g->adv = (int)(adv * f->scale + 0.5f);
+    int x0, y0, x1, y1; stbtt_GetCodepointBitmapBox(info, ch, f->scale, f->scale, &x0, &y0, &x1, &y1);
+    g->w = x1 - x0; g->h = y1 - y0; g->xoff = x0; g->yoff = y0;
+    if (g->w > 0 && g->h > 0) {
+        g->bmp = (uint8_t *)arena_alloc(f->arena, (size_t)g->w * g->h);
+        if (g->bmp) stbtt_MakeCodepointBitmap(info, g->bmp, g->w, g->h, g->w, f->scale, f->scale, ch);
+    }
+    g->ready = 1;
+}
 static Glyph *glyph(Face *f, int ch)
 {
-    if (ch < 32 || ch > 126) ch = '?';
-    Glyph *g = &f->g[ch];
-    if (!g->ready) {
-        stbtt_fontinfo *info = (stbtt_fontinfo *)f->info;
-        int adv, lsb; stbtt_GetCodepointHMetrics(info, ch, &adv, &lsb);
-        g->adv = (int)(adv * f->scale + 0.5f);
-        int x0, y0, x1, y1; stbtt_GetCodepointBitmapBox(info, ch, f->scale, f->scale, &x0, &y0, &x1, &y1);
-        g->w = x1 - x0; g->h = y1 - y0; g->xoff = x0; g->yoff = y0;
-        if (g->w > 0 && g->h > 0) {
-            g->bmp = (uint8_t *)arena_alloc(f->arena, (size_t)g->w * g->h);
-            if (g->bmp) stbtt_MakeCodepointBitmap(info, g->bmp, g->w, g->h, g->w, f->scale, f->scale, ch);
-        }
-        g->ready = 1;
+    static Glyph none;
+    if (ch >= 32 && ch < 127) { Glyph *g = &f->g[ch]; if (!g->ready) make_glyph(f, g, ch); return g; }
+    if (!stbtt_FindGlyphIndex((stbtt_fontinfo *)f->info, ch)) return &none;   // not in the font: draw nothing
+    for (int i = 0; i < f->next; i++) if (f->ext_cp[i] == ch) return &f->ext[i];
+    if (f->next >= 96) return &none;
+    Glyph *g = &f->ext[f->next]; f->ext_cp[f->next++] = ch; make_glyph(f, g, ch); return g;
+}
+// UTF-8 decoder: returns the next code point, 0 at the end; marks (TM, R, C) and control chars are skipped.
+static int next_cp(const char **ps)
+{
+    for (;;) {
+        const unsigned char *s = (const unsigned char *)*ps; int cp, n;
+        if (!*s) return 0;
+        if (s[0] < 0x80) { cp = s[0]; n = 1; }
+        else if ((s[0] & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) { cp = ((s[0] & 31) << 6) | (s[1] & 63); n = 2; }
+        else if ((s[0] & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) { cp = ((s[0] & 15) << 12) | ((s[1] & 63) << 6) | (s[2] & 63); n = 3; }
+        else { *ps += 1; continue; }                                    // invalid byte (e.g. a cut sequence)
+        *ps += n;
+        if (cp < 32 || cp == 0x2122 || cp == 0xAE || cp == 0xA9 || cp == 0x2120) continue;
+        return cp;
     }
-    return g;
 }
 int text_width(Face *f, const char *s, int tracking)
 {
-    int w = 0, n = 0;
-    for (; *s; s++, n++) w += glyph(f, (unsigned char)*s)->adv + tracking;
+    int w = 0, n = 0, cp;
+    while ((cp = next_cp(&s))) { w += glyph(f, cp)->adv + tracking; n++; }
     return n ? w - tracking : 0;
 }
 int draw_text(Canvas *c, Face *f, int x, int base, const char *s, uint32_t col, int tracking)
 {
-    int x0 = x;
-    for (; *s; s++) {
-        Glyph *g = glyph(f, (unsigned char)*s);
+    int x0 = x, cp;
+    while ((cp = next_cp(&s))) {
+        Glyph *g = glyph(f, cp);
         if (g->bmp)
             for (int j = 0; j < g->h; j++) for (int i = 0; i < g->w; i++) {
                 unsigned a = g->bmp[j * g->w + i];

@@ -114,7 +114,7 @@ static void draw_card(Canvas *c, App *a, Game *g, int idx, int x, int y, int w, 
     fill_rect(c, x + p, ry, isz, 4, INK);
     char lab[48] = "";
     if (!g->installed) cat(lab, "NOT INSTALLED");
-    else if (g->testing) cat(lab, "TESTING");
+    else if (g->testing) cat(lab, "UNSTABLE, OFF");
     else if (!g->s.fg) cat(lab, "FG OFF");
     else cat(lab, mode_name(g->s.preset));
     draw_text(c, &f->mono, x + p, y + h - 30, lab, INK, 1);

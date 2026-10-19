@@ -160,6 +160,13 @@ static void save_settings(App *a)
 
 // ---- plugins.ini: point supported titles at our files; keep foreign lines; [default] stays last ----
 static int ours(const char *l) { return strstr(l, PLUG "vcfg") || strstr(l, PLUG "bb_probe"); }
+// Titles marked testing (crashed on hardware) keep an empty section: no plugin, and [default] plugins stay out too.
+static int mapped(int t) { return !k_sup[t].testing; }
+static void section(char *b, size_t n, int t)
+{
+    if (mapped(t)) snprintf(b, n, "[%s]\n" PLUG "%s\n", k_sup[t].id, k_sup[t].prx);
+    else snprintf(b, n, "[%s]\n", k_sup[t].id);
+}
 static char *ini_update(const char *old, int install, size_t *outn)
 {
     size_t cap = strlen(old) + 8192; char *o = malloc(cap); size_t n = 0; if (!o) return NULL;
@@ -171,18 +178,21 @@ static char *ini_update(const char *old, int install, size_t *outn)
         char *s = line; while (*s == ' ' || *s == '\t') s++;
         if (*s == '[') {
             if (install && !strncmp(s, "[default]", 9))
-                for (int t = 0; t < NSUP; t++) if (!done[t]) { char b[128]; snprintf(b, sizeof(b), "[%s]\n" PLUG "%s\n", k_sup[t].id, k_sup[t].prx); EMIT(b); done[t] = 1; }
+                for (int t = 0; t < NSUP; t++) if (!done[t]) { char b[128]; section(b, sizeof(b), t); EMIT(b); done[t] = 1; }
             cur = -1;
             for (int t = 0; t < NSUP; t++) { char h[24]; snprintf(h, sizeof(h), "[%s]", k_sup[t].id); if (!strncmp(s, h, strlen(h))) cur = t; }
             EMIT(line); EMIT("\n");
-            if (install && cur >= 0 && !done[cur]) { char b[96]; snprintf(b, sizeof(b), PLUG "%s\n", k_sup[cur].prx); EMIT(b); done[cur] = 1; }
+            if (install && cur >= 0 && !done[cur]) {
+                if (mapped(cur)) { char b[96]; snprintf(b, sizeof(b), PLUG "%s\n", k_sup[cur].prx); EMIT(b); }
+                done[cur] = 1;
+            }
             continue;
         }
         if (cur >= 0 && ours(s)) continue;
         if (!*s) continue;
         EMIT(line); EMIT("\n");
     }
-    if (install) for (int t = 0; t < NSUP; t++) if (!done[t]) { char b[128]; snprintf(b, sizeof(b), "[%s]\n" PLUG "%s\n", k_sup[t].id, k_sup[t].prx); EMIT(b); }
+    if (install) for (int t = 0; t < NSUP; t++) if (!done[t]) { char b[128]; section(b, sizeof(b), t); EMIT(b); }
 #undef EMIT
     o[n] = 0; *outn = n; return o;
 }

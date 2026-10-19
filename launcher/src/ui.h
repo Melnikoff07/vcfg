@@ -15,6 +15,7 @@ typedef struct {
     const uint8_t *ttf; void *info;          // stbtt_fontinfo
     float scale; int ascent, descent, px;
     Glyph g[128];
+    int ext_cp[96]; Glyph ext[96]; int next;   // non-ASCII glyphs (accents, Cyrillic), filled on demand
     Arena *arena;
 } Face;
 int  face_init(Face *f, const uint8_t *ttf, int pixel_height, Arena *arena);
