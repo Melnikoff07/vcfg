@@ -34,10 +34,10 @@ static const Supported k_sup[] = {
     { "CUSA07439", "vcfg.prx", ENGINE_NEW, 0 },
     { "CUSA08519", "vcfg_classic.prx", ENGINE_CLASSIC, 0 },
     { "CUSA00411", "vcfg_classic.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic_bb.prx", ENGINE_CLASSIC_BB, 1 },
+    { "CUSA00207", "vcfg_classic.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg.prx", "vcfg_classic.prx", "vcfg_classic_bb.prx" };
+static const char *k_files[] = { "vcfg.prx", "vcfg_classic.prx" };
 
 static FILE *g_log;
 static void vlog(const char *fmt, ...)
@@ -204,7 +204,7 @@ static void addlog(App *a, const char *msg)
 static int plugin_state(void)
 {
     int st = 1;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < (int)(sizeof(k_files) / sizeof(k_files[0])); i++) {
         char src[96], dst[96]; size_t n1, n2;
         snprintf(src, sizeof(src), "/app0/plugins/%s", k_files[i]); snprintf(dst, sizeof(dst), PLUG "%s", k_files[i]);
         unsigned char *a = read_all(src, &n1), *b = read_all(dst, &n2);
@@ -231,7 +231,7 @@ static int do_ini(App *a, int install)
 static void do_install(App *a)
 {
     sceKernelMkdir("/data/GoldHEN/plugins", 0777); sceKernelMkdir(CFGDIR, 0777);
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < (int)(sizeof(k_files) / sizeof(k_files[0])); i++) {
         char src[96], dst[96], m[96]; size_t n;
         snprintf(src, sizeof(src), "/app0/plugins/%s", k_files[i]); snprintf(dst, sizeof(dst), PLUG "%s", k_files[i]);
         unsigned char *b = read_all(src, &n);

@@ -116,29 +116,30 @@ body:
   %bx0 = or i1 %bl0, %br0
   %by0 = or i1 %bt0, %bb0
   %isbdr = or i1 %bx0, %by0
-  ; background colour by row_type (0=normal, 1=header, 2=selected, 3=footer) and progress bar
+  ; VCFG palette: row_type 0 = cream row, 1 = yellow header, 2 = selected (ink), 3 = footer bar (ink); value bars in blue
   %ishdr = icmp eq i32 %rtype, 1
   %issel = icmp eq i32 %rtype, 2
+  %isftr = icmp eq i32 %rtype, 3
+  %isdark = or i1 %issel, %isftr
   %inval = icmp uge i32 %col, %vcol
   %inbar0 = icmp ult i32 %col, %bend
   %inbar = and i1 %inval, %inbar0
-  %bg_norm = select i1 %inbar, <4 x float> <float 0.125, float 0.25, float 0.375, float 1.0>, <4 x float> <float 0.0625, float 0.0625, float 0.09375, float 1.0>
-  %bg_sel0 = select i1 %inbar, <4 x float> <float 0.25, float 0.5, float 0.625, float 1.0>, <4 x float> <float 0.1875, float 0.3125, float 0.4375, float 1.0>
-  %bg0 = select i1 %issel, <4 x float> %bg_sel0, <4 x float> %bg_norm
-  %bg1 = select i1 %ishdr, <4 x float> <float 0.125, float 0.25, float 0.375, float 1.0>, <4 x float> %bg0
-  %bg2 = select i1 %issh, <4 x float> <float 0.0, float 0.0, float 0.0, float 1.0>, <4 x float> %bg1
-  ; foreground glyph colour
-  %fg_lbl = select i1 %issel, <4 x float> <float 1.0, float 0.875, float 0.25, float 1.0>, <4 x float> <float 0.9375, float 0.9375, float 0.9375, float 1.0>
-  %fg_lblh = select i1 %ishdr, <4 x float> <float 0.375, float 0.875, float 1.0, float 1.0>, <4 x float> %fg_lbl
+  %bg0 = select i1 %isdark, <4 x float> <float 0.04296875, float 0.04296875, float 0.04296875, float 1.0>, <4 x float> <float 0.9375, float 0.93359375, float 0.91015625, float 1.0>
+  %bg1 = select i1 %ishdr, <4 x float> <float 0.9609375, float 0.8203125, float 0.2265625, float 1.0>, <4 x float> %bg0
+  %bg2 = select i1 %inbar, <4 x float> <float 0.30859375, float 0.5234375, float 0.8984375, float 1.0>, <4 x float> %bg1
+  %fg_lbl = select i1 %isdark, <4 x float> <float 0.9375, float 0.93359375, float 0.91015625, float 1.0>, <4 x float> <float 0.04296875, float 0.04296875, float 0.04296875, float 1.0>
   %vc1 = icmp eq i32 %vclr, 1
   %vc2 = icmp eq i32 %vclr, 2
   %vc3 = icmp eq i32 %vclr, 3
-  %fv0 = select i1 %vc3, <4 x float> <float 0.625, float 0.625, float 0.625, float 1.0>, <4 x float> <float 1.0, float 1.0, float 1.0, float 1.0>
-  %fv1 = select i1 %vc2, <4 x float> <float 0.375, float 0.875, float 1.0, float 1.0>, <4 x float> %fv0
-  %fv2 = select i1 %vc1, <4 x float> <float 0.25, float 1.0, float 0.375, float 1.0>, <4 x float> %fv1
-  %fg = select i1 %inval, <4 x float> %fv2, <4 x float> %fg_lblh
+  %f_v2 = select i1 %isdark, <4 x float> <float 0.9609375, float 0.8203125, float 0.2265625, float 1.0>, <4 x float> <float 0.30859375, float 0.5234375, float 0.8984375, float 1.0>
+  %f_v3 = select i1 %isdark, <4 x float> <float 0.59375, float 0.59375, float 0.578125, float 1.0>, <4 x float> <float 0.453125, float 0.453125, float 0.4375, float 1.0>
+  %fv0 = select i1 %vc3, <4 x float> %f_v3, <4 x float> %fg_lbl
+  %fv1 = select i1 %vc2, <4 x float> %f_v2, <4 x float> %fv0
+  %fv2 = select i1 %vc1, <4 x float> <float 0.9453125, float 0.3125, float 0.1796875, float 1.0>, <4 x float> %fv1
+  %fvb = select i1 %inbar, <4 x float> <float 0.04296875, float 0.04296875, float 0.04296875, float 1.0>, <4 x float> %fv2
+  %fg = select i1 %inval, <4 x float> %fvb, <4 x float> %fg_lbl
   %px0 = select i1 %ison, <4 x float> %fg, <4 x float> %bg2
-  %px = select i1 %isbdr, <4 x float> <float 0.25, float 0.625, float 0.875, float 1.0>, <4 x float> %px0
+  %px = select i1 %isbdr, <4 x float> <float 0.04296875, float 0.04296875, float 0.04296875, float 1.0>, <4 x float> %px0
   %fg_or_bdr = or i1 %ison, %isbdr
   %alpha = select i1 %fg_or_bdr, float 1.0, float %bga
   ; sample clean T#cur (unmodified by OSD yet) so T#prev's old menu state never ghosts into T#out

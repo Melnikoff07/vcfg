@@ -971,7 +971,7 @@ static void osd_build_slot(uint8_t *osd_mem, uint32_t *xy_out, uint32_t *wh_out,
     char line[64];
 
     if (!g_menu_open && now < g_osd_toast_until) {
-        snprintf(line, sizeof(line), " BB_PROBE 8.6 [%s]", g_title_id);
+        snprintf(line, sizeof(line), " VCFG  %s", g_title_id);
         osd_set_row(st, gr, 0, 1, 32, 0, 0, line);
         snprintf(line, sizeof(line), " %s", g_osd_toast);
         osd_set_row(st, gr, 1, 0, 1, 1, 0, line);
@@ -1024,55 +1024,55 @@ static void osd_build_slot(uint8_t *osd_mem, uint32_t *xy_out, uint32_t *wh_out,
     uint32_t ofps = __atomic_load_n(&g_osd_out_fps_x10, __ATOMIC_ACQUIRE);
     if (!c.framegen || g_inert_reason[0]) ofps = rfps;
 
-    snprintf(line, sizeof(line), " BB_PROBE [%s] %2u.%u->%2u.%u", g_title_id, rfps / 10u, rfps % 10u, ofps / 10u, ofps % 10u);
+    snprintf(line, sizeof(line), " VCFG %s  %2u.%u>%2u.%u FPS", g_title_id, rfps / 10u, rfps % 10u, ofps / 10u, ofps % 10u);
     osd_set_row(st, gr, 0, 1, 32, 0, 0, line);
 
     // Always show the edited ON/OFF value here; the inert reason is shown on the status row below.
     const char *fgs;
     if (g_passive_mode) fgs = c.framegen ? "ON (PRESS X)" : "OFF (SAFE)"; // row is cut at 32 chars
-    else if (!c.framegen) fgs = "OFF (NATIVE)";
+    else if (!c.framegen) fgs = "OFF  NATIVE";
     else if (g_inert_reason[0]) fgs = "ON (INERT)";
-    else fgs = c.preset == 1 ? "ON (FAST 60Hz)" : "ON (2X QUAL)";
-    snprintf(line, sizeof(line), " Frame Gen      : %s", fgs);
-    osd_set_row(st, gr, 1, sel == 0 ? 2 : 0, 18, (c.framegen && !g_inert_reason[0]) ? 1 : 3, 0, line);
+    else fgs = c.preset == 1 ? "ON  FAST 60" : "ON  QUALITY 2X";
+    snprintf(line, sizeof(line), " FRAME GEN       %s", fgs);
+    osd_set_row(st, gr, 1, sel == 0 ? 2 : 0, 17, (c.framegen && !g_inert_reason[0]) ? 1 : 3, 0, line);
 
-    const char *pn = c.preset == 1 ? "FAST (TO 60Hz)" : (c.preset == 2 ? "SHARP (2X CR)" : "QUALITY (2X)");
-    snprintf(line, sizeof(line), " FG8 Preset     : %s", pn);
-    osd_set_row(st, gr, 2, sel == 1 ? 2 : 0, 18, 2, 0, line);
+    const char *pn = c.preset == 1 ? "FAST" : (c.preset == 2 ? "SHARP" : "QUALITY");
+    snprintf(line, sizeof(line), " PRESET          %s", pn);
+    osd_set_row(st, gr, 2, sel == 1 ? 2 : 0, 17, 2, 0, line);
 
-    if (c.sharpness > 0) snprintf(line, sizeof(line), " RCAS Sharp: %d%%", c.sharpness);
-    else snprintf(line, sizeof(line), " RCAS Sharp: OFF (0%%)");
-    uint32_t b3 = c.sharpness > 0 ? (18u + (uint32_t)(c.sharpness * 12) / 100u) : 0u;
-    osd_set_row(st, gr, 3, sel == 2 ? 2 : 0, 18, c.sharpness > 0 ? 1 : 3, b3, line);
+    if (c.sharpness > 0) snprintf(line, sizeof(line), " SHARPNESS       %d%%", c.sharpness);
+    else snprintf(line, sizeof(line), " SHARPNESS       OFF");
+    uint32_t b3 = c.sharpness > 0 ? (17u + (uint32_t)(c.sharpness * 15) / 100u) : 0u;
+    osd_set_row(st, gr, 3, sel == 2 ? 2 : 0, 17, c.sharpness > 0 ? 1 : 3, b3, line);
 
-    const char *un = c.upscale <= 0 ? "OFF" : (c.upscale == 1 ? "LIGHT (edge AA/directional AA)" : "STRONG (edge AA/directional AA)");
-    snprintf(line, sizeof(line), " Enhance AA     : %s", un);
-    osd_set_row(st, gr, 4, sel == 3 ? 2 : 0, 18, c.upscale > 0 ? 1 : 3, 0, line);
+    const char *un = c.upscale <= 0 ? "OFF" : (c.upscale == 1 ? "LIGHT" : "STRONG");
+    snprintf(line, sizeof(line), " ENHANCE         %s", un);
+    osd_set_row(st, gr, 4, sel == 3 ? 2 : 0, 17, c.upscale > 0 ? 1 : 3, 0, line);
 
-    snprintf(line, sizeof(line), " FPS Overlay    : %s", overlay_label(c.overlay));
-    osd_set_row(st, gr, 5, sel == 4 ? 2 : 0, 18, c.overlay > 0 ? 1 : 3, 0, line);
+    snprintf(line, sizeof(line), " FPS COUNTER     %s", overlay_label(c.overlay));
+    osd_set_row(st, gr, 5, sel == 4 ? 2 : 0, 17, c.overlay > 0 ? 1 : 3, 0, line);
 
-    const char *vn = !c.game_vectors ? "OFF" : (gv_armed() ? "ON (HYBRID)" : "ON (SAVE+RBT)");
-    snprintf(line, sizeof(line), " Game Vectors   : %s", vn);
-    osd_set_row(st, gr, 6, sel == 5 ? 2 : 0, 18, c.game_vectors ? (gv_armed() ? 1 : 2) : 3, 0, line);
+    const char *vn = !c.game_vectors ? "OFF" : (gv_armed() ? "ON  HYBRID" : "ON  AFTER REBOOT");
+    snprintf(line, sizeof(line), " GAME VECTORS    %s", vn);
+    osd_set_row(st, gr, 6, sel == 5 ? 2 : 0, 17, c.game_vectors ? (gv_armed() ? 1 : 2) : 3, 0, line);
 
     const char *hn = c.hud_protect <= 0 ? "OFF" : (c.hud_protect == 1 ? "CONSERVATIVE" : "AGGRESSIVE");
-    snprintf(line, sizeof(line), " HUD Protection : %s", hn);
-    osd_set_row(st, gr, 7, sel == 6 ? 2 : 0, 18, c.hud_protect > 0 ? 1 : 3, 0, line);
+    snprintf(line, sizeof(line), " HUD PROTECT     %s", hn);
+    osd_set_row(st, gr, 7, sel == 6 ? 2 : 0, 17, c.hud_protect > 0 ? 1 : 3, 0, line);
 
-    if (c.fps_lock <= 0) snprintf(line, sizeof(line), " FPS Lock       : AUTO (VBLANK)");
-    else snprintf(line, sizeof(line), " FPS Lock       : %d FPS", c.fps_lock);
-    osd_set_row(st, gr, 8, sel == 7 ? 2 : 0, 18, 2, 0, line);
+    if (c.fps_lock <= 0) snprintf(line, sizeof(line), " FPS LOCK        AUTO");
+    else snprintf(line, sizeof(line), " FPS LOCK        %d", c.fps_lock);
+    osd_set_row(st, gr, 8, sel == 7 ? 2 : 0, 17, 2, 0, line);
 
-    snprintf(line, sizeof(line), " Menu Opacity   : %d%%", c.menu_opacity);
-    uint32_t b9 = 18u + (uint32_t)(c.menu_opacity * 12) / 100u;
-    osd_set_row(st, gr, 9, sel == 8 ? 2 : 0, 18, 2, b9, line);
+    snprintf(line, sizeof(line), " OPACITY         %d%%", c.menu_opacity);
+    uint32_t b9 = 17u + (uint32_t)(c.menu_opacity * 15) / 100u;
+    osd_set_row(st, gr, 9, sel == 8 ? 2 : 0, 17, 2, b9, line);
 
     snprintf(line, sizeof(line), " GPU:%u.%02ums | %s", g_last_gpu_ms_x100 / 100u, g_last_gpu_ms_x100 % 100u,
              g_inert_reason[0] ? g_inert_reason : g_osd_toast);
     osd_set_row(st, gr, 10, 3, 1, 2, 0, line);
-    osd_set_row(st, gr, 11, 3, 32, 0, 0, " [U/D] Select  [L/R] Adjust Val ");
-    osd_set_row(st, gr, 12, 3, 32, 0, 0, " [X]Apply [[]]Def [/\\]Save [O]Ex");
+    osd_set_row(st, gr, 11, 3, 32, 0, 0, " UP/DN SELECT  LEFT/RIGHT CHANGE");
+    osd_set_row(st, gr, 12, 3, 32, 0, 0, " X APPLY [] RESET /\\ SAVE O EXIT");
 
     *xy_out = 64u | (64u << 16);
     *wh_out = 32u | (13u << 8) | (alpha_u8 << 16) | ((out_flags & 3u) << 24);
