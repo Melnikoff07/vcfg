@@ -31,6 +31,20 @@ for mode in range(4):
                                'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
                                'arrays_exact': len(arrays)})
     print(f'{folder}: {len(arrays)}/{len(arrays)} arrays exact; test hooks isolated; bytes={len(data)}')
+bench = ROOT / 'build/classic-bench'
+if (bench / 'vcfg_classic.elf').exists():
+    elf = (bench / 'vcfg_classic.elf').read_bytes()
+    bench_arrays = arrays | mod.arrays(bench)
+    if any(elf.count(data) != 1 for data in bench_arrays.values()):
+        raise SystemExit('classic-bench: shader array mismatch')
+    sources = json.loads((bench / 'bench_sources.json').read_text())
+    if any(hashlib.sha256((ROOT / path).read_bytes()).hexdigest() != digest for path, digest in sources['members'].items()):
+        raise SystemExit('classic-bench: sources changed since compilation; rebuild the benchmark')
+    data = (bench / 'vcfg_classic.prx').read_bytes()
+    manifest['benchmark'] = {'path': 'build/classic-bench/vcfg_classic.prx', 'bytes': len(data),
+                             'sha256': hashlib.sha256(data).hexdigest(), 'source_hash': sources['sha256'],
+                             'arrays_exact': len(bench_arrays)}
+    print(f'classic-bench: {len(bench_arrays)}/{len(bench_arrays)} arrays exact; source fingerprint matches; bytes={len(data)}')
 sources = list((ROOT / 'classic/source').glob('*.[ch]')) + list((ROOT / 'overlay').glob('*.[ch]'))
 for path in sorted(sources):
     manifest['source_sha256'][str(path.relative_to(ROOT)).replace('\\', '/')] = hashlib.sha256(path.read_bytes()).hexdigest()
