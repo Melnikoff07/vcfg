@@ -8,12 +8,13 @@
   python -I tools/console.py exclude CUSA01113                     empty section: [default] plugins stay out of that game
   python -I tools/console.py remove CUSA09171                      delete that game's section
   python -I tools/console.py logs [--out logs] [--sessions 6]      fetch probe.log (split per session) + discovery logs
+  python -I tools/console.py snapshot [--out logs/snapshot]       read-only snapshot: traces, profiles and logs
 
 Rules (learned the hard way): never overwrite a PRX that a running game may have loaded (always a new name), change
 only the requested section, back up plugins.ini on the console and locally, refuse if the ini changed meanwhile.
 Changes take effect at the next full start of the game; there is no hot reload.
 """
-import ftplib, io, json, pathlib, re, sys, time
+import ftplib, hashlib, io, json, pathlib, re, sys, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 INI = '/data/GoldHEN/plugins.ini'
@@ -132,6 +133,35 @@ def cmd_logs():
                 (out / name).write_bytes(get(f, LOGDIR + name))
     print('saved to', out)
 
+def cmd_snapshot():
+    out = ROOT / opt('--out', 'logs/snapshot_' + time.strftime('%Y%m%d_%H%M%S'))
+    out.mkdir(parents=True, exist_ok=True)
+    manifest = {'captured_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'files': {}, 'errors': {}}
+    allowed = re.compile(r'(?:trace-CUSA\d{5}(?:\.prev)?\.txt|config-CUSA\d{5}\.ini|'
+                         r'probe(?:\.prev)?\.log|vcfg(?:_launcher)?\.ini|result-CUSA\d{5}\.ini)\Z')
+    with connect() as f:
+        paths = [INI]
+        paths += [LOGDIR + p.rsplit('/', 1)[-1] for p in f.nlst(LOGDIR)
+                  if allowed.fullmatch(p.rsplit('/', 1)[-1])]
+        for remote in sorted(set(paths)):
+            name = remote.rsplit('/', 1)[-1]
+            chunks, size = [], 0
+            def receive(chunk):
+                nonlocal size
+                size += len(chunk)
+                if size > 32 * 1024 * 1024:
+                    raise RuntimeError('snapshot file exceeds 32 MiB limit')
+                chunks.append(chunk)
+            try:
+                f.retrbinary('RETR ' + remote, receive)
+                data = b''.join(chunks)
+                (out / name).write_bytes(data)
+                manifest['files'][name] = {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+            except ftplib.error_perm as e:
+                manifest['errors'][name] = str(e)
+    (out / 'snapshot.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+    print('snapshot saved to', out, 'files', len(manifest['files']), 'errors', len(manifest['errors']))
+
 def main():
     a = sys.argv[1:]
     if not a: sys.exit(__doc__)
@@ -142,6 +172,7 @@ def main():
     elif a[0] == 'exclude': cmd_exclude(a[1])
     elif a[0] == 'remove': cmd_remove(a[1])
     elif a[0] == 'logs': cmd_logs()
+    elif a[0] == 'snapshot': cmd_snapshot()
     else: sys.exit(__doc__)
 
 if __name__ == '__main__':
