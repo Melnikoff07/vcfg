@@ -470,6 +470,54 @@ done:
     __atomic_store_n(&a20_pad_lock,0,__ATOMIC_RELEASE);
     return was_menu || menu || now<a20_swallow_until;
 }
+#if A21_MENU
+static int a21_vov_state; // 0 not tried, 1 ready, -1 no memory
+static char a21_vov_title[48];
+static int a21_vov_ready(void)
+{
+    if (a21_vov_state) return a21_vov_state>0;
+    void *mem=alloc_dm((VOV_MEM_SZ+0xFFFFu)&~0xFFFFu,0x10000,0 /*WB_ONION*/);
+    if (!mem) { a21_vov_state=-1; lg("A21_OVERLAY no memory, menu disabled\n"); return 0; }
+    vov_init((uint8_t *)mem);
+    vov_read_title(a21_vov_title,sizeof(a21_vov_title));
+    if (!a21_vov_title[0]) vov_cpy(a21_vov_title,g_title_id,sizeof(a21_vov_title));
+    lg("A21_OVERLAY ready %p title '%s'\n",mem,a21_vov_title);
+    a21_vov_state=1;return 1;
+}
+static void a21_vov_row(VovMenu *m,const char *label,int kind,int on,int pct,const char *value)
+{
+    VovRow *r=&m->rows[m->nrows++];
+    vov_cpy(r->label,label,sizeof(r->label));vov_cpy(r->value,value,sizeof(r->value));r->kind=kind;r->on=on;r->pct=pct;
+}
+static void a20_build_menu(uint32_t *tb,uint8_t *sb)
+{
+    (void)sb;
+    tb[136]=tb[137]=tb[138]=tb[139]=0;
+    if (!a21_vov_ready()) return;
+    static VovMenu m;memset(&m,0,sizeof(m));
+    int enabled=__atomic_load_n(&a20_enabled,__ATOMIC_ACQUIRE);
+    unsigned en=__atomic_load_n(&a21_enhance,__ATOMIC_ACQUIRE);
+    vov_cpy(m.title,a21_vov_title,sizeof(m.title));
+    m.game_fps_x10=__atomic_load_n(&g_osd_real_fps_x10,__ATOMIC_ACQUIRE);
+    m.out_fps_x10=enabled?m.game_fps_x10*2u:m.game_fps_x10;
+    m.sel=(int)__atomic_load_n(&a21_menu_sel,__ATOMIC_ACQUIRE);
+    vov_cpy(m.status,"FG paused while the menu is open",sizeof(m.status));
+    a21_vov_row(&m,"Frame generation",VOV_TOGGLE,enabled,0,"");
+    a21_vov_row(&m,"Mode",VOV_TEXT,0,0,!A21_SCHED?"Quality":__atomic_load_n(&a21_preset,__ATOMIC_ACQUIRE)?"Fast":"Quality");
+    a21_vov_row(&m,"Sharpness",VOV_SEGMENTS,0,(int)__atomic_load_n(&a21_sharp,__ATOMIC_ACQUIRE),"");
+    a21_vov_row(&m,"Anti-aliasing",VOV_TEXT,0,0,en==2?"Strong":en==1?"Light":"Off");
+    a21_vov_row(&m,"FPS counter",VOV_TEXT,0,0,overlay_label((int)__atomic_load_n(&a21_overlay,__ATOMIC_ACQUIRE)));
+    a21_vov_row(&m,"Opacity",VOV_SEGMENTS,0,(int)__atomic_load_n(&a21_opacity,__ATOMIC_ACQUIRE),"");
+    a21_vov_row(&m,"FPS lock",VOV_TEXT,0,0,"Keep game");
+    vov_cpy(m.hints,"\xe2\x86\x95 \xe2\x86\x90 \xe2\x86\x92  \xc3\x97 SET   \xe2\x97\x8b CLOSE",sizeof(m.hints));
+    const uint8_t *pal,*pix;unsigned w,h;
+    if (!vov_menu(&m,&pal,&pix,&w,&h)) return;
+    make_v(tb+128,(uint64_t)(uintptr_t)pal,VOV_PAL_SZ);
+    make_v(tb+132,(uint64_t)(uintptr_t)pix,VOV_PIX_SZ);
+    unsigned alpha=__atomic_load_n(&a21_opacity,__ATOMIC_ACQUIRE)*255u/100u;
+    tb[138]=64u|(64u<<16);tb[139]=vov_wh(w,h,alpha,2u);
+}
+#else
 static void a20_build_menu(uint32_t *tb,uint8_t *sb)
 {
     uint8_t *mem=sb+0x1d00;memset(mem,0,576);
@@ -517,6 +565,7 @@ static void a20_build_menu(uint32_t *tb,uint8_t *sb)
     make_v(tb+132,(uint64_t)(uintptr_t)mem,576);
     tb[136]=tb[137]=0;tb[138]=64u|(64u<<16);tb[139]=32u|(8u<<8)|(200u<<16)|(2u<<24);
 }
+#endif
 static void a20_record(const VoFlipStatus *fs,const VoVblankStatus *vb,int wr,int sr,int vr,int events,unsigned kind)
 {
     A18Observation row={.cpu=sceKernelGetProcessTime(),.count=fs->count,.shown=fs->processTime,.vblank=vb->count,
@@ -1001,47 +1050,43 @@ static void a21_emit_post(uint32_t **pp,uint8_t *tables,uint64_t surface,unsigne
 #if A21_MENU
 // Corner overlay drawn on the native frame C BEFORE the FG passes read it, so it is a static HUD element in both P and
 // C; the warp copies that rectangle from C (HUD protection, tb[31]) into every mid -> same size on mids and natives.
-#define A21_OVL_COLS 26u
+// The counter (overlay/vov.c) fits in a fixed A21_OVL_W x A21_OVL_H box; right corners align it to the right edge.
+#define A21_OVL_W 224u
+#define A21_OVL_H 64u
 static uint32_t a21_overlay_rect(unsigned ovl,unsigned *x,unsigned *y,unsigned *rows)
 {
-    unsigned detailed=(ovl&1u)==0,corner=(ovl-1u)/2u;
-    *rows=detailed?3u:1u;
-    unsigned w=A21_OVL_COLS*16u,h=*rows*16u;
-    *x=(corner==1 || corner==2)?1920u-w-24u:24u;
-    *y=corner>=2?1080u-h-24u:24u;
+    unsigned corner=(ovl-1u)/2u;
+    *rows=A21_OVL_H/16u;
+    unsigned w=A21_OVL_W,h=A21_OVL_H;
+    *x=(corner==1 || corner==2)?1920u-w-32u:32u;
+    *y=corner>=2?1080u-h-32u:32u;
     // HUD rectangle in 1080p source pixels, 8 px units, padded by 8 px.
     return ((*x-8u)/8u)|(((*y-8u)/8u)<<8)|(((*x+w+15u)/8u)<<16)|(((*y+h+15u)/8u)<<24);
 }
 static void a21_emit_overlay(uint32_t **pp,uint8_t *sb,uint64_t target,unsigned ovl,unsigned do_fg,unsigned mids)
 {
+    (void)mids;
     uint32_t *tb=(uint32_t *)(sb+A21_OVL_N_TB);memset(tb,0,0x230);
-    uint32_t *styles=(uint32_t *)(sb+A21_OVL_TXT);char (*grid)[32]=(char (*)[32])(styles+16);
-    memset(styles,0,0x180);
+    if (!a21_vov_ready()) return;
     unsigned x,y,rows;a21_overlay_rect(ovl,&x,&y,&rows);
-    char line[48];
     unsigned g=__atomic_load_n(&g_osd_real_fps_x10,__ATOMIC_ACQUIRE),d=__atomic_load_n(&a21_disp_x10,__ATOMIC_ACQUIRE);
-    unsigned u=__atomic_load_n(&a21_uniq_x10,__ATOMIC_ACQUIRE);
-    snprintf(line,sizeof(line)," G %u.%u D %u.%u U %u.%u",g/10,g%10,d/10,d%10,u/10,u%10);
-    osd_set_row(styles,grid,0,0,32,0,0,line);
-    if (rows>1) {
-        unsigned r=__atomic_load_n(&a21_rep_x10,__ATOMIC_ACQUIRE),s=__atomic_load_n(&a21_skip_x10,__ATOMIC_ACQUIRE);
-        snprintf(line,sizeof(line)," R %u.%u S %u.%u %s",r/10,r%10,s/10,s%10,!do_fg?"NATIVE":mids>1?"2 MIDS":"1 MID");
-        osd_set_row(styles,grid,1,0,32,0,0,line);
-        unsigned us=__atomic_load_n(&a21_gpu_us,__ATOMIC_ACQUIRE);
-        snprintf(line,sizeof(line)," GPU ~%u.%02u MS %s",us/1000,(us%1000)/10,
-            __atomic_load_n(&a21_preset,__ATOMIC_ACQUIRE)?"FAST":"QUALITY");
-        osd_set_row(styles,grid,2,0,32,0,0,line);
-    }
+    unsigned us=__atomic_load_n(&a21_gpu_us,__ATOMIC_ACQUIRE);
+    VovCounter k={do_fg?d:g,(us+50u)/100u,(ovl&1u)==0};
+    const uint8_t *pal,*pix;unsigned w,h;
+    if (!vov_counter(&k,&pal,&pix,&w,&h)) return;
+    if (w>A21_OVL_W) w=A21_OVL_W;
+    unsigned corner=(ovl-1u)/2u;
+    if (corner==1 || corner==2) x+=A21_OVL_W-w;
     make_t(tb+8,target,g_bw,g_bh,g_pitch,g_attr.tilingMode==0?10:8);
     make_t(tb+16,target,g_bw,g_bh,g_pitch,g_attr.tilingMode==0?10:8);
-    make_v(tb+128,(uint64_t)(uintptr_t)(a20_gpu+A21_FONT_OFF),768);
-    make_v(tb+132,(uint64_t)(uintptr_t)styles,64u+32u*rows);
+    make_v(tb+128,(uint64_t)(uintptr_t)pal,VOV_PAL_SZ);
+    make_v(tb+132,(uint64_t)(uintptr_t)pix,VOV_PIX_SZ);
     unsigned alpha=__atomic_load_n(&a21_opacity,__ATOMIC_ACQUIRE)*255u/100u;
-    tb[136]=tb[137]=0;tb[138]=x|(y<<16);tb[139]=A21_OVL_COLS|(rows<<8)|(alpha<<16)|(2u<<24); // flags 2: write T#cur
+    tb[136]=tb[137]=0;tb[138]=x|(y<<16);tb[139]=vov_wh(w,h,alpha,2u); // flags 2: write T#cur
     uint64_t a=(uint64_t)(uintptr_t)tb;uint32_t *p=*pp;
     *p++=PKT3(0x76,3,1);*p++=0x240;*p++=(uint32_t)a;*p++=(uint32_t)(a>>32);
-    // osd8 groups are 8x8 px relative to the panel origin (osd_xy): 2 groups per 16 px cell in x and y.
-    a20_pass(&p,10,OSD8_RSRC1,OSD8_RSRC2,A21_OVL_COLS*2u,rows*2u);
+    // osd8 groups are 8x8 px relative to the panel origin (osd_xy).
+    a20_pass(&p,10,OSD8_RSRC1,OSD8_RSRC2,(w/16u)*2u,(h/16u)*2u);
     *pp=p;
 }
 #endif
@@ -1335,7 +1380,7 @@ static int a20_try_submit(uint32_t count,void **dcb,uint32_t *sizes,void **ccb,u
     } else if (menu) {
         a20_build_menu(table,sb);
         *p++=PKT3(0x76,3,1);*p++=0x240;*p++=(uint32_t)tbl;*p++=(uint32_t)(tbl>>32);
-        a20_pass(&p,10,OSD8_RSRC1,OSD8_RSRC2,64,((table[139]>>8)&255u)*2u);
+        if (table[139]) a20_pass(&p,10,OSD8_RSRC1,OSD8_RSRC2,(table[139]&255u)*2u,((table[139]>>8)&255u)*2u);
     }
     a20_timestamp(&p,sb,5);
     *p++=PKT3(0x58,6,0);*p++=0x80c40000;*p++=0xffffffff;*p++=0;*p++=0;*p++=0;*p++=0xa;

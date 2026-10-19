@@ -29,12 +29,14 @@ if ($Target -eq 'plugin') {
 $out = Join-Path $root "build\$Name"
 New-Item -ItemType Directory -Force $out | Out-Null
 $env:OO_PS4_TOOLCHAIN = $tc
-$inc = @('-isysroot', $tc, '-isystem', "$tc\include", "-I$sdk\include", "-I$src\common", "-I$src\source")
+$inc = @('-isysroot', $tc, '-isystem', "$tc\include", "-I$sdk\include", "-I$src\common", "-I$src\source", "-I$root\overlay")
 $def = @('-D_BSD_SOURCE=1', '-D__BSD_VISIBLE=1', '-D__PS4__=1', '-DOO=1', '-D__OPENORBIS__=1', '-D__OOPS4__=1', '-D__FINAL__=1', '-D__USE_PRINTF__')
 foreach ($d in $Defs) { $def += "-D$d" }
 $flags = @('--target=x86_64-pc-freebsd12-elf', '-fPIC', '-funwind-tables', '-Wno-c99-designator', '-Werror=format')
 $objs = @()
-foreach ($f in @(Get-ChildItem "$src\common\*.c") + @(Get-ChildItem "$src\source\*.c")) {
+$srcs = @(Get-ChildItem "$src\common\*.c") + @(Get-ChildItem "$src\source\*.c")
+if ($Target -eq 'plugin') { $srcs += Get-Item (Join-Path $root 'overlay/vov.c') }   # in-game overlay renderer
+foreach ($f in $srcs) {
     $o = Join-Path $out "$($f.BaseName).o"
     & $clang @flags @def @inc -c $f.FullName -o $o
     if ($LASTEXITCODE -ne 0) { throw "Compile failed: $($f.Name)" }

@@ -1,6 +1,7 @@
 // Descriptor helpers and the mode 8 table / work memory layout. Shared by main.c and the x86 test harness
 // (tools/emu), so the harness checks exactly the descriptors the plugin builds.
 #pragma once
+#include "vov.h"
 #include <stdint.h>
 
 static inline void make_t(uint32_t *t, uint64_t a, uint32_t w, uint32_t h, uint32_t pitch, uint32_t tidx)
@@ -139,8 +140,9 @@ static inline void fill_table8_ext(uint32_t *tb, uint8_t *gpu, uint8_t *slotb,
                                    uint32_t rcas_con_bits, uint32_t rcas_flags,
                                    uint32_t osd_xy, uint32_t osd_wh)
 {
-    make_v(tb + 128, (uint64_t)(uintptr_t)(gpu + FONT8_OFF), 96 * 8);         // +0x200 V#font
-    make_v(tb + 132, (uint64_t)(uintptr_t)(slotb + OSD_SLOT_OFF), 64 + 512);  // +0x210 V#osd
+    (void)gpu; (void)slotb;
+    make_v(tb + 128, (uint64_t)(uintptr_t)vov_pal_ptr(), VOV_PAL_SZ);          // +0x200 V#palette (overlay/vov.c)
+    make_v(tb + 132, (uint64_t)(uintptr_t)vov_pix_ptr(), VOV_PIX_SZ);          // +0x210 V#pixels
     tb[136] = rcas_con_bits;                                                  // +0x220 rcas_con (float bits)
     tb[137] = rcas_flags;                                                     // +0x224 rcas_flags (bit 0=mid, 1=cur, 2..3=enh_mode)
     tb[138] = osd_xy;                                                         // +0x228 osd_xy (x0 | y0 << 16)

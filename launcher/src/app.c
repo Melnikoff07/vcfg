@@ -36,7 +36,7 @@ static int draw_header(Canvas *c, App *a)
     int bottom = top + ph;
     draw_text(c, &f->mono, M + lw + 56 + 34, bottom - 46, "VIBE CODED", INK, 1);
     draw_text(c, &f->mono, M + lw + 56 + 34, bottom - 10, "FRAME GENERATOR", INK, 1);
-    static const char *tabs[TAB_COUNT] = { "01 GAMES", "02 DEFAULTS", "03 OVERLAY", "04 INSTALL" };
+    static const char *tabs[TAB_COUNT] = { "01 GAMES", "02 DEFAULTS", "03 OVERLAY", "04 PLUGIN" };
     int x = c->w - M;
     for (int i = TAB_COUNT - 1; i >= 0; i--) {
         int w = text_width(&f->mono, tabs[i], 1);
@@ -208,13 +208,13 @@ static void draw_install(Canvas *c, App *a, int top)
 {
     Fonts *f = a->f;
     int y = top + 58, w = c->w - 2 * M;
-    static const char *states[3] = { "NOT INSTALLED", "INSTALLED", "UPDATE AVAILABLE" };
+    static const char *states[3] = { "NOT INSTALLED", "UP TO DATE", "NEEDS UPDATE" };
     fill_round(c, M, y, w, 230, 22, a->plugin_state == 1 ? YEL : RED);
-    draw_text(c, &f->mono, M + 34, y + 60, "PLUGINS IN /DATA/GOLDHEN/PLUGINS", INK, 1);
+    draw_text(c, &f->mono, M + 34, y + 60, "PLUGIN ON THIS CONSOLE", INK, 1);
     draw_text(c, &f->big, M + 34, y + 190, states[a->plugin_state % 3], INK, -6);
     int ly = y + 300;
-    draw_text(c, &f->title, M, ly, "Press cross to install or update. Your plugins.ini is backed up first.", INK, 0);
-    draw_text(c, &f->title, M, ly + 52, "Press square to remove VCFG from plugins.ini (files stay, nothing else changes).", INK, 0);
+    draw_text(c, &f->title, M, ly, "Cross copies the plugin from this app to the console. Do it once after installing a new VCFG package.", INK, 0);
+    draw_text(c, &f->title, M, ly + 52, "Settings do not need it: they save as you change them. Nothing is downloaded. Square turns VCFG off.", INK, 0);
     for (int i = 0; i < a->nlog; i++) draw_text(c, &f->mono, M, ly + 140 + i * 42, a->log[i], DIM, 1);
     if (a->status[0]) draw_text(c, &f->mono, M, c->h - FOOT - 40, a->status, INK, 1);
 }
@@ -252,7 +252,7 @@ void app_draw(Canvas *c, App *a)
         draw_footer(c, a, h, 2);
     } else {
         draw_install(c, a, top);
-        Hint h[] = { { BTN_CROSS, "INSTALL" }, { BTN_SQUARE, "REMOVE" } };
+        Hint h[] = { { BTN_CROSS, "INSTALL / UPDATE" }, { BTN_SQUARE, "TURN OFF VCFG" } };
         draw_footer(c, a, h, 2);
     }
 }

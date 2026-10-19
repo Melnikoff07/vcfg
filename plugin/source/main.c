@@ -955,6 +955,9 @@ static const char *overlay_label(int ov)
 // out_flags: 3u = write both mid & cur (when FG is active), 2u = write cur only (native/post-only mode).
 static void osd_build_slot(uint8_t *osd_mem, uint32_t *xy_out, uint32_t *wh_out, uint32_t out_flags)
 {
+    // The legacy grid menu does not match the current osd8 (overlay/vov.c bitmaps): A20/A22 paths draw the overlay.
+    (void)osd_mem; (void)out_flags; *xy_out = 0; *wh_out = 0;
+    if (1) return;
     uint64_t now = sceKernelGetProcessTime();
     int ov = g_cfg.overlay;
     if (!g_menu_open && now >= g_osd_toast_until && ov <= 0) {
@@ -2293,6 +2296,7 @@ static int find_flip_tail_pm4(const uint32_t *dw, uint32_t nd, uint32_t *tail_of
     return 0;
 }
 
+#include "vov_glue.h"
 #include "a20_copy_impl.h"
 
 static int ensure_mbufs_registered(int32_t handle)

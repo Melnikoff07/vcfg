@@ -31,6 +31,7 @@ static volatile int g_opt_nostr = 0; // inject letter b: straddle guard in warp8
 static volatile int g_opt_nocf = 0;  // inject letter k: confidence fallback off
 #include "fg8_table.h"
 #include "gv.h"
+#include "vov_glue.h"
 
 #define PLUGIN_NAME "bb_probe"
 #define LOG_DIR "/data/bb_probe"
@@ -546,147 +547,94 @@ static uint32_t build_dcb_flow(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M,
     return (uint32_t)(p - p0);
 }
 
-static void osd_set_row(uint32_t *styles, char (*grid)[32], int row, uint32_t rtype, uint32_t vcol, uint32_t vclr, uint32_t bend, const char *txt)
+// VCFG overlay (overlay/vov.c): menu panel and corner FPS counter in the launcher design.
+// osd8 composites the bitmap; fill_table8_ext points V#palette / V#pixels at g_vov_pal / g_vov_pix.
+static const uint8_t *g_vov_pal, *g_vov_pix;
+static int g_vov_state; // 0 not tried, 1 ready, -1 no memory
+static char g_vov_title[48];
+
+static int vov_ready(void)
 {
-    styles[row] = (rtype & 0xFFu) | ((vcol & 0xFFu) << 8) | ((vclr & 0xFFu) << 16) | ((bend & 0xFFu) << 24);
-    int i = 0;
-    for (; i < 32 && txt[i]; i++) grid[row][i] = txt[i];
-    for (; i < 32; i++) grid[row][i] = ' ';
+    if (g_vov_state) return g_vov_state > 0;
+    void *mem = alloc_dm(VOV_MEM_SZ + 0xFFFFu & ~0xFFFFu, 0x10000, 0 /*WB_ONION*/);
+    if (!mem) { g_vov_state = -1; lg("overlay: no memory, menu disabled\n"); return 0; }
+    vov_init((uint8_t *)mem);
+    vov_read_title(g_vov_title, sizeof(g_vov_title));
+    if (!g_vov_title[0]) vov_cpy(g_vov_title, g_title_id, sizeof(g_vov_title));
+    lg("overlay: ready at %p, title '%s'\n", mem, g_vov_title);
+    g_vov_state = 1;
+    return 1;
 }
 
 static const char *overlay_label(int ov)
 {
-    static const char *names[9] = {
-        "OFF",
-        "SMALL [TL]", "DETAIL [TL]",
-        "SMALL [TR]", "DETAIL [TR]",
-        "SMALL [BR]", "DETAIL [BR]",
-        "SMALL [BL]", "DETAIL [BL]"
-    };
-    if (ov < 0 || ov > 8) return "OFF";
-    return names[ov];
+    static const char *names[9] = { "OFF", "SMALL TL", "DETAIL TL", "SMALL TR", "DETAIL TR", "SMALL BR", "DETAIL BR", "SMALL BL", "DETAIL BL" };
+    return ov < 0 || ov > 8 ? "OFF" : names[ov];
 }
 
-// Builds OSD character/style grid in slotb + OSD_SLOT_OFF.
+static void vov_row(VovMenu *m, const char *label, int kind, int on, int pct, const char *value)
+{
+    VovRow *r = &m->rows[m->nrows++];
+    vov_cpy(r->label, label, sizeof(r->label)); vov_cpy(r->value, value, sizeof(r->value));
+    r->kind = kind; r->on = on; r->pct = pct;
+}
+
 // out_flags: 3u = write both mid & cur (when FG is active), 2u = write cur only (native/post-only mode).
 static void osd_build_slot(uint8_t *osd_mem, uint32_t *xy_out, uint32_t *wh_out, uint32_t out_flags)
 {
+    (void)osd_mem;
+    *xy_out = 0; *wh_out = 0;
     uint64_t now = sceKernelGetProcessTime();
-    int ov = g_cfg.overlay;
-    if (!g_menu_open && now >= g_osd_toast_until && ov <= 0) {
-        *xy_out = 0;
-        *wh_out = 0;
-        return;
-    }
-    uint32_t *st = (uint32_t *)osd_mem;
-    char (*gr)[32] = (char (*)[32])(osd_mem + 64);
+    int ov = g_cfg.overlay, toast = !g_menu_open && now < g_osd_toast_until;
+    if (!g_menu_open && !toast && ov <= 0) return;
+    if (!vov_ready()) return;
     int op = g_menu_open ? g_menu_edit.menu_opacity : g_cfg.menu_opacity;
     if (op < 20) op = 20;
     if (op > 100) op = 100;
-    uint32_t alpha_u8 = (uint32_t)(op * 255 / 100);
-    char line[64];
-
-    if (!g_menu_open && now < g_osd_toast_until) {
-        snprintf(line, sizeof(line), " VCFG  %s", g_title_id);
-        osd_set_row(st, gr, 0, 1, 32, 0, 0, line);
-        snprintf(line, sizeof(line), " %s", g_osd_toast);
-        osd_set_row(st, gr, 1, 0, 1, 1, 0, line);
-        *xy_out = 48u | (48u << 16);
-        *wh_out = 28u | (2u << 8) | (alpha_u8 << 16) | ((out_flags & 3u) << 24);
-        return;
-    }
-
-    // 1.3: Corner FPS Overlay when menu is closed and overlay > 0
-    if (!g_menu_open) {
-        int is_det = (ov & 1) == 0;          // 1,3,5,7 = SMALL; 2,4,6,8 = DETAILED
-        int corner = (ov - 1) / 2;           // 0=TL, 1=TR, 2=BR, 3=BL
-        uint32_t rfps = __atomic_load_n(&g_osd_real_fps_x10, __ATOMIC_ACQUIRE);
-        uint32_t ofps = __atomic_load_n(&g_osd_out_fps_x10, __ATOMIC_ACQUIRE);
-        uint32_t ftms = __atomic_load_n(&g_osd_frame_ms_x10, __ATOMIC_ACQUIRE);
-        uint32_t gpums = __atomic_load_n(&g_last_gpu_ms_x100, __ATOMIC_ACQUIRE);
-        if (!g_cfg.framegen || g_inert_reason[0]) ofps = rfps;
-
-        const char *mtag = (!g_cfg.framegen || g_inert_reason[0]) ? "NAT" : (g_cfg.preset == 1 ? "F60" : "2X");
-        uint32_t cols = is_det ? 28u : 22u;
-        uint32_t rows = is_det ? 2u : 1u;
-
-        if (!is_det) {
-            snprintf(line, sizeof(line), " FPS %2u.%u->%2u.%u [%s]",
-                     rfps / 10u, rfps % 10u, ofps / 10u, ofps % 10u, mtag);
-            osd_set_row(st, gr, 0, 0, 5, g_cfg.framegen && !g_inert_reason[0] ? 1 : 2, 0, line);
-        } else {
-            snprintf(line, sizeof(line), " FPS:%2u.%u->%2u.%u FT:%2u.%ums",
-                     rfps / 10u, rfps % 10u, ofps / 10u, ofps % 10u, ftms / 10u, ftms % 10u);
-            osd_set_row(st, gr, 0, 1, 5, 1, 0, line);
-            const char *aat = g_cfg.upscale == 2 ? "AA:HI" : (g_cfg.upscale == 1 ? "AA:LO" : "AA:--");
-            snprintf(line, sizeof(line), " GPU:%u.%02ums %s %s",
-                     gpums / 100u, gpums % 100u, mtag, aat);
-            osd_set_row(st, gr, 1, 0, 5, 2, 0, line);
-        }
-
-        uint32_t sw = g_bw >= 640 ? g_bw : 1920u;
-        uint32_t sh = g_bh >= 360 ? g_bh : 1080u;
-        uint32_t pw = cols * 16u, ph = rows * 16u;
-        uint32_t x0 = (corner == 1 || corner == 2) ? (sw > pw + 24u ? sw - pw - 24u : 0u) : 24u;
-        uint32_t y0 = (corner == 2 || corner == 3) ? (sh > ph + 24u ? sh - ph - 24u : 0u) : 24u;
-        *xy_out = (x0 & 0xFFFFu) | ((y0 & 0xFFFFu) << 16);
-        *wh_out = cols | (rows << 8) | (alpha_u8 << 16) | ((out_flags & 3u) << 24);
-        return;
-    }
-
-    fg_config_t c = g_menu_edit;
-    int sel = g_menu_sel;
+    uint32_t alpha = (uint32_t)(op * 255 / 100);
     uint32_t rfps = __atomic_load_n(&g_osd_real_fps_x10, __ATOMIC_ACQUIRE);
     uint32_t ofps = __atomic_load_n(&g_osd_out_fps_x10, __ATOMIC_ACQUIRE);
-    if (!c.framegen || g_inert_reason[0]) ofps = rfps;
+    unsigned w = 0, h = 0;
 
-    snprintf(line, sizeof(line), " VCFG %s  %2u.%u>%2u.%u FPS", g_title_id, rfps / 10u, rfps % 10u, ofps / 10u, ofps % 10u);
-    osd_set_row(st, gr, 0, 1, 32, 0, 0, line);
+    if (!g_menu_open && !toast) {   // corner counter
+        if (!g_cfg.framegen || g_inert_reason[0]) ofps = rfps;
+        VovCounter k = { ofps, (__atomic_load_n(&g_last_gpu_ms_x100, __ATOMIC_ACQUIRE) + 5u) / 10u, (ov & 1) == 0 };
+        if (!vov_counter(&k, &g_vov_pal, &g_vov_pix, &w, &h)) return;
+        int corner = (ov - 1) / 2;   // 0=TL, 1=TR, 2=BR, 3=BL
+        uint32_t sw = g_bw >= 640 ? g_bw : 1920u, sh = g_bh >= 360 ? g_bh : 1080u;
+        uint32_t x0 = (corner == 1 || corner == 2) ? (sw > w + 32u ? sw - w - 32u : 0u) : 32u;
+        uint32_t y0 = (corner == 2 || corner == 3) ? (sh > h + 32u ? sh - h - 32u : 0u) : 32u;
+        *xy_out = (x0 & 0xFFFFu) | ((y0 & 0xFFFFu) << 16);
+        *wh_out = vov_wh(w, h, alpha, out_flags);
+        return;
+    }
 
-    const char *fgs = g_inert_reason[0] ? g_inert_reason : (c.framegen ? (c.preset == 1 ? "ON  FAST 60" : "ON  QUALITY 2X") : "OFF  NATIVE");
-    snprintf(line, sizeof(line), " FRAME GEN       %s", fgs);
-    osd_set_row(st, gr, 1, sel == 0 ? 2 : 0, 17, (c.framegen && !g_inert_reason[0]) ? 1 : 3, 0, line);
-
-    const char *pn = c.preset == 1 ? "FAST" : (c.preset == 2 ? "SHARP" : "QUALITY");
-    snprintf(line, sizeof(line), " PRESET          %s", pn);
-    osd_set_row(st, gr, 2, sel == 1 ? 2 : 0, 17, 2, 0, line);
-
-    if (c.sharpness > 0) snprintf(line, sizeof(line), " SHARPNESS       %d%%", c.sharpness);
-    else snprintf(line, sizeof(line), " SHARPNESS       OFF");
-    uint32_t b3 = c.sharpness > 0 ? (17u + (uint32_t)(c.sharpness * 15) / 100u) : 0u;
-    osd_set_row(st, gr, 3, sel == 2 ? 2 : 0, 17, c.sharpness > 0 ? 1 : 3, b3, line);
-
-    const char *un = c.upscale <= 0 ? "OFF" : (c.upscale == 1 ? "LIGHT" : "STRONG");
-    snprintf(line, sizeof(line), " ENHANCE         %s", un);
-    osd_set_row(st, gr, 4, sel == 3 ? 2 : 0, 17, c.upscale > 0 ? 1 : 3, 0, line);
-
-    snprintf(line, sizeof(line), " FPS COUNTER     %s", overlay_label(c.overlay));
-    osd_set_row(st, gr, 5, sel == 4 ? 2 : 0, 17, c.overlay > 0 ? 1 : 3, 0, line);
-
-    const char *vn = !c.game_vectors ? "OFF" : (gv_armed() ? "ON  HYBRID" : "ON  AFTER REBOOT");
-    snprintf(line, sizeof(line), " GAME VECTORS    %s", vn);
-    osd_set_row(st, gr, 6, sel == 5 ? 2 : 0, 17, c.game_vectors ? (gv_armed() ? 1 : 2) : 3, 0, line);
-
-    const char *hn = c.hud_protect <= 0 ? "OFF" : (c.hud_protect == 1 ? "CONSERVATIVE" : "AGGRESSIVE");
-    snprintf(line, sizeof(line), " HUD PROTECT     %s", hn);
-    osd_set_row(st, gr, 7, sel == 6 ? 2 : 0, 17, c.hud_protect > 0 ? 1 : 3, 0, line);
-
-    if (c.fps_lock <= 0) snprintf(line, sizeof(line), " FPS LOCK        AUTO");
-    else snprintf(line, sizeof(line), " FPS LOCK        %d", c.fps_lock);
-    osd_set_row(st, gr, 8, sel == 7 ? 2 : 0, 17, 2, 0, line);
-
-    snprintf(line, sizeof(line), " OPACITY         %d%%", c.menu_opacity);
-    uint32_t b9 = 17u + (uint32_t)(c.menu_opacity * 15) / 100u;
-    osd_set_row(st, gr, 9, sel == 8 ? 2 : 0, 17, 2, b9, line);
-
-    snprintf(line, sizeof(line), " GPU:%u.%02ums | %s", g_last_gpu_ms_x100 / 100u, g_last_gpu_ms_x100 % 100u,
-             g_inert_reason[0] ? g_inert_reason : g_osd_toast);
-    osd_set_row(st, gr, 10, 3, 1, 2, 0, line);
-    osd_set_row(st, gr, 11, 3, 32, 0, 0, " UP/DN SELECT  LEFT/RIGHT CHANGE");
-    osd_set_row(st, gr, 12, 3, 32, 0, 0, " X APPLY [] RESET /\\ SAVE O EXIT");
-
+    static VovMenu m;
+    memset(&m, 0, sizeof(m));
+    vov_cpy(m.title, g_vov_title, sizeof(m.title));
+    fg_config_t c = toast ? g_cfg : g_menu_edit;
+    m.game_fps_x10 = rfps;
+    m.out_fps_x10 = (!c.framegen || g_inert_reason[0]) ? rfps : ofps;
+    if (toast) {
+        vov_cpy(m.status, g_osd_toast, sizeof(m.status));
+    } else {
+        m.sel = g_menu_sel;
+        if (g_inert_reason[0]) vov_cpy(m.status, g_inert_reason, sizeof(m.status));
+        vov_row(&m, "Frame generation", VOV_TOGGLE, c.framegen, 0, "");
+        vov_row(&m, "Mode", VOV_TEXT, 0, 0, c.preset == 1 ? "Fast" : (c.preset == 2 ? "Sharp" : "Quality"));
+        vov_row(&m, "Sharpness", VOV_SEGMENTS, 0, c.sharpness, "");
+        vov_row(&m, "Anti-aliasing", VOV_TEXT, 0, 0, c.upscale <= 0 ? "Off" : (c.upscale == 1 ? "Light" : "Strong"));
+        vov_row(&m, "FPS counter", VOV_TEXT, 0, 0, overlay_label(c.overlay));
+        vov_row(&m, "Game vectors", VOV_TOGGLE, c.game_vectors, 0, "");
+        vov_row(&m, "HUD protection", VOV_TEXT, 0, 0, c.hud_protect <= 0 ? "Off" : (c.hud_protect == 1 ? "Conservative" : "Aggressive"));
+        char lock[16]; if (c.fps_lock <= 0) vov_cpy(lock, "Auto", sizeof(lock)); else snprintf(lock, sizeof(lock), "%d", c.fps_lock);
+        vov_row(&m, "FPS lock", VOV_TEXT, 0, 0, lock);
+        vov_row(&m, "Opacity", VOV_SEGMENTS, 0, c.menu_opacity, "");
+        vov_cpy(m.hints, "\xe2\x86\x95 \xe2\x86\x90 \xe2\x86\x92  \xc3\x97 APPLY  \xe2\x96\xa1 RESET  \xe2\x96\xb3 SAVE  \xe2\x97\x8b", sizeof(m.hints));
+    }
+    if (!vov_menu(&m, &g_vov_pal, &g_vov_pix, &w, &h)) return;
     *xy_out = 64u | (64u << 16);
-    *wh_out = 32u | (13u << 8) | (alpha_u8 << 16) | ((out_flags & 3u) << 24);
+    *wh_out = vov_wh(w, h, alpha, out_flags);
 }
 
 static void calc_rcas_params(uint32_t target_mask, uint32_t *con_bits_out, uint32_t *flags_out)
