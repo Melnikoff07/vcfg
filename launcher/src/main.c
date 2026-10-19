@@ -32,14 +32,14 @@
 typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
-    { "CUSA07439", "vcfg6.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic7.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic7.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic7.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA07439", "vcfg7.prx", ENGINE_NEW, 0 },
+    { "CUSA08519", "vcfg_classic8.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic8.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic8.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg6.prx", "vcfg_classic7.prx" };
-static const char *k_exp_prx = "vcfg_classic7.prx";   // engine for experimental (not verified) titles
+static const char *k_files[] = { "vcfg7.prx", "vcfg_classic8.prx" };
+static const char *k_exp_prx = "vcfg_classic8.prx";   // engine for experimental (not verified) titles
 
 static FILE *g_log;
 static void vlog(const char *fmt, ...)
@@ -258,7 +258,7 @@ static int plugin_state(void)
         if (!st) break;
     }
     size_t n; unsigned char *ini = read_all(INI, &n);
-    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg6.prx"))) st = 2;
+    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg7.prx"))) st = 2;
     free(ini);
     return st;
 }

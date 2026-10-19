@@ -30,16 +30,28 @@ static uint32_t mix(uint32_t a, uint32_t b, unsigned t) // t 0..15
     return r;
 }
 
-static unsigned g_drawn_w[2], g_drawn_h[2];   // layout last drawn into each buffer
-// With one buffer the GPU may be reading while we draw: nothing is cleared first (every pixel of the layout is
-// overwritten with its final value, palette entries keep their values), so a redraw never shows an empty panel.
+// Drawing happens in CPU memory (g_scratch); vov_commit then writes only the bytes that differ into the GPU buffer,
+// each straight to its final value. The GPU may be reading that buffer (one buffer on small memory), and it never
+// sees a half-drawn state (a row filled but its text not drawn yet).
+static uint32_t g_scratch_pal[256];
+static uint8_t g_scratch_pix[VOV_W * VOV_MAX_H];
 static void canvas_begin(Canvas *c, int buf, unsigned w, unsigned h)
 {
-    uint8_t *base = g_mem + (size_t)buf * g_buf_sz;
-    c->pal = (uint32_t *)base; c->pix = base + VOV_PAL_SZ; c->w = w; c->h = h; c->npairs = 0;
-    c->pal[0] = 0;
+    (void)buf;
+    c->pal = g_scratch_pal; c->pix = g_scratch_pix; c->w = w; c->h = h; c->npairs = 0;
+    bset(c->pal, 0, VOV_PAL_SZ);
     for (int i = 1; i < C_N; i++) c->pal[i] = pack(k_rgb[i], 255);
-    if (g_drawn_w[buf] != w || g_drawn_h[buf] != h) { bset(c->pix, C_NONE, (size_t)w * h); g_drawn_w[buf] = w; g_drawn_h[buf] = h; }
+    bset(c->pix, C_NONE, (size_t)w * h);
+}
+static void vov_commit(const Canvas *c, int buf)
+{
+    uint8_t *base = g_mem + (size_t)buf * g_buf_sz;
+    volatile uint32_t *pal = (volatile uint32_t *)base;
+    for (int i = 0; i < 256; i++) if (pal[i] != c->pal[i]) pal[i] = c->pal[i];
+    volatile uint64_t *d = (volatile uint64_t *)(base + VOV_PAL_SZ);
+    const uint64_t *s = (const uint64_t *)c->pix;
+    size_t n = ((size_t)c->w * c->h + 7) / 8;
+    for (size_t i = 0; i < n; i++) if (d[i] != s[i]) d[i] = s[i];
 }
 
 static int pair(Canvas *c, int fg, int bg)
@@ -136,7 +148,7 @@ static uint32_t hash(const void *p, size_t n)
 }
 
 static const uint8_t *g_last;
-void vov_init(uint8_t *mem) { g_drawn_w[0] = g_drawn_w[1] = 0; g_mem = mem; g_buf_sz = VOV_BUF_SZ; g_nbuf = 2; g_max_h = VOV_MAX_H; g_cur = 0; g_hash[0] = g_hash[1] = 0; g_last = 0; }
+void vov_init(uint8_t *mem) { g_mem = mem; g_buf_sz = VOV_BUF_SZ; g_nbuf = 2; g_max_h = VOV_MAX_H; g_cur = 0; g_hash[0] = g_hash[1] = 0; g_last = 0; }
 void vov_init_size(uint8_t *mem, size_t size)
 {
     if (size >= VOV_MEM_SZ) { vov_init(mem); return; }
@@ -236,6 +248,7 @@ int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigne
         text(&c, &vov_mono20, PAD, fy + 35, m->hints, C_CREAM, C_INK, 1, W - PAD);
         if ((int)H > bottom) rect(&c, 0, bottom, W, (int)H - bottom, C_INK);
         round_corners(&c, 0, 0, W, (int)H, 12);
+        vov_commit(&c, buf);
         g_hash[buf] = hs;
     }
     uint8_t *base = g_mem + (size_t)buf * g_buf_sz;
@@ -263,6 +276,7 @@ int vov_counter(const VovCounter *k, const uint8_t **pal, const uint8_t **pix, u
         rect(&c, split, 0, nw, (int)H, C_YELLOW);
         text(&c, &vov_big40, split + 16, 47, num, C_INK, C_YELLOW, -1, 0);
         round_corners(&c, 0, 0, (int)W, (int)H, 10);
+        vov_commit(&c, buf);
         g_hash[buf] = hs;
     }
     uint8_t *base = g_mem + (size_t)buf * g_buf_sz;
