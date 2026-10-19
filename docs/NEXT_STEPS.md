@@ -56,6 +56,14 @@ its `#define *_RSRC1/2 … *_code[] = {…};` block. Never search/replace text i
 4. Classic counter artifacts on fast camera turns (fixed in the warp in v2.07): confirm on CUSA00207.
 5. `discovery/source/main.c` has an uncommitted local change of unknown origin; review before committing.
 
+## 4b. Tried and reverted
+
+- FAST for games above 30 fps (2026-10-20): letting FAST show frames without a mid (M = 1) and dropping the 30 cap
+  uncapped CUSA00411 to 45-52 fps with 10-25 mids/s; on a 60 Hz output this judders and flickers (uneven 1/2-vblank
+  holds, mids look different from real frames). Reverted: FAST is for 20..30 fps games, QUALITY (cap 30, 2x) for
+  games between 30 and 60. A smooth path for 40-55 fps would need even pacing at a fixed lower rate (e.g. 40 Hz on
+  120 Hz output), which the console's 60 Hz output does not offer.
+
 ## 5. Next steps, in order
 
 1. **Confirm v2.11 on hardware** (all four verified titles): menu, counter, AA, no flicker, no artifacts around the
