@@ -5,9 +5,10 @@ GoldHEN homebrew enabler, as a GoldHEN plugin. The plugin hooks the game's frame
 submission, builds a motion field between the previous and the current game frame on the GPU, synthesises an
 in-between image and presents it before the real frame: a 30 fps game is shown at 60 Hz.
 
-**Status: experimental.** Working on hardware: CUSA07439 (30 → 60, menu, sharpening, overlay). Partly working:
-CUSA09171 (about 40 % of frames generated, HUD flicker). Not yet: CUSA13801, CUSA08519 on this runtime (see
-[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)). Tested only on a base console with GoldHEN. Use at your own risk.
+**Status: experimental.** Verified on hardware (base console, GoldHEN): CUSA07439 (new engine), CUSA08519,
+CUSA00411 and CUSA00207 (classic engine): 30 → 60, in-game menu, FPS counter, anti-aliasing and sharpening.
+Any other installed game can be switched on in the app as EXPERIMENTAL (classic engine, may not work or may crash).
+See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). Use at your own risk.
 
 Русское описание: [README_RU.md](README_RU.md).
 
@@ -31,50 +32,54 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Measured hardware facts: 
 
 | Path | What |
 |---|---|
-| `plugin/source` | runtime (`a20_copy_impl.h`), hooks and old paths (`main.c`), PM4 scanner, scheduler, shader arrays (`*.h`) |
-| `plugin/shaders` | LLVM IR (gfx700) of every GPU pass; `plugin/build_shader.py` turns IR into the arrays |
+| `launcher/` | the VCFG app (PKG): game cards with console titles and icons, per-game settings, plugin install |
+| `plugin/` | new engine (A20/A22 runtime) for CUSA07439: `source/a20_copy_impl.h`, shaders in `shaders/` |
+| `classic/` | classic engine (v1.16 line) for the other titles and EXPERIMENTAL games; `classic/build.sh` |
+| `overlay/` | in-game menu and FPS counter: CPU renderer (`vov.c`, baked fonts), compositor `osd8.ll`, PC preview |
 | `discovery/` | passive plugin: logs how any game presents frames (no GPU commands, no allocations) |
-| `tools/console.py` | install to a game / `[default]` / exclude / fetch logs over GoldHEN FTP, with backups |
-| `tools/analyze.py` | logs → Markdown compatibility report |
-| `tools/elf_arrays.py` | build-time check that shader machine arrays are byte-exact in the ELF |
+| `tools/` | `console.py` (FTP install / logs with backups), `analyze.py`, `elf_arrays.py` |
 
 ## Build
 
-Requirements: Windows PowerShell, [OpenOrbis toolchain](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain),
-GoldHEN Plugins SDK, LLVM (clang, ld.lld), Python 3. For shader work also an LLVM `llc` with the AMDGPU target.
+Requirements: Windows PowerShell, Git Bash, [OpenOrbis toolchain](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain),
+GoldHEN Plugins SDK, LLVM (clang, ld.lld), Python 3 (Pillow for `overlay/bake_fonts.py`), an LLVM `llc` with the
+AMDGPU target for shaders.
 
 ```powershell
-copy config.example.json config.json   # set your paths and console IP
-powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1                    # plugin, release flags
-powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Target discovery
+copy config.example.json config.json                                   # paths and console IP
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1          # new engine -> build/vcfg/vcfg.prx
+sh classic/build.sh                                                    # classic engine -> build/classic/vcfg_classic.prx
+powershell -NoProfile -ExecutionPolicy Bypass -File launcher/build_pkg.ps1 -Version 2.11   # -> build/launcher/VCFG_v2.11.pkg
+python -I overlay/preview.py build/preview/vov                         # overlay preview PNGs (after building the DLL, see the script)
 ```
 
-## Install (easy way: installer package)
+The new engine keeps generated shader arrays in `plugin/source/*.h`; after changing IR in `plugin/shaders`,
+regenerate the arrays (`plugin/build_shader.py`) and replace only that shader's block. The classic engine
+regenerates `classic/source/shaders.h` on every build.
 
-1. Download `VCFG_Installer_vX.pkg` from [Releases](https://github.com/Melnikoff07/vcfg/releases).
-2. Install it like any homebrew package (GoldHEN Package Installer, e.g. from `/data/pkg`).
-3. Launch **VCFG Installer** from the home screen once. It copies the plugin to `/data/GoldHEN/plugins/vcfg.prx`,
-   backs up `plugins.ini` (`plugins.ini.vcfg_backup_<time>`), adds the plugin for the supported titles (other plugins
-   are kept), enables FG in `/data/bb_probe/vcfg.ini`, shows a notification and closes. Log: `/data/vcfg_installer.log`.
-4. Start the game, wait ~20 s, hold **L3+R3 for 3 s** for the menu.
+## Install
 
-Uninstall: remove the `vcfg.prx` line from `/data/GoldHEN/plugins.ini` (or restore the backup).
-Build the package yourself: `installer/build_pkg.ps1` (after `build.ps1`).
+1. Download `VCFG_vX.pkg` from [Releases](https://github.com/Melnikoff07/vcfg/releases) and install it with the
+   GoldHEN Package Installer (e.g. from `/data/pkg`).
+2. Start **VCFG** from the home screen. On start it copies the plugins to `/data/GoldHEN/plugins/`, backs up
+   `plugins.ini` and maps the verified games (your other plugins are kept).
+3. Pick a game (cross toggles FG, triangle opens its settings, square saves and exits). Other games appear as
+   EXPERIMENTAL and are off until you switch them on.
+4. Start the game, wait ~20 s, hold **L3+R3 for 3 s** for the in-game menu.
+
+Turn off: tab **04 PLUGIN** → square (removes VCFG from `plugins.ini`; files stay).
 
 ## Install and test (developers)
 
 ```powershell
-python -I tools/console.py set CUSA07439 build/vcfg/vcfg.prx     # CUSA07439 (EU)
-python -I tools/console.py default build/vcfg_discovery/vcfg_discovery.prx   # passive logs for all other games
+python -I tools/console.py set CUSA07439 build/vcfg/vcfg.prx
+python -I tools/console.py logs
 ```
-
-Start the game fully (no hot reload). After ~20 s hold **L3+R3 for 3 s** for the menu: FG on/off, QUALITY/FAST,
-sharpness, enhance, overlay. Then `python -I tools/console.py logs` and `python -I tools/analyze.py logs`.
 
 ## Contributing
 
 The most useful contribution right now is **data**: run the discovery plugin in your games and send the reports.
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md), [docs/ROADMAP.md](docs/ROADMAP.md) and [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md).
 
 ## Rules that keep consoles and saves safe
 
