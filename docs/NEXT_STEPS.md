@@ -13,9 +13,9 @@ what is broken or unverified, and what to do next, in order.
 | Overlay | `overlay/` | Menu panel + corner FPS counter in the launcher design. CPU draws an 8-bit palette bitmap (baked Inter / JetBrains Mono atlases, `bake_fonts.py`) off-screen and commits only changed bytes; `osd8.ll` composites it (optional 2/3 downscale). PC preview: `overlay/preview.py`. |
 | Discovery | `discovery/` | Passive logger plugin for unknown games. |
 
-On the console (`/data/GoldHEN/plugins/`): `vcfg7.prx` (new engine), `vcfg_classic9.prx` (classic). Settings:
+On the console (`/data/GoldHEN/plugins/`): `vcfg8.prx` (new engine), `vcfg_classic10.prx` (classic). Settings:
 `/data/bb_probe/vcfg.ini` (new engine), `/data/bb_probe/config-<TITLE>.ini` (classic), `/data/bb_probe/vcfg_launcher.ini`
-(app). Logs: `/data/bb_probe/probe.log`, `/data/vcfg_launcher.log`.
+(app). Logs: `/data/bb_probe/probe.log` (+ `probe.prev.log`), written only while `/data/bb_probe/debug_log` exists (app: PLUGIN tab, triangle); `/data/vcfg_launcher.log`. Bug report: app PLUGIN tab, circle → `/data/vcfg_report.txt` (+ USB stick).
 
 ## 2. Build and deploy
 

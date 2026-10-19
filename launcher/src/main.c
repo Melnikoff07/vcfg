@@ -32,14 +32,14 @@
 typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
-    { "CUSA07439", "vcfg7.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic9.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic9.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic9.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA07439", "vcfg8.prx", ENGINE_NEW, 0 },
+    { "CUSA08519", "vcfg_classic10.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic10.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic10.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg7.prx", "vcfg_classic9.prx" };
-static const char *k_exp_prx = "vcfg_classic9.prx";   // engine for experimental (not verified) titles
+static const char *k_files[] = { "vcfg8.prx", "vcfg_classic10.prx" };
+static const char *k_exp_prx = "vcfg_classic10.prx";   // engine for experimental (not verified) titles
 
 static FILE *g_log;
 static void vlog(const char *fmt, ...)
@@ -258,7 +258,7 @@ static int plugin_state(void)
         if (!st) break;
     }
     size_t n; unsigned char *ini = read_all(INI, &n);
-    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg7.prx"))) st = 2;
+    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg8.prx"))) st = 2;
     free(ini);
     return st;
 }
@@ -303,6 +303,94 @@ static void remap_if_changed(App *a)
 {
     if (exp_sig(a) == g_exp_written) return;
     if (!do_ini(a, 1)) g_exp_written = exp_sig(a);
+}
+
+// ---- debug log switch and bug report ----
+// The plugins write /data/bb_probe/probe.log only while CFGDIR/debug_log exists (one file per game start, the
+// previous one is kept as probe.prev.log). The report collects what a bug report needs into one text file.
+#define VCFG_STR2(x) #x
+#define VCFG_STR(x) VCFG_STR2(x)
+#ifdef VCFG_VER
+#define VCFG_VERSION VCFG_STR(VCFG_VER)   // build_pkg.ps1 passes -DVCFG_VER=<version>
+#else
+#define VCFG_VERSION "dev"
+#endif
+static int file_exists(const char *p) { FILE *f = fopen(p, "rb"); if (f) fclose(f); return f != NULL; }
+static void do_debug_toggle(App *a)
+{
+    a->debug_log = !a->debug_log;
+    int rc = a->debug_log ? write_all(CFGDIR "/debug_log", "1\n", 2) : remove(CFGDIR "/debug_log");
+    addlog(a, rc ? "CANNOT CHANGE THE DEBUG LOG SWITCH" : a->debug_log ? "DEBUG LOG ON: THE NEXT GAME START WRITES A LOG" : "DEBUG LOG OFF");
+    if (rc) a->debug_log = !a->debug_log;
+}
+typedef struct { char *b; size_t n, cap; } Buf;
+static void bput(Buf *r, const char *s, size_t n)
+{
+    if (!r->b || r->n + n + 1 > r->cap) return;
+    memcpy(r->b + r->n, s, n); r->n += n; r->b[r->n] = 0;
+}
+static void bprintf(Buf *r, const char *fmt, ...)
+{
+    char t[512]; va_list v; va_start(v, fmt); int n = vsnprintf(t, sizeof(t), fmt, v); va_end(v);
+    if (n > 0) bput(r, t, (size_t)n < sizeof(t) ? (size_t)n : sizeof(t) - 1);
+}
+static void bfile(Buf *r, const char *title, const char *path, size_t tail)
+{
+    size_t n = 0; unsigned char *d = read_all(path, &n);
+    bprintf(r, "\n==== %s (%s, %zu bytes%s) ====\n", title, path, n, d && n > tail ? ", last part" : "");
+    if (!d) { bprintf(r, "(missing)\n"); return; }
+    size_t off = n > tail ? n - tail : 0;
+    if (off) while (off < n && d[off - 1] != '\n') off++;   // start at a line
+    bput(r, (const char *)d + off, n - off);
+    free(d);
+}
+static void do_report(App *a)
+{
+    Buf r = { malloc(4u << 20), 0, 4u << 20 };
+    if (!r.b) { addlog(a, "NO MEMORY FOR THE REPORT"); return; }
+    r.b[0] = 0;
+    time_t now = time(NULL);
+    bprintf(&r, "VCFG bug report\napp version: %s\ntime: %lld\ndebug log: %s\nplugin state: %d\n", VCFG_VERSION,
+            (long long)now, a->debug_log ? "on" : "off", a->plugin_state);
+    bprintf(&r, "\n==== games ====\n");
+    for (int i = 0; i < a->ngames; i++) {
+        const Game *g = &a->games[i];
+        bprintf(&r, "%s installed=%d experimental=%d fg=%d preset=%d sharp=%d enhance=%d overlay=%d title='%s'\n", g->id,
+                g->installed, g->experimental, g->s.fg, g->s.preset, g->s.sharp, g->s.enhance, g->s.overlay, g->title);
+    }
+    bprintf(&r, "\n==== plugin files ====\n");
+    for (int i = 0; i < (int)(sizeof(k_files) / sizeof(k_files[0])); i++) {
+        char p[96]; size_t n = 0; snprintf(p, sizeof(p), PLUG "%s", k_files[i]);
+        unsigned char *d = read_all(p, &n); bprintf(&r, "%s %s %zu bytes\n", p, d ? "present" : "MISSING", n); free(d);
+    }
+    bfile(&r, "plugins.ini", INI, 64u << 10);
+    bfile(&r, "launcher settings", CFGDIR "/vcfg_launcher.ini", 8u << 10);
+    bfile(&r, "new engine settings", CFGDIR "/vcfg.ini", 8u << 10);
+    for (int i = 0; i < a->ngames; i++) {
+        char p[96]; snprintf(p, sizeof(p), CFGDIR "/config-%s.ini", a->games[i].id);
+        if (file_exists(p)) bfile(&r, "game settings", p, 8u << 10);
+    }
+    bfile(&r, "plugin log, last game start", CFGDIR "/probe.log", 1536u << 10);
+    bfile(&r, "plugin log, the start before", CFGDIR "/probe.prev.log", 1024u << 10);
+    bfile(&r, "app log", "/data/vcfg_launcher.log", 64u << 10);
+    if (!a->debug_log) bprintf(&r, "\nNOTE: the debug log was off. Switch it on in the app (PLUGIN tab, triangle), reproduce, save again.\n");
+
+    int rc = write_all("/data/vcfg_report.txt", r.b, r.n);
+    char m[96]; snprintf(m, sizeof(m), rc ? "CANNOT WRITE /DATA/VCFG_REPORT.TXT" : "REPORT SAVED: /DATA/VCFG_REPORT.TXT (%zu KB)", r.n / 1024);
+    addlog(a, m);
+    // USB sticks are outside the app sandbox: write there under a GoldHEN jailbreak (like the game metadata).
+    struct jailbreak_backup jb; memset(&jb, 0, sizeof(jb));
+    int jrc = sys_sdk_jailbreak(&jb), usb = 0;
+    for (int i = 0; i < 8 && !usb; i++) {
+        char dir[32], p[64]; snprintf(dir, sizeof(dir), "/mnt/usb%d", i);
+        DIR *d = opendir(dir); if (!d) continue; closedir(d);
+        snprintf(p, sizeof(p), "%s/vcfg_report.txt", dir);
+        if (!write_all(p, r.b, r.n)) { snprintf(m, sizeof(m), "ALSO ON THE USB STICK: %s", p); addlog(a, m); usb = 1; }
+    }
+    if (jrc == 0) sys_sdk_unjailbreak(&jb);
+    if (!usb) addlog(a, "NO USB STICK: TAKE THE FILE OVER FTP");
+    snprintf(a->status, sizeof(a->status), "ATTACH VCFG_REPORT.TXT TO THE ISSUE ON GITHUB.");
+    free(r.b);
 }
 
 // ---- video ----
@@ -385,6 +473,7 @@ int main(void)
         Game t = a->games[j]; a->games[j] = a->games[j - 1]; a->games[j - 1] = t;
     }
     load_settings(a);
+    a->debug_log = file_exists(CFGDIR "/debug_log");
     g_exp_written = exp_sig(a);
     a->plugin_state = plugin_state();
     if (a->plugin_state != 1) { addlog(a, a->plugin_state ? "UPDATING PLUGINS" : "INSTALLING PLUGINS"); do_install(a); }
@@ -409,6 +498,8 @@ int main(void)
             int act = app_input(a, edge); redraw = 1;
             if (act == ACT_INSTALL) do_install(a);
             else if (act == ACT_REMOVE) { do_ini(a, 0); a->plugin_state = plugin_state(); }
+            else if (act == ACT_DEBUG) do_debug_toggle(a);
+            else if (act == ACT_REPORT) do_report(a);
             else if (act == ACT_SAVE) { save_settings(a); remap_if_changed(a); }
             else if (act == ACT_SAVE_EXIT) {
                 save_settings(a); remap_if_changed(a);

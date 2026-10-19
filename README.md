@@ -76,6 +76,13 @@ python -I tools/console.py set CUSA07439 build/vcfg/vcfg.prx
 python -I tools/console.py logs
 ```
 
+## Bug reports
+
+In the app: tab **04 PLUGIN** → triangle (**debug log on**) → start the game and reproduce → back in the app,
+circle (**save report**). Attach `vcfg_report.txt` (USB stick, or `/data/vcfg_report.txt` over FTP) to an
+[issue](https://github.com/Melnikoff07/vcfg/issues/new?template=bug_report.md). The report holds the app version,
+`plugins.ini`, settings, plugin files and the plugin logs of the last two game starts.
+
 ## Contributing
 
 The most useful contribution right now is **data**: run the discovery plugin in your games and send the reports.

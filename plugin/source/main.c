@@ -219,7 +219,14 @@ static void log_open(void)
     if (tried) return;
     tried = 1;
     sceKernelMkdir(LOG_DIR, 0777);
-    g_log = fopen(LOG_PATH, "a");
+    // VCFG: the file log is written only while the app's "Debug log" switch is on (LOG_DIR/debug_log exists).
+    // One file per game start; the previous one is kept as probe.prev.log for crash reports.
+    FILE *on = fopen(LOG_DIR "/debug_log", "r");
+    if (!on) return;
+    fclose(on);
+    remove(LOG_DIR "/probe.prev.log");
+    rename(LOG_PATH, LOG_DIR "/probe.prev.log");
+    g_log = fopen(LOG_PATH, "w");
 }
 
 static void lg_write(const char *buf)

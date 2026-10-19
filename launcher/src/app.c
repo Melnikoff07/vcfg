@@ -210,13 +210,20 @@ static void draw_install(Canvas *c, App *a, int top)
     Fonts *f = a->f;
     int y = top + 58, w = c->w - 2 * M;
     static const char *states[3] = { "NOT INSTALLED", "UP TO DATE", "NEEDS UPDATE" };
-    fill_round(c, M, y, w, 230, 22, a->plugin_state == 1 ? YEL : RED);
+    int dw = 520, pw = w - dw - 46;
+    fill_round(c, M, y, pw, 230, 22, a->plugin_state == 1 ? YEL : RED);
     draw_text(c, &f->mono, M + 34, y + 60, "PLUGIN ON THIS CONSOLE", INK, 1);
     draw_text(c, &f->big, M + 34, y + 190, states[a->plugin_state % 3], INK, -6);
+    int dx = M + pw + 46;   // debug log switch
+    if (a->debug_log) fill_round(c, dx, y, dw, 230, 22, BLUE);
+    else { fill_round(c, dx, y, dw, 230, 22, CREAM); dashed_rect(c, dx, y, dw, 230, 4, 14, INK); }
+    draw_text(c, &f->mono, dx + 34, y + 60, "DEBUG LOG", INK, 1);
+    draw_text(c, &f->big, dx + 34, y + 190, a->debug_log ? "ON" : "OFF", INK, -6);
     int ly = y + 300;
     draw_text(c, &f->title, M, ly, "The app installs and updates the plugin by itself when it starts. Cross repeats that if a file got damaged.", INK, 0);
     draw_text(c, &f->title, M, ly + 52, "Settings do not need it: they save as you change them. Nothing is downloaded. Square turns VCFG off.", INK, 0);
-    for (int i = 0; i < a->nlog; i++) draw_text(c, &f->mono, M, ly + 140 + i * 42, a->log[i], DIM, 1);
+    draw_text(c, &f->title, M, ly + 104, "Triangle: debug log from the next game start. Circle: save a report for a bug report.", INK, 0);
+    for (int i = 0; i < a->nlog; i++) draw_text(c, &f->mono, M, ly + 180 + i * 42, a->log[i], DIM, 1);
     if (a->status[0]) draw_text(c, &f->mono, M, c->h - FOOT - 40, a->status, INK, 1);
 }
 
@@ -253,8 +260,8 @@ void app_draw(Canvas *c, App *a)
         draw_footer(c, a, h, 2);
     } else {
         draw_install(c, a, top);
-        Hint h[] = { { BTN_CROSS, "INSTALL / UPDATE" }, { BTN_SQUARE, "TURN OFF VCFG" } };
-        draw_footer(c, a, h, 2);
+        Hint h[] = { { BTN_CROSS, "INSTALL / UPDATE" }, { BTN_SQUARE, "TURN OFF" }, { BTN_TRIANGLE, "DEBUG LOG" }, { BTN_CIRCLE, "SAVE REPORT" } };
+        draw_footer(c, a, h, 4);
     }
 }
 
@@ -288,6 +295,8 @@ int app_input(App *a, uint32_t b)
     if (a->tab == TAB_INSTALL) {
         if (b & PAD_CROSS) return ACT_INSTALL;
         if (b & PAD_SQUARE) return ACT_REMOVE;
+        if (b & PAD_TRIANGLE) return ACT_DEBUG;
+        if (b & PAD_CIRCLE) return ACT_REPORT;
         return ACT_NONE;
     }
     if (b & PAD_UP) step(&a->row, -1, 0, rows - 1, 1);

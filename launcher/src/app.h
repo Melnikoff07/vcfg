@@ -24,13 +24,14 @@ typedef struct {
     Settings defaults;
     int overlay_pos, overlay_detail, overlay_opacity;   // shared overlay style
     int plugin_state;                                    // 0 missing, 1 installed, 2 outdated
+    int debug_log;                                       // plugins write /data/bb_probe/probe.log
     char status[128];
     char log[6][96]; int nlog;
     int dirty;
     Fonts *f;
 } App;
 
-enum { ACT_NONE, ACT_SAVE_EXIT, ACT_INSTALL, ACT_REMOVE, ACT_SAVE };
+enum { ACT_NONE, ACT_SAVE_EXIT, ACT_INSTALL, ACT_REMOVE, ACT_SAVE, ACT_DEBUG, ACT_REPORT };
 enum { PAD_UP = 0x10, PAD_RIGHT = 0x20, PAD_DOWN = 0x40, PAD_LEFT = 0x80, PAD_OPTIONS = 0x08,
        PAD_TRIANGLE = 0x1000, PAD_CIRCLE = 0x2000, PAD_CROSS = 0x4000, PAD_SQUARE = 0x8000, PAD_L1 = 0x400, PAD_R1 = 0x800 };
 

@@ -33,6 +33,12 @@ CUSA00411 и CUSA00207 (классический движок): 30 → 60, ме�
 
 Выключить: вкладка **04 PLUGIN** → квадрат (VCFG убирается из `plugins.ini`, файлы остаются).
 
+## Если что-то сломалось
+
+В приложении: вкладка **04 PLUGIN** → треугольник (**debug log on**) → запустите игру и повторите проблему →
+снова в приложении кружок (**save report**). Приложите `vcfg_report.txt` (на флешке или `/data/vcfg_report.txt`
+по FTP) к [issue](https://github.com/Melnikoff07/vcfg/issues/new?template=bug_report.md).
+
 ## Быстрый старт (для разработчиков)
 
 ```powershell
