@@ -24,7 +24,8 @@ typedef struct {
     Settings defaults;
     int overlay_pos, overlay_detail, overlay_opacity;   // shared overlay style
     int plugin_state;                                    // 0 missing, 1 installed, 2 outdated
-    int debug_log;                                       // plugins write /data/bb_probe/probe.log
+    int debug_log;
+    char version[16];                                    // app and plugin version, shown in the header                                       // plugins write /data/bb_probe/probe.log
     char status[128];
     char log[6][96]; int nlog;
     int dirty;

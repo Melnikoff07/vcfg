@@ -34,6 +34,7 @@ static int draw_header(Canvas *c, App *a)
     fill_rect(c, M, top, lw + 56, ph, RED);
     draw_text(c, &f->logo, M + 28, top + 17 + cap, "VCFG", INK, -6);
     int bottom = top + ph;
+    if (a->version[0]) { char v[24] = "V"; cat(v, a->version); draw_text(c, &f->mono, M + lw + 56 + 34, bottom - 82, v, DIM, 1); }
     draw_text(c, &f->mono, M + lw + 56 + 34, bottom - 46, "VIBE CODED", INK, 1);
     draw_text(c, &f->mono, M + lw + 56 + 34, bottom - 10, "FRAME GENERATOR", INK, 1);
     static const char *tabs[TAB_COUNT] = { "01 GAMES", "02 DEFAULTS", "03 OVERLAY", "04 PLUGIN" };

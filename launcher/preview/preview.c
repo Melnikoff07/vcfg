@@ -30,6 +30,7 @@ __declspec(dllexport) int vcfg_preview(uint32_t *px, int w, int h, const uint8_t
         g->s = (Settings){ i != 3, i == 1, 40, 1, 0 };
     }
     a->ngames = ngames;
+    ui_memcpy(a->version, "2.14", 5);
     a->tab = scene == 2 ? TAB_DEFAULTS : scene == 3 ? TAB_OVERLAY : scene == 4 ? TAB_INSTALL : TAB_GAMES;
     a->detail = scene == 1; a->row = scene == 1 ? 2 : 0; a->sel = scene == 5 ? 3 : 0;
     if (scene == 4) { a->debug_log = 1; a->nlog = 2; ui_memcpy(a->log[0], "COPIED VCFG.PRX (395 KB)", 25); ui_memcpy(a->log[1], "PLUGINS.INI BACKED UP, 4 GAMES MAPPED", 38); }

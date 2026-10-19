@@ -486,7 +486,7 @@ int main(void)
     sceKernelMkdir(CFGDIR, 0777);
     g_log = fopen("/data/vcfg_launcher.log", "w");
     vlog("VCFG launcher start\n");
-    static Fonts fonts; static App app; App *a = &app; a->f = &fonts;
+    static Fonts fonts; static App app; App *a = &app; a->f = &fonts; snprintf(a->version, sizeof(a->version), "%s", VCFG_VERSION);
     Arena arena = { malloc(24 << 20), 24 << 20, 0 };
     uint8_t *disp = font_file("InterDisplay-Medium.ttf"), *text = font_file("Inter-Medium.ttf"), *mono = font_file("JetBrainsMono-Medium.ttf");
     if (!arena.base || !disp || !text || !mono || !face_init(&fonts.logo, disp, 124, &arena) || !face_init(&fonts.title, text, 37, &arena) ||
