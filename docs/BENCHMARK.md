@@ -54,6 +54,103 @@ name, mapped to one 60 fps title only):
 
 10-bit titles: dump through the same T# (the passes read floats), store 16-bit PNG.
 
+### Local capture-v1
+
+Implemented locally in `classic/source/bench_capture.h`, with a separate export shader in
+`classic/bench/shaders/pack16.ll`. This is an experimental capture build, not a production FG mode.
+Hardware validation and the first real-game score are pending; see [NIGHT_REPORT.md](NIGHT_REPORT.md).
+
+Build from Windows PowerShell:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File classic/build.ps1 -Bench
+$py = (Get-Content config.json -Raw | ConvertFrom-Json).python
+& $py -I tools/bench/check_capture.py
+& $py -I tools/tests/check_classic_builds.py
+```
+
+Output: `build/classic-bench/vcfg_classic.prx`. It cannot be combined with `-Test 1..3`.
+Normal builds do not include this export kernel or capture state machine. Source shaders for motion/warp are unchanged.
+
+First hardware run, **one title only: CUSA00557**:
+
+1. Capture a fresh `tools/console.py snapshot` and record the live CUSA00557 plugin line and its profile.
+   Use the game's native 60 fps mode. Set the VCFG profile to `mode=8`, `preset=0`, `game_vectors=0`.
+   Keep sharpness, Enhance AA and HUD protection fixed across all scenes; record a second dataset under a new scene
+   name if those settings change. The capture build freezes this profile at startup and draws no VCFG OSD.
+2. Create `/data/bb_probe/bench_capture` with text `240 6 960` (K, M, requested width).
+   If that marker already exists, back it up before replacing it. The marker affects only this capture build.
+   `240 6 1920` requests the full width, with fallback to the left half if export allocation fails.
+3. Upload/map the PRX under a new name with the existing helper, which stages/readbacks PRX and backs up the INI:
+
+   ```powershell
+   & $py -I tools/console.py set CUSA00557 build/classic-bench/vcfg_classic.prx --name vcfg_classic_bench_n20261020a.prx
+   ```
+
+   If the name exists, choose a new one; do not use `--reuse`. Do not map a second title or `[default]`.
+4. Fully start the game. During one scene, wait for six accepted samples; nominally about 24 seconds after native
+   60 fps settles, plus disk IO and rejected triples. A one-minute scene is the initial target, not a completion guarantee.
+   `BENCH saved 6/6` confirms completion. `STAT gnm` should stay near 60 in the measured scene; `BENCH STOP` means
+   the capture is unusable until its cause is addressed. Do not interpret an empty run as zero error.
+5. Fetch **before** changing scenes. The log prints a unique run directory. List/fetch commands:
+
+   ```powershell
+   & $py -I tools/bench/fetch.py --list
+   & $py -I tools/bench/fetch.py --remote /data/bb_probe/bench_CUSA00557_<16_hex_run_id> --scene slow_pan
+   & $py -I tools/bench/metrics.py bench/clips/CUSA00557_slow_pan bench/vcfg_classic/CUSA00557_slow_pan --crossfade --csv bench/slow_pan.csv
+   ```
+
+   Substitute the actual run ID; each scene name must be new. To retry conversion without another FTP read:
+   `fetch.py --local-raw bench/raw/<run_directory> --scene slow_pan_retry`.
+6. Exit fully and repeat the start for each scene below. A new process gets a new run directory. After capture,
+   back up the live INI again, restore only the original CUSA00557 line, and restore its profile/previous marker.
+   Move any new unused marker to quarantine rather than deleting it. Do not save in the old launcher between
+   mappings: it rewrites plugin names. No PKG is required.
+
+| Scene label | About one minute of action | What it measures |
+|---|---|---|
+| `slow_pan` | steady slow camera rotation, no menus | clean motion and static detail |
+| `fast_pan` | repeated quick camera turns | large motion and ghosting |
+| `disocclusion` | character/foreground object over moving background | occlusion edges and newly visible pixels |
+| `particles` | particles or foliage while moving | small independent motion and unstable detail |
+| `hud_heavy` | HUD/minimap/subtitles visible during camera movement | HUD error and flicker; create an aligned `hud_mask.png` |
+| `camera_cut` | repeat a reproducible camera cut | scene-change behavior; only uniform-time triples are retained |
+| `fade` | repeat a fade/transition | fade detection and static/HUD preservation |
+
+CUSA09171 is a later, separate HDR-code-value dataset. Do not combine its scores with an SDR clip.
+The first run must confirm native 60 fps: allowlisted title IDs alone do not establish the current scene's rate.
+
+Capture details and limits:
+
+- A and mid are full-size tiled offscreen surfaces; GT/B export reads native game surfaces before the one original flip.
+  The regular passes run with A's pyramid prepared at parity 0 and B at parity 1, explicit phase 0.5.
+  Post/AA targets only the offscreen mid. No scratch surface is registered or flipped.
+- Export uses rounded normalized channel values from the same texture descriptor format as the engine and writes
+  RGBA16LE. PNG conversion preserves all 16 bits, including for RGB/RGBA files that Pillow would otherwise reduce.
+  HDR scores are over encoded code values, not display-light/perceptual HDR distances.
+- Each capture clears temporal motion history: metadata is `history=cold`. This deliberately sparse baseline does
+  **not** measure warmed temporal predictions. A warm-history capture extension would need separate attribution.
+- Three private 8 KiB command buffers and separate descriptor tables are held until GPU completion and IO acknowledgement.
+  On timeout/error they are retained and not reused. A JSON commit marker is written only after all four raw files.
+  Fetch ignores `.stage` files and refuses wrong sizes, mixed source/profile/geometry and invalid frame/timing metadata.
+- Capture memory is two 8 MiB surfaces plus four export planes (~63 MiB full width or ~32 MiB half width), before
+  the small command tables and normal work memory. Six raw triplets take ~380 MiB full width or ~190 MiB half width.
+  Capture overhead can disturb the game; such triples are filtered, not scored as ground truth.
+- Timing is a CPU-submit proxy: each interval 15–18.5 ms, pair 32–35 ms, interval difference at most 1.5 ms.
+  This filter supplements native-mode/frame-rate verification; it does not recover exact scanout timestamps.
+- The raw run, PNGs, manifest and metric CSV stay inside ignored `bench/`. A result method must contain every
+  captured mid at matching dimensions. Missing mids are errors, not silently skipped difficult samples.
+
+Local verification (configured Python includes NumPy/Pillow):
+
+```powershell
+& $py -I -m unittest discover -s tools/tests -p 'test_*.py' -v
+& $py -I tools/bench/selftest.py bench/selftest
+```
+
+Synthetic selftest numbers validate the metric implementation only. Until console captures exist, no VCFG-vs-GT
+quality improvement, regression-free runtime behavior or new-engine HUD-flicker result is claimed.
+
 ## 4. PC reference and tuning
 
 1. `tools/bench/vcfg_ref.py`: a NumPy port of mode 8 (pyr8 -> me3/me2/me1 -> gm8/fgs8/mf8 -> phase8 -> warp8) with
