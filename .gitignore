@@ -11,3 +11,4 @@ __pycache__/
 
 # launcher drawing preview output
 build/preview/
+/bench/
