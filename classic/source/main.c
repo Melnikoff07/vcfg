@@ -1854,9 +1854,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                 }
                 if (g_cfg.fps_lock == 20) pace_hz(20);
                 else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
-                // Present copy with buffer rings: nothing waits for the display any more, so release by timer (pace_vblank
-                // waited ~16 ms for the previous real frame to be on screen: 20.5 + 16 ms = 27 fps on CUSA05571).
-                else if (g_inject_on == 8 && second_flip && (g_pcopy_on || pace_timer_on())) pace_pair();
+                else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair();
                 else if (g_inject_on >= 7 && second_flip) {
                     static int last_show = -1;                  // with present copy the shown real buffers are the copies
                     int shown = (int)show_idx, pp1 = show_idx != index ? last_show : pace_p1;
