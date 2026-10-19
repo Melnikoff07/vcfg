@@ -9,21 +9,14 @@ import argparse
 import csv
 import pathlib
 import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from pngio import load_rgb
 
 import numpy as np
-from PIL import Image
 
 
 def load(p):
-    im = Image.open(p)
-    a = np.asarray(im)
-    if a.dtype == np.uint16:
-        a = a.astype(np.float64) / 65535.0
-    else:
-        a = a.astype(np.float64) / 255.0
-    if a.ndim == 2:
-        a = np.stack([a] * 3, -1)
-    return a[..., :3]
+    return load_rgb(p)
 
 
 def psnr(x, y, mask=None):
@@ -115,9 +108,12 @@ def evaluate(clip, method_dir, crossfade=False):
         else:
             pm = method_dir / f'{n}_mid.png'
             if not pm.exists():
-                print(f'missing {pm}', file=sys.stderr)
-                continue
+                raise FileNotFoundError(f'missing {pm}; partial-method scores are refused')
             m = load(pm)
+        if a.shape != gt.shape or b.shape != gt.shape or m.shape != gt.shape:
+            raise ValueError(f'geometry mismatch in triplet {n}')
+        if hud is not None and hud.shape != gt.shape[:2]:
+            raise ValueError('HUD mask geometry mismatch')
         rows.append(frame_metrics(a, gt, b, m, hud))
     if not rows:
         return None

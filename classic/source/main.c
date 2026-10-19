@@ -293,6 +293,7 @@ static void *g_pre_mem = NULL;
 static size_t g_pre_size = 0;
 
 #include "two_buffer_test.h"
+#include "bench_state.h"
 
 void *alloc_dm(size_t len, size_t align, int type);
 void *alloc_dm(size_t len, size_t align, int type)
@@ -365,6 +366,12 @@ static void gpu_init(void)
             off = (off + nw[i] * 4 + 0xFFu) & ~0xFFu;
         }
         lg("gpu_init: mode 8 + rcas8/osd8 shaders %s, end 0x%x\n", g_sh8_ok ? "ok" : "DO NOT FIT", off);
+#if VCFG_BENCH
+        if (g_bench_enabled && g_sh8_ok) {
+            if (off + sizeof(pack16_code) > DCB8_OFF) g_sh8_ok = 0;
+            else { memcpy((uint8_t *)addr + off, pack16_code, sizeof(pack16_code)); g_bench_pack_off = off; }
+        }
+#endif
         if (g_sh8_ok && gv_armed() && g_gpu_sz == GPU_SZ) {
             int vok = 1;
             for (int i = 10; i < 14; i++) {
@@ -801,7 +808,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     volatile uint32_t *stats = (volatile uint32_t *)(slotb + STATS_OFF);
     for (int i = 0; i < 8; i++) stats[i] = 0xFFFFFFFFu;
 
-    uint32_t base_flags = (g_opt_phase ? 1u : 0u) | ((g_fg_off || force_repeat) ? 2u : 0u) | (g_opt_marker ? 4u : 0u)
+    uint32_t base_flags = (g_opt_phase ? 1u : 0u) | (((g_fg_off && !g_bench_offscreen) || force_repeat) ? 2u : 0u) | (g_opt_marker ? 4u : 0u)
                         | (g_opt_nocf ? 8u : 0u) | (g_opt_nofgk ? 16u : 0u) | (g_opt_noanc ? 32u : 0u)
                         | (g_opt_notp ? 64u : 0u) | (g_opt_nomf ? 128u : 0u) | (g_opt_notex ? 256u : 0u)
                         | (g_opt_notpg ? 512u : 0u) | (g_opt_sharp ? 1024u : 0u) | (g_opt_nostr ? 2048u : 0u)
@@ -812,8 +819,9 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
 
     uint32_t rcas_con_bits = 0, rcas_flags1 = 0, osd_xy = 0, osd_wh1 = 0;
     uint32_t mask1 = two_mids ? 1u /*mid1 only; mid2+cur done in pass 2*/ : 3u /*mid1 + cur*/;
-    calc_rcas_params(post_mid_only() ? 1u /*mid1 only*/ : mask1, &rcas_con_bits, &rcas_flags1);
-    if (g_sh8_off[15]) osd_build_slot(slotb + OSD_SLOT_OFF, &osd_xy, &osd_wh1, mask1);
+    if (g_bench_offscreen) mask1 = 1u;  // never post-process the game's B/scanout surface during capture
+    calc_rcas_params((post_mid_only() || g_bench_offscreen) ? 1u /*mid1 only*/ : mask1, &rcas_con_bits, &rcas_flags1);
+    if (g_sh8_off[15] && !g_bench_offscreen) osd_build_slot(slotb + OSD_SLOT_OFF, &osd_xy, &osd_wh1, mask1);
     fill_table8_ext(tb, g_gpu, slotb, rcas_con_bits, rcas_flags1, osd_xy, osd_wh1);
 
     *(volatile uint64_t *)(slotb + 0x900) = 0;
@@ -856,7 +864,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         p = gv_emit_ts(p, slot, 3);
     }
     TS_EOP(2);
-    {
+    if (!g_bench_offscreen) {
         int32_t fr = insert_wait_flip_done(p, 7, vo_handle, mid1_idx);
         if (fr != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
         if (!g_fence_logged) { g_fence_logged = 1; lg("fence (mode 8): 0x%08x\n", (unsigned)fr); }
@@ -880,7 +888,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     // the aliasing that crawls on edges is smoothed the same way in real and generated frames, and the sharpening only
     // compensates the generated frame's softness. Separate table in the tb2 region (only FG Fast's mid2 uses it; in that
     // mode this pass is skipped). Runs after the warp has read the raw C, before the overlay is drawn.
-    if (post_mid_only() && !two_mids && g_sh8_off[14]) {
+    if (post_mid_only() && !two_mids && !g_bench_offscreen && g_sh8_off[14]) {
         int enh = g_cfg.upscale < 0 ? 0 : (g_cfg.upscale > 2 ? 2 : g_cfg.upscale);
         if (enh > 0) {
             uint32_t *tbr = (uint32_t *)(slotb + SLOT_TB2_OFF);
@@ -939,7 +947,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         }
     }
 
-    if (g_dump_req && g_dump_mem) {
+    if (g_dump_req && g_dump_mem && !g_bench_offscreen) {
         PASS_BARRIER();
         make_v(tb + 88, (uint64_t)(uintptr_t)g_dump_mem, 3 * 960 * 1080 * 4 + 163200);
         SET_PASS(g_sh8_off[6], DUMP8_RSRC1, DUMP8_RSRC2); DISPATCH(120, 135);
@@ -1264,6 +1272,7 @@ static void *io_thread(void *arg)
     for (;;) {
         sceKernelUsleep(2000);
         if (g_lgq_r != g_lgq_w) lg_drain();
+        bench_io_tick();
         if (__atomic_exchange_n(&g_cfg_save_req, 0, __ATOMIC_ACQ_REL)) cfg_save_game_ini();
         if (g_inject_on == 8) gv_io_tick();
         poll_n++;
@@ -1273,7 +1282,7 @@ static void *io_thread(void *arg)
             lg("inert: no flip hook (0 flips after 10 s; game does not call sceGnmSubmitAndFlipCommandBuffers, voSubmitFlips=%u)\n",
                g_vo_submit_flips);
         }
-        if ((poll_n % 250) == 0 && g_inject_on == 8) {
+        if ((poll_n % 250) == 0 && g_inject_on == 8 && !g_bench_enabled) {
             cfg_reload_from_disk(0);
         }
         if (g_dump_frame && g_dump_frame != 0xFFFFFFFFu && g_dump_mem && g_flips > g_dump_frame + 2 &&
@@ -1581,6 +1590,10 @@ static int dcb_mem_ok(uintptr_t a, size_t n)
     return (prot & 0x01 /*PROT_CPU_READ*/) != 0;
 }
 
+#if VCFG_BENCH
+#include "bench_capture.h"
+#endif
+
 static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
 {
     uint64_t t_hook_in = sceKernelGetProcessTime();
@@ -1599,6 +1612,9 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
     }
     tick(g_flips, handle, index, flipMode);
     uint64_t raw_dt_us = (prev_flip_t && g_freq) ? ((g_last - prev_flip_t) * 1000000ull / g_freq) : 33366ull;
+#if VCFG_BENCH
+    if (g_bench_enabled) return bench_flip(count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg, t_hook_in);
+#endif
 
 #if INJECT
     if (g_flips == INJECT_AFTER_FLIPS) {
@@ -2108,6 +2124,11 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
         if (startIndex + i + 1 > g_nbuf) g_nbuf = startIndex + i + 1;
         lg("  buf[%d]=%p\n", startIndex + i, addresses[i]);
     }
+    if (g_bench_enabled) {
+        if (startIndex == 0) g_ngame = bufferNum;
+        return HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                             handle, startIndex, addresses, bufferNum, attr);
+    }
     // 1.4: Support 2..8 game display buffers (some engines register 4 buffers)
     if (attr && startIndex == 0 && bufferNum >= 2 && bufferNum <= 8 && addresses && g_mbuf_state >= 0) {
         g_ngame = bufferNum;
@@ -2518,6 +2539,7 @@ static void pad_poll_start(void)
 
 int32_t sceVideoOutSetFlipRate_hook(int32_t handle, int32_t rate)
 {
+    if (g_bench_enabled) return HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), handle, rate);
     int m_raw = read_mode_raw();
     int want4 = (m_raw == 4 || m_raw == 6 || m_raw == 7 || m_raw == 8);
     lg("SetFlipRate handle=%d rate=%d%s\n", handle, rate, want4 ? " -> forced 0 (mode 4/8: 60 Hz output, we pace the game ourselves)" : "");
@@ -2535,6 +2557,9 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         klog("[bb_probe] inert: process title_id='%s' is not a CUSA game -> skipping hooks and allocations\n", g_title_id);
         return 0;
     }
+#if VCFG_BENCH
+    if (!bench_bootstrap()) return 0;
+#endif
 #if VCFG_2BUF_TEST
     if (tb_title()) {
         HOOK32(sceVideoOutGetFlipStatus);
@@ -2544,12 +2569,12 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
     }
 #endif
     {
-        int m = read_mode_raw();
-        if (m == 8) gv_load(alloc_dm);
+        int m = g_bench_enabled ? 8 : read_mode_raw();
+        if (m == 8 && !g_bench_enabled) gv_load(alloc_dm);
         if (m >= 1 && m <= 8) {
             g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
             g_pre_gpu = alloc_dm(g_gpu_sz, g_gpu_sz, 0);
-            { int ff = file_flags(); if (ff > 0 && (ff & 16)) { g_dump_mem = (uint8_t *)alloc_dm(DUMP_SZ, 0x10000, 0); klog("[bb_probe] dump memory: %p\n", (void *)g_dump_mem); } }
+            { int ff = file_flags(); if (!g_bench_enabled && ff > 0 && (ff & 16)) { g_dump_mem = (uint8_t *)alloc_dm(DUMP_SZ, 0x10000, 0); klog("[bb_probe] dump memory: %p\n", (void *)g_dump_mem); } }
             if (m == 8) {
                 g_pre_work = alloc_dm(WORK_SZ, 0x10000, 3);
                 g_work_garlic = g_pre_work != NULL;
@@ -2557,7 +2582,10 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
             if (!g_pre_work && m >= 6) g_pre_work = alloc_dm(WORK_SZ, 0x10000, 0);
             klog("[bb_probe] early gpu/work memory: %p / %p\n", g_pre_gpu, g_pre_work);
         }
-        if (m == 4 || m >= 6) {
+#if VCFG_BENCH
+        if (g_bench_enabled) bench_allocate();
+#endif
+        if ((m == 4 || m >= 6) && !g_bench_enabled) {
             // Try 16 MB first (2 mid buffers at 1080p for FG Fast 3-step pulldown), fall back to 8 MB (1 mid buffer)
             // CUSA00207 (SIGSEGV in the game right after plugin_load with 16 MB taken) and other tight games: 8 MB unless FG Fast asked for 2 mid buffers
             const size_t try_sz[2] = { g_cfg.preset == 1 ? 0x1000000u : 0x800000u, 0x800000u };
@@ -2593,6 +2621,9 @@ s32 attr_public plugin_unload(s32 argc, const char *argv[])
 {
     (void)argc; (void)argv;
     if (!g_is_game_proc) return 0;
+#if VCFG_BENCH
+    if (!g_bench_enabled) return 0;  // bootstrap may have returned without installing hooks
+#endif
 #if VCFG_2BUF_TEST
     if (g_tb_hooks) {
         UNHOOK(sceVideoOutGetFlipStatus);
