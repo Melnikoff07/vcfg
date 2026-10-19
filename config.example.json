@@ -1,0 +1,9 @@
+{
+  "openorbis_toolchain": "C:/path/to/OpenOrbis/PS4Toolchain",
+  "goldhen_sdk": "C:/path/to/GoldHEN_Plugins_SDK",
+  "llvm_bin": "C:/path/to/llvm/bin",
+  "llc_gfx700": "C:/path/to/llvm-amdgpu/bin/llc.exe",
+  "python": "python",
+  "ps4_host": "192.168.1.x",
+  "ps4_ftp_port": 2121
+}

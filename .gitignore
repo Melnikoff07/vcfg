@@ -1,0 +1,10 @@
+build/
+logs/
+backups/
+config.json
+*.prx
+*.elf
+*.oelf
+*.o
+*.token
+__pycache__/
