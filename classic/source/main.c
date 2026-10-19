@@ -1865,7 +1865,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
         // Scanout formats: 8-bit 0x8000xxxx and 10-bit 0x88xxxxxx (each needs its own T# data format; treating 10-bit as
         // 8888 turned the picture into noise). Sticky: an unknown format, or sets of both kinds, leaves every frame alone.
         // 10-bit 0x88xxxxxx (SDR or HDR10 output) is used with a 2_10_10_10 T#. Mixed sets (8-bit and 10-bit) stay off.
-        uint32_t fam = attr->format & 0xFFFF0000u, dfmt = fam == 0x80000000u ? 10u : fam == 0x88000000u ? 9u : 0u;
+        uint32_t fam = attr->format >> 24, dfmt = fam == 0x80u ? 10u : fam == 0x88u ? 9u : 0u;   // 0x88740000 = HDR10 PQ
         static uint32_t seen_dfmt;
         if (!dfmt || (seen_dfmt && seen_dfmt != dfmt)) g_fmt_supported = 0;
         else { seen_dfmt = dfmt; g_t_dfmt = dfmt; }
