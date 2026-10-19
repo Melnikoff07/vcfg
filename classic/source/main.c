@@ -252,7 +252,7 @@ _Static_assert(DCB8_OFF + 4 * DCB8_SZ <= GPU_SZ, "mode 8 DCB areas do not fit GP
 
 #define MON_OFF 0xE00u
 static volatile uint32_t *g_mon = NULL;
-static uint32_t g_sh8_off[16];         // code offsets in g_gpu: 0..9 pyr8..mf8, 10..13 gv8..gvz8, 14 rcas8, 15 osd8
+static uint32_t g_sh8_off[17];         // code offsets in g_gpu: 0..9 pyr8..mf8, 10..13 gv8..gvz8, 14 rcas8, 15 osd8, 16 pcopy8
 #define STATS_OFF 0x960u
 #define CUT_BLOCKS 3264u
 static uint32_t g_st_n = 0, g_st_cut_max = 0, g_st_cuts = 0, g_st_fgf = 0, g_st_fades = 0;
@@ -273,6 +273,12 @@ static VoAttr g_attr;
 static int g_mbuf_state = 0; // 0 untried, 1 ok, -1 failed
 static void *g_mbuf_mem = NULL;
 static int g_nmid = 3;
+// Present copy (double-buffered games): the real frame is copied into one of two own buffers (g_ngame + 1, + 2) and
+// that copy is flipped, so the game's buffer is free right after the copy instead of one refresh later. Mid frames
+// use g_ngame. g_pcopy_cfg: 0 auto (games with 2 buffers), 1 on, 2 off (config key present_copy).
+static int g_pcopy_avail = 0, g_pcopy_cfg = 0;
+static volatile int g_pcopy_on = 0;
+#define IS_MID(b) ((b) >= g_ngame && !(g_pcopy_on && (b) > g_ngame))
 static int g_ngame = 3;
 static void *g_pre_mem = NULL;
 static size_t g_pre_size = 0;
@@ -327,11 +333,12 @@ static void gpu_init(void)
     memcpy((uint8_t *)addr + 0x6000, flow2_code, sizeof(flow2_code));
     memcpy((uint8_t *)addr + 0x6800, warp_code, sizeof(warp_code));
     {
-        const uint32_t *code[16] = { pyr8_code, me3_code, me2_code, me1_code, phase8_code, warp8_code, dump8_code, gm8_code,
-                                     fgs8_code, mf8_code, gv8_code, gvc8_code, warp8g_code, gvz8_code, rcas8_code, osd8_code };
-        const uint32_t nw[16] = { PYR8_NWORDS, ME3_NWORDS, ME2_NWORDS, ME1_NWORDS, PHASE8_NWORDS, WARP8_NWORDS, DUMP8_NWORDS,
+        const uint32_t *code[17] = { pyr8_code, me3_code, me2_code, me1_code, phase8_code, warp8_code, dump8_code, gm8_code,
+                                     fgs8_code, mf8_code, gv8_code, gvc8_code, warp8g_code, gvz8_code, rcas8_code, osd8_code,
+                                     pcopy8_code };
+        const uint32_t nw[17] = { PYR8_NWORDS, ME3_NWORDS, ME2_NWORDS, ME1_NWORDS, PHASE8_NWORDS, WARP8_NWORDS, DUMP8_NWORDS,
                                   GM8_NWORDS, FGS8_NWORDS, MF8_NWORDS, GV8_NWORDS, GVC8_NWORDS, WARP8G_NWORDS, GVZ8_NWORDS,
-                                  RCAS8_NWORDS, OSD8_NWORDS };
+                                  RCAS8_NWORDS, OSD8_NWORDS, PCOPY8_NWORDS };
         uint32_t off = 0x8000;
         g_sh8_ok = 1;
         for (int i = 0; i < 10; i++) {
@@ -340,7 +347,7 @@ static void gpu_init(void)
             g_sh8_off[i] = off;
             off = (off + nw[i] * 4 + 0xFFu) & ~0xFFu;
         }
-        for (int i = 14; g_sh8_ok && i < 16; i++) {
+        for (int i = 14; g_sh8_ok && i < 17; i++) {
             if (off + nw[i] * 4 > DCB8_OFF) { g_sh8_ok = 0; break; }
             memcpy((uint8_t *)addr + off, code[i], nw[i] * 4);
             g_sh8_off[i] = off;
@@ -726,7 +733,8 @@ static uint32_t build_dcb_post8(uint32_t *p0, uint64_t C, uint32_t w, uint32_t h
 static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M1, uint64_t M2,
                                 uint32_t pitch, uint32_t tidx, uint32_t nbytes, uint32_t slot, uint32_t seq,
                                 const uint32_t *nop64, int32_t vo_handle, uint32_t mid1_idx, uint32_t mid2_idx,
-                                uint32_t t1_q16, uint32_t t2_q16, int two_mids, int force_repeat)
+                                uint32_t t1_q16, uint32_t t2_q16, int two_mids, int force_repeat,
+                                uint64_t copy_dst, uint32_t copy_idx)
 {
     uint32_t *p = p0;
     uint32_t r = seq & 1;
@@ -869,6 +877,21 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         g_dump_req = 0;
         g_dump_frame = seq;
     }
+    if (copy_dst && g_sh8_off[16]) {   // present copy: finished real frame -> own display buffer (see g_pcopy_avail)
+        uint32_t *tb3 = (uint32_t *)(slotb + OSD_SLOT_OFF);   // old text-grid OSD area, unused since the bitmap overlay
+        uint64_t tbl3 = (uint64_t)(uintptr_t)tb3;
+        memset(tb3, 0, 0x60);
+        make_t(tb3 + 8, C, 1920, 1080, pitch, tidx);
+        make_t(tb3 + 16, copy_dst, 1920, 1080, pitch, tidx);
+        int32_t fr3 = sceGnmInsertWaitFlipDone(p, 7, vo_handle, copy_idx);
+        if (fr3 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
+        p += 7;
+        PASS_BARRIER();
+        *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; // inv scalar cache
+        *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl3; *p++ = (uint32_t)(tbl3 >> 32);
+        SET_PASS(g_sh8_off[16], PCOPY8_RSRC1, PCOPY8_RSRC2); DISPATCH(240, 135);
+        PASS_BARRIER();
+    }
     TS2(6);
     TS_EOP(4);
 #undef DISPATCH
@@ -951,6 +974,7 @@ static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
                 else if (strcmp(key, "sharpness") == 0) c->sharpness = val < 0 ? 0 : (val > 100 ? 100 : val);
                 else if (strcmp(key, "upscale") == 0 || strcmp(key, "enhance") == 0) c->upscale = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "upscale_factor") == 0) c->upscale_factor = val < 50 ? 50 : (val > 100 ? 100 : val);
+                else if (strcmp(key, "present_copy") == 0) g_pcopy_cfg = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "hud_protect") == 0) c->hud_protect = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "game_vectors") == 0) c->game_vectors = (val != 0);
                 else if (strcmp(key, "fps_lock") == 0) c->fps_lock = (val == 20 || val == 30 || val == 60) ? val : 0;
@@ -1223,8 +1247,8 @@ static void *mon_thread(void *arg)
                     uint32_t nv = (uint32_t)((dt + 8341) / 16683);
                     if (nv < 1) nv = 1;
                     if (nv > 4) nv = 4;
-                    g_hist[last_buf >= g_ngame ? 0 : 1][nv - 1]++;
-                    if (last_buf < g_ngame && g_mon) {
+                    g_hist[IS_MID(last_buf) ? 0 : 1][nv - 1]++;
+                    if (!IS_MID(last_buf) && g_mon) {
                         static uint32_t ema_dt = 16683u;
                         uint32_t dtu = dt > 66732u ? 66732u : (uint32_t)dt;
                         __atomic_store_n(&g_last_real_hold_us, dtu, __ATOMIC_RELEASE);
@@ -1236,23 +1260,23 @@ static void *mon_thread(void *arg)
                     }
                 }
                 uint64_t nf = fs.count - last_count;
-                int cur_mid = fs.currentBuffer >= g_ngame, last_mid = last_buf >= g_ngame;
+                int cur_mid = IS_MID(fs.currentBuffer), last_mid = IS_MID(last_buf);
                 if (nf > 1 && fs.currentBuffer >= 0 && last_buf >= 0 && ((nf & 1) ? cur_mid != last_mid : cur_mid == last_mid)) {
                     uint64_t a = (nf + 1) / 2, b = nf / 2;
                     if (cur_mid) { g_mids_shown += a; g_reals_shown += b; } else { g_reals_shown += a; g_mids_shown += b; }
                     g_mon_gaps++;
                 } else {
-                    if (fs.currentBuffer >= 0 && fs.currentBuffer < g_ngame && last_buf >= g_ngame) g_reals_shown++;
-                    if (fs.currentBuffer >= g_ngame && last_buf >= 0 && last_buf < g_ngame) g_mids_shown++;
+                    if (fs.currentBuffer >= 0 && !IS_MID(fs.currentBuffer) && last_buf >= 0 && IS_MID(last_buf)) g_reals_shown++;
+                    if (IS_MID(fs.currentBuffer) && last_buf >= 0 && !IS_MID(last_buf)) g_mids_shown++;
                 }
             }
-            if (fs.currentBuffer >= 0 && fs.currentBuffer < g_ngame && fs.currentBuffer < 16 && fs.currentBuffer != last_buf) {
+            if (fs.currentBuffer >= 0 && !IS_MID(fs.currentBuffer) && fs.currentBuffer < 16 && fs.currentBuffer != last_buf) {
                 uint64_t t0 = __atomic_exchange_n(&g_sub_t[fs.currentBuffer], 0ull, __ATOMIC_ACQ_REL);
                 if (t0 && fs.processTime > t0 && fs.processTime - t0 < 500000ull) {
                     uint64_t l = fs.processTime - t0; g_lat_sum += l; g_lat_n++; if (l > g_lat_max) g_lat_max = l;
                 }
             }
-            if (fs.currentBuffer >= 0 && fs.currentBuffer < g_ngame) g_last_real_buf = fs.currentBuffer;
+            if (fs.currentBuffer >= 0 && !IS_MID(fs.currentBuffer)) g_last_real_buf = fs.currentBuffer;
             last_count = fs.count;
             last_t = fs.processTime;
             last_buf = fs.currentBuffer;
@@ -1611,7 +1635,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                 }
 
                 uint32_t n = 0;
-                uint32_t flip_idx = index;
+                uint32_t flip_idx = index, show_idx = index;   // show_idx: buffer flipped for the real frame
                 uint32_t mid2_flip_idx = 0;
                 int second_flip = 0;
                 int third_flip = 0;
@@ -1625,7 +1649,9 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     g_inert_reason[0] = 0;
                     uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
                     uint32_t tidx = (g_attr.tilingMode == 0) ? 10u : 8u;
-                    uint32_t mi1 = (uint32_t)g_ngame + (g_flips % (uint32_t)g_nmid);
+                    int pcopy = g_pcopy_avail && g_pcopy_cfg != 2;   // auto and on: available only for 2-buffer games
+                    g_pcopy_on = pcopy;
+                    uint32_t mi1 = pcopy ? (uint32_t)g_ngame : (uint32_t)g_ngame + (g_flips % (uint32_t)g_nmid);
                     uint32_t mi2 = (uint32_t)g_ngame + ((g_flips + 1u) % (uint32_t)g_nmid);
                     uint32_t t1_q16 = 32768u, t2_q16 = 43690u;
                     int two_mids = 0;
@@ -1699,9 +1725,18 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                         }
                     }
 
+                    uint32_t ci = 0;
+                    if (pcopy) {
+                        static uint32_t pc_flip;
+                        pc_flip ^= 1u;
+                        ci = (uint32_t)g_ngame + 1u + pc_flip;
+                        two_mids = 0; third_flip = 0;      // FAST 3-step needs a second mid buffer: not with present copy
+                        show_idx = ci;
+                        if (index < 16u && ci < 16u) __atomic_store_n(&g_sub_t[ci], __atomic_load_n(&g_sub_t[index], __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+                    }
                     n = build_dcb_flow8(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi1], g_buf[mi2], g_pitch,
                                         tidx, px * 4, slot, g_flips, tail, (int32_t)handle, mi1, mi2,
-                                        t1_q16, t2_q16, two_mids, force_repeat);
+                                        t1_q16, t2_q16, two_mids, force_repeat, pcopy ? g_buf[ci] : 0ull, ci);
                     flip_idx = mi1;
                     second_flip = 1;
                 } else if (g_inject_on == 8 && g_sh8_ok && g_fmt_supported && g_bw >= 640 && g_bh >= 360) {
@@ -1801,13 +1836,18 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     uint32_t s3[1] = { 64 * 4 };
                     int32_t r2 = HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
                                      int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
-                                     1, d3, s3, NULL, NULL, handle, index, flipMode, flipArg);
+                                     1, d3, s3, NULL, NULL, handle, show_idx, flipMode, flipArg);
                     if (g_flips < INJECT_AFTER_FLIPS + 12) lg("mode4 #%u: gnm flip(mid idx %u)=0x%08x, gnm flip(cur idx %u)=0x%08x\n", g_flips, flip_idx, (unsigned)rc, index, (unsigned)r2);
                 }
                 if (g_cfg.fps_lock == 20) pace_hz(20);
                 else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
                 else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair();
-                else if (g_inject_on >= 7 && second_flip) pace_vblank(pace_p2, pace_p1, (int)index);
+                else if (g_inject_on >= 7 && second_flip) {
+                    static int last_show = -1;                  // with present copy the shown real buffers are the copies
+                    int shown = (int)show_idx, pp1 = show_idx != index ? last_show : pace_p1;
+                    pace_vblank(show_idx != index ? -1 : pace_p2, pp1, shown);
+                    last_show = shown;
+                }
                 else if (second_flip) pace_30();
                 return rc;
             } else if (g_flips == INJECT_AFTER_FLIPS) {
@@ -1964,11 +2004,22 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 m = (uint8_t *)alloc_mbufs((one * (size_t)want + 0x1FFFFFu) & ~(size_t)0x1FFFFFu);
                 if (m) nm = want;
             }
+            // Double-buffered game: one mid buffer + two present-copy buffers (more memory taken here, outside the
+            // early block, only for such games).
+            uint8_t *m2 = NULL; int nm2 = 0;
+            if (g_ngame == 2 && m && nm < 3) {
+                m2 = (uint8_t *)alloc_mbufs((one * (size_t)(3 - nm) + 0x1FFFFFu) & ~(size_t)0x1FFFFFu);
+                if (m2) nm2 = 3 - nm;
+            }
             g_nmid = nm > 0 ? nm : 1;
             if (m && nm >= 1) {
                 void *ext[16];
                 for (int i = 0; i < g_ngame; i++) ext[i] = addresses[i];
                 for (int i = 0; i < nm; i++) ext[g_ngame + i] = m + (size_t)i * one;
+                for (int i = 0; i < nm2; i++) ext[g_ngame + nm + i] = m2 + (size_t)i * one;
+                nm += nm2;
+                g_pcopy_avail = (g_ngame == 2 && nm >= 3);
+                if (g_pcopy_avail) lg("double-buffered game: present copy available (mid %d, copies %d/%d)\n", g_ngame, g_ngame + 1, g_ngame + 2);
                 int32_t r = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
                                           handle, startIndex, ext, g_ngame + nm, attr);
                 lg("mbufs: %d extra buffer(s) of 0x%zx at %p%s, game RegisterBuffers extended to %d = 0x%08x\n", nm, one, (void *)m,
