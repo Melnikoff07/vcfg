@@ -49,7 +49,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1                   
 powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Target discovery
 ```
 
-## Install and test
+## Install (easy way: installer package)
+
+1. Download `VCFG_Installer_vX.pkg` from [Releases](https://github.com/Melnikoff07/vcfg/releases).
+2. Install it like any homebrew package (GoldHEN Package Installer, e.g. from `/data/pkg`).
+3. Launch **VCFG Installer** from the home screen once. It copies the plugin to `/data/GoldHEN/plugins/vcfg.prx`,
+   backs up `plugins.ini` (`plugins.ini.vcfg_backup_<time>`), adds the plugin for the supported titles (other plugins
+   are kept), enables FG in `/data/bb_probe/vcfg.ini`, shows a notification and closes. Log: `/data/vcfg_installer.log`.
+4. Start the game, wait ~20 s, hold **L3+R3 for 3 s** for the menu.
+
+Uninstall: remove the `vcfg.prx` line from `/data/GoldHEN/plugins.ini` (or restore the backup).
+Build the package yourself: `installer/build_pkg.ps1` (after `build.ps1`).
+
+## Install and test (developers)
 
 ```powershell
 python -I tools/console.py set CUSA07439 build/vcfg/vcfg.prx     # CUSA07439 (EU)

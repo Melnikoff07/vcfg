@@ -2,7 +2,7 @@
 #include <Common.h>
 
 // Thanks to OSM
-// https://github.com/OSM-Made/console-Notify/blob/c6d259bc5bd4aa519f5b0ce4f5e27ef7cb01ffdd/Notify.cpp
+// https://github.com/OSM-Made/PS4-Notify/blob/c6d259bc5bd4aa519f5b0ce4f5e27ef7cb01ffdd/Notify.cpp
 
 // For pre formatted strings
 void NotifyStatic(const char* IconUri, const char* text) {
