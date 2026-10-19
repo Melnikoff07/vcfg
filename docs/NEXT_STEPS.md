@@ -68,6 +68,17 @@ its `#define *_RSRC1/2 … *_code[] = {…};` block. Never search/replace text i
   then cur. Needs two mid buffers (allocated when the preset is on at game start), no pace_30, fallback to
   QUALITY below ~37 fps. Costs ~40 generated frames per second.
 
+## 4c. Latency and CPU-bound games (measured 2026-10-20, CUSA05571)
+
+- LATENCY log line (classic): real frame hand-over -> on screen. FG off 31-36 ms; FG on (QUALITY) 48-62 ms with up to
+  4 flips queued.
+- In a CPU-heavy game (~26 ms CPU per frame, 37-42 fps without FG) FG QUALITY dropped the game to 22-24 fps although
+  our GPU passes cost only 3.4 ms: the classic engine paces inside the game's submit call (pace_30, mid hold sleeps),
+  so the game's render thread is blocked and its next frame starts late. Holding the game until the queue drains
+  (tried, reverted) made it worse.
+- Fix to do: pace without blocking the game's thread (let the flip FIFO and flip arguments time the pair, or move
+  the second flip to our own thread), then re-measure latency and fps.
+
 ## 5. Next steps, in order
 
 1. **Confirm v2.11 on hardware** (all four verified titles): menu, counter, AA, no flicker, no artifacts around the
