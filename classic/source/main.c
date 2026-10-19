@@ -1862,10 +1862,13 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
     if (attr && startIndex == 0) { g_handle = handle; g_attr = *attr; }
     if (attr) {
         g_bw = attr->width; g_bh = attr->height; g_pitch = attr->pitchInPixel;
-        // Only 8-bit 8888 scanout formats (0x8000xxxx, e.g. 0x80000000 / 0x80002200). 10-bit HDR formats (0x88060000)
-        // also have a zero low byte and came out as noise. Sticky: if any registered buffer set is not 8888 (a second
-        // set for the UI, or HDR), the plugin leaves every frame alone (no FG, post or overlay).
-        if ((attr->format & 0xFFFF0000u) != 0x80000000u) g_fmt_supported = 0;
+        // Scanout formats: 8-bit 0x8000xxxx and 10-bit 0x88xxxxxx (each needs its own T# data format; treating 10-bit as
+        // 8888 turned the picture into noise). Sticky: an unknown format, or sets of both kinds, leaves every frame alone.
+        // 10-bit 0x88xxxxxx (SDR or HDR10 output) is used with a 2_10_10_10 T#. Mixed sets (8-bit and 10-bit) stay off.
+        uint32_t fam = attr->format & 0xFFFF0000u, dfmt = fam == 0x80000000u ? 10u : fam == 0x88000000u ? 9u : 0u;
+        static uint32_t seen_dfmt;
+        if (!dfmt || (seen_dfmt && seen_dfmt != dfmt)) g_fmt_supported = 0;
+        else { seen_dfmt = dfmt; g_t_dfmt = dfmt; }
         lg("  attr: fmt=0x%x (supported=%d) tiling=%u aspect=%u %ux%u pitch=%u option=%u\n",
            attr->format, g_fmt_supported, attr->tilingMode, attr->aspectRatio, attr->width, attr->height, attr->pitchInPixel, attr->option);
     }

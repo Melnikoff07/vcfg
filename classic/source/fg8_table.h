@@ -4,10 +4,13 @@
 #include "vov.h"
 #include <stdint.h>
 
+// Data format of the game's scanout buffers in every T#: 10 = 8_8_8_8 (0x8000xxxx), 9 = 2_10_10_10 (0x88xxxxxx).
+// The passes read and write floats, so only this field changes; both are 4 bytes per pixel.
+static uint32_t g_t_dfmt = 10u;
 static inline void make_t(uint32_t *t, uint64_t a, uint32_t w, uint32_t h, uint32_t pitch, uint32_t tidx)
 {
     t[0] = (uint32_t)(a >> 8);
-    t[1] = (uint32_t)((a >> 40) & 0xFFu) | (10u << 20);
+    t[1] = (uint32_t)((a >> 40) & 0xFFu) | (g_t_dfmt << 20);
     t[2] = (w - 1u) | ((h - 1u) << 14);
     t[3] = 4u | (5u << 3) | (6u << 6) | (7u << 9) | (tidx << 20) | (9u << 28);
     t[4] = (pitch - 1u) << 13;
