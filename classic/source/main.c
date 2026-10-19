@@ -1073,6 +1073,7 @@ static uint32_t g_hist[2][4];
 static uint32_t g_mon_missed = 0, g_pace_timeouts = 0, g_pace_resync = 0, g_pace_fix = 0, g_mon_gaps = 0;
 static volatile uint64_t g_rel_t = 0;
 static volatile uint32_t g_cpu_n = 0, g_cpu_sum_us = 0, g_cpu_max_us = 0;
+static uint32_t g_cpu_ema_us = 0;   // game time release -> next submit (its own work, without our waits)
 
 static int file_flags_ex(uint32_t *hash_io)
 {
@@ -1495,7 +1496,8 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
     if (g_rel_t) {
         uint64_t us = sceKernelGetProcessTime() - g_rel_t;
         g_rel_t = 0;
-        if (us < 1000000) { g_cpu_n++; g_cpu_sum_us += (uint32_t)us; if (us > g_cpu_max_us) g_cpu_max_us = (uint32_t)us; }
+        if (us < 1000000) { g_cpu_n++; g_cpu_sum_us += (uint32_t)us; if (us > g_cpu_max_us) g_cpu_max_us = (uint32_t)us;
+                            g_cpu_ema_us = g_cpu_ema_us ? (g_cpu_ema_us * 7u + (uint32_t)us) / 8u : (uint32_t)us; }
     }
     tick(g_flips, handle, index, flipMode);
     uint64_t raw_dt_us = (prev_flip_t && g_freq) ? ((g_last - prev_flip_t) * 1000000ull / g_freq) : 33366ull;
@@ -1713,7 +1715,9 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                         t1_q16 = (t_real + 32768u) >> 1;
                         if (t1_q16 < 22937u) t1_q16 = 22937u; // 0.35
                         if (t1_q16 > 42598u) t1_q16 = 42598u; // 0.65
-                        if (tot_us > 38000u) {
+                        // Only when the game itself is slow: the 15 ms hold sleeps in the game's thread, so applying it to a
+                        // game that needs ~26 ms per frame kept it below 26 fps for good (CUSA05571: 24-25 fps).
+                        if (tot_us > 38000u && g_cpu_ema_us > 30000u) {
                             // Distribute extra vblanks evenly between mid and cur when game drops below 30 fps (e.g. 25 fps -> 50)
                             uint32_t half_us = tot_us >> 1;
                             int32_t extra_q16 = (int32_t)(((uint64_t)(half_us > 16683u ? half_us - 16683u : 0u) << 16) / 16683ull);
