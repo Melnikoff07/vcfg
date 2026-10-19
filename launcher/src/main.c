@@ -16,6 +16,7 @@
 #include <orbis/Sysmodule.h>
 #include <orbis/SystemService.h>
 #include "app.h"
+#include <GoldHEN.h>
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 #define STBI_NO_STDIO_FAILURE_STRINGS
@@ -84,23 +85,18 @@ static int sfo_title(const unsigned char *b, size_t n, char *out, size_t on)
     }
     return 0;
 }
+// The app sandbox cannot read these folders (drwx------ root); main() wraps the calls in a GoldHEN jailbreak.
 static void load_meta(Game *g)
 {
-    static const char *roots[] = { "/user/appmeta", "/system_data/priv/appmeta" };
-    for (int r = 0; r < 2; r++) {
-        char p[128]; size_t n = 0;
-        snprintf(p, sizeof(p), "%s/%s/param.sfo", roots[r], g->id);
-        unsigned char *b = read_all(p, &n);
-        if (b) { g->installed = 1; sfo_title(b, n, g->title, sizeof(g->title)); free(b); }
-        snprintf(p, sizeof(p), "%s/%s/icon0.png", roots[r], g->id);
-        int w, h, ch; unsigned char *img = stbi_load(p, &w, &h, &ch, 4);
-        if (img) { g->icon = img; g->iw = w; g->ih = h; g->installed = 1; }
-        if (g->installed) break;
-    }
-    if (!g->installed) {   // fall back to the app folder for the installed check
-        char p[64]; snprintf(p, sizeof(p), "/user/app/%s", g->id);
-        FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; }
-    }
+    char p[128]; size_t n = 0;
+    snprintf(p, sizeof(p), "/system_data/priv/appmeta/%s/param.sfo", g->id);
+    unsigned char *b = read_all(p, &n);
+    if (!b) { snprintf(p, sizeof(p), "/user/appmeta/%s/param.sfo", g->id); b = read_all(p, &n); }
+    if (b) { g->installed = 1; sfo_title(b, n, g->title, sizeof(g->title)); free(b); }
+    snprintf(p, sizeof(p), "/user/appmeta/%s/icon0.png", g->id);
+    int w, h, ch; unsigned char *img = stbi_load(p, &w, &h, &ch, 4);
+    if (img) { g->icon = img; g->iw = w; g->ih = h; g->installed = 1; }
+    if (!g->installed) { snprintf(p, sizeof(p), "/user/app/%s/app.json", g->id); FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; } }
     vlog("game %s installed=%d title='%s' icon=%dx%d\n", g->id, g->installed, g->title, g->iw, g->ih);
 }
 
@@ -288,11 +284,15 @@ int main(void)
         !face_init(&fonts.mono, mono, 25, &arena) || !face_init(&fonts.num, disp, 80, &arena) || !face_init(&fonts.big, disp, 150, &arena)) {
         vlog("init failed\n"); quit();
     }
+    struct jailbreak_backup jb; memset(&jb, 0, sizeof(jb));
+    int jrc = sys_sdk_jailbreak(&jb);           // fonts are loaded already: /app0 is not reachable while jailbroken
+    vlog("jailbreak rc=%d\n", jrc);
     for (int i = 0; i < NSUP; i++) {
         Game *g = &a->games[a->ngames++];
         snprintf(g->id, sizeof(g->id), "%s", k_sup[i].id); g->engine = k_sup[i].engine; g->testing = k_sup[i].testing;
         load_meta(g);
     }
+    if (jrc == 0) vlog("unjailbreak rc=%d\n", sys_sdk_unjailbreak(&jb));
     // Installed games first, keep the table order otherwise.
     for (int i = 1; i < a->ngames; i++) for (int j = i; j > 0 && a->games[j].installed > a->games[j - 1].installed; j--) {
         Game t = a->games[j]; a->games[j] = a->games[j - 1]; a->games[j - 1] = t;

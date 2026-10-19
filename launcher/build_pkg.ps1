@@ -15,13 +15,13 @@ function Run($exe, [string[]]$a) { & $exe @a; if ($LASTEXITCODE -ne 0) { throw "
 
 # 1. App executable (ui.c / app.c are the same files the PC preview renders).
 $flags = @('--target=x86_64-pc-freebsd12-elf', '-fPIC', '-funwind-tables', '-O2', '-Wall', '-Wno-unused-function', '-Werror=format',
-    '-D_BSD_SOURCE=1', '-D__BSD_VISIBLE=1', '-D__PS4__=1', '-DOO=1', '-isysroot', $tc, '-isystem', "$tc\include")
+    '-D_BSD_SOURCE=1', '-D__BSD_VISIBLE=1', '-D__PS4__=1', '-DOO=1', '-isysroot', $tc, '-isystem', "$tc\include", "-I$($cfg.goldhen_sdk)\include")
 $objs = @()
 foreach ($f in 'main', 'ui', 'app') {
     Run "$llvm\clang.exe" ($flags + @('-c', "$PSScriptRoot\src\$f.c", '-o', "$out\$f.o")); $objs += "$out\$f.o"
 }
 Run "$llvm\ld.lld.exe" (@('-m', 'elf_x86_64', '-pie', '--script', "$tc\link.x", '--eh-frame-hdr', "$tc\lib\crt1.o") + $objs +
-    @('-L', "$tc\lib", '-lc', '-lkernel', '-lSceVideoOut', '-lScePad', '-lSceUserService', '-lSceSysmodule', '-lSceSystemService',
+    @('-L', "$tc\lib", '-L', $cfg.goldhen_sdk, '-lGoldHEN_Hook', '-lc', '-lkernel', '-lSceVideoOut', '-lScePad', '-lSceUserService', '-lSceSysmodule', '-lSceSystemService',
       '-o', "$out\launcher.elf"))
 Run "$tc\bin\windows\create-fself.exe" @("-in=$out\launcher.elf", "-out=$out\launcher.oelf", "--eboot=$stage\eboot.bin", '--paid', '0x3800000000000011')
 
