@@ -35,4 +35,4 @@ Run "$ll/ld.lld.exe" (@("$sdk/build/crtprx.o") + $objects + @('-o', "$out/vcfg_c
     '-lSceSysmodule', '-lSceSystemService', '-lSceUserService'))
 Run "$tc/bin/windows/create-fself.exe" @("-in=$out/vcfg_classic.elf", "-out=$out/vcfg_classic.oelf", "-lib=$out/vcfg_classic.prx", '--paid', '0x3800000000000011')
 Get-Item "$out/vcfg_classic.prx" | Select-Object FullName, Length
-Get-FileHash "$out/vcfg_classic.prx" -Algorithm SHA256
+Write-Host "SHA256 $((Get-FileHash "$out/vcfg_classic.prx" -Algorithm SHA256).Hash)"
