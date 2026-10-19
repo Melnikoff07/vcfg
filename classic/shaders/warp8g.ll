@@ -23,7 +23,7 @@ declare <4 x float> @llvm.maxnum.v4f32(<4 x float>, <4 x float>)
 declare <4 x float> @llvm.minnum.v4f32(<4 x float>, <4 x float>)
 
 define internal { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v,
-                           float %vx, float %vy, float %t, float %tc1) alwaysinline {
+                           float %vx, float %vy, float %t, float %tc1, float %rx0, float %rx1, float %ry0, float %ry1) alwaysinline {
   %px = fmul float %vx, %t
   %py = fmul float %vy, %t
   %cx = fmul float %vx, %tc1
@@ -40,7 +40,15 @@ define internal { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i3
   %pl3 = fcmp ogt float %vp, 1080.0
   %pla = or i1 %pl0, %pl1
   %plb = or i1 %pl2, %pl3
-  %oobp = or i1 %pla, %plb
+  %oobp0 = or i1 %pla, %plb
+  %or0 = fcmp oge float %up, %rx0
+  %or1 = fcmp olt float %up, %rx1
+  %or2 = fcmp oge float %vp, %ry0
+  %or3 = fcmp olt float %vp, %ry1
+  %ora = and i1 %or0, %or1
+  %orb = and i1 %or2, %or3
+  %inovl = and i1 %ora, %orb
+  %oobp = or i1 %oobp0, %inovl
   %cl0 = fcmp olt float %uc, 0.0
   %cl1 = fcmp ogt float %uc, 1920.0
   %cl2 = fcmp olt float %vc, 0.0
@@ -64,7 +72,7 @@ define internal { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i3
 }
 
 define internal { <4 x float>, <4 x float>, float } @tapsq(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v,
-                           float %vx, float %vy, float %t, float %tc1) alwaysinline {
+                           float %vx, float %vy, float %t, float %tc1, float %rx0, float %rx1, float %ry0, float %ry1) alwaysinline {
   %px = fmul float %vx, %t
   %py = fmul float %vy, %t
   %cx = fmul float %vx, %tc1
@@ -81,7 +89,15 @@ define internal { <4 x float>, <4 x float>, float } @tapsq(<8 x i32> %tp, <8 x i
   %pl3 = fcmp ogt float %vp, 1080.0
   %pla = or i1 %pl0, %pl1
   %plb = or i1 %pl2, %pl3
-  %oobp = or i1 %pla, %plb
+  %oobp0 = or i1 %pla, %plb
+  %or0 = fcmp oge float %up, %rx0
+  %or1 = fcmp olt float %up, %rx1
+  %or2 = fcmp oge float %vp, %ry0
+  %or3 = fcmp olt float %vp, %ry1
+  %ora = and i1 %or0, %or1
+  %orb = and i1 %or2, %or3
+  %inovl = and i1 %ora, %orb
+  %oobp = or i1 %oobp0, %inovl
   %cl0 = fcmp olt float %uc, 0.0
   %cl1 = fcmp ogt float %uc, 1920.0
   %cl2 = fcmp olt float %vc, 0.0
@@ -297,6 +313,33 @@ entry:
   %tp = load <8 x i32>, ptr addrspace(4) %tbl, align 32, !invariant.load !0
   %ptc = getelementptr i8, ptr addrspace(4) %tbl, i64 32
   %tc = load <8 x i32>, ptr addrspace(4) %ptc, align 32, !invariant.load !0
+  ; overlay rectangle (VCFG osd8, drawn last into the frame that becomes T#prev): prev taps inside it use cur
+  %porc = getelementptr i8, ptr addrspace(4) %tbl, i64 544
+  %orc = load <4 x i32>, ptr addrspace(4) %porc, align 16, !invariant.load !0
+  %oxy = extractelement <4 x i32> %orc, i32 2
+  %owh = extractelement <4 x i32> %orc, i32 3
+  %ox0i = and i32 %oxy, 65535
+  %oy0i = lshr i32 %oxy, 16
+  %ocl = and i32 %owh, 255
+  %orw0 = lshr i32 %owh, 8
+  %orw = and i32 %orw0, 255
+  %ocw = shl i32 %ocl, 4
+  %orh = shl i32 %orw, 4
+  %ox1i = add i32 %ox0i, %ocw
+  %oy1i = add i32 %oy0i, %orh
+  %oxf0 = uitofp i32 %ox0i to float
+  %oyf0 = uitofp i32 %oy0i to float
+  %oxf1 = uitofp i32 %ox1i to float
+  %oyf1 = uitofp i32 %oy1i to float
+  %oxm = fsub float %oxf0, 3.0
+  %oym = fsub float %oyf0, 3.0
+  %oxp = fadd float %oxf1, 3.0
+  %oyp = fadd float %oyf1, 3.0
+  %oon = icmp ne i32 %ocl, 0
+  %rx0 = select i1 %oon, float %oxm, float -1000.0
+  %rx1 = select i1 %oon, float %oxp, float -1000.0
+  %ry0 = select i1 %oon, float %oym, float -1000.0
+  %ry1 = select i1 %oon, float %oyp, float -1000.0
   %pto = getelementptr i8, ptr addrspace(4) %tbl, i64 64
   %to = load <8 x i32>, ptr addrspace(4) %pto, align 32, !invariant.load !0
   %psm = getelementptr i8, ptr addrspace(4) %tbl, i64 96
@@ -519,7 +562,7 @@ fastzero:
   %zm = call <4 x float> @lerp4(<4 x float> %sp, <4 x float> %sc, float %t)
   br label %merge
 fastmove:
-  %cf = call { <4 x float>, <4 x float>, float } @tapsq(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %vbx, float %vby, float %t, float %tc1)
+  %cf = call { <4 x float>, <4 x float>, float } @tapsq(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %vbx, float %vby, float %t, float %tc1, float %rx0, float %rx1, float %ry0, float %ry1)
   %fa = extractvalue { <4 x float>, <4 x float>, float } %cf, 0
   %fb = extractvalue { <4 x float>, <4 x float>, float } %cf, 1
   %fe = extractvalue { <4 x float>, <4 x float>, float } %cf, 2
@@ -527,25 +570,25 @@ fastmove:
   br label %merge
 
 slow:
-  %c0 = call { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %x00, float %y00, float %t, float %tc1)
+  %c0 = call { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %x00, float %y00, float %t, float %tc1, float %rx0, float %rx1, float %ry0, float %ry1)
   %st0 = insertvalue { <4 x float>, float, float } zeroinitializer, float 1.0e4, 2
   %st1 = call { <4 x float>, float, float } @accum({ <4 x float>, float, float } %st0, { <4 x float>, <4 x float>, float } %c0, float %w00, float %t, <4 x float> %sp, <4 x float> %sc, float %es, i1 %anon)
-  %c1 = call { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %x10, float %y10, float %t, float %tc1)
+  %c1 = call { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %x10, float %y10, float %t, float %tc1, float %rx0, float %rx1, float %ry0, float %ry1)
   %st2 = call { <4 x float>, float, float } @accum({ <4 x float>, float, float } %st1, { <4 x float>, <4 x float>, float } %c1, float %w10, float %t, <4 x float> %sp, <4 x float> %sc, float %es, i1 %anon)
-  %c2 = call { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %x01, float %y01, float %t, float %tc1)
+  %c2 = call { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %x01, float %y01, float %t, float %tc1, float %rx0, float %rx1, float %ry0, float %ry1)
   %st3 = call { <4 x float>, float, float } @accum({ <4 x float>, float, float } %st2, { <4 x float>, <4 x float>, float } %c2, float %w01, float %t, <4 x float> %sp, <4 x float> %sc, float %es, i1 %anon)
-  %c3 = call { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %x11, float %y11, float %t, float %tc1)
+  %c3 = call { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %x11, float %y11, float %t, float %tc1, float %rx0, float %rx1, float %ry0, float %ry1)
   %st4 = call { <4 x float>, float, float } @accum({ <4 x float>, float, float } %st3, { <4 x float>, <4 x float>, float } %c3, float %w11, float %t, <4 x float> %sp, <4 x float> %sc, float %es, i1 %anon)
   br i1 %gvcp, label %gslc, label %gslc_d
 gslc:
-  %c4 = call { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %gcxp, float %gcyp, float %t, float %tc1)
+  %c4 = call { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %gcxp, float %gcyp, float %t, float %tc1, float %rx0, float %rx1, float %ry0, float %ry1)
   %st5a = call { <4 x float>, float, float } @accum({ <4 x float>, float, float } %st4, { <4 x float>, <4 x float>, float } %c4, float 0x3FE3333340000000, float %t, <4 x float> %sp, <4 x float> %sc, float %es, i1 %anon) ; 0.6
   br label %gslc_d
 gslc_d:
   %st5 = phi { <4 x float>, float, float } [ %st4, %slow ], [ %st5a, %gslc ]
   br i1 %gvop, label %gslo, label %gslo_d
 gslo:
-  %c5 = call { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %goxp, float %goyp, float %t, float %tc1)
+  %c5 = call { <4 x float>, <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %goxp, float %goyp, float %t, float %tc1, float %rx0, float %rx1, float %ry0, float %ry1)
   %st6a = call { <4 x float>, float, float } @accum({ <4 x float>, float, float } %st5, { <4 x float>, <4 x float>, float } %c5, float 0x3FD99999A0000000, float %t, <4 x float> %sp, <4 x float> %sc, float %es, i1 %anon) ; 0.4
   br label %gslo_d
 gslo_d:
