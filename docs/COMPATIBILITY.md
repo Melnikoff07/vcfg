@@ -1,5 +1,10 @@
 # Compatibility
 
+> Offline audit, 2026-10-20: [LOCAL_TRACE_REPORT.md](LOCAL_TRACE_REPORT.md) lists saved v2.14 evidence separately
+> by start. Those files cover different internal builds/settings without exact build attribution.
+> The older runtime table below is historical; the local experiments in [NIGHT_REPORT.md](NIGHT_REPORT.md)
+> have not been tested on hardware and do not establish additional supported titles.
+
 > **v2.11 status.** Verified: CUSA07439 (new engine); CUSA08519, CUSA00411, CUSA00207 (classic engine).
 > Other games: EXPERIMENTAL switch in the app (classic engine). Older per-title notes below.
 

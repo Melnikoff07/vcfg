@@ -1,5 +1,10 @@
 # VCFG: state and next steps (handoff, 2026-10-19, v2.12)
 
+> Local offline continuation, 2026-10-20: see [NIGHT_REPORT.md](NIGHT_REPORT.md) for the profile fix,
+> isolated two-buffer experiments, validated local builds and the exact hardware test order.
+> [LOCAL_TRACE_REPORT.md](LOCAL_TRACE_REPORT.md) separates current/previous saved starts and archived full logs.
+> No console deployment or new hardware result was obtained in this pass.
+
 This file is written for whoever (human or AI) continues the work. It says what exists, how to build and deploy it,
 what is broken or unverified, and what to do next, in order.
 
