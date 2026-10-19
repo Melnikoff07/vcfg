@@ -30,13 +30,16 @@ static uint32_t mix(uint32_t a, uint32_t b, unsigned t) // t 0..15
     return r;
 }
 
+static unsigned g_drawn_w[2], g_drawn_h[2];   // layout last drawn into each buffer
+// With one buffer the GPU may be reading while we draw: nothing is cleared first (every pixel of the layout is
+// overwritten with its final value, palette entries keep their values), so a redraw never shows an empty panel.
 static void canvas_begin(Canvas *c, int buf, unsigned w, unsigned h)
 {
     uint8_t *base = g_mem + (size_t)buf * g_buf_sz;
     c->pal = (uint32_t *)base; c->pix = base + VOV_PAL_SZ; c->w = w; c->h = h; c->npairs = 0;
-    bset(c->pal, 0, VOV_PAL_SZ);
+    c->pal[0] = 0;
     for (int i = 1; i < C_N; i++) c->pal[i] = pack(k_rgb[i], 255);
-    bset(c->pix, C_NONE, (size_t)w * h);
+    if (g_drawn_w[buf] != w || g_drawn_h[buf] != h) { bset(c->pix, C_NONE, (size_t)w * h); g_drawn_w[buf] = w; g_drawn_h[buf] = h; }
 }
 
 static int pair(Canvas *c, int fg, int bg)
@@ -133,7 +136,7 @@ static uint32_t hash(const void *p, size_t n)
 }
 
 static const uint8_t *g_last;
-void vov_init(uint8_t *mem) { g_mem = mem; g_buf_sz = VOV_BUF_SZ; g_nbuf = 2; g_max_h = VOV_MAX_H; g_cur = 0; g_hash[0] = g_hash[1] = 0; g_last = 0; }
+void vov_init(uint8_t *mem) { g_drawn_w[0] = g_drawn_w[1] = 0; g_mem = mem; g_buf_sz = VOV_BUF_SZ; g_nbuf = 2; g_max_h = VOV_MAX_H; g_cur = 0; g_hash[0] = g_hash[1] = 0; g_last = 0; }
 void vov_init_size(uint8_t *mem, size_t size)
 {
     if (size >= VOV_MEM_SZ) { vov_init(mem); return; }
@@ -181,7 +184,9 @@ int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigne
     }
     unsigned H = (unsigned)(HEAD + nrows * ROW + FOOT);
     H = (H + 15u) & ~15u; if (H > g_max_h) H = g_max_h;
-    uint32_t hs = hash(m, sizeof(*m)) ^ 0x4D454E55u;
+    static VovMenu key; key = *m;   // only what is shown: the fps numbers are drawn rounded to 10
+    key.out_fps_x10 = (m->out_fps_x10 + 5) / 10 * 10; key.game_fps_x10 = (m->game_fps_x10 + 5) / 10 * 10;
+    uint32_t hs = hash(&key, sizeof(key)) ^ 0x4D454E55u;
     int buf = pick(hs);
     Canvas c; c.w = W; c.h = H;
     if (!g_hash[buf]) {
@@ -253,6 +258,7 @@ int vov_counter(const VovCounter *k, const uint8_t **pal, const uint8_t **pix, u
     if (!g_hash[buf]) {
         Canvas c; canvas_begin(&c, buf, W, H);
         int split = (int)W - nw;
+        if (!mw) rect(&c, 0, 0, split, (int)H, C_NONE);
         if (mw) { rect(&c, 0, 0, split, (int)H, C_INK); text(&c, &vov_mono20, 18, 40, ms, C_YELLOW, C_INK, 1, 0); }
         rect(&c, split, 0, nw, (int)H, C_YELLOW);
         text(&c, &vov_big40, split + 16, 47, num, C_INK, C_YELLOW, -1, 0);
