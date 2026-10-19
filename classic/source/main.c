@@ -1489,7 +1489,8 @@ static int dcb_mem_ok(uintptr_t a, size_t n)
 
 static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
 {
-    if (index < 16u) __atomic_store_n(&g_sub_t[index], sceKernelGetProcessTime(), __ATOMIC_RELEASE);
+    uint64_t t_hook_in = sceKernelGetProcessTime();
+    if (index < 16u) __atomic_store_n(&g_sub_t[index], t_hook_in, __ATOMIC_RELEASE);
     uint64_t prev_flip_t = g_last;
     g_flips++;
     if (g_flips == 1) lg("first SubmitAndFlip: count=%u flipMode=%u title=%s\n", count, flipMode, g_title_id);
@@ -1823,9 +1824,11 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                 }
                 if (g_flips == INJECT_AFTER_FLIPS || (g_flips % 600) == 0)
                     lg("inject #%u: count %u->%u, our DCB %u dw, out buf[%u]=%llx\n", g_flips, count, ncount, n, index, (unsigned long long)g_buf[index]);
+                uint64_t t_s1 = sceKernelGetProcessTime();
                 int32_t rc = HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
                                      int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
                                      ncount, d2, s2, ccb ? c2 : ccb, ccbSz ? cs2 : ccbSz, handle, flip_idx, flipMode, flipArg);
+                uint64_t t_s1e = sceKernelGetProcessTime(), t_hold = t_s1e, t_s2e = t_s1e;
                 if (third_flip) {
                     uint32_t *fb2 = (uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + SLOT_FB2_OFF);
                     for (int i = 0; i < 64; i++) fb2[i] = tail[i];
@@ -1837,6 +1840,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                 }
                 if (second_flip) {
                     if (hold_mid_us > 0) sceKernelUsleep(hold_mid_us);
+                    t_hold = sceKernelGetProcessTime();
                     uint32_t *fb = (uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0xE00);
                     for (int i = 0; i < 64; i++) fb[i] = tail[i];
                     void *d3[1] = { fb };
@@ -1844,6 +1848,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     int32_t r2 = HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
                                      int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
                                      1, d3, s3, NULL, NULL, handle, show_idx, flipMode, flipArg);
+                    t_s2e = sceKernelGetProcessTime();
                     if (g_flips < INJECT_AFTER_FLIPS + 12) lg("mode4 #%u: gnm flip(mid idx %u)=0x%08x, gnm flip(cur idx %u)=0x%08x\n", g_flips, flip_idx, (unsigned)rc, index, (unsigned)r2);
                 }
                 if (g_cfg.fps_lock == 20) pace_hz(20);
@@ -1856,6 +1861,19 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     last_show = shown;
                 }
                 else if (second_flip) pace_30();
+                if (second_flip) {   // where the game's thread spends its time inside this hook (FG frames)
+                    static uint64_t a_build, a_sub, a_hold, a_flip2, a_pace, a_n;
+                    uint64_t t_end = sceKernelGetProcessTime();
+                    a_build += t_s1 - t_hook_in; a_sub += t_s1e - t_s1; a_hold += t_hold - t_s1e; a_flip2 += t_s2e - t_hold;
+                    a_pace += t_end - t_s2e; a_n++;
+                    if (a_n >= 60) {
+                        double k = 1.0 / 1000.0 / (double)a_n;
+                        lg("HOOK ms per FG frame: build %.1f submit %.1f hold %.1f flip2 %.1f pace %.1f total %.1f | game own %.1f | pending %u\n",
+                           a_build * k, a_sub * k, a_hold * k, a_flip2 * k, a_pace * k, (a_build + a_sub + a_hold + a_flip2 + a_pace) * k,
+                           g_cpu_ema_us / 1000.0, __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE));
+                        a_build = a_sub = a_hold = a_flip2 = a_pace = a_n = 0;
+                    }
+                }
                 return rc;
             } else if (g_flips == INJECT_AFTER_FLIPS) {
                 snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: NO FLIP TAIL");
