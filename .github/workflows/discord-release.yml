@@ -1,0 +1,103 @@
+name: Announce release on Discord
+
+on:
+  release:
+    types: [published]
+
+# No checkout or GitHub API token is required.
+permissions: {}
+
+concurrency:
+  group: discord-release-${{ github.event.release.id }}
+  cancel-in-progress: false
+
+jobs:
+  announce:
+    if: github.repository == 'Melnikoff07/vcfg' && !github.event.release.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Publish version, release notes and download link
+        env:
+          DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          # Event fields are data, never interpolated into executable code.
+          with open(os.environ['GITHUB_EVENT_PATH'], encoding='utf-8') as stream:
+              event = json.load(stream)
+          release = event['release']
+          webhook = os.environ.get('DISCORD_RELEASE_WEBHOOK', '').strip()
+          parsed = urllib.parse.urlsplit(webhook)
+          if (parsed.scheme != 'https' or parsed.netloc != 'discord.com'
+                  or not re.fullmatch(r'/api/webhooks/[0-9]+/[A-Za-z0-9_-]+', parsed.path)
+                  or parsed.query or parsed.fragment):
+              sys.exit('DISCORD_RELEASE_WEBHOOK is missing or invalid. Configure the repository Actions secret.')
+
+          url = str(release.get('html_url', ''))
+          if not url.startswith('https://github.com/Melnikoff07/vcfg/releases/tag/'):
+              sys.exit('Unexpected release URL; refusing to publish.')
+          tag = str(release.get('tag_name') or 'New version')
+          kind = 'Pre-release' if release.get('prerelease') else 'Release'
+          title = ('VCFG ' + tag + ' - ' + kind)[:256]
+          notes = str(release.get('body') or '').strip()
+          if not notes:
+              notes = 'See the release page for details and installation instructions.'
+          if len(notes) > 3400:
+              notes = notes[:3300].rstrip() + '\n\n[Read the full changelog](' + url + ')'
+          description = '**What\'s new**\n' + notes
+          fields = [{'name': 'Download', 'value': '[Open release and download the files](' + url + ')'}]
+          packages = [asset for asset in release.get('assets', [])
+                      if str(asset.get('name', '')).lower().endswith('.pkg')]
+          if packages:
+              package_url = str(packages[0].get('browser_download_url', ''))
+              if package_url.startswith('https://github.com/Melnikoff07/vcfg/releases/download/'):
+                  fields.append({'name': 'Installer', 'value': '[Download PKG](' + package_url + ')'})
+          payload = {
+              'username': 'VCFG Releases',
+              'allowed_mentions': {'parse': []},
+              'embeds': [{
+                  'title': title,
+                  'url': url,
+                  'description': description,
+                  'color': 0xF1CE4B,
+                  'fields': fields,
+                  'footer': {'text': 'Melnikoff07/vcfg | Release ' + str(release['id'])},
+              }],
+          }
+          if release.get('published_at'):
+              payload['embeds'][0]['timestamp'] = release['published_at']
+          data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+          for attempt in range(5):
+              request = urllib.request.Request(
+                  webhook + '?wait=true', data=data, method='POST',
+                  headers={'Content-Type': 'application/json', 'User-Agent': 'VCFG-release-notifier/1.0'})
+              try:
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      result = json.load(response)
+                  print('Discord release announcement published. Message ID: ' + str(result['id']))
+                  break
+              except urllib.error.HTTPError as error:
+                  if error.code == 429 and attempt < 4:
+                      try:
+                          delay = float(json.load(error).get('retry_after', 1))
+                      except (ValueError, TypeError):
+                          sys.exit('Discord rate limit response could not be read.')
+                      if delay > 30:
+                          sys.exit('Discord rate limit is too long; retry the workflow later.')
+                      time.sleep(max(delay, 0.25))
+                      continue
+                  # Never log the request, secret URL, headers, or traceback.
+                  sys.exit('Discord rejected the announcement (HTTP ' + str(error.code) + ').')
+              except (urllib.error.URLError, TimeoutError, OSError):
+                  sys.exit('Discord delivery failed. Check the channel before rerunning to avoid duplicates.')
+          else:
+              sys.exit('Discord rate limit retry budget exhausted.')
