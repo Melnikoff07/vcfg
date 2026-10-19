@@ -1862,8 +1862,10 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
     if (attr && startIndex == 0) { g_handle = handle; g_attr = *attr; }
     if (attr) {
         g_bw = attr->width; g_bh = attr->height; g_pitch = attr->pitchInPixel;
-        // 1.4: Check pixel format compatibility (SDR 8-bit 8888 formats have low byte 0x00, e.g. 0x80000000 / 0x80002200)
-        g_fmt_supported = ((attr->format & 0xFFu) == 0u);
+        // Only 8-bit 8888 scanout formats (0x8000xxxx, e.g. 0x80000000 / 0x80002200). 10-bit HDR formats (0x88060000)
+        // also have a zero low byte and came out as noise. Sticky: if any registered buffer set is not 8888 (a second
+        // set for the UI, or HDR), the plugin leaves every frame alone (no FG, post or overlay).
+        if ((attr->format & 0xFFFF0000u) != 0x80000000u) g_fmt_supported = 0;
         lg("  attr: fmt=0x%x (supported=%d) tiling=%u aspect=%u %ux%u pitch=%u option=%u\n",
            attr->format, g_fmt_supported, attr->tilingMode, attr->aspectRatio, attr->width, attr->height, attr->pitchInPixel, attr->option);
     }
