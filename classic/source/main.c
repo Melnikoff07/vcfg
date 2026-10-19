@@ -291,6 +291,8 @@ static int g_ngame = 3;
 static void *g_pre_mem = NULL;
 static size_t g_pre_size = 0;
 
+#include "two_buffer_test.h"
+
 void *alloc_dm(size_t len, size_t align, int type);
 void *alloc_dm(size_t len, size_t align, int type)
 {
@@ -557,7 +559,7 @@ static uint32_t build_dcb_flow(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M,
     PASS_BARRIER();
     TS_EOP(3);
     if (fence) {
-        int32_t fr = sceGnmInsertWaitFlipDone(p, 7, vo_handle, mid_idx);
+        int32_t fr = insert_wait_flip_done(p, 7, vo_handle, mid_idx);
         if (fr != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
         if (!g_fence_logged) {
             g_fence_logged = 1;
@@ -854,7 +856,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     }
     TS_EOP(2);
     {
-        int32_t fr = sceGnmInsertWaitFlipDone(p, 7, vo_handle, mid1_idx);
+        int32_t fr = insert_wait_flip_done(p, 7, vo_handle, mid1_idx);
         if (fr != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
         if (!g_fence_logged) { g_fence_logged = 1; lg("fence (mode 8): 0x%08x\n", (unsigned)fr); }
         p += 7;
@@ -913,7 +915,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         calc_rcas_params(post_mid_only() ? 1u /*mid2 only*/ : 3u /*mid2 + cur*/, &rcas_con2, &rcas_flags2);
         fill_table8_ext(tb2, g_gpu, slotb, rcas_con2, rcas_flags2, osd_xy, osd_wh1 ? osd_wh2 : 0u);
 
-        int32_t fr2 = sceGnmInsertWaitFlipDone(p, 7, vo_handle, mid2_idx);
+        int32_t fr2 = insert_wait_flip_done(p, 7, vo_handle, mid2_idx);
         if (fr2 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
         p += 7;
 
@@ -955,7 +957,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         memset(tb3, 0, 0x60);
         make_t(tb3 + 8, C, 1920, 1080, pitch, tidx);
         make_t(tb3 + 16, copy_dst, 1920, 1080, pitch, tidx);
-        int32_t fr3 = sceGnmInsertWaitFlipDone(p, 7, vo_handle, copy_idx);
+        int32_t fr3 = insert_wait_flip_done(p, 7, vo_handle, copy_idx);
         if (fr3 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
         p += 7;
         PASS_BARRIER();
@@ -1308,7 +1310,7 @@ static void *mon_thread(void *arg)
         if (g_handle < 0) continue;
         memset(&fs, 0, sizeof(fs));
         memset(&vs, 0, sizeof(vs));
-        if (sceVideoOutGetFlipStatus(g_handle, &fs) != 0) continue;
+        if (read_flip_status(g_handle, &fs) != 0) continue;
         sceVideoOutGetVblankStatus(g_handle, &vs);
         __atomic_store_n(&g_cur_pending_flips, (uint32_t)(fs.flipPendingNum > 0 ? fs.flipPendingNum : 0), __ATOMIC_RELEASE);
         __atomic_store_n(&g_cur_gcq, (uint32_t)(fs.gcQueueNum > 0 ? fs.gcQueueNum : 0), __ATOMIC_RELEASE);
@@ -1386,6 +1388,13 @@ static void *mon_thread(void *arg)
                hz, pend_max, gcq_max, g_mon_missed, g_mon_gaps, g_pace_timeouts, g_pace_resync, g_pace_fix,
                cn_ ? csum_ / 1000.0 / cn_ : 0.0, cmax_ / 1000.0);
             memset(g_hist, 0, sizeof(g_hist));
+            // Keep the CPU measurement visible in the 200-byte flight-recorder rows.
+            if (tb_title()) {
+                lg("CPU release->submit avg %.1f max %.1f ms | test=%d FG=%d pcopy=%d preset=%d\n",
+                   cn_ ? csum_ / 1000.0 / cn_ : 0.0, cmax_ / 1000.0,
+                   VCFG_2BUF_TEST, !g_fg_off, g_pcopy_on, g_cfg.preset);
+                tb_report();
+            }
             pend_max = gcq_max = 0;
             g_mon_missed = g_pace_timeouts = g_pace_resync = g_pace_fix = g_mon_gaps = 0;
             win_t = vs.processTime;
@@ -1451,7 +1460,7 @@ static void pace_vblank(int prev2_real, int prev_real, int cur_real)
     if (distinct_ok) {
         VoFlipStatus fs;
         memset(&fs, 0, sizeof(fs));
-        if (sceVideoOutGetFlipStatus(g_handle, &fs) == 0) {
+        if (read_flip_status(g_handle, &fs) == 0) {
             int late = fs.currentBuffer == cur_real ||
                        (g_opt_early && fs.currentBuffer >= g_mbase && g_last_real_buf == prev_real);
             if (late) { g_pace_off--; g_pace_fix++; }
@@ -1575,7 +1584,10 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
     if (index < 16u) __atomic_store_n(&g_sub_t[index], t_hook_in, __ATOMIC_RELEASE);
     uint64_t prev_flip_t = g_last;
     g_flips++;
-    if (g_flips == 1) lg("first SubmitAndFlip: count=%u flipMode=%u title=%s\n", count, flipMode, g_title_id);
+    if (g_flips == 1) {
+        lg("first SubmitAndFlip: count=%u flipMode=%u title=%s\n", count, flipMode, g_title_id);
+        lg("CLASSIC_BUILD version=%s test=%d target=%d\n", VCFG_TRACE_VERSION, VCFG_2BUF_TEST, tb_title());
+    }
     if (g_rel_t) {
         uint64_t us = sceKernelGetProcessTime() - g_rel_t;
         g_rel_t = 0;
@@ -1741,11 +1753,17 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     g_pcopy_on = pcopy;
                     uint32_t mi1 = pcopy ? (uint32_t)g_mbase + (g_flips % (uint32_t)g_pcopy_k) : (uint32_t)g_mbase + (g_flips % (uint32_t)g_nmid);
                     uint32_t mi2 = (uint32_t)g_mbase + ((g_flips + 1u) % (uint32_t)g_nmid);
+                    int tb_fast = VCFG_2BUF_TEST == 3 && tb_title() && pcopy && !g_fg_off;
+                    static uint32_t tb_mid_cursor;
+                    if (tb_fast) {
+                        mi1 = tb_mid_index((uint32_t)g_mbase, (uint32_t)g_pcopy_k, tb_mid_cursor, 0);
+                        mi2 = tb_mid_index((uint32_t)g_mbase, (uint32_t)g_pcopy_k, tb_mid_cursor, 1);
+                    }
                     uint32_t t1_q16 = 32768u, t2_q16 = 43690u;
                     int two_mids = 0;
                     int force_repeat = (raw_dt_us > 66667ull) ? 1 : 0; // >66.7 ms (<15 fps hitch) -> repeat frame
 
-                    if (g_cfg.preset == 1 && !g_fg_off) {
+                    if ((g_cfg.preset == 1 || tb_fast) && !g_fg_off) {
                         // 1.1 FG Fast (aggressive 60 Hz output target for 20..40 fps):
                         if (force_repeat) {
                             g_fast_acc_q16 = 0;
@@ -1774,7 +1792,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                                 if (p2 < 38010) p2 = 38010; if (p2 > 49152) p2 = 49152;
                                 t1_q16 = (uint32_t)p1;
                                 t2_q16 = (uint32_t)p2;
-                                if (g_nmid >= 2 && mi1 != mi2) {
+                                if ((tb_fast ? g_pcopy_k : g_nmid) >= 2 && mi1 != mi2) {
                                     two_mids = 1;
                                     mid2_flip_idx = mi2;
                                     third_flip = 1;
@@ -1820,9 +1838,15 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                         static uint32_t pc_flip;
                         pc_flip = (pc_flip + 1u) % (uint32_t)g_pcopy_k;
                         ci = (uint32_t)g_mbase + (uint32_t)g_pcopy_k + pc_flip;
-                        two_mids = 0; third_flip = 0;      // FAST 3-step needs a second mid buffer: not with present copy
+                        if (!tb_fast) { two_mids = 0; third_flip = 0; }   // FAST 3-step needs a second mid buffer: only the test-3 pulldown keeps it
                         show_idx = ci;
                         if (index < 16u && ci < 16u) __atomic_store_n(&g_sub_t[ci], __atomic_load_n(&g_sub_t[index], __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+                    }
+                    if (tb_fast) {
+                        tb_mid_cursor = (tb_mid_cursor + (two_mids ? 2u : 1u)) % (uint32_t)g_pcopy_k;
+                        if ((g_flips % 60u) == 0)
+                            lg("PULLDOWN dt_us=%u mids=%d mi1=%u mi2=%u copy=%u pending=%u\n", g_ema_frame_us,
+                               two_mids ? 2 : 1, mi1, mi2, ci, __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE));
                     }
                     n = build_dcb_flow8(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi1], g_buf[mi2], g_pitch,
                                         tidx, px * 4, slot, g_flips, tail, (int32_t)handle, mi1, mi2,
@@ -1927,9 +1951,18 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     for (int i = 0; i < 64; i++) fb[i] = tail[i];
                     void *d3[1] = { fb };
                     uint32_t s3[1] = { 64 * 4 };
+                    // Experiment 2: the first mid keeps the game's opaque argument;
+                    // tag only the real copy. This does not virtualize status or labels.
+                    int64_t real_arg = flipArg;
+                    if (VCFG_2BUF_TEST == 2 && tb_title() && g_pcopy_on && show_idx != index) {
+                        real_arg = tb_tag_real_arg(flipArg);
+                        if (g_flips < INJECT_AFTER_FLIPS + 5)
+                            lg("FLIP_ARGS mid=%lld real=%lld mid_buf=%u real_buf=%u\n", (long long)flipArg,
+                               (long long)real_arg, flip_idx, show_idx);
+                    }
                     int32_t r2 = HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
                                      int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
-                                     1, d3, s3, NULL, NULL, handle, show_idx, flipMode, flipArg);
+                                     1, d3, s3, NULL, NULL, handle, show_idx, flipMode, real_arg);
                     t_s2e = sceKernelGetProcessTime();
                     if (g_flips < INJECT_AFTER_FLIPS + 12) lg("mode4 #%u: gnm flip(mid idx %u)=0x%08x, gnm flip(cur idx %u)=0x%08x\n", g_flips, flip_idx, (unsigned)rc, index, (unsigned)r2);
                 }
@@ -2497,6 +2530,14 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         klog("[bb_probe] inert: process title_id='%s' is not a CUSA game -> skipping hooks and allocations\n", g_title_id);
         return 0;
     }
+#if VCFG_2BUF_TEST
+    if (tb_title()) {
+        HOOK32(sceVideoOutGetFlipStatus);
+        HOOK32(sceVideoOutAddFlipEvent);
+        HOOK32(sceGnmInsertWaitFlipDone);
+        g_tb_hooks = 1;
+    }
+#endif
     {
         int m = read_mode_raw();
         if (m == 8) gv_load(alloc_dm);
@@ -2547,6 +2588,13 @@ s32 attr_public plugin_unload(s32 argc, const char *argv[])
 {
     (void)argc; (void)argv;
     if (!g_is_game_proc) return 0;
+#if VCFG_2BUF_TEST
+    if (g_tb_hooks) {
+        UNHOOK(sceVideoOutGetFlipStatus);
+        UNHOOK(sceVideoOutAddFlipEvent);
+        UNHOOK(sceGnmInsertWaitFlipDone);
+    }
+#endif
     UNHOOK(sceGnmSubmitAndFlipCommandBuffers);
     UNHOOK(sceVideoOutRegisterBuffers);
     UNHOOK(sceVideoOutSetFlipRate);
