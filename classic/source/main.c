@@ -99,7 +99,9 @@ int32_t sceGnmSubmitAndFlipCommandBuffersForWorkload(uint32_t workload, uint32_t
 int32_t sceVideoOutRegisterBuffers(int32_t handle, int32_t startIndex, void *const *addresses, int32_t bufferNum, const VoAttr *attr);
 int32_t sceVideoOutSetFlipRate(int32_t handle, int32_t rate);
 int32_t sceKernelAllocateDirectMemory(long searchStart, long searchEnd, size_t length, size_t alignment, int type, long *physAddrOut);
+int32_t sceKernelReleaseDirectMemory(long start, size_t len);
 int32_t sceKernelMapDirectMemory(void **addr, size_t length, int prot, int flags, long directMemoryStart, size_t maxPageSize);
+int32_t sceKernelMapNamedDirectMemory(void **addr, size_t length, int prot, int flags, long directMemoryStart, size_t maxPageSize, const char *name);
 size_t sceKernelGetDirectMemorySize(void);
 int32_t sceVideoOutSubmitFlip(int32_t handle, int32_t index, uint32_t mode, int64_t arg);
 int32_t sceKernelUsleep(uint32_t usec);
@@ -259,8 +261,10 @@ static int g_inject_on = 0;
 static int g_gpu_state = 0; // 0 untried, 1 ok, -1 failed
 
 static void *g_pre_gpu = NULL, *g_pre_work = NULL;
-#define WORK_SZ 0x220000u
-_Static_assert(W8_END <= WORK_SZ, "mode 8 work memory layout does not fit WORK_SZ");
+#define WORK_SZ   0x220000u
+#define WORK_SZ_8 0x190000u
+_Static_assert(W8_END <= WORK_SZ_8, "mode 8 work memory layout does not fit WORK_SZ_8");
+_Static_assert(WORK_SZ_8 <= WORK_SZ, "WORK_SZ_8 must not exceed WORK_SZ");
 _Static_assert(DCB8_OFF + 4 * DCB8_SZ <= GPU_SZ, "mode 8 DCB areas do not fit GPU_SZ");
 
 #define MON_OFF 0xE00u
@@ -303,43 +307,106 @@ static int g_ngame = 3;
 // same buffers again as further groups (0-1, 2-3, 4-5: seen on a 2-buffer title that then flips any of them).
 static int g_game_idx_hi = 0;
 static void *g_pre_mem = NULL;
-static size_t g_pre_size = 0;
+static size_t g_pre_size = 0, g_pre_work_sz = 0;
+static long g_pre_gpu_phys = 0, g_pre_work_phys = 0, g_pre_mem_phys = 0, g_dump_phys = 0;
 
 #include "two_buffer_test.h"
 #include "bench_state.h"
 #include "boot_stage.h"
+
+static void free_dm_block(void **va, long *phys, size_t *sz, const char *tag)
+{
+    if (!*va || !*sz) return;
+    int um = sceKernelMunmap(*va, *sz);
+    int rr = um == 0 ? sceKernelReleaseDirectMemory(*phys, *sz) : -1;
+    STAGE("memory valve: released %s va=%p phys=0x%lx len=0x%zx unmap=0x%08x release=0x%08x",
+          tag, *va, *phys, *sz, (unsigned)um, (unsigned)rr);
+    *va = NULL;
+    *phys = 0;
+    *sz = 0;
+}
+static void release_early_dump(void)
+{
+    size_t sz = g_dump_mem ? (size_t)DUMP_SZ : 0;
+    void *va = g_dump_mem;
+    free_dm_block(&va, &g_dump_phys, &sz, "dump");
+    g_dump_mem = NULL;
+}
+static void release_early_mem(void)
+{
+    free_dm_block(&g_pre_mem, &g_pre_mem_phys, &g_pre_size, "display");
+}
+static void release_early_work(void)
+{
+    free_dm_block(&g_pre_work, &g_pre_work_phys, &g_pre_work_sz, "work");
+    g_work_garlic = 0;
+}
+static void release_early_gpu(void)
+{
+    size_t sz = g_pre_gpu ? (size_t)g_gpu_sz : 0;
+    free_dm_block(&g_pre_gpu, &g_pre_gpu_phys, &sz, "gpu");
+}
+
 #include "debug_hooks.h"
 
 // Largest free direct-memory range for an alignment, for the logs: a refused allocation is a refused request (length,
 // alignment, type), not proof that no memory is left. OpenOrbis declares this call with by-value outputs, hence the cast.
 static size_t dm_avail(size_t align)
 {
-    off_t start = 0; size_t size = 0;
-    int r = ((int32_t (*)(off_t, off_t, size_t, off_t *, size_t *))(void *)sceKernelAvailableDirectMemorySize)(
-        0, (off_t)sceKernelGetDirectMemorySize(), align, &start, &size);
-    return r == 0 ? size : 0;
+    return dm_avail_range(0, (long)sceKernelGetDirectMemorySize(), align, NULL);
+}
+
+static void *alloc_dm_range(long s, long e, size_t len, size_t align, int type, long *phys_out)
+{
+    long phys = 0; void *addr = NULL;
+    g_own_alloc++;
+    int r = sceKernelAllocateDirectMemory(s, e, len, align, type, &phys);
+    int stage = r == 0 ? 2 : 1;
+    if (r == 0) r = sceKernelMapDirectMemory(&addr, len, 0x33 /*CPU rw + GPU rw*/, 0, phys, align);
+    g_own_alloc--;
+    if (r != 0 || !addr) {
+        if (stage == 2) sceKernelReleaseDirectMemory(phys, len);
+        size_t av = dm_avail(align);
+        klog("[bb_probe] alloc_dm(0x%zx) failed 0x%08x\n", len, (unsigned)r);
+        STAGE("alloc_dm FAILED at %s: len=0x%zx align=0x%zx type=%d range=0x%lx..0x%lx r=0x%08x largest free=0x%zx",
+              stage == 1 ? "allocate" : "map", len, align, type, s, e, (unsigned)r, av);
+        return NULL;
+    }
+    if (phys_out) *phys_out = phys;
+    STAGE("alloc_dm ok: len=0x%zx align=0x%zx type=%d range=0x%lx..0x%lx phys=0x%lx va=%p", len, align, type, s, e, phys, addr);
+    memset(addr, 0, len);
+    return addr;
 }
 
 void *alloc_dm(size_t len, size_t align, int type);
 void *alloc_dm(size_t len, size_t align, int type)
 {
-    long phys = 0; void *addr = NULL;
-    size_t total = sceKernelGetDirectMemorySize();
-    g_own_alloc++;
-    int r = sceKernelAllocateDirectMemory(0, (long)total, len, align, type, &phys);
-    g_own_alloc--;
-    int stage = r == 0 ? 2 : 1;
-    if (r == 0) r = sceKernelMapDirectMemory(&addr, len, 0x33 /*CPU rw + GPU rw*/, 0, phys, align);
-    if (r != 0 || !addr) {
-        size_t av = dm_avail(align);
-        klog("[bb_probe] alloc_dm(0x%zx) failed 0x%08x\n", len, (unsigned)r);
-        STAGE("alloc_dm FAILED at %s: len=0x%zx align=0x%zx type=%d range=0..0x%zx r=0x%08x largest free=0x%zx",
-              stage == 1 ? "allocate" : "map", len, align, type, total, (unsigned)r, av);
-        return NULL;
+    return alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), len, align, type, NULL);
+}
+
+static void *alloc_work_early(size_t wsz, int type)
+{
+    size_t dm_sz = sceKernelGetDirectMemorySize();
+    // 1. If g_pre_gpu sits in a partially used 2MB page whose tail >= wsz (e.g. CUSA00918, CUSA11456), place work
+    //    right after g_pre_gpu so it costs zero 2MB-aligned pages.
+    if (g_pre_gpu && g_pre_gpu_phys >= 0) {
+        long end_gpu = g_pre_gpu_phys + (long)g_gpu_sz;
+        long next_2mb = (end_gpu + 0x1FFFFFL) & ~0x1FFFFFL;
+        if (next_2mb - end_gpu >= (long)wsz) {
+            void *w = alloc_dm_range(end_gpu, next_2mb, wsz, 0x10000, type, &g_pre_work_phys);
+            if (w) { g_pre_work_sz = wsz; return w; }
+        }
     }
-    STAGE("alloc_dm ok: len=0x%zx align=0x%zx type=%d phys=0x%lx va=%p", len, align, type, phys, addr);
-    memset(addr, 0, len);
-    return addr;
+    // 2. Otherwise, if g_pre_mem was placed at the top of the pool (e.g. CUSA17419), place work right below g_pre_mem
+    //    at the top so the game's contiguous arena from 0 upward is not fragmented at its start.
+    if (g_pre_mem && g_pre_mem_phys >= 0x200000L) {
+        void *w = alloc_dm_range(g_pre_mem_phys - 0x200000L, g_pre_mem_phys, wsz, 0x10000, type, &g_pre_work_phys);
+        if (w) { g_pre_work_sz = wsz; return w; }
+    }
+    // 3. Fallback: anywhere in the pool.
+    void *w = alloc_dm_range(0, (long)dm_sz, wsz, 0x10000, type, &g_pre_work_phys);
+    if (w) g_pre_work_sz = wsz;
+    return w;
 }
 
 static void gpu_init(void)
@@ -426,7 +493,7 @@ static void gpu_init(void)
             }
         }
     }
-    g_work = (uint8_t *)(g_pre_work ? g_pre_work : alloc_dm(WORK_SZ, 0x10000, 0));
+    g_work = (uint8_t *)(g_pre_work ? g_pre_work : alloc_dm(g_inject_on == 8 ? WORK_SZ_8 : WORK_SZ, 0x10000, 0));
     if (!g_work) lg("gpu_init: work memory unavailable, mode 6 disabled\n");
     g_mon = (volatile uint32_t *)((uint8_t *)addr + MON_OFF);
     g_gpu = (uint8_t *)addr;
@@ -1177,8 +1244,8 @@ static void *alloc_mbufs(size_t total)
     size_t range = sceKernelGetDirectMemorySize();
     g_own_alloc++;
     int r = sceKernelAllocateDirectMemory(0, (long)range, total, 0x200000, 3 /*WC_GARLIC*/, &phys);
-    g_own_alloc--;
     if (r != 0) {
+        g_own_alloc--;
         size_t av = dm_avail(0x200000);
         lg("mbufs: AllocateDirectMemory = 0x%08x (len 0x%zx align 0x200000 type 3 range 0..0x%zx, largest free 0x%zx)\n",
            (unsigned)r, total, range, av);
@@ -1188,10 +1255,13 @@ static void *alloc_mbufs(size_t total)
     }
     r = sceKernelMapDirectMemory(&addr, total, 0x33, 0, phys, 0x200000);
     if (r != 0 || !addr) {
+        sceKernelReleaseDirectMemory(phys, total);
+        g_own_alloc--;
         lg("mbufs: MapDirectMemory = 0x%08x (len 0x%zx phys 0x%lx)\n", (unsigned)r, total, phys);
         STAGE("mbufs map FAILED: len=0x%zx phys=0x%lx r=0x%08x", total, phys, (unsigned)r);
         return NULL;
     }
+    g_own_alloc--;
     STAGE("mbufs ok: len=0x%zx phys=0x%lx va=%p", total, phys, addr);
     memset(addr, 0, total);
     return addr;
@@ -1273,6 +1343,9 @@ static void safe_refuse(const char *why)
     snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: SAFE %s", why);
     STAGE("safe mode frame %u: refused (%s) -> the game stays native", g_flips, why);
     lg("safe mode: refused at frame %u (%s)\n", g_flips, why);
+    release_early_mem();
+    release_early_work();
+    release_early_gpu();
     if (!strncmp(why, "NO ", 3) && strstr(why, "MEM")) {   // no free memory late: next start takes it early
         safe_state_write(1);
         STAGE("safe mode: state saved -> the next start takes its memory early (a start that does not reach frame %d is then given up)", INJECT_AFTER_FLIPS);
@@ -1303,29 +1376,46 @@ static void safe_try_activate(uint32_t handle)
           g_title_id, g_bw, g_bh, g_attr.format, g_ngame, g_game_idx_hi, g_detected_60fps, g_dbg_alloc_fail);
     STAGE("safe mode frame %u: free direct memory: largest block for align 0x10000 = 0x%zx, 0x200000 = 0x%zx (pool 0x%zx)", g_flips,
           dm_avail(0x10000), dm_avail(0x200000), (size_t)sceKernelGetDirectMemorySize());
-    if (g_fg_off && !g_cfg.upscale && !g_cfg.overlay) { STAGE("safe mode: FG, Enhance and overlay all off -> nothing to set up"); return; }
+    if (g_fg_off && !g_cfg.upscale && !g_cfg.overlay) {
+        STAGE("safe mode: FG, Enhance and overlay all off -> nothing to set up");
+        release_early_mem(); release_early_work(); release_early_gpu();
+        return;
+    }
     if (!g_fmt_supported) { char w[24]; snprintf(w, sizeof(w), "FMT 0x%x", g_attr.format); safe_refuse(w); return; }
     if (!fg_res_supported(g_bw, g_bh)) { char w[24]; snprintf(w, sizeof(w), "RES %ux%u", g_bw, g_bh); safe_refuse(w); return; }
     if (g_ngame < 2 || g_ngame > 8) { safe_refuse("BUFFERS"); return; }
     if (g_dbg_alloc_fail) { safe_refuse("GAME ALLOC FAILS"); return; }
-    if (g_detected_60fps && g_cfg.fps_lock != 30) { snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)"); return; }
+    if (g_detected_60fps && g_cfg.fps_lock != 30) {
+        snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)");
+        release_early_mem(); release_early_work(); release_early_gpu();
+        return;
+    }
     size_t one = safe_surface_stride();
     if (!one) { safe_refuse("SURFACE SIZE"); return; }
     int hi = g_game_idx_hi > g_ngame ? g_game_idx_hi : g_ngame;
     int want = g_ngame == 2 ? 6 : 3;
     if (want > 16 - hi) want = 16 - hi;
     if (want < 1) { safe_refuse("NO INDICES"); return; }
-    // gpu + work first (they decide whether FG can run at all), display buffers last
+    // Use early pre-reserved buffers if they survived boot; otherwise try late allocation.
     g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
-    g_pre_gpu = alloc_dm(g_gpu_sz, g_gpu_sz, 0);
+    if (!g_pre_gpu) g_pre_gpu = alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
     if (!g_pre_gpu) { safe_refuse("NO GPU MEM"); return; }
-    g_pre_work = alloc_dm(WORK_SZ, 0x10000, 3);
-    g_work_garlic = g_pre_work != NULL;
-    if (!g_pre_work) g_pre_work = alloc_dm(WORK_SZ, 0x10000, 0);
+    if (!g_pre_work) {
+        g_pre_work = alloc_work_early(WORK_SZ_8, 3);
+        g_work_garlic = g_pre_work != NULL;
+    }
+    if (!g_pre_work) g_pre_work = alloc_work_early(WORK_SZ_8, 0);
     if (!g_pre_work) { safe_refuse("NO WORK MEM"); return; }
     uint8_t *m = NULL; int nm = 0;
+    if (g_pre_mem && g_pre_size >= one) {
+        m = (uint8_t *)g_pre_mem;
+        nm = (int)(g_pre_size / one);
+        if (nm > want) nm = want;
+    }
     for (int n = want; !m && n >= 1; n = (n == 6 ? 4 : n - 1)) {   // 6, 4, 3, 2, 1
-        m = (uint8_t *)alloc_mbufs((one * (size_t)n + 0x1FFFFFu) & ~(size_t)0x1FFFFFu);
+        size_t need = (one * (size_t)n + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
+        if (n > 1 && dm_avail(0x200000) < need + (128ull << 20)) continue;
+        m = (uint8_t *)alloc_mbufs(need);
         if (m) nm = n;
     }
     if (!m) { safe_refuse("NO DISPLAY MEM"); return; }
@@ -2334,6 +2424,8 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
     if (!g_in_submit) {
         uint32_t vf = ++g_vo_submit_flips;
         if (vf == INJECT_AFTER_FLIPS && g_flips == 0) {
+            if (g_safe_early) { safe_marker(2); STAGE("safe mode: VideoOut-flip title reached flip %d -> marker removed", INJECT_AFTER_FLIPS); }
+            if (g_safe) { release_early_mem(); release_early_work(); release_early_gpu(); }
             snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: VOUT FLIP API");
             mon_start();
             lg("inert: game flips via sceVideoOutSubmitFlip (%u flips, 0 gnm flips)\n", vf);
@@ -2435,11 +2527,13 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 if (m) nm = want;
             }
             // Double-buffered game: one mid buffer + two present-copy buffers (more memory taken here, outside the
-            // early block, only for such games).
+            // early block, only when >= 128 MB of 2MB-aligned DirectMemory remains free for the game after m2).
             uint8_t *m2 = NULL; int nm2 = 0;
             for (int want = 6; g_ngame == 2 && m && !m2 && want >= 4; want -= 2) {
                 if (nm >= want) break;
-                m2 = (uint8_t *)alloc_mbufs((one * (size_t)(want - nm) + 0x1FFFFFu) & ~(size_t)0x1FFFFFu);
+                size_t need2 = (one * (size_t)(want - nm) + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
+                if (dm_avail(0x200000) < need2 + (128ull << 20)) continue;
+                m2 = (uint8_t *)alloc_mbufs(need2);
                 if (m2) nm2 = want - nm;
             }
             g_nmid = nm > 0 ? nm : 1;
@@ -2863,53 +2957,81 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         g_safe = !g_bench_enabled && !is_verified_title();
         if (g_safe) {   // what an earlier start of this title taught us (see safe_state_read)
             int st = safe_state_read();
-            if (st == 1 && safe_marker(0)) {
+            if (safe_marker(0)) {
+                safe_marker(2);
                 safe_state_write(2); st = 2;
-                STAGE("safe mode: the early start before did not reach frame %d -> this title is only observed from now on", INJECT_AFTER_FLIPS);
+                STAGE("safe mode: the previous start did not reach frame %d -> this title is only observed from now on", INJECT_AFTER_FLIPS);
             }
-            if (st == 2) g_safe_never = 1;
-            else if (st == 1) {
-                g_safe = 0; g_safe_early = 1; safe_marker(1);
-                STAGE("safe mode: an earlier start found no free memory late -> this start takes its memory early (marker set, removed at frame %d)", INJECT_AFTER_FLIPS);
+            if (st == 2) {
+                g_safe_never = 1;
+                m = 0;
+                STAGE("safe mode: title %s is in passive state=2 -> no early memory, hooks only observe", g_title_id);
+            } else {
+                g_safe_early = 1; safe_marker(1);
+                STAGE("safe mode: title %s pre-reserves compact FG memory with Memory Valve + Arena Shaving active (RegisterBuffers/SetFlipRate deferred to frame %d)",
+                      g_title_id, INJECT_AFTER_FLIPS);
             }
         }
-        if (g_safe) { STAGE("safe mode: title %s is not verified -> no early memory, hooks only observe until frame %d", g_title_id, INJECT_AFTER_FLIPS); m = 0; }
         if (m == 8 && !g_bench_enabled) gv_load(alloc_dm);
         if (m >= 1 && m <= 8) {
             g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
             STAGE("alloc gpu sz=0x%zx (mode %d)", (size_t)g_gpu_sz, m);
-            g_pre_gpu = alloc_dm(g_gpu_sz, g_gpu_sz, 0);
+            g_pre_gpu = alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
             STAGE("alloc gpu -> %p", g_pre_gpu);
-            { int ff = file_flags(); if (!g_bench_enabled && ff > 0 && (ff & 16)) { g_dump_mem = (uint8_t *)alloc_dm(DUMP_SZ, 0x10000, 0); klog("[bb_probe] dump memory: %p\n", (void *)g_dump_mem); } }
-            if (m == 8) {
-                STAGE("alloc work sz=0x%zx garlic", (size_t)WORK_SZ);
-                g_pre_work = alloc_dm(WORK_SZ, 0x10000, 3);
-                g_work_garlic = g_pre_work != NULL;
+            {
+                int ff = file_flags();
+                if (!g_bench_enabled && ff > 0 && (ff & 16)) {
+                    g_dump_mem = (uint8_t *)alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), DUMP_SZ, 0x10000, 0, &g_dump_phys);
+                    klog("[bb_probe] dump memory: %p\n", (void *)g_dump_mem);
+                }
             }
-            if (!g_pre_work && m >= 6) g_pre_work = alloc_dm(WORK_SZ, 0x10000, 0);
-            STAGE("alloc work -> %p garlic=%d", g_pre_work, (int)g_work_garlic);
-            klog("[bb_probe] early gpu/work memory: %p / %p\n", g_pre_gpu, g_pre_work);
         }
 #if VCFG_BENCH
         // capture memory (~50 MB) is taken later, from bench_flip once the game runs: taking it here crashed the game (run d, 2026-10-20)
 #endif
         if ((m == 4 || m >= 6) && !g_bench_enabled) {
-            // Try 16 MB first (2 mid buffers at 1080p for FG Fast 3-step pulldown), fall back to 8 MB (1 mid buffer)
-            // CUSA00207 (SIGSEGV in the game right after plugin_load with 16 MB taken) and other tight games: 8 MB unless FG Fast asked for 2 mid buffers
+            // Try 16 MB first when FG Fast asked for 2 mid buffers, else 8 MB (1 mid buffer).
+            // Place at the top of the DirectMemory pool so the game's lowest-first arena remains contiguous from 0 upward.
+            size_t dm_sz = sceKernelGetDirectMemorySize();
             const size_t try_sz[2] = { g_cfg.preset == 1 ? 0x1000000u : 0x800000u, 0x800000u };
             int r = -1;
             for (int ti = 0; ti < 2 && !g_pre_mem; ti++) {
-                long phys = 0; void *addr = NULL;
                 size_t total = try_sz[ti];
-                g_own_alloc++;
-                r = sceKernelAllocateDirectMemory(0, (long)sceKernelGetDirectMemorySize(), total, 0x200000, 3 /*WC_GARLIC*/, &phys);
-                g_own_alloc--;
-                if (r == 0) r = sceKernelMapDirectMemory(&addr, total, 0x33, 0, phys, 0x200000);
-                if (r == 0 && addr) { memset(addr, 0, total); g_pre_mem = addr; g_pre_size = total; }
-                STAGE("early display memory try %d: len=0x%zx align=0x200000 type=3 r=0x%08x%s", ti + 1, total, (unsigned)r,
-                      g_pre_mem ? " ok" : "");
+                if (ti > 0 && total == try_sz[0]) continue;
+                long hi_s = dm_sz > total ? (long)(dm_sz - total) : 0;
+                for (int hi = (hi_s > 0 ? 1 : 0); hi >= 0 && !g_pre_mem; hi--) {
+                    long phys = 0; void *addr = NULL;
+                    long s = hi ? hi_s : 0;
+                    g_own_alloc++;
+                    r = sceKernelAllocateDirectMemory(s, (long)dm_sz, total, 0x200000, 3 /*WC_GARLIC*/, &phys);
+                    if (r == 0) {
+                        r = sceKernelMapDirectMemory(&addr, total, 0x33, 0, phys, 0x200000);
+                        if (r != 0 || !addr) sceKernelReleaseDirectMemory(phys, total);
+                    }
+                    g_own_alloc--;
+                    if (r == 0 && addr) {
+                        memset(addr, 0, total);
+                        g_pre_mem = addr;
+                        g_pre_size = total;
+                        g_pre_mem_phys = phys;
+                    }
+                    STAGE("early display memory try %d (%s): len=0x%zx align=0x200000 type=3 range=0x%lx..0x%zx r=0x%08x phys=0x%lx%s",
+                          ti + 1, hi ? "top" : "full", total, s, dm_sz, (unsigned)r, g_pre_mem ? phys : 0L,
+                          g_pre_mem ? " ok" : "");
+                }
             }
             klog("[bb_probe] early display-buffer memory: %s (size=0x%zx, r=0x%08x)\n", g_pre_mem ? "ok" : "FAILED", g_pre_size, (unsigned)r);
+        }
+        if (m >= 6) {
+            size_t wsz = (m == 8) ? WORK_SZ_8 : WORK_SZ;
+            if (m == 8) {
+                STAGE("alloc work sz=0x%zx garlic", wsz);
+                g_pre_work = alloc_work_early(wsz, 3);
+                g_work_garlic = g_pre_work != NULL;
+            }
+            if (!g_pre_work) g_pre_work = alloc_work_early(wsz, 0);
+            STAGE("alloc work -> %p garlic=%d", g_pre_work, (int)g_work_garlic);
+            klog("[bb_probe] early gpu/work memory: %p / %p\n", g_pre_gpu, g_pre_work);
         }
     }
     STAGE("hooking");
