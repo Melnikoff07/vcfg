@@ -2220,6 +2220,8 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                          count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
 }
 
+#include "vout_trace.h"
+
 int32_t sceGnmSubmitAndFlipCommandBuffers_hook(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
 {
     void *gd[GV_MAXE]; uint32_t gs[GV_MAXE]; void *gc[GV_MAXE]; uint32_t gcs[GV_MAXE];
@@ -2241,6 +2243,8 @@ int32_t sceGnmSubmitCommandBuffers_hook(uint32_t count, void *dcb[], uint32_t *d
 {
     void *gd[GV_MAXE]; uint32_t gs[GV_MAXE]; void *gc[GV_MAXE]; uint32_t gcs[GV_MAXE];
     uint32_t gn = gv_rewrite(count, dcb, dcbSz, ccb, ccbSz, gd, gs, gc, gcs, 0);
+    if (g_vt_on && count >= 1 && count <= 16 && dcb && dcbSz)
+        vt_rec(VT_SUBMIT, count, dcbSz[count - 1], ccbSz ? ccbSz[count - 1] : 0, (uint32_t)(uintptr_t)dcb[count - 1], (const uint32_t *)dcb[count - 1], dcbSz[count - 1]);
     int32_t rc;
     g_in_submit++;
     if (gn)
@@ -2288,7 +2292,13 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
             lg("inert: game flips via sceVideoOutSubmitFlip (%u flips, 0 gnm flips)\n", vf);
         }
     }
-    return HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t), handle, index, mode, arg);
+    if (g_vt_hooked && !g_in_submit) {
+        if (g_vo_submit_flips >= VT_START_FLIP && !g_vt_dumped) g_vt_on = 1;
+        vt_rec(VT_FLIP, (uint32_t)index, mode, (uint32_t)arg, (uint32_t)handle, NULL, 0);
+    }
+    int32_t vr = HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t), handle, index, mode, arg);
+    if (g_vt_hooked && g_vt_n >= VT_N) vt_dump();
+    return vr;
 }
 
 int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void *const *addresses, int32_t bufferNum, const VoAttr *attr)
@@ -2759,7 +2769,7 @@ int32_t sceVideoOutSetFlipRate_hook(int32_t handle, int32_t rate)
     if (g_bench_enabled) return HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), handle, rate);
     int m_raw = read_mode_raw();
     int want4 = (m_raw == 4 || m_raw == 6 || m_raw == 7 || m_raw == 8);
-    lg("SetFlipRate handle=%d rate=%d%s\n", handle, rate, want4 ? " -> forced 0 (mode 4/8: 60 Hz output, we pace the game ourselves)" : "");
+    lg("SetFlipRate handle=%d rate=%d%s\n", handle, rate, (want4 && (!g_safe || g_safe_active)) ? " -> forced 0 (mode 4/8: 60 Hz output, we pace the game ourselves)" : "");
     STAGE("SetFlipRate enter: handle=%d rate=%d%s", handle, rate, want4 ? " -> 0" : "");
     g_game_flip_rate = rate;   // safe mode: the game's own rate stays until the late set-up succeeded
     if (want4 && (!g_safe || g_safe_active)) rate = 0;
@@ -2851,7 +2861,12 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         int ff = file_flags();
         if (ff > 0 && (ff & 128)) g_diag_hooks = 1;
     }
-    if (gv_armed() || g_diag_hooks) HOOK32(sceGnmSubmitCommandBuffers);
+    if (g_dbg_hooks && g_safe && !g_bench_enabled) {   // debug log on + unverified title: research trace of VideoOut-flip games
+        g_vt_hooked = 1;
+        HOOK32(sceGnmSubmitDone);
+        STAGE("voutrace armed: records the game's submits and flips from VideoOut flip %d (%d events)", VT_START_FLIP, VT_N);
+    }
+    if (gv_armed() || g_diag_hooks || g_vt_hooked) HOOK32(sceGnmSubmitCommandBuffers);
     if (g_diag_hooks) {
         HOOK32(sceGnmSubmitCommandBuffersForWorkload);
         HOOK32(sceGnmSubmitAndFlipCommandBuffersForWorkload);
@@ -2879,7 +2894,8 @@ s32 attr_public plugin_unload(s32 argc, const char *argv[])
     UNHOOK(sceVideoOutRegisterBuffers);
     UNHOOK(sceVideoOutSetFlipRate);
     UNHOOK(sceVideoOutSubmitFlip);
-    if (gv_armed() || g_diag_hooks) UNHOOK(sceGnmSubmitCommandBuffers);
+    if (gv_armed() || g_diag_hooks || g_vt_hooked) UNHOOK(sceGnmSubmitCommandBuffers);
+    if (g_vt_hooked) UNHOOK(sceGnmSubmitDone);
     if (g_diag_hooks) { UNHOOK(sceGnmSubmitCommandBuffersForWorkload); UNHOOK(sceGnmSubmitAndFlipCommandBuffersForWorkload); }
     if (g_log) { fclose(g_log); g_log = NULL; }
     return 0;
