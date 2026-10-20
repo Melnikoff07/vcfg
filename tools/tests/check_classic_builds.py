@@ -13,7 +13,7 @@ spec.loader.exec_module(mod)
 arrays = mod.arrays(ROOT / 'classic/source')
 main_source = (ROOT / 'classic/source/main.c').read_text()
 arrays = {name: data for name, data in arrays.items() if re.search(r'\b' + re.escape(name) + r'_code\b', main_source)}
-hooks = ['Detour_sceVideoOutGetFlipStatus', 'Detour_sceVideoOutAddFlipEvent', 'Detour_sceGnmInsertWaitFlipDone']
+hooks = ['Detour_sceVideoOutAddFlipEvent', 'Detour_sceGnmInsertWaitFlipDone']   # test builds only; the status hook (virtual queue) is in every build, installed per title
 manifest = {'revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
             'builds': [], 'source_sha256': {}}
 for mode in range(5):

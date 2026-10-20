@@ -18,7 +18,7 @@ static void cat(char *d, const char *s) { while (*d) d++; while (*s) *d++ = *s++
 
 static const char *mode_name(int p) { return p ? "FAST" : "QUALITY"; }
 static const char *aa_name(int e) { return e == 2 ? "STRONG" : e == 1 ? "LIGHT" : "OFF"; }
-static const char *engine_name(int e) { return e == ENGINE_NEW ? "NEW" : "CLASSIC"; }
+static const char *engine_name(int e) { return e == ENGINE_NEW ? "NEW" : e == ENGINE_CLASSIC_2BUF ? "2-BUFFER" : "CLASSIC"; }
 static const char *corner_name(int ov)
 {
     static const char *n[9] = { "OFF", "SMALL TL", "DETAIL TL", "SMALL TR", "DETAIL TR", "SMALL BR", "DETAIL BR", "SMALL BL", "DETAIL BL" };
@@ -111,7 +111,7 @@ static void draw_card(Canvas *c, App *a, Game *g, int idx, int x, int y, int w, 
     int ty = y + p + isz + 50;
     draw_text(c, &f->title, x + p, ty, l1, INK, 0);
     if (l2[0]) draw_text(c, &f->title, x + p, ty + 44, l2, INK, 0);
-    if (g->installed) { char eng[32] = ""; cat(eng, engine_name(g->engine)); cat(eng, " ENGINE"); draw_text(c, &f->mono, x + p, ty + (l2[0] ? 92 : 48), eng, INK, 1); }
+    if (g->installed) { char eng[32] = ""; cat(eng, engine_name(game_engine(g))); cat(eng, " ENGINE"); draw_text(c, &f->mono, x + p, ty + (l2[0] ? 92 : 48), eng, INK, 1); }
     int ry = y + h - 98;
     fill_rect(c, x + p, ry, isz, 4, INK);
     char lab[48] = "";
@@ -150,7 +150,7 @@ static void draw_rows(Canvas *c, App *a, int x, int y, int w, const char *head, 
                       Row *r, int n)
 {
     Fonts *f = a->f;
-    int hh = 250, rh = 92;
+    int hh = 250, rh = n > 5 ? 80 : 92;   // the game panel has a sixth row (engine)
     fill_round(c, x, y, w, hh + rh * n + 34, 22, CREAM);
     fill_round(c, x, y, w, hh + 22, 22, YEL);
     fill_rect(c, x, y + hh, w, 22, CREAM);
@@ -199,10 +199,16 @@ static void draw_detail(Canvas *c, App *a, int top, Game *g, Settings *s, const 
         char l1[64], l2[64]; wrap2(&f->title, g->title[0] ? g->title : g->id, left - 60, l1, l2);
         draw_text(c, &f->title, M, y + left - 60 + 54, l1, INK, 0);
         if (l2[0]) draw_text(c, &f->title, M, y + left - 60 + 98, l2, INK, 0);
-        char lab[48] = ""; cat(lab, g->id); cat(lab, " / "); cat(lab, engine_name(g->engine)); cat(lab, " ENGINE");
+        char lab[48] = ""; cat(lab, g->id); cat(lab, " / "); cat(lab, engine_name(game_engine(g))); cat(lab, " ENGINE");
         draw_text(c, &f->mono, M, y + left - 60 + (l2[0] ? 146 : 102), lab, DIM, 1);
     }
     Row r[6]; int n = settings_rows(s, r);
+    if (g) {   // experimental engine choice, per game only
+        r[n] = (Row){ "Engine (test)", "", 0, 0 };
+        if (g->eng_sel == SEL_AUTO) { cat(r[n].value, "AUTO: "); cat(r[n].value, engine_name(g->engine)); }
+        else cat(r[n].value, engine_name(game_engine(g)));
+        n++;
+    }
     draw_rows(c, a, M + left, y, c->w - 2 * M - left, head, s->fg ? "60" : "30", s->fg ? "FROM 30" : "NATIVE", r, n);
 }
 
@@ -333,7 +339,7 @@ int app_input(App *a, uint32_t b)
         return ACT_NONE;
     }
     Settings *s = a->tab == TAB_GAMES ? &a->games[a->sel].s : &a->defaults;
-    int rows = a->tab == TAB_OVERLAY ? 4 : 5;
+    int rows = a->tab == TAB_OVERLAY ? 4 : a->tab == TAB_GAMES ? 6 : 5;
     if (a->tab == TAB_INSTALL) {
         if (b & PAD_CROSS) return ACT_INSTALL;
         if (b & PAD_SQUARE) return ACT_REMOVE;
@@ -352,7 +358,8 @@ int app_input(App *a, uint32_t b)
                 int i = menu_combo_index(a->menu_combo); if (i < 0) i = dir > 0 ? -1 : MENU_COMBO_COUNT;
                 step(&i, dir, 0, MENU_COMBO_COUNT - 1, 1); a->menu_combo = menu_combo_from_index(i); set_msg(a, "");
             }
-        } else change(s, a->row, dir);
+        } else if (a->tab == TAB_GAMES && a->row == 5) step(&a->games[a->sel].eng_sel, dir, 0, SEL_COUNT - 1, 1);
+        else change(s, a->row, dir);
         a->dirty = 1;
     }
     if (a->tab == TAB_OVERLAY && a->row == 3 && (b & PAD_CROSS)) { a->rec = 1; a->rec_prev = a->rec_peak = 0; set_msg(a, ""); }

@@ -57,13 +57,14 @@ typedef struct {
     int overlay;         // 0 = off, 1..2 = TL (Small/Detail), 3..4 = TR, 5..6 = BR, 7..8 = BL
     uint32_t menu_combo; // pad buttons held together to open the menu (menu_combo.h table, default L3+R3)
     int present_copy;    // 0 = auto, 1 = on, 2 = off; profile setting, not an overlay menu row
+    int two_buffer;      // 1 = virtual flip queue for a double-buffered game (app engine choice "2-BUFFER"), read at start
 } fg_config_t;
 
 static char g_title_id[16] = "UNKNOWN";
 static int g_known_game = 0;
 static int g_is_game_proc = 1;
-static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0 };
-static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0 };
+static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0 };
+static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0 };
 static volatile int g_menu_open = 0, g_menu_sel = 0, g_cfg_save_req = 0;
 static volatile uint64_t g_osd_toast_until = 0;
 static char g_osd_toast[32] = "READY";
@@ -1051,6 +1052,7 @@ static void cfg_defaults(fg_config_t *c)
     c->overlay        = 0;
     c->menu_combo     = MENU_COMBO_DEFAULT;
     c->present_copy   = 0;
+    c->two_buffer     = 0;
 }
 
 static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
@@ -1082,6 +1084,7 @@ static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
                 else if (strcmp(key, "upscale") == 0 || strcmp(key, "enhance") == 0) c->upscale = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "upscale_factor") == 0) c->upscale_factor = val < 50 ? 50 : (val > 100 ? 100 : val);
                 else if (strcmp(key, "present_copy") == 0) c->present_copy = val < 0 ? 0 : (val > 2 ? 2 : val);
+                else if (strcmp(key, "two_buffer") == 0) c->two_buffer = (val != 0);
                 else if (strcmp(key, "hud_protect") == 0) c->hud_protect = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "game_vectors") == 0) c->game_vectors = (val != 0);
                 else if (strcmp(key, "fps_lock") == 0) c->fps_lock = (val == 20 || val == 30 || val == 60) ? val : 0;
@@ -1136,6 +1139,20 @@ static int read_mode_raw(void)
         if (parse_ini_file(gpath, &c, NULL)) have = 1;
     }
     return have ? c.mode : 8;
+}
+// two_buffer=1 in config.ini / config-<TITLE>.ini (the app writes it for the "2-BUFFER" engine choice): read once at start,
+// it decides whether the status hook of the virtual flip queue is installed at all.
+static int read_two_buffer_raw(void)
+{
+    fg_config_t c;
+    cfg_defaults(&c);
+    parse_ini_file(LOG_DIR "/config.ini", &c, NULL);
+    if (g_title_id[0] && strcmp(g_title_id, "UNKNOWN") != 0) {
+        char gpath[96];
+        snprintf(gpath, sizeof(gpath), LOG_DIR "/config-%s.ini", g_title_id);
+        parse_ini_file(gpath, &c, NULL);
+    }
+    return c.two_buffer;
 }
 
 static void *alloc_mbufs(size_t total)
@@ -1442,6 +1459,7 @@ static void *mon_thread(void *arg)
                    VCFG_2BUF_TEST, !g_fg_off, g_pcopy_on, g_cfg.preset);
                 tb_report();
             }
+            vq_report();
             pend_max = gcq_max = 0;
             g_mon_missed = g_pace_timeouts = g_pace_resync = g_pace_fix = g_mon_gaps = 0;
             win_t = vs.processTime;
@@ -1637,7 +1655,8 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
     g_flips++;
     if (g_flips == 1) {
         lg("first SubmitAndFlip: count=%u flipMode=%u title=%s\n", count, flipMode, g_title_id);
-        lg("CLASSIC_BUILD version=%s test=%d target=%d\n", VCFG_TRACE_VERSION, VCFG_2BUF_TEST, tb_title());
+        lg("CLASSIC_BUILD version=%s test=%d target=%d two_buffer=%d status_hook=%d\n", VCFG_TRACE_VERSION, VCFG_2BUF_TEST, tb_title(),
+           g_vq_on, g_status_hooked);
     }
     if (g_rel_t) {
         uint64_t us = sceKernelGetProcessTime() - g_rel_t;
@@ -2628,9 +2647,14 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
     if (!bench_bootstrap()) { BLOG("bench_bootstrap: inert"); return 0; }
     BLOG("bench_bootstrap ok");
 #endif
+    g_vq_on = !g_bench_enabled && read_two_buffer_raw();
+    if (g_vq_on || tb_title()) {   // virtual flip queue (two_buffer=1) or a test build on a test title
+        HOOK32(sceVideoOutGetFlipStatus);
+        g_status_hooked = 1;
+        STAGE("status hook installed (two_buffer=%d, test=%d)", g_vq_on, VCFG_2BUF_TEST);
+    }
 #if VCFG_2BUF_TEST
     if (tb_title()) {
-        HOOK32(sceVideoOutGetFlipStatus);
         HOOK32(sceVideoOutAddFlipEvent);
         HOOK32(sceGnmInsertWaitFlipDone);
         g_tb_hooks = 1;
@@ -2700,9 +2724,9 @@ s32 attr_public plugin_unload(s32 argc, const char *argv[])
 #if VCFG_BENCH
     if (!g_bench_enabled) return 0;  // bootstrap may have returned without installing hooks
 #endif
+    if (g_status_hooked) UNHOOK(sceVideoOutGetFlipStatus);
 #if VCFG_2BUF_TEST
     if (g_tb_hooks) {
-        UNHOOK(sceVideoOutGetFlipStatus);
         UNHOOK(sceVideoOutAddFlipEvent);
         UNHOOK(sceGnmInsertWaitFlipDone);
     }

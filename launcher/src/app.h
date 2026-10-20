@@ -2,7 +2,10 @@
 #pragma once
 #include "ui.h"
 
-enum { ENGINE_NEW, ENGINE_CLASSIC, ENGINE_CLASSIC_BB };
+enum { ENGINE_NEW, ENGINE_CLASSIC, ENGINE_CLASSIC_BB, ENGINE_CLASSIC_2BUF };
+// Engine choice per game in the app (experimental): AUTO = the table / old behaviour, CLASSIC, NEW, or 2-BUFFER = the
+// classic engine with the virtual flip queue for double-buffered games (writes two_buffer=1 into config-<TITLE>.ini).
+enum { SEL_AUTO, SEL_CLASSIC, SEL_NEW, SEL_2BUF, SEL_COUNT };
 enum { TAB_GAMES, TAB_DEFAULTS, TAB_OVERLAY, TAB_INSTALL, TAB_COUNT };
 
 typedef struct { int fg, preset, sharp, enhance, overlay; } Settings;   // preset 0 quality 1 fast; overlay 0..8
@@ -10,9 +13,21 @@ typedef struct { int fg, preset, sharp, enhance, overlay; } Settings;   // prese
 typedef struct {
     char id[12], title[64], version[16];   // version: APP_VER of the installed game (with its update)
     int engine, installed, testing, experimental;   // experimental: not verified, plugin only when switched on
+    int eng_sel;                               // SEL_*: the player's engine choice (AUTO keeps engine)
     const uint8_t *icon; int iw, ih;           // RGBA8, may be 0
     Settings s;
 } Game;
+
+// The engine a game runs with: the player's choice, AUTO = the table entry.
+static inline int game_engine(const Game *g)
+{
+    switch (g->eng_sel) {
+    case SEL_CLASSIC: return g->engine == ENGINE_CLASSIC_BB ? ENGINE_CLASSIC_BB : ENGINE_CLASSIC;
+    case SEL_NEW: return ENGINE_NEW;
+    case SEL_2BUF: return ENGINE_CLASSIC_2BUF;
+    default: return g->engine;
+    }
+}
 
 typedef struct {
     Face logo, title, mono, num, big;

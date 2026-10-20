@@ -34,14 +34,24 @@
 typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
-    { "CUSA07439", "vcfg13.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic39.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic39.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic39.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA07439", "vcfg14.prx", ENGINE_NEW, 0 },
+    { "CUSA08519", "vcfg_classic40.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic40.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic40.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg13.prx", "vcfg_classic39.prx" };
-static const char *k_exp_prx = "vcfg_classic39.prx";   // engine for experimental (not verified) titles
+static const char *k_files[] = { "vcfg14.prx", "vcfg_classic40.prx" };
+static const char *k_exp_prx = "vcfg_classic40.prx";   // engine for experimental (not verified) titles
+#define MAPMAX 176   // plugins.ini sections we manage: the verified table + every game in the list (App.games)
+#define ENGFILE CFGDIR "/vcfg_engines.ini"   // the player's engine choice per game: CUSAxxxxx=<SEL_*>, AUTO not written
+static const char *prx_of(int engine) { return engine == ENGINE_NEW ? k_files[0] : k_files[1]; }
+static const Game *find_game(const App *a, const char *id)
+{
+    for (int i = 0; i < a->ngames; i++) if (!strcmp(a->games[i].id, id)) return &a->games[i];
+    return NULL;
+}
+// The new engine keeps its settings in one vcfg.ini (its verified title); any other game uses config-<TITLE>.ini.
+static int uses_vcfg_ini(const Game *g) { return g->engine == ENGINE_NEW && game_engine(g) == ENGINE_NEW; }
 
 static FILE *g_log;
 static void vlog(const char *fmt, ...)
@@ -167,9 +177,15 @@ static void load_settings(App *a)
     a->overlay_pos = ini_int(t, "overlay_pos", 4); a->overlay_opacity = ini_int(t, "overlay_opacity", 80);
     a->menu_combo = menu_combo_sanitize((uint32_t)ini_int(t, "menu_combo", (int)MENU_COMBO_DEFAULT));   // preset or recorded mask, else L3 + R3
     free(l);
+    unsigned char *e = read_all(ENGFILE, &n);
+    for (int i = 0; i < a->ngames; i++) {
+        int v = e ? ini_int((const char *)e, a->games[i].id, SEL_AUTO) : SEL_AUTO;
+        a->games[i].eng_sel = (v >= 0 && v < SEL_COUNT) ? v : SEL_AUTO;
+    }
+    free(e);
     for (int i = 0; i < a->ngames; i++) {
         Game *g = &a->games[i]; g->s = a->defaults; if (g->testing || g->experimental) g->s.fg = 0;
-        if (g->engine == ENGINE_NEW) {
+        if (uses_vcfg_ini(g)) {
             unsigned char *b = read_all(CFGDIR "/vcfg.ini", &n); if (!b) continue;
             const char *s = (const char *)b;
             g->s = (Settings){ ini_int(s, "enabled", 1), ini_int(s, "preset", 0), ini_int(s, "sharp", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
@@ -191,17 +207,24 @@ static void save_settings(App *a)
     snprintf(buf, sizeof(buf), "fg=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\noverlay_pos=%d\noverlay_opacity=%d\nmenu_combo=%u\n",
              a->defaults.fg, a->defaults.preset, a->defaults.sharp, a->defaults.enhance, a->defaults.overlay, a->overlay_pos, a->overlay_opacity, combo);
     write_all(CFGDIR "/vcfg_launcher.ini", buf, strlen(buf));
+    {
+        static char eb[MAPMAX * 16]; size_t en = 0;
+        for (int i = 0; i < a->ngames; i++)
+            if (a->games[i].eng_sel != SEL_AUTO && en + 16 < sizeof(eb))
+                en += (size_t)snprintf(eb + en, sizeof(eb) - en, "%s=%d\n", a->games[i].id, a->games[i].eng_sel);
+        if (en) write_all(ENGFILE, eb, en); else remove(ENGFILE);
+    }
     for (int i = 0; i < a->ngames; i++) {
         Game *g = &a->games[i]; Settings *s = &g->s;
         if (!g->installed) continue;
-        if (g->engine == ENGINE_NEW) {
+        if (uses_vcfg_ini(g)) {
             snprintf(buf, sizeof(buf), "enabled=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\nopacity=%d\nmenu_combo=%u\n",
                      s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo);
             write_all(CFGDIR "/vcfg.ini", buf, strlen(buf));
         } else {
             snprintf(path, sizeof(path), CFGDIR "/config-%s.ini", g->id);
-            snprintf(buf, sizeof(buf), "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\nmenu_combo=%u\n",
-                     s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo);
+            snprintf(buf, sizeof(buf), "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\nmenu_combo=%u\ntwo_buffer=%d\n",
+                     s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo, game_engine(g) == ENGINE_CLASSIC_2BUF);
             write_all(path, buf, strlen(buf));
         }
     }
@@ -212,18 +235,19 @@ static void save_settings(App *a)
 // Verified titles always get their plugin. Experimental titles get the classic engine only while switched on;
 // switched off, their section is dropped when nothing else is left in it (an empty section would block [default]).
 typedef struct { char id[12]; const char *prx; int keep_empty; } Map;
-static Map g_map[48]; static int g_nmap;
+static Map g_map[MAPMAX]; static int g_nmap;
 static void build_map(const App *a)
 {
     g_nmap = 0;
     for (int t = 0; t < NSUP; t++) {
         Map *m = &g_map[g_nmap++]; snprintf(m->id, sizeof(m->id), "%s", k_sup[t].id);
-        m->prx = k_sup[t].testing ? NULL : k_sup[t].prx; m->keep_empty = 1;
+        const Game *g = find_game(a, k_sup[t].id);   // the player's engine choice, if the game is listed
+        m->prx = k_sup[t].testing ? NULL : g ? prx_of(game_engine(g)) : k_sup[t].prx; m->keep_empty = 1;
     }
-    for (int i = 0; i < a->ngames && g_nmap < 48; i++) {
+    for (int i = 0; i < a->ngames && g_nmap < MAPMAX; i++) {
         const Game *g = &a->games[i]; if (!g->experimental) continue;
         Map *m = &g_map[g_nmap++]; snprintf(m->id, sizeof(m->id), "%s", g->id);
-        m->prx = g->s.fg ? k_exp_prx : NULL; m->keep_empty = 0;
+        m->prx = g->s.fg ? (game_engine(g) == ENGINE_NEW ? k_files[0] : k_exp_prx) : NULL; m->keep_empty = 0;
     }
 }
 static int ours(const char *l) { return strstr(l, PLUG "vcfg") || strstr(l, PLUG "bb_probe"); }
@@ -265,7 +289,7 @@ static char *ini_update(const char *old, int install, size_t *outn)
     size_t cap = strlen(old) + 8192;
     Out w = { malloc(cap), 0, cap, 0 }; if (!w.o) return NULL;
     static Section sec; memset(&sec, 0, sizeof(sec)); sec.cur = -1;
-    int done[48] = {0}, defaults_seen = 0; char line[512];
+    static int done[MAPMAX]; memset(done, 0, sizeof(done)); int defaults_seen = 0; char line[512];
     for (const char *p = old; *p; ) {
         size_t L = strcspn(p, "\r\n"); if (L >= sizeof(line)) L = sizeof(line) - 1;
         memcpy(line, p, L); line[L] = 0; p += strcspn(p, "\r\n"); while (*p == '\r' || *p == '\n') p++;
@@ -306,7 +330,7 @@ static int plugin_state(void)
         if (!st) break;
     }
     size_t n; unsigned char *ini = read_all(INI, &n);
-    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg13.prx"))) st = 2;
+    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg14.prx"))) st = 2;
     free(ini);
     return st;
 }
@@ -342,8 +366,10 @@ static void do_install(App *a)
 static uint64_t exp_sig(const App *a)
 {
     uint64_t h = 1469598103934665603ull;
-    for (int i = 0; i < a->ngames; i++)
+    for (int i = 0; i < a->ngames; i++) {
         if (a->games[i].experimental) { h ^= (uint64_t)(a->games[i].s.fg != 0) + (uint64_t)i * 31u; h *= 1099511628211ull; }
+        h ^= (uint64_t)a->games[i].eng_sel * 7u + (uint64_t)i * 131u; h *= 1099511628211ull;   // engine choice changes the mapping
+    }
     return h;
 }
 static uint64_t g_exp_written;
@@ -506,9 +532,9 @@ static void do_report(App *a)
     bprintf(&r, "\n==== games ====\n");
     for (int i = 0; i < a->ngames; i++) {
         const Game *g = &a->games[i];
-        bprintf(&r, "%s version=%s installed=%d experimental=%d fg=%d preset=%d sharp=%d enhance=%d overlay=%d title='%s'\n", g->id,
+        bprintf(&r, "%s version=%s installed=%d experimental=%d fg=%d preset=%d sharp=%d enhance=%d overlay=%d engine_choice=%d engine=%d title='%s'\n", g->id,
                 g->version[0] ? g->version : "?", g->installed, g->experimental, g->s.fg, g->s.preset, g->s.sharp, g->s.enhance,
-                g->s.overlay, g->title);
+                g->s.overlay, g->eng_sel, game_engine(g), g->title);
     }
     bprintf(&r, "\n==== plugin files ====\n");
     for (int i = 0; i < (int)(sizeof(k_files) / sizeof(k_files[0])); i++) {
@@ -518,6 +544,7 @@ static void do_report(App *a)
     bfile(&r, "plugins.ini", INI, 64u << 10);
     bfile(&r, "launcher settings", CFGDIR "/vcfg_launcher.ini", 8u << 10);
     bfile(&r, "new engine settings", CFGDIR "/vcfg.ini", 8u << 10);
+    bfile(&r, "engine choice per game", ENGFILE, 8u << 10);
     for (int i = 0; i < a->ngames; i++) {
         char p[96]; snprintf(p, sizeof(p), CFGDIR "/config-%s.ini", a->games[i].id);
         if (file_exists(p)) bfile(&r, "game settings", p, 8u << 10);
