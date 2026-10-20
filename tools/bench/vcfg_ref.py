@@ -57,13 +57,14 @@ def motion(A, B, params=None):
         p.update(params)
     L1a, L2a, L3a = pyr8(A)
     L1b, L2b, L3b = pyr8(B)
-    V3, sum_b = vm.me3(L3a, L3b)
-    V2, S2 = vm.me2(L2a, L2b, V3)
+    prevF = p.get('prevF')
+    V3, sum_b = vm.me3(L3a, L3b, prevF)
+    V2, S2 = vm.me2(L2a, L2b, V3, prevF)
     gm = vm.gm8(V2, S2)
     GK, hist = vm.fgs8(L2a, L2b, V2, S2, gm)
     sum_a = int(L3a.sum()) if p['prev_luma_sum'] is None else p['prev_luma_sum']
-    FT, cutn, fade = vm.me1(L1a, L1b, V2, GK, gm, sum_b, sum_a)
-    F = vm.mf8(L1a, L1b, FT, GK, V2, gm, fade)
+    FT, cutn, fade = vm.me1(L1a, L1b, V2, GK, gm, sum_b, sum_a, prevF, p.get('mp'))
+    F = vm.mf8(L1a, L1b, FT, GK, V2, gm, fade, p.get('mp'))
     return dict(V3=V3, V2=V2, S2=S2, gm=gm, GK=GK, FT=FT, F=F, cutn=cutn, fade=fade)
 
 

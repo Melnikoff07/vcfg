@@ -238,7 +238,8 @@ def _equi(m, c, p):
     return np.clip(o, -0.5, 0.5).astype(np.float32)
 
 
-def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None):
+def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
+    mp = mp or {}
     """raw field FT (68, 120, 2) float32 (full-res px, mid grid), the unmatched-block count and the fade flag"""
     h, w = L1c.shape
     nbx, nby = (w + 7) // 8, (h + 7) // 8
@@ -285,7 +286,7 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None):
         ist = 4 <= sub <= 6
         bias = np.zeros(N, np.int64)
         if ist:
-            bias += 16
+            bias += mp.get("tbias", 16)
         if sub == 7:
             bias = np.where(still, 48, 0).astype(np.int64)
         if sub == 9:
@@ -323,7 +324,7 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None):
         sad2, sum2 = sad_bilateral(L1p, L1c, X, Y, d2x, d2y)
         p2f = (np.abs(d2x) + np.abs(d2y)) > 8
         p2p = np.where(p2f, np.maximum((np.abs(sum2 - zsum) >> 1) - zs, 0), 0)
-        key = ((sad2 + 256 + p2p + 4 * (abs(ox) + abs(oy))) << 8) | k
+        key = ((sad2 + 256 + p2p + mp.get("lam1", 4) * (abs(ox) + abs(oy))) << 8) | k
         better = key < best2
         best2 = np.where(better, key, best2)
         bk = np.where(better, k, bk)
@@ -353,7 +354,8 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None):
 # ---------------------------------------------------------------------------------------------------------------
 # mf8: robust smoothness filter of the field
 # ---------------------------------------------------------------------------------------------------------------
-def mf8(L1p, L1c, FT, GK, V2, gm, fade):
+def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None):
+    mp = mp or {}
     nby, nbx = FT.shape[:2]
     bx, by = _grid(nbx, nby)
     X, Y = bx * 8, by * 8
@@ -364,8 +366,8 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade):
     nfgk = ~isfgk
     gmx4, gmy4 = np.float32(gm[0] * 4), np.float32(gm[1] * 4)
     av = V2.reshape(-1, 2)[gk & 4095].astype(np.int64) * 2
-    cap = np.where(nfgk, 32, 8)
-    lsh = np.where(nfgk, 2, 1)
+    cap = np.where(nfgk, mp.get("cap", 32), 8)
+    lsh = np.where(nfgk, mp.get("lsh", 2), 1)
 
     def ldT(ox, oy):
         return FT[np.clip(by + oy, 0, nby - 1), np.clip(bx + ox, 0, nbx - 1)]

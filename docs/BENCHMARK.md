@@ -167,3 +167,27 @@ quality improvement, regression-free runtime behavior or new-engine HUD-flicker 
 - Clips stay local (`bench/` is git-ignored): they are game frames.
 - A change to the warp is accepted only if it does not lose on PSNR HUD / PSNR static / HUD flicker (where VCFG
   classic is strong) while it gains on PSNR / SSIM / LPIPS / TCE.
+
+## 6. Measured PC experiments
+
+The [8x8 seeded-refinement experiment](GRID8_EXPERIMENT_20261020.md) records a
+12-triplet comparison with LPIPS, per-frame outputs and reproduction commands.
+Its mixed result does not meet the acceptance rule above; no runtime change is
+recommended from that experiment.
+
+The follow-up [two-grid clear-profile experiment](QUALITY_ROUND_20261020.md)
+records a measured candidate, IR/reference conformance checks and the isolated
+CUSA00557 hardware-test build. Its offline gains are not hardware acceptance.
+
+The [edge-stability research](EDGE_STABILITY_RESEARCH_20261020.md) records the
+owner's remaining contour artifacts, rejected spatial/motion experiments and
+consecutive-sequence tests of validated generated-frame history. These include
+temporal residual diagnostics, detail-loss limits and external-video caveats.
+
+The [post-chain correction and diagnostic build](POSTFIX_EXPERIMENT_20261020.md)
+models post-processed color history separately from raw motion pyramids, and
+records the raw-real / out-of-place mid-post test with command/IR checks.
+
+The next [split-AA/raw-history test](POSTSPLIT_EXPERIMENT_20261020.md) follows
+the owner's report of persistent flicker. It includes the raw-GT detail-loss
+tradeoff, separate raw color history, and the corresponding isolated build.

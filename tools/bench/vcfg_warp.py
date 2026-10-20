@@ -107,21 +107,29 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
     out = np.empty((H, W, 3), F32)
     xs = np.arange(W, dtype=F32)
     nby, nbx = F.shape[:2]
+    # PC experiment only: the production shader uses a 16-pixel grid.
+    block = int(wp.get("block", 16))
+    if block not in (8, 16):
+        raise ValueError("motion grid block must be 8 or 16")
+    gny, gnx = GK.shape[:2]
     chunk = int(wp.get("chunk", 90))
-    for y0 in range(0, H, chunk):
-        y1 = min(H, y0 + chunk)
+    halo = int(wp.get("e_win", 1)) // 2 if wp.get("slow_select") else 0
+    for core0 in range(0, H, chunk):
+        core1 = min(H, core0 + chunk)
+        y0, y1 = max(0, core0 - halo), min(H, core1 + halo)
         ys = np.arange(y0, y1, dtype=F32)
         X, Y = np.meshgrid(xs, ys)
         u, v = X + F32(0.5), Y + F32(0.5)
         sp, sc = tp[y0:y1], tc[y0:y1]
         es = diff3(sp, sc)
         # fractional phase advection (zero at t == 0.5)
-        cbx, cby = np.minimum(X.astype(np.int64) >> 4, nbx - 1), np.minimum(Y.astype(np.int64) >> 4, nby - 1)
+        cbx, cby = np.minimum(X.astype(np.int64) // block, nbx - 1), np.minimum(Y.astype(np.int64) // block, nby - 1)
         dt05 = F32(t) - F32(0.5)
         shx = np.clip(dt05 * F[cby, cbx, 0], -16, 16).astype(F32)
         shy = np.clip(dt05 * F[cby, cbx, 1], -16, 16).astype(F32)
         xfs, yfs = X + shx, Y + shy
-        fbx, fby = xfs * F32(0.0625) - F32(0.46875), yfs * F32(0.0625) - F32(0.46875)
+        scale, centre = F32(1.0 / block), F32(0.5 - 0.5 / block)
+        fbx, fby = xfs * scale - centre, yfs * scale - centre
         flx, fly = np.floor(fbx), np.floor(fby)
         wx, wy = fbx - flx, fby - fly
         ixr, iyr = flx.astype(np.int64), fly.astype(np.int64)
@@ -159,17 +167,24 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         # ---- non-coherent pixels: per-corner vectors, edge-weighted accumulation
         slow = ~coh
         if slow.any():
-            gk_s = GK[np.clip(yfs.astype(np.int64) >> 4, 0, nby - 1), np.clip(xfs.astype(np.int64) >> 4, 0, nbx - 1)]
+            gk_s = GK[np.clip(yfs.astype(np.int64) >> 4, 0, gny - 1), np.clip(xfs.astype(np.int64) >> 4, 0, gnx - 1)]
             nsl = sum((l < 12).astype(np.int64) for l in lsum)
             str_en = (gk_s == 0) & ((flags & 2048) == 0) & (nsl >= 2) & (es < 0.1875)
             win = int(wp.get("e_win", 1))
             acc = np.zeros_like(sp)
             sw = np.zeros(es.shape, F32)
             em = None
+            ranked = []
             for fv, w in ((f00, w00), (f10, w10), (f01, w01), (f11, w11)):
                 a2, b2, e = _taps(tp, tc, u, v, fv[..., 0], fv[..., 1], t, sp, sc, es, str_en, False, csh=wp.get("csh", 0.5), use_cr=bool(wp.get("slow_cr", False)))
+                if wp.get('slow_cr_max') is not None:
+                    ab, bb, eb = _taps(tp, tc, u, v, fv[..., 0], fv[..., 1], t, sp, sc, es, str_en, False)
+                    sharp = (np.abs(fv[..., 0]) + np.abs(fv[..., 1])) <= F32(wp['slow_cr_max'])
+                    a2, b2, e = np.where(sharp[..., None], a2, ab), np.where(sharp[..., None], b2, bb), np.where(sharp, e, eb)
                 if win > 1:
                     e = boxf(e, win)
+                if wp.get("slow_select"):
+                    ranked.append((e, lerp4(a2, b2, t), w))
                 if em is None:
                     em = e.copy()
                 em1 = np.minimum(em, e)
@@ -180,12 +195,26 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
                 sw = sw * scl + om
                 em = em1
             sm_ = acc / sw[..., None]
+            if ranked:
+                # Alternative layers: choose the best two local matches rather
+                # than mixing all four vectors across a motion boundary.
+                costs = np.stack([r[0] + F32(wp.get("layer_prior", 0.01)) * (1 - r[2]) for r in ranked])
+                order = np.argsort(costs, axis=0, kind='stable')
+                colors = np.stack([r[1] for r in ranked])
+                best_color = np.take_along_axis(colors, order[:1, ..., None], axis=0)[0]
+                if wp['slow_select'] == 'best':
+                    sm_ = best_color
+                else:
+                    second = np.take_along_axis(colors, order[1:2, ..., None], axis=0)[0]
+                    scores = np.take_along_axis(costs, order[:2], axis=0)
+                    weight = F32(1.0) / (F32(1.0) + np.exp2(np.minimum((scores[1] - scores[0]) * F32(wp.get('layer_k', 64.0)), F32(80.0))))
+                    sm_ = best_color + (second - best_color) * weight[..., None]
             mov = np.where(slow[..., None], sm_, mov)
             emov = np.where(slow, em, emov)
             vmg = np.where(slow, F32(0.0), vmg)
         # ---- merge: static / foreground logic
         ws0 = sat((F32(0.006) - es) * F32(333.33334))
-        gk = GK[np.clip(yfs.astype(np.int64) >> 4, 0, nby - 1), np.clip(xfs.astype(np.int64) >> 4, 0, nbx - 1)]
+        gk = GK[np.clip(yfs.astype(np.int64) >> 4, 0, gny - 1), np.clip(xfs.astype(np.int64) >> 4, 0, gnx - 1)]
         hasfg = gk >= (1 << 20)
         fgkill = hasfg & (emov < 0.25) & ((flags & 16) == 0)
         ws = np.where(fgkill, F32(0.0), ws0)
@@ -219,10 +248,11 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
             fbp = sc if wp.get("fb", "cur") == "cur" else (stat if wp.get("fb") == "stat" else (sc * F32(0.5) + sp * F32(0.5)))
             w = sat((emov - F32(fbt)) * F32(wp.get("fb_slope", 8.0)))[..., None]
             out0 = out0 * (1 - w) + fbp * w
-        out[y0:y1] = out0
+        crop = slice(core0 - y0, core1 - y0)
+        out[core0:core1] = out0[crop]
         if dbg is not None:
             for k, val in (("coh", coh), ("es", es), ("ws", ws), ("cw", cw), ("bg3", bg3), ("mov", mov), ("stat", stat), ("emov", emov)):
-                dbg.setdefault(k, []).append(val)
+                dbg.setdefault(k, []).append(val[crop])
     return out
 
 
