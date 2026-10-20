@@ -643,7 +643,15 @@ merge:
   %cw = select i1 %nocf, float 0.0, float %cw2
   %movc = call <4 x float> @lerp4(<4 x float> %mov, <4 x float> %stat, float %cw)
   %out0 = call <4 x float> @lerp4(<4 x float> %movc, <4 x float> %stat, float %ws)
-  %cut = icmp ugt i32 %cutn, 3264
+  ; per-title scene-change threshold: consts flags bits 16..31 = blocks / 8 (0 = the original 3264 = 40 % of 8160)
+  %pcnc = getelementptr i8, ptr addrspace(4) %tbl, i64 112
+  %cnc = load <4 x i32>, ptr addrspace(4) %pcnc, align 16, !invariant.load !0
+  %flc = extractelement <4 x i32> %cnc, i32 2
+  %cbk = lshr i32 %flc, 16
+  %cbk8 = shl i32 %cbk, 3
+  %cbz = icmp eq i32 %cbk, 0
+  %cthr = select i1 %cbz, i32 3264, i32 %cbk8
+  %cut = icmp ugt i32 %cutn, %cthr
   %t_ge_half = fcmp oge float %t, 0.5
   %cut_px = select i1 %t_ge_half, <4 x float> %sc, <4 x float> %sp
   %out1 = select i1 %cut, <4 x float> %cut_px, <4 x float> %out0

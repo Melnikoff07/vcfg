@@ -736,6 +736,29 @@ static uint32_t build_dcb_post8(uint32_t *p0, uint64_t C, uint32_t w, uint32_t h
     return (uint32_t)(p - p0);
 }
 
+// Per-title scene-change threshold (blocks of 8160 that must be unmatched for warp8 to copy the real frame instead of
+// the generated one): LOG_DIR/cut_blocks_<TITLE> holds the number. No file = the original 3264 (40 %), unchanged.
+// Fast camera motion with blur can push the unmatched count past 3264 although the scene did not change.
+static uint32_t g_cut_blocks8 = 0;
+static int g_cut_blocks_loaded = 0;
+static uint32_t cut_blocks8(void)
+{
+    if (!g_cut_blocks_loaded) {
+        g_cut_blocks_loaded = 1;
+        char p[96]; snprintf(p, sizeof(p), LOG_DIR "/cut_blocks_%s", g_title_id);
+        int fd = sceKernelOpen(p, 0 /*O_RDONLY*/, 0);
+        if (fd >= 0) {
+            char b[16] = {0};
+            long n = (long)sceKernelRead(fd, b, 15);
+            sceKernelClose(fd);
+            unsigned v = 0;
+            if (n > 0 && sscanf(b, "%u", &v) == 1 && v >= 1000u && v <= 8160u) g_cut_blocks8 = v / 8u;
+        }
+        lg("scene-change threshold: %u blocks (%s)\n", g_cut_blocks8 ? g_cut_blocks8 * 8u : 3264u, g_cut_blocks8 ? p : "default");
+    }
+    return g_cut_blocks8;
+}
+
 static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M1, uint64_t M2,
                                 uint32_t pitch, uint32_t tidx, uint32_t nbytes, uint32_t slot, uint32_t seq,
                                 const uint32_t *nop64, int32_t vo_handle, uint32_t mid1_idx, uint32_t mid2_idx,
@@ -755,7 +778,8 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     uint32_t base_flags = (g_opt_phase ? 1u : 0u) | ((g_fg_off || force_repeat) ? 2u : 0u) | (g_opt_marker ? 4u : 0u)
                         | (g_opt_nocf ? 8u : 0u) | (g_opt_nofgk ? 16u : 0u) | (g_opt_noanc ? 32u : 0u)
                         | (g_opt_notp ? 64u : 0u) | (g_opt_nomf ? 128u : 0u) | (g_opt_notex ? 256u : 0u)
-                        | (g_opt_notpg ? 512u : 0u) | (g_opt_sharp ? 1024u : 0u) | (g_opt_nostr ? 2048u : 0u);
+                        | (g_opt_notpg ? 512u : 0u) | (g_opt_sharp ? 1024u : 0u) | (g_opt_nostr ? 2048u : 0u)
+                        | (cut_blocks8() << 16);
     uint32_t mid1_packed = (mid1_idx & 0x7FFFu) | ((t1_q16 & 0xFFFFu) << 16);
 
     fill_table8(tb, P, C, M1, pitch, tidx, r, mid1_packed, base_flags, g_work, g_mon, stats);
