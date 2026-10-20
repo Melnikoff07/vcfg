@@ -290,6 +290,9 @@ static volatile int g_pcopy_on = 0;
 static int g_mbase = 3;
 #define IS_MID(b) ((b) >= g_mbase && !(g_pcopy_on && (b) >= g_mbase + g_pcopy_k))
 static int g_ngame = 3;
+// Highest display index the game itself registered + 1. Most games register one group at index 0; some register the
+// same buffers again as further groups (0-1, 2-3, 4-5: seen on a 2-buffer title that then flips any of them).
+static int g_game_idx_hi = 0;
 static void *g_pre_mem = NULL;
 static size_t g_pre_size = 0;
 
@@ -1179,6 +1182,14 @@ static void *alloc_mbufs(size_t total)
     return addr;
 }
 
+// End of the game's own display indices (its groups), never reaching into ours.
+static uint32_t game_idx_end(void)
+{
+    int e = g_game_idx_hi > g_ngame ? g_game_idx_hi : g_ngame;
+    if (g_mbuf_state == 1 && g_mbase >= g_ngame && e > g_mbase) e = g_mbase;
+    return (uint32_t)e;
+}
+
 static int mbufs_ready(uint32_t handle)
 {
     (void)handle;
@@ -1815,7 +1826,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                 uint32_t hold_mid_us = 0;
 
                 int can_fg8 = (g_inject_on == 8 && g_work && g_sh8_ok && g_fmt_supported &&
-                               g_bw == 1920 && g_bh == 1080 && g_prev_idx < (uint32_t)g_ngame && mbufs_ready(handle));
+                               g_bw == 1920 && g_bh == 1080 && g_prev_idx < game_idx_end() && mbufs_ready(handle));
                 int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);
 
                 if (can_fg8 && want_fg) {
@@ -1931,7 +1942,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
                     uint32_t tidx = (g_attr.tilingMode == 0) ? 10u : 8u;
                     n = build_dcb_post8(mine, g_buf[index], g_bw, g_bh, g_pitch, tidx, px * 4, slot, g_flips, tail);
-                } else if ((g_inject_on == 4 || g_inject_on == 6 || g_inject_on == 7) && g_prev_idx < (uint32_t)g_ngame && mbufs_ready(handle)) {
+                } else if ((g_inject_on == 4 || g_inject_on == 6 || g_inject_on == 7) && g_prev_idx < game_idx_end() && mbufs_ready(handle)) {
                     uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
                     uint32_t mi = (uint32_t)g_mbase + (g_flips % (uint32_t)g_nmid);
                     if (g_inject_on >= 6 && g_work && g_bw >= 1280 && (g_bw % 640) == 0 && g_bh == g_bw * 9 / 16 && g_bw / 640 <= 4)
@@ -2182,6 +2193,11 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
         vov_set_hdr(attr->format == 0x88740000u);   // HDR10 (BT.2020 PQ): overlay palette re-encoded, passes unchanged
         lg("  attr: fmt=0x%x (supported=%d) tiling=%u aspect=%u %ux%u pitch=%u option=%u\n",
            attr->format, g_fmt_supported, attr->tilingMode, attr->aspectRatio, attr->width, attr->height, attr->pitchInPixel, attr->option);
+    }
+    if (addresses && bufferNum > 0) {
+        if (g_mbuf_state == 1 && startIndex < g_nbuf && startIndex + bufferNum > g_mbase)
+            STAGE("RegisterBuffers: the game registers %d..%d over our buffers from %d", startIndex, startIndex + bufferNum - 1, g_mbase);
+        if (startIndex + bufferNum > g_game_idx_hi) g_game_idx_hi = startIndex + bufferNum;
     }
     for (int i = 0; addresses && i < bufferNum && startIndex + i < 16; i++) {
         g_buf[startIndex + i] = (uint64_t)(uintptr_t)addresses[i];

@@ -34,14 +34,21 @@
 typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
-    { "CUSA07439", "vcfg14.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic40.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic40.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic40.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA07439", "vcfg15.prx", ENGINE_NEW, 0 },
+    { "CUSA08519", "vcfg_classic41.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic41.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic41.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg14.prx", "vcfg_classic40.prx" };
-static const char *k_exp_prx = "vcfg_classic40.prx";   // engine for experimental (not verified) titles
+static const char *k_files[] = { "vcfg15.prx", "vcfg_classic41.prx" };
+static const char *k_exp_prx = "vcfg_classic41.prx";   // engine for experimental (not verified) titles
+// Double-buffered titles that run best with the 2-BUFFER engine (virtual flip queue, tested on hardware 20.10): AUTO = 2-BUFFER.
+static const char *const k_auto_2buf[] = { "CUSA05571", "CUSA08809" };
+static int auto_2buf(const char *id)
+{
+    for (unsigned i = 0; i < sizeof(k_auto_2buf) / sizeof(k_auto_2buf[0]); i++) if (!strcmp(id, k_auto_2buf[i])) return 1;
+    return 0;
+}
 #define MAPMAX 176   // plugins.ini sections we manage: the verified table + every game in the list (App.games)
 #define ENGFILE CFGDIR "/vcfg_engines.ini"   // the player's engine choice per game: CUSAxxxxx=<SEL_*>, AUTO not written
 static const char *prx_of(int engine) { return engine == ENGINE_NEW ? k_files[0] : k_files[1]; }
@@ -330,7 +337,7 @@ static int plugin_state(void)
         if (!st) break;
     }
     size_t n; unsigned char *ini = read_all(INI, &n);
-    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg14.prx"))) st = 2;
+    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg15.prx"))) st = 2;
     free(ini);
     return st;
 }
@@ -651,7 +658,7 @@ int main(void)
             if (known) { sr->known++; continue; }
             if (a->ngames >= (int)(sizeof(a->games) / sizeof(a->games[0]))) { sr->full++; continue; }   // counted, shown in the report
             Game *g = &a->games[a->ngames++]; memset(g, 0, sizeof(*g));
-            snprintf(g->id, sizeof(g->id), "%s", e->d_name); g->engine = ENGINE_CLASSIC; g->experimental = 1;
+            snprintf(g->id, sizeof(g->id), "%s", e->d_name); g->engine = auto_2buf(e->d_name) ? ENGINE_CLASSIC_2BUF : ENGINE_CLASSIC; g->experimental = 1;
             load_meta(g);
             if (!g->installed) { a->ngames--; sr->not_installed++; } else sr->added++;
         }
