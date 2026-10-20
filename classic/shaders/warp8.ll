@@ -609,7 +609,14 @@ merge:
   %cbk8 = shl i32 %cbk, 3
   %cbz = icmp eq i32 %cbk, 0
   %cthr = select i1 %cbz, i32 3264, i32 %cbk8
-  %cut = icmp ugt i32 %cutn, %cthr
+  %cutc = icmp ugt i32 %cutn, %cthr
+  ; with a per-title file the replacement also needs the two motion-compensated samples to disagree (emov > 0.3): fast
+  ; motion keeps its warp (the samples agree), a real scene change (unrelated frames) still copies the real frame
+  %gate_on = icmp ne i32 %cbk, 0
+  %emov_hi = fcmp ogt float %emov, 0x3FD3333340000000
+  %gate_off = xor i1 %gate_on, true
+  %gate_ok = or i1 %emov_hi, %gate_off
+  %cut = and i1 %cutc, %gate_ok
   %t_ge_half = fcmp oge float %t, 0.5
   %cut_px = select i1 %t_ge_half, <4 x float> %sc, <4 x float> %sp
   %out1 = select i1 %cut, <4 x float> %cut_px, <4 x float> %out0
