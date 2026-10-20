@@ -101,6 +101,12 @@ static void load_meta(Game *g)
     int w, h, ch; unsigned char *img = stbi_load(p, &w, &h, &ch, 4);
     if (img) { g->icon = img; g->iw = w; g->ih = h; g->installed = 1; }
     if (!g->installed) { snprintf(p, sizeof(p), "/user/app/%s/app.json", g->id); FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; } }
+    // Games on extended (external HDD) storage have no appmeta here: look at the extended mounts, then at a settings file
+    // (it is only written for installed games, see save_settings).
+    for (int e = 0; e < 2 && !g->installed; e++) {
+        snprintf(p, sizeof(p), "/mnt/ext%d/user/app/%s/app.json", e, g->id); FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; }
+    }
+    if (!g->installed) { snprintf(p, sizeof(p), CFGDIR "/config-%s.ini", g->id); FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; } }
     vlog("game %s installed=%d version=%s title='%s' icon=%dx%d\n", g->id, g->installed, g->version, g->title, g->iw, g->ih);
 }
 
@@ -148,6 +154,7 @@ static void save_settings(App *a)
     write_all(CFGDIR "/vcfg_launcher.ini", buf, strlen(buf));
     for (int i = 0; i < a->ngames; i++) {
         Game *g = &a->games[i]; Settings *s = &g->s;
+        if (!g->installed) continue;
         if (g->engine == ENGINE_NEW) {
             snprintf(buf, sizeof(buf), "enabled=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\nopacity=%d\n",
                      s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity);
