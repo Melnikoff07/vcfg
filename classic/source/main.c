@@ -1230,13 +1230,54 @@ static int is_verified_title(void)
     return 0;
 }
 
+// What the plugin learned about a title (LOG_DIR/safe-<TITLE>.state, one digit; raw kernel calls, stdio faults in plugin_load):
+// 0/none = observe, then try to take memory late; 1 = the late set-up found no free memory (a game that claims the whole
+// pool at its start), so the next start takes the memory early like a verified title; 2 = such an early start did not
+// reach frame INJECT_AFTER_FLIPS (LOG_DIR/safe-<TITLE>.boot marker left behind), so this title only gets observed.
+static int g_safe_early = 0;      // 1: this start takes its memory early (state 1)
+static int g_safe_never = 0;      // 1: state 2, never touch the game
+static void safe_path(char *buf, size_t n, const char *ext) { snprintf(buf, n, LOG_DIR "/safe-%s.%s", g_title_id, ext); }
+static int safe_state_read(void)
+{
+    char p[64], c = '0';
+    safe_path(p, sizeof(p), "state");
+    int fd = sceKernelOpen(p, 0, 0);
+    if (fd < 0) return 0;
+    if ((long)sceKernelRead(fd, &c, 1) != 1) c = '0';
+    sceKernelClose(fd);
+    return c == '1' ? 1 : c == '2' ? 2 : 0;
+}
+static void safe_state_write(int st)
+{
+    char p[64], c = (char)('0' + st);
+    safe_path(p, sizeof(p), "state");
+    int fd = sceKernelOpen(p, 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0666);
+    if (fd < 0) return;
+    sceKernelWrite(fd, &c, 1);
+    sceKernelClose(fd);
+}
+static int safe_marker(int op)   // 0 = exists?, 1 = create, 2 = remove
+{
+    char p[64];
+    safe_path(p, sizeof(p), "boot");
+    if (op == 2) { sceKernelUnlink(p); return 0; }
+    int fd = sceKernelOpen(p, op == 1 ? 0x601 : 0, 0666);
+    if (fd < 0) return 0;
+    if (op == 1) sceKernelWrite(fd, "1", 1);
+    sceKernelClose(fd);
+    return 1;
+}
+
 static void safe_refuse(const char *why)
 {
     snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: SAFE %s", why);
     STAGE("safe mode frame %u: refused (%s) -> the game stays native", g_flips, why);
     lg("safe mode: refused at frame %u (%s)\n", g_flips, why);
+    if (!strncmp(why, "NO ", 3) && strstr(why, "MEM")) {   // no free memory late: next start takes it early
+        safe_state_write(1);
+        STAGE("safe mode: state saved -> the next start takes its memory early (a start that does not reach frame %d is then given up)", INJECT_AFTER_FLIPS);
+    }
 }
-
 // Surface size of one game display buffer: the VA gap between the game's buffers if it looks like a surface, else
 // pitch * height * 4. 0 = unknown (the same rules as the early path in RegisterBuffers).
 static size_t safe_surface_stride(void)
@@ -1813,6 +1854,8 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
         cfg_reload_from_disk(1);
         // 1.4: Verify compatibility & populate g_inert_reason if FG cannot run
         char safe_reason[sizeof(g_inert_reason)];
+        if (g_safe_early) { safe_marker(2); STAGE("safe mode: the early start reached frame %d -> marker removed", INJECT_AFTER_FLIPS); }
+        if (g_safe && g_safe_never) { g_safe_done = 1; snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: SAFE GIVEN UP"); }
         if (g_safe && !g_safe_done) {
             if (g_inject_on == 8) safe_try_activate(handle);
             else safe_refuse("MODE");
@@ -2818,6 +2861,18 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
     {
         int m = g_bench_enabled ? 8 : read_mode_raw();
         g_safe = !g_bench_enabled && !is_verified_title();
+        if (g_safe) {   // what an earlier start of this title taught us (see safe_state_read)
+            int st = safe_state_read();
+            if (st == 1 && safe_marker(0)) {
+                safe_state_write(2); st = 2;
+                STAGE("safe mode: the early start before did not reach frame %d -> this title is only observed from now on", INJECT_AFTER_FLIPS);
+            }
+            if (st == 2) g_safe_never = 1;
+            else if (st == 1) {
+                g_safe = 0; g_safe_early = 1; safe_marker(1);
+                STAGE("safe mode: an earlier start found no free memory late -> this start takes its memory early (marker set, removed at frame %d)", INJECT_AFTER_FLIPS);
+            }
+        }
         if (g_safe) { STAGE("safe mode: title %s is not verified -> no early memory, hooks only observe until frame %d", g_title_id, INJECT_AFTER_FLIPS); m = 0; }
         if (m == 8 && !g_bench_enabled) gv_load(alloc_dm);
         if (m >= 1 && m <= 8) {
