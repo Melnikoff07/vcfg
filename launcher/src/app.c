@@ -253,17 +253,25 @@ void app_draw(Canvas *c, App *a)
         r[0] = (Row){ "Position", "", 0, 0 }; cat(r[0].value, corner_name(a->overlay_pos ? a->overlay_pos : 0));
         r[1] = (Row){ "Opacity", "", 2, a->overlay_opacity / 10 };
         r[2] = (Row){ "Shown in", "", 0, 0 }; cat(r[2].value, "ALL GAMES");
-        r[3] = (Row){ "Menu hotkey", "", 0, 0 }; cat(r[3].value, k_menu_combo_name[menu_combo_index(menu_combo_from_index(a->menu_combo))]);
+        r[3] = (Row){ "Menu hotkey", "", 0, 0 };
+        if (a->rec) cat(r[3].value, "RECORDING...");
+        else menu_combo_name(a->menu_combo, r[3].value, (int)sizeof(r[3].value));
         (void)s;
         draw_rows(c, a, M + 520, top + 58, c->w - 2 * M - 520, "PERFORMANCE OVERLAY", "60", "GAME 30 / GPU 1.7 MS", r, 4);
         draw_text(c, a->f->mono.ttf ? &a->f->mono : &a->f->mono, M, top + 120, "SHOWS GAME FPS,", INK, 1);
         draw_text(c, &a->f->mono, M, top + 162, "FRAMES ON SCREEN", INK, 1);
         draw_text(c, &a->f->mono, M, top + 204, "AND GPU TIME", INK, 1);
-        draw_text(c, &a->f->mono, M, top + 288, "MENU HOTKEY: HOLD THE", INK, 1);
-        draw_text(c, &a->f->mono, M, top + 330, "BUTTONS 3 SECONDS IN A GAME.", INK, 1);
-        draw_text(c, &a->f->mono, M, top + 372, "APPLIES AT NEXT GAME START.", DIM, 1);
-        Hint h[] = { { BTN_UD, "SELECT" }, { BTN_LR, "CHANGE" } };
-        draw_footer(c, a, h, 2);
+        if (a->rec) {
+            draw_text(c, &a->f->mono, M, top + 288, "HOLD THE BUTTONS TOGETHER,", RED, 1);
+            draw_text(c, &a->f->mono, M, top + 330, "THEN LET GO. L1 R1 L2 R2 L3 R3.", RED, 1);
+            draw_text(c, &a->f->mono, M, top + 372, "CIRCLE ALONE: CANCEL.", DIM, 1);
+        } else {
+            draw_text(c, &a->f->mono, M, top + 288, "MENU HOTKEY: HOLD THE", INK, 1);
+            draw_text(c, &a->f->mono, M, top + 330, "BUTTONS 3 SECONDS IN A GAME.", INK, 1);
+            draw_text(c, &a->f->mono, M, top + 372, a->rec_msg[0] ? a->rec_msg : "APPLIES AT NEXT GAME START.", a->rec_msg[0] ? RED : DIM, 1);
+        }
+        Hint h[] = { { BTN_UD, "SELECT" }, { BTN_LR, "CHANGE" }, { BTN_CROSS, "RECORD HOTKEY" } };
+        draw_footer(c, a, h, a->row == 3 ? 3 : 2);
     } else {
         draw_install(c, a, top);
         Hint h[] = { { BTN_CROSS, "INSTALL / UPDATE" }, { BTN_SQUARE, "TURN OFF" }, { BTN_TRIANGLE, "DEBUG LOG" }, { BTN_CIRCLE, "SAVE REPORT" } };
@@ -283,8 +291,26 @@ static void change(Settings *s, int row, int dir)
     case 4: step(&s->overlay, dir, 0, 8, 1); break;
     }
 }
+static void set_msg(App *a, const char *s) { a->rec_msg[0] = 0; cat(a->rec_msg, s); }
+// Recording of the hotkey: the largest set of buttons held at the same moment, taken when all are released.
+int app_pad(App *a, uint32_t held)
+{
+    if (!a->rec) return 0;
+    if (a->rec_wait) { if (!held) { a->rec_wait = 0; return 1; } return 0; }   // the Cross that started it is still down
+    if (held && __builtin_popcount(held) > __builtin_popcount(a->rec_peak)) { a->rec_peak = held; return 1; }
+    if (held) return 0;
+    uint32_t m = a->rec_peak;
+    a->rec = 0; a->rec_peak = 0;
+    if (!m) return 1;
+    if (m == PAD_CIRCLE) set_msg(a, "CANCELLED.");
+    else if (m & ~MENU_COMBO_ALLOWED) set_msg(a, "ONLY L1 R1 L2 R2 L3 R3 ALLOWED.");
+    else if (menu_combo_buttons(m) < 2) set_msg(a, "HOLD AT LEAST TWO BUTTONS.");
+    else { a->menu_combo = m; a->dirty = 1; set_msg(a, ""); }
+    return 1;
+}
 int app_input(App *a, uint32_t b)
 {
+    if (a->rec) return ACT_NONE;   // recording the hotkey: every button belongs to it
     if (b & PAD_L1) { step(&a->tab, -1, 0, TAB_COUNT - 1, 1); a->detail = 0; a->row = 0; return ACT_NONE; }
     if (b & PAD_R1) { step(&a->tab, 1, 0, TAB_COUNT - 1, 1); a->detail = 0; a->row = 0; return ACT_NONE; }
     if (b & PAD_OPTIONS) return ACT_SAVE_EXIT;
@@ -312,10 +338,14 @@ int app_input(App *a, uint32_t b)
         if (a->tab == TAB_OVERLAY) {
             if (a->row == 0) step(&a->overlay_pos, dir, 1, 8, 1);
             else if (a->row == 1) step(&a->overlay_opacity, dir * 10, 20, 100, 0);
-            else if (a->row == 3) step(&a->menu_combo, dir, 0, MENU_COMBO_COUNT - 1, 1);
+            else if (a->row == 3) {   // presets; a recorded combination continues from the start / the end of the list
+                int i = menu_combo_index(a->menu_combo); if (i < 0) i = dir > 0 ? -1 : MENU_COMBO_COUNT;
+                step(&i, dir, 0, MENU_COMBO_COUNT - 1, 1); a->menu_combo = menu_combo_from_index(i); set_msg(a, "");
+            }
         } else change(s, a->row, dir);
         a->dirty = 1;
     }
+    if (a->tab == TAB_OVERLAY && a->row == 3 && (b & PAD_CROSS)) { a->rec = 1; a->rec_wait = 1; a->rec_peak = 0; set_msg(a, ""); }
     if (b & PAD_CIRCLE) { a->detail = 0; return ACT_SAVE; }
     if (a->tab == TAB_DEFAULTS && (b & PAD_CROSS)) {
         for (int i = 0; i < a->ngames; i++) if (!a->games[i].testing && !a->games[i].experimental) a->games[i].s = a->defaults;

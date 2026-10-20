@@ -33,14 +33,14 @@
 typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
-    { "CUSA07439", "vcfg11.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic37.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic37.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic37.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA07439", "vcfg12.prx", ENGINE_NEW, 0 },
+    { "CUSA08519", "vcfg_classic38.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic38.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic38.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg11.prx", "vcfg_classic37.prx" };
-static const char *k_exp_prx = "vcfg_classic37.prx";   // engine for experimental (not verified) titles
+static const char *k_files[] = { "vcfg12.prx", "vcfg_classic38.prx" };
+static const char *k_exp_prx = "vcfg_classic38.prx";   // engine for experimental (not verified) titles
 
 static FILE *g_log;
 static void vlog(const char *fmt, ...)
@@ -161,7 +161,7 @@ static void load_settings(App *a)
     const char *t = l ? (const char *)l : "";
     a->defaults = (Settings){ ini_int(t, "fg", 1), ini_int(t, "preset", 0), ini_int(t, "sharp", 40), ini_int(t, "enhance", 1), ini_int(t, "overlay", 0) };
     a->overlay_pos = ini_int(t, "overlay_pos", 4); a->overlay_opacity = ini_int(t, "overlay_opacity", 80);
-    a->menu_combo = menu_combo_index(menu_combo_sanitize((uint32_t)ini_int(t, "menu_combo", (int)MENU_COMBO_DEFAULT)));   // table only, else L3 + R3
+    a->menu_combo = menu_combo_sanitize((uint32_t)ini_int(t, "menu_combo", (int)MENU_COMBO_DEFAULT));   // preset or recorded mask, else L3 + R3
     free(l);
     for (int i = 0; i < a->ngames; i++) {
         Game *g = &a->games[i]; g->s = a->defaults; if (g->testing || g->experimental) g->s.fg = 0;
@@ -183,7 +183,7 @@ static void save_settings(App *a)
 {
     char buf[512], path[96];
     sceKernelMkdir(CFGDIR, 0777);
-    const unsigned combo = menu_combo_from_index(a->menu_combo);   // validated mask, written to every file the plugins read
+    const unsigned combo = menu_combo_sanitize(a->menu_combo);   // validated mask, written to every file the plugins read
     snprintf(buf, sizeof(buf), "fg=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\noverlay_pos=%d\noverlay_opacity=%d\nmenu_combo=%u\n",
              a->defaults.fg, a->defaults.preset, a->defaults.sharp, a->defaults.enhance, a->defaults.overlay, a->overlay_pos, a->overlay_opacity, combo);
     write_all(CFGDIR "/vcfg_launcher.ini", buf, strlen(buf));
@@ -302,7 +302,7 @@ static int plugin_state(void)
         if (!st) break;
     }
     size_t n; unsigned char *ini = read_all(INI, &n);
-    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg11.prx"))) st = 2;
+    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg12.prx"))) st = 2;
     free(ini);
     return st;
 }
@@ -592,6 +592,7 @@ int main(void)
         if (edge & dirs) hold_t = now + 380000;
         else if (dirs && now > hold_t) { edge |= dirs; hold_t = now + 110000; }   // key repeat
         prev = btn;
+        if (app_pad(a, btn)) redraw = 1;   // hotkey recording needs the held buttons, not only the presses
         if (edge) {
             int act = app_input(a, edge); redraw = 1;
             if (act == ACT_INSTALL) do_install(a);
@@ -601,7 +602,7 @@ int main(void)
             else if (act == ACT_SAVE) { save_settings(a); remap_if_changed(a); }
             else if (act == ACT_SAVE_EXIT) {
                 save_settings(a); remap_if_changed(a);
-                snprintf(a->status, sizeof(a->status), "SAVED. START A GAME, HOLD L3+R3 FOR 3 S FOR THE MENU.");
+                snprintf(a->status, sizeof(a->status), "SAVED. START A GAME, HOLD THE MENU HOTKEY FOR 3 S.");
                 app_draw(&c, a); present(back); sceKernelUsleep(900000); quit();
             }
         }

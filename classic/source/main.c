@@ -2269,7 +2269,8 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
                 g_pad_prev_nav = raw_btn;
                 g_pad_rep_t = now;
                 pad_swallow(pkts, count);
-                lg("menu opened (%s held %d ms)\n", k_menu_combo_name[menu_combo_index(combo)], g_cfg.menu_hold_ms);
+                char cname[32]; menu_combo_name(combo, cname, sizeof(cname));
+                lg("menu opened (%s held %d ms)\n", cname, g_cfg.menu_hold_ms);
             }
         } else {
             g_combo_t = 0;

@@ -568,7 +568,7 @@ static void a20_build_menu(uint32_t *tb,uint8_t *sb)
     osd_set_row(styles,grid,5,0,32,0,0," MEMORY PRESSURE: AUTO OFF");
     osd_set_row(styles,grid,6,3,32,0,0," [X] TOGGLE   [O] CLOSE");
     {char combo_name[24],hint[40];menu_combo_compact(A20_COMBO(),combo_name,sizeof(combo_name));
-     snprintf(hint,sizeof(hint)," %s: HOLD 3 SECONDS",combo_name);osd_set_row(styles,grid,7,3,32,0,0,hint);}
+     snprintf(hint,sizeof(hint),strlen(combo_name)>11?" %s: HOLD 3 S":" %s: HOLD 3 SECONDS",combo_name);osd_set_row(styles,grid,7,3,32,0,0,hint);}   // a recorded combo can be long: keep the row within 32 columns
     make_v(tb+128,(uint64_t)(uintptr_t)(a20_gpu+A21_FONT_OFF),768);
     make_v(tb+132,(uint64_t)(uintptr_t)mem,576);
     tb[136]=tb[137]=0;tb[138]=64u|(64u<<16);tb[139]=32u|(8u<<8)|(200u<<16)|(2u<<24);
@@ -896,7 +896,7 @@ static void a20_init(void)
     a20_thread_started=1;a20_ready_at=sceKernelGetProcessTime();
     __atomic_store_n(&a20_state,2,__ATOMIC_RELEASE);
     lg("A20_READY continuous=1 menu=L3_R3_3sec toggle=CROSS off_by_default=1 synthesis=A13_exact_shader_arrays menu=enabled\n");
-    {char note[96];snprintf(note,sizeof(note),"VCFG REF ready. Hold %s for 3 seconds to open menu.",k_menu_combo_name[menu_combo_index(A20_COMBO())]);
+    {char note[96],cname[32];menu_combo_name(A20_COMBO(),cname,sizeof(cname));snprintf(note,sizeof(note),"VCFG REF ready. Hold %s for 3 seconds to open menu.",cname);
      NotifyStatic(TEX_ICON_SYSTEM,note);}
     return;
 unused_failure:

@@ -1,4 +1,4 @@
-// Host test of overlay/menu_combo.h (the hotkey table shared by the app and both engines).
+// Host test of overlay/menu_combo.h (presets and recorded combinations shared by the app and both engines).
 // Build and run with the toolchain LLVM: clang -O0 -emit-llvm -c menu_combo_test.c -o t.bc && lli t.bc
 int printf(const char *, ...);
 static unsigned long str_len(const char *s) { unsigned long n = 0; while (s[n]) n++; return n; }
@@ -24,9 +24,29 @@ int main(void)
         CHECK(str_len(c) > 0 && str_len(c) <= 11 && !has_space(c));      // fits a 32-column OSD row with " ...: HOLD 3 SECONDS"
         CHECK(str_len(k_menu_combo_name[i]) < 32);          // fits Row.value of the app
     }
-    // everything else falls back to L3 + R3
-    const uint32_t bad[] = { 0u, 0x0002u, 0x0004u, 0x0008u, 0x0001u, 0x4000u, 0x0402u, 0x0C00u, 0x0C07u, 0x0F06u, 0x10006u, 0xFFFFFFFFu, 0x80000000u, 0x0007u };
-    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) { CHECK(menu_combo_index(bad[i]) == -1); CHECK(menu_combo_sanitize(bad[i]) == MENU_COMBO_DEFAULT); }
+    // recorded combinations: every set of 2..6 of the six allowed buttons is valid (57 sets), nothing else is
+    int valid = 0;
+    for (uint32_t m = 0; m < 0x10000u; m++) {
+        int ok = (m & ~0x0F06u) == 0 && __builtin_popcount(m) >= 2;
+        CHECK(menu_combo_valid(m) == ok);
+        CHECK(menu_combo_sanitize(m) == (ok ? m : MENU_COMBO_DEFAULT));
+        if (!ok) continue;
+        valid++;
+        char n[40], c[40]; menu_combo_name(m, n, sizeof(n)); menu_combo_compact(m, c, sizeof(c));
+        CHECK(str_len(n) > 0 && str_len(n) <= 27 && str_len(c) <= 17 && !has_space(c));
+        CHECK(str_len(n) == str_len(c) + 2 * (unsigned long)(__builtin_popcount(m) - 1));   // " + " vs "+"
+    }
+    CHECK(valid == 57);
+    // names are built in the order L1 R1 L2 R2 L3 R3
+    { char n[40]; menu_combo_name(0x0F06u, n, sizeof(n)); CHECK(!__builtin_memcmp(n, "L1 + R1 + L2 + R2 + L3 + R3", 28)); }
+    { char c[40]; menu_combo_compact(0x0402u, c, sizeof(c)); CHECK(!__builtin_memcmp(c, "L1+L3", 6)); }
+    // a small buffer is never overrun and stays terminated
+    { char n[8]; menu_combo_name(0x0F06u, n, sizeof(n)); CHECK(n[7] == 0 || str_len(n) < 8); CHECK(str_len(n) <= 7); }
+    // everything else falls back to L3 + R3: single buttons, Options, d-pad, face buttons, PS/touchpad, empty, noise
+    const uint32_t bad[] = { 0u, 0x0002u, 0x0004u, 0x0008u, 0x0001u, 0x4000u, 0x0400u, 0x0C01u, 0x0C07u, 0x0F0Eu, 0x10006u, 0xFFFFFFFFu, 0x80000000u, 0x0007u, 0x2006u, 0x0046u };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) { CHECK(!menu_combo_valid(bad[i])); CHECK(menu_combo_sanitize(bad[i]) == MENU_COMBO_DEFAULT); }
+    // a recorded combination is not a preset, presets are found by index
+    CHECK(menu_combo_index(0x0402u) == -1 && menu_combo_sanitize(0x0402u) == 0x0402u);
     // a negative number from an ini (read with %d and cast) is also rejected
     CHECK(menu_combo_sanitize((uint32_t)-1) == MENU_COMBO_DEFAULT && menu_combo_sanitize((uint32_t)-6) == MENU_COMBO_DEFAULT);
     // index helpers are total

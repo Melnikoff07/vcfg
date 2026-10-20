@@ -23,7 +23,9 @@ typedef struct {
     int tab, sel, detail, row;
     Settings defaults;
     int overlay_pos, overlay_detail, overlay_opacity;   // shared overlay style
-    int menu_combo;                                      // in-game menu hotkey: index into k_menu_combo_mask (overlay/menu_combo.h), 0 = L3 + R3
+    uint32_t menu_combo;                                 // in-game menu hotkey: pad button mask (overlay/menu_combo.h), preset or recorded, L3 + R3 by default
+    int rec, rec_wait; uint32_t rec_peak;                // recording of the hotkey: waiting for release / largest set held together
+    char rec_msg[64];                                    // result of the last recording, shown next to the hotkey
     int plugin_state;                                    // 0 missing, 1 installed, 2 outdated
     int debug_log;
     char version[16];                                    // app and plugin version, shown in the header                                       // plugins write /data/bb_probe/probe.log
@@ -39,3 +41,4 @@ enum { PAD_UP = 0x10, PAD_RIGHT = 0x20, PAD_DOWN = 0x40, PAD_LEFT = 0x80, PAD_OP
 
 void app_draw(Canvas *c, App *a);
 int  app_input(App *a, uint32_t pressed);      // edge-triggered buttons -> ACT_*
+int  app_pad(App *a, uint32_t held);           // every frame, buttons held now: hotkey recording; 1 when a redraw is needed
