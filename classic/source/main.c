@@ -32,6 +32,7 @@ static volatile int g_opt_nocf = 0;  // inject letter k: confidence fallback off
 #include "fg8_table.h"
 #include "gv.h"
 #include "vov_glue.h"
+#include "menu_combo.h"
 
 #define PLUGIN_NAME "bb_probe"
 #define LOG_DIR "/data/bb_probe"
@@ -54,13 +55,14 @@ typedef struct {
     int menu_hold_ms;    // hold L3+R3 in ms to open menu (default 3000)
     int menu_opacity;    // 0..100 (default 80)
     int overlay;         // 0 = off, 1..2 = TL (Small/Detail), 3..4 = TR, 5..6 = BR, 7..8 = BL
+    uint32_t menu_combo; // pad buttons held together to open the menu (menu_combo.h table, default L3+R3)
 } fg_config_t;
 
 static char g_title_id[16] = "UNKNOWN";
 static int g_known_game = 0;
 static int g_is_game_proc = 1;
-static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0 };
-static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0 };
+static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT };
+static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT };
 static volatile int g_menu_open = 0, g_menu_sel = 0, g_cfg_save_req = 0;
 static volatile uint64_t g_osd_toast_until = 0;
 static char g_osd_toast[32] = "READY";
@@ -974,6 +976,7 @@ static void cfg_defaults(fg_config_t *c)
     c->menu_hold_ms   = 3000;
     c->menu_opacity   = 80;
     c->overlay        = 0;
+    c->menu_combo     = MENU_COMBO_DEFAULT;
 }
 
 static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
@@ -1011,6 +1014,7 @@ static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
                 else if (strcmp(key, "menu_hold_ms") == 0) c->menu_hold_ms = val < 500 ? 500 : (val > 10000 ? 10000 : val);
                 else if (strcmp(key, "menu_opacity") == 0) c->menu_opacity = val < 20 ? 20 : (val > 100 ? 100 : val);
                 else if (strcmp(key, "overlay") == 0) c->overlay = val < 0 ? 0 : (val > 8 ? 8 : val);
+                else if (strcmp(key, "menu_combo") == 0) c->menu_combo = menu_combo_sanitize((uint32_t)val);   // table only, else L3+R3
             }
         }
         if (!saved) break;
@@ -1196,6 +1200,7 @@ static void cfg_save_game_ini(void)
     fprintf(f, "menu_hold_ms = %d\n", c.menu_hold_ms);
     fprintf(f, "menu_opacity = %d\n", c.menu_opacity);
     fprintf(f, "overlay = %d\n", c.overlay);
+    fprintf(f, "menu_combo = %u\n", (unsigned)menu_combo_sanitize(c.menu_combo));
     fflush(f);
     fclose(f);
     rename(tmp, path);
@@ -2189,6 +2194,7 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
     if (!pkts || count < 1) return;
     PadDataRaw *latest = &pkts[count - 1];
     uint32_t raw_btn = latest->buttons;
+    const uint32_t combo = menu_combo_sanitize(g_cfg.menu_combo);   // buttons held together (table only, default L3+R3)
     uint64_t now = sceKernelGetProcessTime();
 
     if (latest->timestamp && latest->timestamp == g_pad_last_ts && raw_btn == g_pad_last_raw) {
@@ -2203,7 +2209,7 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
             if ((raw_btn & 0xFFFFu) == 0) g_pad_swallow_until = 0;
             else { pad_swallow(pkts, count); return; }
         }
-        if ((raw_btn & (PAD_L3 | PAD_R3)) == (PAD_L3 | PAD_R3)) {
+        if ((raw_btn & combo) == combo) {
             uint64_t hold_us = (uint64_t)(g_cfg.menu_hold_ms >= 500 ? g_cfg.menu_hold_ms : 3000) * 1000ull;
             if (!g_combo_t) g_combo_t = now;
             else if (!g_combo_fired && now > g_combo_t && now - g_combo_t >= hold_us) {
@@ -2215,7 +2221,7 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
                 g_pad_prev_nav = raw_btn;
                 g_pad_rep_t = now;
                 pad_swallow(pkts, count);
-                lg("menu opened (L3+R3 held %d ms)\n", g_cfg.menu_hold_ms);
+                lg("menu opened (%s held %d ms)\n", k_menu_combo_name[menu_combo_index(combo)], g_cfg.menu_hold_ms);
             }
         } else {
             g_combo_t = 0;
@@ -2226,7 +2232,7 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
 
     pad_swallow(pkts, count);
 
-    if ((raw_btn & (PAD_L3 | PAD_R3)) != (PAD_L3 | PAD_R3)) g_combo_fired = 0;
+    if ((raw_btn & combo) != combo) g_combo_fired = 0;
 
     uint32_t nav_btn = raw_btn;
     if (latest->ly < 0x38) nav_btn |= PAD_UP;
@@ -2244,7 +2250,7 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
     }
     g_pad_prev_nav = nav_btn;
 
-    if ((edge & (PAD_CIRCLE | PAD_OPTIONS)) || (!g_combo_fired && (raw_btn & (PAD_L3 | PAD_R3)) == (PAD_L3 | PAD_R3))) {
+    if ((edge & (PAD_CIRCLE | PAD_OPTIONS)) || (!g_combo_fired && (raw_btn & combo) == combo)) {
         g_menu_open = 0;
         g_combo_fired = 1;
         g_combo_t = now;
@@ -2269,6 +2275,7 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
     }
     if (edge & PAD_SQUARE) {
         cfg_defaults(&g_menu_edit);
+        g_menu_edit.menu_combo = g_cfg.menu_combo;   // the hotkey is not a visible setting: defaults must not change it
         cfg_apply_live(&g_menu_edit, "menu-defaults");
         snprintf(g_osd_toast, sizeof(g_osd_toast), "DEFAULTS LOADED");
     }

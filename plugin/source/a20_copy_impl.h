@@ -1,5 +1,6 @@
 #pragma once
 #include "a21_config.h"
+#include "menu_combo.h"
 #include "a20_copy_shader.h"
 #include "pm4scan.h"
 #include "warp720.h"
@@ -341,6 +342,8 @@ static void a20_append_observation(A18Observation row)
     a20_ring[a20_ring_total++%A20_RING]=row;
     if (a20_ring_count<A20_RING) a20_ring_count++;else a20_ring_dropped++;
 }
+static uint32_t a20_menu_combo=MENU_COMBO_DEFAULT;   // hotkey of the menu (vcfg.ini menu_combo, table only, default L3+R3)
+#define A20_COMBO() menu_combo_sanitize(__atomic_load_n(&a20_menu_combo,__ATOMIC_RELAXED))
 #if A21_SLAB2
 // User preferences (vcfg.ini). Read by the submit thread with relaxed atomics; written by pad/worker.
 static unsigned a21_preset;        // 0 = QUALITY 2X, 1 = FAST (target refresh)
@@ -357,6 +360,7 @@ static void a21_parse_key(const char *line,int *enabled)
     else if (sscanf(line,"enhance=%d",&v)==1 && v>=0 && v<=2) a21_enhance=(unsigned)v;
     else if (sscanf(line,"overlay=%d",&v)==1 && v>=0 && v<=8) a21_overlay=(unsigned)v;
     else if (sscanf(line,"opacity=%d",&v)==1 && v>=20 && v<=100) a21_opacity=(unsigned)v;
+    else if (sscanf(line,"menu_combo=%d",&v)==1) __atomic_store_n(&a20_menu_combo,menu_combo_sanitize((uint32_t)v),__ATOMIC_RELAXED);
 }
 #endif
 static void a20_load_config(void)
@@ -379,10 +383,10 @@ static void a20_write_config(void)
     const char *tmp=LOG_DIR "/vcfg.ini.tmp",*path=LOG_DIR "/vcfg.ini";
     FILE *f=fopen(tmp,"w");int rc=-1;
 #if A21_SLAB2
-    if (f) {int n=fprintf(f,"enabled=%d\npreset=%u\nsharp=%u\nenhance=%u\noverlay=%u\nopacity=%u\n",value,
+    if (f) {int n=fprintf(f,"enabled=%d\npreset=%u\nsharp=%u\nenhance=%u\noverlay=%u\nopacity=%u\nmenu_combo=%u\n",value,
         __atomic_load_n(&a21_preset,__ATOMIC_RELAXED),__atomic_load_n(&a21_sharp,__ATOMIC_RELAXED),
         __atomic_load_n(&a21_enhance,__ATOMIC_RELAXED),__atomic_load_n(&a21_overlay,__ATOMIC_RELAXED),
-        __atomic_load_n(&a21_opacity,__ATOMIC_RELAXED));
+        __atomic_load_n(&a21_opacity,__ATOMIC_RELAXED),(unsigned)A20_COMBO());
         int close_rc=fclose(f);if (n>0 && !close_rc) rc=rename(tmp,path);}
 #else
     if (f) {int n=fprintf(f,"enabled=%d\n",value);int close_rc=fclose(f);if (n>0 && !close_rc) rc=rename(tmp,path);}
@@ -430,7 +434,7 @@ static int a20_pad_step(uint32_t buttons,uint64_t stamp,uint64_t now)
     if ((stamp && stamp==a20_pad_stamp) || (!stamp && now-a20_pad_last_cpu<2000ull)) goto done;
     a20_pad_stamp=stamp;a20_pad_last_cpu=now;
     uint32_t edge=buttons&~a20_pad_buttons;a20_pad_buttons=buttons;
-    if ((buttons&6u)==6u) { // L3+R3 from PadDataRaw button ABI.
+    if ((buttons&A20_COMBO())==A20_COMBO()) { // menu hotkey (default L3+R3) from PadDataRaw button ABI.
         if (!a20_pad_hold) {a20_pad_hold=now;lg("A20_COMBO_BEGIN stamp=%llu\n",(unsigned long long)stamp);}
         if (!a20_pad_fired && now-a20_pad_hold>=3000000ull) {
             menu=!menu;a20_pad_fired=1;
@@ -563,7 +567,8 @@ static void a20_build_menu(uint32_t *tb,uint8_t *sb)
     osd_set_row(styles,grid,4,0,32,0,0," MODE: QUALITY 2X");
     osd_set_row(styles,grid,5,0,32,0,0," MEMORY PRESSURE: AUTO OFF");
     osd_set_row(styles,grid,6,3,32,0,0," [X] TOGGLE   [O] CLOSE");
-    osd_set_row(styles,grid,7,3,32,0,0," L3+R3: HOLD 3 SECONDS");
+    {char combo_name[24],hint[40];menu_combo_compact(A20_COMBO(),combo_name,sizeof(combo_name));
+     snprintf(hint,sizeof(hint)," %s: HOLD 3 SECONDS",combo_name);osd_set_row(styles,grid,7,3,32,0,0,hint);}
     make_v(tb+128,(uint64_t)(uintptr_t)(a20_gpu+A21_FONT_OFF),768);
     make_v(tb+132,(uint64_t)(uintptr_t)mem,576);
     tb[136]=tb[137]=0;tb[138]=64u|(64u<<16);tb[139]=32u|(8u<<8)|(200u<<16)|(2u<<24);
@@ -891,7 +896,8 @@ static void a20_init(void)
     a20_thread_started=1;a20_ready_at=sceKernelGetProcessTime();
     __atomic_store_n(&a20_state,2,__ATOMIC_RELEASE);
     lg("A20_READY continuous=1 menu=L3_R3_3sec toggle=CROSS off_by_default=1 synthesis=A13_exact_shader_arrays menu=enabled\n");
-    NotifyStatic(TEX_ICON_SYSTEM,"VCFG REF ready. Hold L3+R3 for 3 seconds to open menu.");
+    {char note[96];snprintf(note,sizeof(note),"VCFG REF ready. Hold %s for 3 seconds to open menu.",k_menu_combo_name[menu_combo_index(A20_COMBO())]);
+     NotifyStatic(TEX_ICON_SYSTEM,note);}
     return;
 unused_failure:
     // None of these resources have been submitted to GPU or selected for scanout.

@@ -65,7 +65,7 @@ regenerates `classic/source/shaders.h` on every build.
    `plugins.ini` and maps the verified games (your other plugins are kept).
 3. Pick a game (cross toggles FG, triangle opens its settings, square saves and exits). Other games appear as
    EXPERIMENTAL and are off until you switch them on.
-4. Start the game, wait ~20 s, hold **L3+R3 for 3 s** for the in-game menu.
+4. Start the game, wait ~20 s, hold **L3+R3 for 3 s** for the in-game menu (the buttons can be changed in the app: OVERLAY tab, "Menu hotkey"; takes effect at the next game start).
 
 Turn off: tab **04 PLUGIN** → square (removes VCFG from `plugins.ini`; files stay).
 

@@ -23,6 +23,7 @@ typedef struct {
     int tab, sel, detail, row;
     Settings defaults;
     int overlay_pos, overlay_detail, overlay_opacity;   // shared overlay style
+    int menu_combo;                                      // in-game menu hotkey: index into k_menu_combo_mask (overlay/menu_combo.h), 0 = L3 + R3
     int plugin_state;                                    // 0 missing, 1 installed, 2 outdated
     int debug_log;
     char version[16];                                    // app and plugin version, shown in the header                                       // plugins write /data/bb_probe/probe.log

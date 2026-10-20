@@ -17,6 +17,7 @@
 #include <orbis/Sysmodule.h>
 #include <orbis/SystemService.h>
 #include "app.h"
+#include "../../overlay/menu_combo.h"
 #include <GoldHEN.h>
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -32,14 +33,14 @@
 typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
-    { "CUSA07439", "vcfg10.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic36.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic36.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic36.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA07439", "vcfg11.prx", ENGINE_NEW, 0 },
+    { "CUSA08519", "vcfg_classic37.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic37.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic37.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg10.prx", "vcfg_classic36.prx" };
-static const char *k_exp_prx = "vcfg_classic36.prx";   // engine for experimental (not verified) titles
+static const char *k_files[] = { "vcfg11.prx", "vcfg_classic37.prx" };
+static const char *k_exp_prx = "vcfg_classic37.prx";   // engine for experimental (not verified) titles
 
 static FILE *g_log;
 static void vlog(const char *fmt, ...)
@@ -160,6 +161,7 @@ static void load_settings(App *a)
     const char *t = l ? (const char *)l : "";
     a->defaults = (Settings){ ini_int(t, "fg", 1), ini_int(t, "preset", 0), ini_int(t, "sharp", 40), ini_int(t, "enhance", 1), ini_int(t, "overlay", 0) };
     a->overlay_pos = ini_int(t, "overlay_pos", 4); a->overlay_opacity = ini_int(t, "overlay_opacity", 80);
+    a->menu_combo = menu_combo_index(menu_combo_sanitize((uint32_t)ini_int(t, "menu_combo", (int)MENU_COMBO_DEFAULT)));   // table only, else L3 + R3
     free(l);
     for (int i = 0; i < a->ngames; i++) {
         Game *g = &a->games[i]; g->s = a->defaults; if (g->testing || g->experimental) g->s.fg = 0;
@@ -181,20 +183,21 @@ static void save_settings(App *a)
 {
     char buf[512], path[96];
     sceKernelMkdir(CFGDIR, 0777);
-    snprintf(buf, sizeof(buf), "fg=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\noverlay_pos=%d\noverlay_opacity=%d\n",
-             a->defaults.fg, a->defaults.preset, a->defaults.sharp, a->defaults.enhance, a->defaults.overlay, a->overlay_pos, a->overlay_opacity);
+    const unsigned combo = menu_combo_from_index(a->menu_combo);   // validated mask, written to every file the plugins read
+    snprintf(buf, sizeof(buf), "fg=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\noverlay_pos=%d\noverlay_opacity=%d\nmenu_combo=%u\n",
+             a->defaults.fg, a->defaults.preset, a->defaults.sharp, a->defaults.enhance, a->defaults.overlay, a->overlay_pos, a->overlay_opacity, combo);
     write_all(CFGDIR "/vcfg_launcher.ini", buf, strlen(buf));
     for (int i = 0; i < a->ngames; i++) {
         Game *g = &a->games[i]; Settings *s = &g->s;
         if (!g->installed) continue;
         if (g->engine == ENGINE_NEW) {
-            snprintf(buf, sizeof(buf), "enabled=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\nopacity=%d\n",
-                     s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity);
+            snprintf(buf, sizeof(buf), "enabled=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\nopacity=%d\nmenu_combo=%u\n",
+                     s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo);
             write_all(CFGDIR "/vcfg.ini", buf, strlen(buf));
         } else {
             snprintf(path, sizeof(path), CFGDIR "/config-%s.ini", g->id);
-            snprintf(buf, sizeof(buf), "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\n",
-                     s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity);
+            snprintf(buf, sizeof(buf), "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\nmenu_combo=%u\n",
+                     s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo);
             write_all(path, buf, strlen(buf));
         }
     }
@@ -299,7 +302,7 @@ static int plugin_state(void)
         if (!st) break;
     }
     size_t n; unsigned char *ini = read_all(INI, &n);
-    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg10.prx"))) st = 2;
+    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg11.prx"))) st = 2;
     free(ini);
     return st;
 }

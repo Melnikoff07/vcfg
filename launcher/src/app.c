@@ -1,4 +1,5 @@
 #include "app.h"
+#include "../../overlay/menu_combo.h"
 
 // Palette (approved design: variant 2 colours, horizontal card row).
 #define CREAM 0xFFEFEEE8u
@@ -248,15 +249,19 @@ void app_draw(Canvas *c, App *a)
         draw_footer(c, a, h, 3);
     } else if (a->tab == TAB_OVERLAY) {
         Settings s = a->defaults;
-        Row r[3];
+        Row r[4];
         r[0] = (Row){ "Position", "", 0, 0 }; cat(r[0].value, corner_name(a->overlay_pos ? a->overlay_pos : 0));
         r[1] = (Row){ "Opacity", "", 2, a->overlay_opacity / 10 };
         r[2] = (Row){ "Shown in", "", 0, 0 }; cat(r[2].value, "ALL GAMES");
+        r[3] = (Row){ "Menu hotkey", "", 0, 0 }; cat(r[3].value, k_menu_combo_name[menu_combo_index(menu_combo_from_index(a->menu_combo))]);
         (void)s;
-        draw_rows(c, a, M + 520, top + 58, c->w - 2 * M - 520, "PERFORMANCE OVERLAY", "60", "GAME 30 / GPU 1.7 MS", r, 3);
+        draw_rows(c, a, M + 520, top + 58, c->w - 2 * M - 520, "PERFORMANCE OVERLAY", "60", "GAME 30 / GPU 1.7 MS", r, 4);
         draw_text(c, a->f->mono.ttf ? &a->f->mono : &a->f->mono, M, top + 120, "SHOWS GAME FPS,", INK, 1);
         draw_text(c, &a->f->mono, M, top + 162, "FRAMES ON SCREEN", INK, 1);
         draw_text(c, &a->f->mono, M, top + 204, "AND GPU TIME", INK, 1);
+        draw_text(c, &a->f->mono, M, top + 288, "MENU HOTKEY: HOLD THE", INK, 1);
+        draw_text(c, &a->f->mono, M, top + 330, "BUTTONS 3 SECONDS IN A GAME.", INK, 1);
+        draw_text(c, &a->f->mono, M, top + 372, "APPLIES AT NEXT GAME START.", DIM, 1);
         Hint h[] = { { BTN_UD, "SELECT" }, { BTN_LR, "CHANGE" } };
         draw_footer(c, a, h, 2);
     } else {
@@ -292,7 +297,7 @@ int app_input(App *a, uint32_t b)
         return ACT_NONE;
     }
     Settings *s = a->tab == TAB_GAMES ? &a->games[a->sel].s : &a->defaults;
-    int rows = a->tab == TAB_OVERLAY ? 3 : 5;
+    int rows = a->tab == TAB_OVERLAY ? 4 : 5;
     if (a->tab == TAB_INSTALL) {
         if (b & PAD_CROSS) return ACT_INSTALL;
         if (b & PAD_SQUARE) return ACT_REMOVE;
@@ -307,6 +312,7 @@ int app_input(App *a, uint32_t b)
         if (a->tab == TAB_OVERLAY) {
             if (a->row == 0) step(&a->overlay_pos, dir, 1, 8, 1);
             else if (a->row == 1) step(&a->overlay_opacity, dir * 10, 20, 100, 0);
+            else if (a->row == 3) step(&a->menu_combo, dir, 0, MENU_COMBO_COUNT - 1, 1);
         } else change(s, a->row, dir);
         a->dirty = 1;
     }
