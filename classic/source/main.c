@@ -280,7 +280,11 @@ static int g_pcopy_avail = 0, g_pcopy_cfg = 0, g_pcopy_k = 2;   // k mids + k co
 static volatile int g_pcopy_on = 0;
 // mids: g_ngame .. g_ngame + k - 1, copies: g_ngame + k .. + 2k - 1 (rings, so the buffer the GPU writes has long
 // left the screen and WaitFlipDone does not stall the GPU behind a full flip queue)
-#define IS_MID(b) ((b) >= g_ngame && !(g_pcopy_on && (b) >= g_ngame + g_pcopy_k))
+// g_mbase: index of our first extra display buffer. Verified titles: right after the game's buffers (g_ngame).
+// Other titles: a separate VideoOut group at the top of the 16 indices, so a game that registers more buffers
+// later (CUSA04841 crashed right after we took index 3) still finds its indices free.
+static int g_mbase = 3;
+#define IS_MID(b) ((b) >= g_mbase && !(g_pcopy_on && (b) >= g_mbase + g_pcopy_k))
 static int g_ngame = 3;
 static void *g_pre_mem = NULL;
 static size_t g_pre_size = 0;
@@ -1380,7 +1384,7 @@ static void pace_vblank(int prev2_real, int prev_real, int cur_real)
         memset(&fs, 0, sizeof(fs));
         if (sceVideoOutGetFlipStatus(g_handle, &fs) == 0) {
             int late = fs.currentBuffer == cur_real ||
-                       (g_opt_early && fs.currentBuffer >= g_ngame && g_last_real_buf == prev_real);
+                       (g_opt_early && fs.currentBuffer >= g_mbase && g_last_real_buf == prev_real);
             if (late) { g_pace_off--; g_pace_fix++; }
         }
     }
@@ -1658,8 +1662,8 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     uint32_t tidx = (g_attr.tilingMode == 0) ? 10u : 8u;
                     int pcopy = g_pcopy_avail && g_pcopy_cfg != 2;   // auto and on: available only for 2-buffer games
                     g_pcopy_on = pcopy;
-                    uint32_t mi1 = pcopy ? (uint32_t)g_ngame + (g_flips % (uint32_t)g_pcopy_k) : (uint32_t)g_ngame + (g_flips % (uint32_t)g_nmid);
-                    uint32_t mi2 = (uint32_t)g_ngame + ((g_flips + 1u) % (uint32_t)g_nmid);
+                    uint32_t mi1 = pcopy ? (uint32_t)g_mbase + (g_flips % (uint32_t)g_pcopy_k) : (uint32_t)g_mbase + (g_flips % (uint32_t)g_nmid);
+                    uint32_t mi2 = (uint32_t)g_mbase + ((g_flips + 1u) % (uint32_t)g_nmid);
                     uint32_t t1_q16 = 32768u, t2_q16 = 43690u;
                     int two_mids = 0;
                     int force_repeat = (raw_dt_us > 66667ull) ? 1 : 0; // >66.7 ms (<15 fps hitch) -> repeat frame
@@ -1738,7 +1742,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     if (pcopy) {
                         static uint32_t pc_flip;
                         pc_flip = (pc_flip + 1u) % (uint32_t)g_pcopy_k;
-                        ci = (uint32_t)g_ngame + (uint32_t)g_pcopy_k + pc_flip;
+                        ci = (uint32_t)g_mbase + (uint32_t)g_pcopy_k + pc_flip;
                         two_mids = 0; third_flip = 0;      // FAST 3-step needs a second mid buffer: not with present copy
                         show_idx = ci;
                         if (index < 16u && ci < 16u) __atomic_store_n(&g_sub_t[ci], __atomic_load_n(&g_sub_t[index], __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
@@ -1755,7 +1759,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     n = build_dcb_post8(mine, g_buf[index], g_bw, g_bh, g_pitch, tidx, px * 4, slot, g_flips, tail);
                 } else if ((g_inject_on == 4 || g_inject_on == 6 || g_inject_on == 7) && g_prev_idx < (uint32_t)g_ngame && mbufs_ready(handle)) {
                     uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
-                    uint32_t mi = g_ngame + (g_flips % (uint32_t)g_nmid);
+                    uint32_t mi = (uint32_t)g_mbase + (g_flips % (uint32_t)g_nmid);
                     if (g_inject_on >= 6 && g_work && g_bw >= 1280 && (g_bw % 640) == 0 && g_bh == g_bw * 9 / 16 && g_bw / 640 <= 4)
                         n = build_dcb_flow(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi], g_bw, g_bh, g_pitch,
                                            (g_attr.tilingMode == 0) ? 10u : 8u, px * 4, slot, g_flips, tail,
@@ -2047,6 +2051,30 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 nm += nm2;
                 g_pcopy_avail = (g_ngame == 2 && nm >= 4);
                 g_pcopy_k = nm >= 6 ? 3 : 2;
+                static const char *k_verified[] = { "CUSA00207", "CUSA08519", "CUSA00411", "CUSA05571", "CUSA08809",
+                                                    "CUSA00557", "CUSA09171", "CUSA13801" };
+                int verified = 0;
+                for (unsigned v = 0; v < sizeof(k_verified) / sizeof(k_verified[0]); v++) if (!strcmp(g_title_id, k_verified[v])) verified = 1;
+                if (!verified && 16 - nm > g_ngame) {
+                    // separate group at the top: the game's own registration stays exactly as the game asked
+                    int base = 16 - nm;
+                    int32_t r0 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                                               handle, startIndex, addresses, bufferNum, attr);
+                    int32_t r1 = r0 < 0 ? r0 : HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                                                             handle, base, ext + g_ngame, nm, attr);
+                    lg("mbufs: %d extra buffer(s) of 0x%zx in a separate group at index %d: game = 0x%08x, ours = 0x%08x\n",
+                       nm, one, base, (unsigned)r0, (unsigned)r1);
+                    if (r0 >= 0 && r1 >= 0) {
+                        g_mbase = base;
+                        for (int i = 0; i < nm; i++) g_buf[base + i] = (uint64_t)(uintptr_t)ext[g_ngame + i];
+                        g_nbuf = base + nm;
+                        g_mbuf_state = 1;
+                    }
+                    if (g_pcopy_avail && r1 >= 0) lg("double-buffered game: present copy available (%d mids + %d copies from index %d)\n", g_pcopy_k, g_pcopy_k, base);
+                    if (r1 < 0) g_pcopy_avail = 0;
+                    return r0;
+                }
+                g_mbase = g_ngame;
                 if (g_pcopy_avail) lg("double-buffered game: present copy available (%d mids + %d copies from index %d)\n", g_pcopy_k, g_pcopy_k, g_ngame);
                 int32_t r = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
                                           handle, startIndex, ext, g_ngame + nm, attr);
