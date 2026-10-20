@@ -28,6 +28,7 @@ out = ROOT / 'build/tests'
 out.mkdir(parents=True, exist_ok=True)
 source = out / 'classic_config.c'
 source.write_text('''#include <stdint.h>
+#include "menu_combo.h"
 #include <stddef.h>
 extern int sscanf(const char *, const char *, ...);
 extern int strcmp(const char *, const char *);
@@ -65,6 +66,6 @@ int main(void) {
 bitcode = out / 'classic_config.bc'
 llvm = pathlib.Path(cfg['llvm_bin'])
 subprocess.run([str(llvm / 'clang.exe'), '--target=x86_64-pc-windows-msvc', '-O0', '-fno-builtin',
-                '-emit-llvm', '-c', str(source), '-o', str(bitcode)], check=True)
+                '-emit-llvm', '-I', str(ROOT / 'overlay'), '-c', str(source), '-o', str(bitcode)], check=True)
 subprocess.run([str(llvm / 'lli.exe'), '--dlopen=msvcrt.dll', str(bitcode)], check=True)
 print('classic INI parser: reset, inheritance, per-title override and clamps passed')
