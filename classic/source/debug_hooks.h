@@ -126,54 +126,39 @@ static int32_t handle_game_map(void **addr, size_t len, int prot, int flags, lon
         long shave_end = g_shave_phys + (long)g_shave_orig_len;
         long req_end = dmStart + (long)len;
         if (dmStart >= g_shave_phys && dmStart < shave_end && req_end > shave_cut && req_end <= shave_end) {
-            long alias_phys = shave_cut - 0x200000L;
             size_t real_part = dmStart < shave_cut ? (size_t)(shave_cut - dmStart) : 0;
             size_t tail_part = len - real_part;
-            size_t page_sz = (maxPageSize > 0 && maxPageSize < 0x200000u) ? maxPageSize : 0x200000u;
             int32_t r = 0;
             if (real_part > 0)
                 r = call_orig_map(addr, real_part, prot, flags, dmStart, maxPageSize, name, is_named);
-            int tail_ok = (r == 0 && addr != NULL && (real_part == 0 || *addr != NULL));
-            size_t mapped_tail = 0;
-            for (size_t off = 0; tail_ok && off < tail_part; off += page_sz) {
-                size_t chunk = tail_part - off < page_sz ? tail_part - off : page_sz;
-                if (real_part == 0 && off == 0) {
-                    int32_t rt = call_orig_map(addr, chunk, prot, flags, alias_phys, page_sz, name, is_named);
-                    if (rt != 0 || !*addr) {
-                        STAGE("arena shave tail0 map FAILED: rt=0x%08x", (unsigned)rt);
-                        tail_ok = 0;
-                        r = rt ? rt : -1;
-                        break;
-                    }
-                    mapped_tail += chunk;
-                    continue;
-                }
-                void *want_va = (uint8_t *)(*addr) + real_part + off;
+            if (real_part > 0 && r == 0 && addr && *addr) {
+                void *want_va = (uint8_t *)(*addr) + real_part;
                 void *got_va = want_va;
-                int32_t rt = call_orig_map(&got_va, chunk, prot, flags, alias_phys, page_sz, name, is_named);
-                if (rt != 0 || got_va != want_va) {
-                    if (rt == 0 && got_va) sceKernelMunmap(got_va, chunk);
-                    void *qs = NULL, *qe = NULL; int32_t qprot = 0;
-                    if (sceKernelQueryMemoryProtection(want_va, &qs, &qe, &qprot) != 0) {
-                        got_va = want_va;
-                        rt = call_orig_map(&got_va, chunk, prot, flags | 0x10 /*MAP_FIXED*/, alias_phys, page_sz, name, is_named);
+                int32_t rf = sceKernelMapFlexibleMemory(&got_va, tail_part, prot, flags | 0x10 /*MAP_FIXED*/);
+                if (rf != 0 || got_va != want_va) {
+                    if (rf == 0 && got_va) sceKernelMunmap(got_va, tail_part);
+                    got_va = want_va;
+                    rf = sceKernelMapFlexibleMemory(&got_va, tail_part, prot, flags);
+                    if (rf == 0 && got_va != want_va) {
+                        sceKernelMunmap(got_va, tail_part);
+                        rf = -1;
                     }
                 }
-                if (rt != 0 || got_va != want_va) {
-                    if (rt == 0 && got_va) sceKernelMunmap(got_va, chunk);
-                    STAGE("arena shave tail map FAILED at off=0x%zx: rt=0x%08x want=%p got=%p", off, (unsigned)rt, want_va, got_va);
-                    tail_ok = 0;
-                    break;
-                }
-                mapped_tail += chunk;
-            }
-            if (tail_ok) {
-                STAGE("arena shave map OK: va=%p real=0x%zx tail=0x%zx alias_phys=0x%lx",
-                      *addr, real_part, tail_part, alias_phys);
+                STAGE("arena shave map OK: va=%p real=0x%zx shaved_tail=0x%zx flex_tail=%s (rf=0x%08x)",
+                      *addr, real_part, tail_part, (rf == 0 && got_va == want_va) ? "mapped" : "unmapped-guard", (unsigned)rf);
+                if (!g_own_alloc && __atomic_add_fetch(&g_dbg_maps, 1u, __ATOMIC_RELAXED) <= DBG_ALLOCS_MAX)
+                    STAGE("game %s(phys=0x%lx len=0x%zx prot=0x%x flags=0x%x align=0x%zx in=%p) = 0x00000000 va=%p (shaved)",
+                          is_named ? "MapNamedDirectMemory" : "MapDirectMemory", dmStart, len, prot, flags, maxPageSize,
+                          orig_addr_in, *addr);
                 return 0;
             }
-            if (r == 0 && addr && *addr && (real_part + mapped_tail) > 0)
-                sceKernelMunmap(*addr, real_part + mapped_tail);
+            if (real_part == 0 && addr) {
+                int32_t rf = sceKernelMapFlexibleMemory(addr, tail_part, prot, flags);
+                if (rf == 0 && *addr) {
+                    STAGE("arena shave tail-only flex map OK: va=%p len=0x%zx", *addr, tail_part);
+                    return 0;
+                }
+            }
             if (addr) *addr = orig_addr_in;
             if (dmStart == g_shave_phys && g_flips == 0 && g_gpu_state == 0 && g_mbuf_state <= 0) {
                 int rr = sceKernelReleaseDirectMemory(g_shave_phys, g_shave_real_len);

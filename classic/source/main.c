@@ -1863,8 +1863,9 @@ static void tick(uint32_t n, uint32_t handle, uint32_t index, uint32_t mode)
         uint32_t prev_rfps = __atomic_load_n(&g_osd_real_fps_x10, __ATOMIC_ACQUIRE);
         uint32_t sm_rfps = prev_rfps ? (prev_rfps + cur_rfps) / 2u : cur_rfps;
         __atomic_store_n(&g_osd_real_fps_x10, sm_rfps, __ATOMIC_RELEASE);
-        // 1.4: Auto-detect 60 fps games during warmup (flips 30..120) before FG pacing begins
-        if (n >= 60 && n <= INJECT_AFTER_FLIPS && sm_rfps >= 480u && !g_detected_60fps) {
+        // 1.4: Auto-detect 60 fps games during warmup (flips 30..120) before FG pacing begins.
+        // Skip if the game explicitly requested a 30/20 Hz lock via sceVideoOutSetFlipRate(handle, >=1).
+        if (n >= 60 && n <= INJECT_AFTER_FLIPS && sm_rfps >= 480u && !g_detected_60fps && g_game_flip_rate <= 0) {
             g_detected_60fps = 1;
             snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)");
             lg("auto-detect: game runs at %.1f fps (>= 48 fps) -> FrameGen auto-disabled (60 Hz output limit)\n", rfps);
@@ -2910,10 +2911,12 @@ int32_t sceVideoOutSetFlipRate_hook(int32_t handle, int32_t rate)
     if (g_bench_enabled) return HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), handle, rate);
     int m_raw = read_mode_raw();
     int want4 = (m_raw == 4 || m_raw == 6 || m_raw == 7 || m_raw == 8);
-    lg("SetFlipRate handle=%d rate=%d%s\n", handle, rate, (want4 && (!g_safe || g_safe_active)) ? " -> forced 0 (mode 4/8: 60 Hz output, we pace the game ourselves)" : "");
-    static uint32_t s_sfr_n;   // some games call SetFlipRate every frame: only the first calls are boot stages (the 200-line boot file filled up with them)
-    int sfr_log = s_sfr_n < 4 ? (int)++s_sfr_n : 0;
-    if (sfr_log) STAGE("SetFlipRate enter: handle=%d rate=%d%s", handle, rate, want4 ? " -> 0" : "");
+    static uint32_t s_sfr_n;   // some games call SetFlipRate every frame: only the first calls (or rate changes) are logged
+    int sfr_log = (s_sfr_n < 4 || rate != g_game_flip_rate) ? (int)++s_sfr_n : 0;
+    if (sfr_log) {
+        lg("SetFlipRate handle=%d rate=%d%s\n", handle, rate, (want4 && (!g_safe || g_safe_active)) ? " -> forced 0 (mode 4/8: 60 Hz output, we pace the game ourselves)" : "");
+        STAGE("SetFlipRate enter: handle=%d rate=%d%s", handle, rate, (want4 && (!g_safe || g_safe_active)) ? " -> 0" : "");
+    }
     g_game_flip_rate = rate;   // safe mode: the game's own rate stays until the late set-up succeeded
     if (want4 && (!g_safe || g_safe_active)) rate = 0;
     int32_t r = HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), handle, rate);
