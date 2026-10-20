@@ -16,7 +16,7 @@ arrays = {name: data for name, data in arrays.items() if re.search(r'\b' + re.es
 hooks = ['Detour_sceVideoOutGetFlipStatus', 'Detour_sceVideoOutAddFlipEvent', 'Detour_sceGnmInsertWaitFlipDone']
 manifest = {'revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
             'builds': [], 'source_sha256': {}}
-for mode in range(4):
+for mode in range(5):
     folder = 'classic' if mode == 0 else f'classic-test{mode}'
     elf = (ROOT / 'build' / folder / 'vcfg_classic.elf').read_bytes()
     bad = {name: elf.count(data) for name, data in arrays.items() if elf.count(data) != 1}

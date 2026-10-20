@@ -2074,6 +2074,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
 int32_t sceGnmSubmitAndFlipCommandBuffers_hook(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
 {
     void *gd[GV_MAXE]; uint32_t gs[GV_MAXE]; void *gc[GV_MAXE]; uint32_t gcs[GV_MAXE];
+    tb_on_game_submit();            // test builds: the status poll that let the game out of its wait
     static uint32_t s_boot_flips;   // the first submits are boot stages too (B01: starts that end before the first one)
     uint32_t bf = s_boot_flips < 3 ? ++s_boot_flips : 0;
     if (bf) STAGE("SubmitAndFlip #%u enter: count=%u handle=%u index=%u flipMode=%u", bf, count, handle, index, flipMode);

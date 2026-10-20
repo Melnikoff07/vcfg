@@ -1,4 +1,4 @@
-param([ValidateRange(0,3)][int]$Test = 0, [switch]$Bench)
+param([ValidateRange(0,4)][int]$Test = 0, [switch]$Bench)
 $ErrorActionPreference = 'Stop'
 if ($Bench -and $Test -ne 0) { throw 'Bench and two-buffer experiments are separate builds' }
 $root = Split-Path $PSScriptRoot -Parent

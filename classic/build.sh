@@ -8,7 +8,7 @@ TC=$(j openorbis_toolchain); SDK=$(j goldhen_sdk); LL=$(j llvm_bin); LLC=$(j llc
 export OO_PS4_TOOLCHAIN="$TC" DOTNET_ROLL_FORWARD=Major
 VER=$(head -n 1 "$R/VERSION" | tr -cd "0-9.")
 TEST=${VCFG_2BUF_TEST:-0}
-case "$TEST" in 0|1|2|3) ;; *) echo 'VCFG_2BUF_TEST must be 0 (normal), 1 (observe), 2 (argument), or 3 (pulldown)' >&2; exit 1 ;; esac
+case "$TEST" in 0|1|2|3|4) ;; *) echo 'VCFG_2BUF_TEST must be 0 (normal), 1 (observe), 2 (argument), 3 (pulldown) or 4 (virtual queue)' >&2; exit 1 ;; esac
 B="$R/build/classic"; [ "$TEST" = 0 ] || B="$R/build/classic-test$TEST"
 mkdir -p "$B"
 "$PY" -I "$H/gen_shaders.py" "$LLC" "$H/shaders" "$H/source/shaders.h"
