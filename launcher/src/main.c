@@ -10,6 +10,7 @@
 #include <time.h>
 #include <stdarg.h>
 #include <dirent.h>
+#include <errno.h>
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/Pad.h>
@@ -91,6 +92,9 @@ static int sfo_str(const unsigned char *b, size_t n, const char *key, char *out,
 // The app sandbox cannot read these folders (drwx------ root); main() wraps the calls in a GoldHEN jailbreak.
 static const char *const k_roots[] = { "", "/mnt/ext0", "/mnt/ext1", "/mnt/ext2", "/mnt/ext3" };   // internal drive, then extended storage (external HDD)
 #define NROOT ((int)(sizeof(k_roots) / sizeof(k_roots[0])))
+// What the game scan saw on each root, for the bug report (an external drive that cannot be listed, a full list).
+typedef struct { int listed, err, found, added, known, not_installed, full; } ScanRoot;
+static ScanRoot g_scan[NROOT];
 // Where a title's icon can be: appmeta (all internal titles), the title's own sce_sys on its drive, an installed patch.
 static const char *const k_icon_tpl[] = { "%s/user/appmeta/%s/icon0.png", "%s/user/appmeta/%s/icon0_08.png", "%s/user/app/%s/sce_sys/icon0.png",
                                           "%s/user/app/%s/icon0.png", "%s/user/patch/%s/sce_sys/icon0.png", "%s/system_data/priv/appmeta/%s/icon0.png" };
@@ -420,6 +424,30 @@ static void summarize(Buf *r, const char *id, const char *which, const char *t)
     if (!frame) bprintf(r, "    => stopped before the first frame was shown (loading): see the first lines of this trace\n");
 }
 
+// Trace files in CFGDIR for any title: also games the list does not show (external drive not listed, list full,
+// removed game), so the summary does not depend on the game scan.
+typedef struct { char id[12]; int prev; } TraceFile;
+static int list_traces(TraceFile *out, int cap, int *err)
+{
+    int n = 0; *err = 0;
+    DIR *d = opendir(CFGDIR); if (!d) { *err = errno ? errno : -1; return 0; }
+    struct dirent *e;
+    while ((e = readdir(d)) && n < cap) {
+        const char *s = e->d_name;   // trace-CUSAxxxxx.txt / trace-CUSAxxxxx.prev.txt
+        if (strncmp(s, "trace-CUSA", 10) || strlen(s) < 19) continue;
+        int prev;
+        if (!strcmp(s + 15, ".txt")) prev = 0; else if (!strcmp(s + 15, ".prev.txt")) prev = 1; else continue;
+        snprintf(out[n].id, sizeof(out[n].id), "%.9s", s + 6); out[n].prev = prev; n++;
+    }
+    closedir(d);
+    for (int i = 1; i < n; i++) for (int j = i; j > 0; j--) {   // by title, the last start before the one before
+        int c = strcmp(out[j - 1].id, out[j].id);
+        if (c < 0 || (c == 0 && out[j - 1].prev <= out[j].prev)) break;
+        TraceFile t = out[j]; out[j] = out[j - 1]; out[j - 1] = t;
+    }
+    return n;
+}
+
 static void do_report(App *a)
 {
     Buf r = { malloc(4u << 20), 0, 4u << 20 };
@@ -430,15 +458,33 @@ static void do_report(App *a)
     int swr = sceKernelGetSystemSwVersion(&sw);
     bprintf(&r, "VCFG bug report\napp version: %s\nfirmware: %s\ntime: %lld\ndebug log: %s\nplugin state: %d\n", VCFG_VERSION,
             swr == 0 ? sw.VersionString : "?", (long long)now, a->debug_log ? "on" : "off", a->plugin_state);
-    bprintf(&r, "\n==== summary (flight recorder, trace-<TITLE>.txt) ====\n");
+    bprintf(&r, "\n==== game scan (where the app looked for installed games) ====\n");
+    for (int i = 0; i < NROOT; i++) {
+        const ScanRoot *s = &g_scan[i];
+        if (s->listed)
+            bprintf(&r, "%s/user/app: CUSA folders %d, new %d, already listed %d, not installed %d, list full %d\n", k_roots[i],
+                    s->found, s->added, s->known, s->not_installed, s->full);
+        else bprintf(&r, "%s/user/app: cannot list (errno %d)\n", k_roots[i], s->err);
+    }
+    bprintf(&r, "games in the list: %d (room for %d)\n", a->ngames, (int)(sizeof(a->games) / sizeof(a->games[0])));
+
+    static TraceFile tf[128]; int terr = 0, nt = list_traces(tf, 128, &terr);
+    bprintf(&r, "\n==== summary (flight recorder, trace-<TITLE>.txt, %d files in " CFGDIR ") ====\n", nt);
+    if (terr) bprintf(&r, "READ ERROR: cannot list " CFGDIR " (errno %d)\n", terr);
+    for (int k = 0; k < nt; k++) {
+        char p[96]; size_t n = 0;
+        snprintf(p, sizeof(p), CFGDIR "/trace-%s%s.txt", tf[k].id, tf[k].prev ? ".prev" : "");
+        unsigned char *d = read_all(p, &n);
+        if (!d) { bprintf(&r, "%s: READ ERROR %s\n", tf[k].id, p); continue; }
+        summarize(&r, tf[k].id, tf[k].prev ? "game start before" : "last game start", (const char *)d);
+        free(d);
+        int listed = 0; for (int i = 0; i < a->ngames; i++) if (!strcmp(a->games[i].id, tf[k].id)) listed = 1;
+        if (!listed && !tf[k].prev) bprintf(&r, "    (not in the app's game list)\n");
+    }
     for (int i = 0; i < a->ngames; i++) {
-        for (int prev = 0; prev < 2; prev++) {
-            char p[96]; size_t n = 0;
-            snprintf(p, sizeof(p), CFGDIR "/trace-%s%s.txt", a->games[i].id, prev ? ".prev" : "");
-            unsigned char *d = read_all(p, &n); if (!d) continue;
-            summarize(&r, a->games[i].id, prev ? "game start before" : "last game start", (const char *)d);
-            free(d);
-        }
+        int has = 0; for (int k = 0; k < nt; k++) if (!strcmp(tf[k].id, a->games[i].id)) has = 1;
+        if (!has) bprintf(&r, "%s: NOT COLLECTED (no trace file: the plugin has not run in this game yet, or GoldHEN did not load it;"
+                          " not proof that the game was never started)\n", a->games[i].id);
     }
     bprintf(&r, "\n==== games ====\n");
     for (int i = 0; i < a->ngames; i++) {
@@ -459,9 +505,9 @@ static void do_report(App *a)
         char p[96]; snprintf(p, sizeof(p), CFGDIR "/config-%s.ini", a->games[i].id);
         if (file_exists(p)) bfile(&r, "game settings", p, 8u << 10);
     }
-    for (int i = 0; i < a->ngames; i++) for (int prev = 0; prev < 2; prev++) {
-        char p[96]; snprintf(p, sizeof(p), CFGDIR "/trace-%s%s.txt", a->games[i].id, prev ? ".prev" : "");
-        if (file_exists(p)) bfile(&r, prev ? "flight recorder, game start before" : "flight recorder, last game start", p, 64u << 10);
+    for (int k = 0; k < nt; k++) {
+        char p[96]; snprintf(p, sizeof(p), CFGDIR "/trace-%s%s.txt", tf[k].id, tf[k].prev ? ".prev" : "");
+        bfile(&r, tf[k].prev ? "flight recorder, game start before" : "flight recorder, last game start", p, 64u << 10);
     }
     bfile(&r, "plugin log, last game start", CFGDIR "/probe.log", 1536u << 10);
     bfile(&r, "plugin log, the start before", CFGDIR "/probe.prev.log", 1024u << 10);
@@ -548,19 +594,26 @@ int main(void)
     for (int r = 0; r < NROOT; r++) {
     char ap[48]; snprintf(ap, sizeof(ap), "%s/user/app", k_roots[r]);
     DIR *dir = opendir(ap);
+    ScanRoot *sr = &g_scan[r];
     if (dir) {
         struct dirent *e;
-        while ((e = readdir(dir)) && a->ngames < (int)(sizeof(a->games) / sizeof(a->games[0]))) {
+        sr->listed = 1;
+        while ((e = readdir(dir))) {
             if (strncmp(e->d_name, "CUSA", 4) || strlen(e->d_name) != 9) continue;
+            sr->found++;
             int known = 0; for (int i = 0; i < a->ngames; i++) if (!strcmp(a->games[i].id, e->d_name)) known = 1;
-            if (known) continue;
+            if (known) { sr->known++; continue; }
+            if (a->ngames >= (int)(sizeof(a->games) / sizeof(a->games[0]))) { sr->full++; continue; }   // counted, shown in the report
             Game *g = &a->games[a->ngames++]; memset(g, 0, sizeof(*g));
             snprintf(g->id, sizeof(g->id), "%s", e->d_name); g->engine = ENGINE_CLASSIC; g->experimental = 1;
             load_meta(g);
-            if (!g->installed) a->ngames--;
+            if (!g->installed) { a->ngames--; sr->not_installed++; } else sr->added++;
         }
         closedir(dir);
-    } else vlog("cannot list %s\n", ap);
+    } else { sr->err = errno; vlog("cannot list %s (errno %d)\n", ap, sr->err); }
+    if (sr->listed)
+        vlog("scan %s: CUSA folders %d, new %d, already listed %d, not installed %d, list full %d\n", ap, sr->found, sr->added,
+             sr->known, sr->not_installed, sr->full);
     }
     if (jrc == 0) vlog("unjailbreak rc=%d\n", sys_sdk_unjailbreak(&jb));
     // Hide games that are not installed (plugins.ini keeps mapping them, see build_map).
