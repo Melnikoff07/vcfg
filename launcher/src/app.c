@@ -254,7 +254,10 @@ void app_draw(Canvas *c, App *a)
         r[1] = (Row){ "Opacity", "", 2, a->overlay_opacity / 10 };
         r[2] = (Row){ "Shown in", "", 0, 0 }; cat(r[2].value, "ALL GAMES");
         r[3] = (Row){ "Menu hotkey", "", 0, 0 };
-        if (a->rec) cat(r[3].value, "RECORDING...");
+        if (a->rec) {   // live: the largest set held together so far
+            if (!a->rec_peak) cat(r[3].value, "PRESS BUTTONS...");
+            else for (int i = 0; i < 6; i++) if (a->rec_peak & k_menu_combo_bits[i]) { if (r[3].value[0]) cat(r[3].value, "+"); cat(r[3].value, k_menu_combo_btn[i]); }
+        }
         else menu_combo_name(a->menu_combo, r[3].value, (int)sizeof(r[3].value));
         (void)s;
         draw_rows(c, a, M + 520, top + 58, c->w - 2 * M - 520, "PERFORMANCE OVERLAY", "60", "GAME 30 / GPU 1.7 MS", r, 4);
@@ -262,15 +265,15 @@ void app_draw(Canvas *c, App *a)
         draw_text(c, &a->f->mono, M, top + 162, "FRAMES ON SCREEN", INK, 1);
         draw_text(c, &a->f->mono, M, top + 204, "AND GPU TIME", INK, 1);
         if (a->rec) {
-            draw_text(c, &a->f->mono, M, top + 288, "HOLD THE BUTTONS TOGETHER,", RED, 1);
-            draw_text(c, &a->f->mono, M, top + 330, "THEN LET GO. L1 R1 L2 R2 L3 R3.", RED, 1);
-            draw_text(c, &a->f->mono, M, top + 372, "CIRCLE ALONE: CANCEL.", DIM, 1);
+            draw_text(c, &a->f->mono, M, top + 288, "PRESS YOUR BUTTONS TOGETHER", RED, 1);
+            draw_text(c, &a->f->mono, M, top + 330, "(L1 R1 L2 R2 L3 R3), THEN CROSS", RED, 1);
+            draw_text(c, &a->f->mono, M, top + 372, "TO SAVE. CIRCLE: CANCEL.", DIM, 1);
         } else {
             draw_text(c, &a->f->mono, M, top + 288, "MENU HOTKEY: HOLD THE", INK, 1);
             draw_text(c, &a->f->mono, M, top + 330, "BUTTONS 3 SECONDS IN A GAME.", INK, 1);
             draw_text(c, &a->f->mono, M, top + 372, a->rec_msg[0] ? a->rec_msg : "APPLIES AT NEXT GAME START.", a->rec_msg[0] ? RED : DIM, 1);
         }
-        Hint h[] = { { BTN_UD, "SELECT" }, { BTN_LR, "CHANGE" }, { BTN_CROSS, "RECORD HOTKEY" } };
+        Hint h[] = { { BTN_UD, "SELECT" }, { BTN_LR, "CHANGE" }, { BTN_CROSS, a->rec ? "SAVE HOTKEY" : "RECORD HOTKEY" } };
         draw_footer(c, a, h, a->row == 3 ? 3 : 2);
     } else {
         draw_install(c, a, top);
@@ -292,25 +295,32 @@ static void change(Settings *s, int row, int dir)
     }
 }
 static void set_msg(App *a, const char *s) { a->rec_msg[0] = 0; cat(a->rec_msg, s); }
-// Recording of the hotkey: the largest set of buttons held at the same moment, taken when all are released.
+// Recording of the hotkey (Cross starts it, Cross saves): the largest set of L1 R1 L2 R2 L3 R3 held at the same moment during
+// the latest press. Other buttons are ignored while recording, so Cross and Circle never end up in the combination.
 int app_pad(App *a, uint32_t held)
 {
     if (!a->rec) return 0;
-    if (a->rec_wait) { if (!held) { a->rec_wait = 0; return 1; } return 0; }   // the Cross that started it is still down
-    if (held && __builtin_popcount(held) > __builtin_popcount(a->rec_peak)) { a->rec_peak = held; return 1; }
-    if (held) return 0;
+    held &= MENU_COMBO_ALLOWED;
+    int redraw = 0;
+    if (held && !a->rec_prev) { a->rec_peak = held; redraw = 1; }   // a new press starts over
+    else if (held && __builtin_popcount(held) > __builtin_popcount(a->rec_peak)) { a->rec_peak = held; redraw = 1; }
+    a->rec_prev = held;
+    return redraw;
+}
+static void rec_finish(App *a)
+{
     uint32_t m = a->rec_peak;
-    a->rec = 0; a->rec_peak = 0;
-    if (!m) return 1;
-    if (m == PAD_CIRCLE) set_msg(a, "CANCELLED.");
-    else if (m & ~MENU_COMBO_ALLOWED) set_msg(a, "ONLY L1 R1 L2 R2 L3 R3 ALLOWED.");
-    else if (menu_combo_buttons(m) < 2) set_msg(a, "HOLD AT LEAST TWO BUTTONS.");
+    a->rec = 0; a->rec_peak = 0; a->rec_prev = 0;
+    if (menu_combo_buttons(m) < 2) set_msg(a, "NOT SAVED: PRESS TWO BUTTONS OR MORE.");
     else { a->menu_combo = m; a->dirty = 1; set_msg(a, ""); }
-    return 1;
 }
 int app_input(App *a, uint32_t b)
 {
-    if (a->rec) return ACT_NONE;   // recording the hotkey: every button belongs to it
+    if (a->rec) {   // recording the hotkey: Cross saves, Circle cancels, the rest belongs to the recording
+        if (b & PAD_CROSS) rec_finish(a);
+        else if (b & PAD_CIRCLE) { a->rec = 0; a->rec_peak = 0; a->rec_prev = 0; set_msg(a, "CANCELLED."); }
+        return ACT_NONE;
+    }
     if (b & PAD_L1) { step(&a->tab, -1, 0, TAB_COUNT - 1, 1); a->detail = 0; a->row = 0; return ACT_NONE; }
     if (b & PAD_R1) { step(&a->tab, 1, 0, TAB_COUNT - 1, 1); a->detail = 0; a->row = 0; return ACT_NONE; }
     if (b & PAD_OPTIONS) return ACT_SAVE_EXIT;
@@ -345,7 +355,7 @@ int app_input(App *a, uint32_t b)
         } else change(s, a->row, dir);
         a->dirty = 1;
     }
-    if (a->tab == TAB_OVERLAY && a->row == 3 && (b & PAD_CROSS)) { a->rec = 1; a->rec_wait = 1; a->rec_peak = 0; set_msg(a, ""); }
+    if (a->tab == TAB_OVERLAY && a->row == 3 && (b & PAD_CROSS)) { a->rec = 1; a->rec_prev = a->rec_peak = 0; set_msg(a, ""); }
     if (b & PAD_CIRCLE) { a->detail = 0; return ACT_SAVE; }
     if (a->tab == TAB_DEFAULTS && (b & PAD_CROSS)) {
         for (int i = 0; i < a->ngames; i++) if (!a->games[i].testing && !a->games[i].experimental) a->games[i].s = a->defaults;

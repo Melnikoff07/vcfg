@@ -24,7 +24,7 @@ typedef struct {
     Settings defaults;
     int overlay_pos, overlay_detail, overlay_opacity;   // shared overlay style
     uint32_t menu_combo;                                 // in-game menu hotkey: pad button mask (overlay/menu_combo.h), preset or recorded, L3 + R3 by default
-    int rec, rec_wait; uint32_t rec_peak;                // recording of the hotkey: waiting for release / largest set held together
+    int rec; uint32_t rec_prev, rec_peak;                // recording of the hotkey: Cross starts, Cross saves; buttons held last frame / largest set of the latest press
     char rec_msg[64];                                    // result of the last recording, shown next to the hotkey
     int plugin_state;                                    // 0 missing, 1 installed, 2 outdated
     int debug_log;
