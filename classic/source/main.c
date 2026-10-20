@@ -294,21 +294,41 @@ static size_t g_pre_size = 0;
 
 #include "two_buffer_test.h"
 #include "bench_state.h"
+#include "boot_stage.h"
+
+// Largest free direct-memory range for an alignment, for the logs: a refused allocation is a refused request (length,
+// alignment, type), not proof that no memory is left. OpenOrbis declares this call with by-value outputs, hence the cast.
+static size_t dm_avail(size_t align)
+{
+    off_t start = 0; size_t size = 0;
+    int r = ((int32_t (*)(off_t, off_t, size_t, off_t *, size_t *))(void *)sceKernelAvailableDirectMemorySize)(
+        0, (off_t)sceKernelGetDirectMemorySize(), align, &start, &size);
+    return r == 0 ? size : 0;
+}
 
 void *alloc_dm(size_t len, size_t align, int type);
 void *alloc_dm(size_t len, size_t align, int type)
 {
     long phys = 0; void *addr = NULL;
-    int r = sceKernelAllocateDirectMemory(0, (long)sceKernelGetDirectMemorySize(), len, align, type, &phys);
+    size_t total = sceKernelGetDirectMemorySize();
+    int r = sceKernelAllocateDirectMemory(0, (long)total, len, align, type, &phys);
+    int stage = r == 0 ? 2 : 1;
     if (r == 0) r = sceKernelMapDirectMemory(&addr, len, 0x33 /*CPU rw + GPU rw*/, 0, phys, align);
-    if (r != 0 || !addr) { klog("[bb_probe] alloc_dm(0x%zx) failed 0x%08x\n", len, (unsigned)r); return NULL; }
+    if (r != 0 || !addr) {
+        size_t av = dm_avail(align);
+        klog("[bb_probe] alloc_dm(0x%zx) failed 0x%08x\n", len, (unsigned)r);
+        STAGE("alloc_dm FAILED at %s: len=0x%zx align=0x%zx type=%d range=0..0x%zx r=0x%08x largest free=0x%zx",
+              stage == 1 ? "allocate" : "map", len, align, type, total, (unsigned)r, av);
+        return NULL;
+    }
+    STAGE("alloc_dm ok: len=0x%zx align=0x%zx type=%d phys=0x%lx va=%p", len, align, type, phys, addr);
     memset(addr, 0, len);
     return addr;
 }
 
 static void gpu_init(void)
 {
-    BLOG("gpu_init enter pre_gpu=%p pre_work=%p", g_pre_gpu, g_pre_work);
+    STAGE("gpu_init enter pre_gpu=%p pre_work=%p", g_pre_gpu, g_pre_work);
     g_gpu_state = -1;
     {
         char hpath[96] = LOG_DIR "/hud";
@@ -332,7 +352,7 @@ static void gpu_init(void)
     }
     if (!g_pre_gpu) g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
     void *addr = g_pre_gpu ? g_pre_gpu : alloc_dm(g_gpu_sz, g_gpu_sz, 0 /*WB_ONION*/);
-    if (!addr) return;
+    if (!addr) { STAGE("gpu_init FAILED: no GPU memory (0x%zx) -> native", (size_t)g_gpu_sz); return; }
     memset(addr, 0, g_gpu_sz);
     memcpy(addr, cs_code, sizeof(cs_code));
     memcpy((uint8_t *)addr + 0x100, ghost_code, sizeof(ghost_code));
@@ -395,7 +415,7 @@ static void gpu_init(void)
     g_mon = (volatile uint32_t *)((uint8_t *)addr + MON_OFF);
     g_gpu = (uint8_t *)addr;
     g_gpu_state = 1;
-    BLOG("gpu_init ok at %p work %p", addr, (void *)g_work);
+    STAGE("gpu_init ok at %p work %p", addr, (void *)g_work);
     lg("gpu_init: ok at %p (%s), work %p\n", addr, g_pre_gpu ? "early" : "late", (void *)g_work);
 }
 
@@ -1121,10 +1141,23 @@ static int read_mode_raw(void)
 static void *alloc_mbufs(size_t total)
 {
     long phys = 0; void *addr = NULL;
-    int r = sceKernelAllocateDirectMemory(0, (long)sceKernelGetDirectMemorySize(), total, 0x200000, 3 /*WC_GARLIC*/, &phys);
-    if (r != 0) { lg("mbufs: AllocateDirectMemory = 0x%08x\n", (unsigned)r); return NULL; }
+    size_t range = sceKernelGetDirectMemorySize();
+    int r = sceKernelAllocateDirectMemory(0, (long)range, total, 0x200000, 3 /*WC_GARLIC*/, &phys);
+    if (r != 0) {
+        size_t av = dm_avail(0x200000);
+        lg("mbufs: AllocateDirectMemory = 0x%08x (len 0x%zx align 0x200000 type 3 range 0..0x%zx, largest free 0x%zx)\n",
+           (unsigned)r, total, range, av);
+        STAGE("mbufs allocate FAILED: len=0x%zx align=0x200000 type=3 range=0..0x%zx r=0x%08x largest free=0x%zx",
+              total, range, (unsigned)r, av);
+        return NULL;
+    }
     r = sceKernelMapDirectMemory(&addr, total, 0x33, 0, phys, 0x200000);
-    if (r != 0 || !addr) { lg("mbufs: MapDirectMemory = 0x%08x\n", (unsigned)r); return NULL; }
+    if (r != 0 || !addr) {
+        lg("mbufs: MapDirectMemory = 0x%08x (len 0x%zx phys 0x%lx)\n", (unsigned)r, total, phys);
+        STAGE("mbufs map FAILED: len=0x%zx phys=0x%lx r=0x%08x", total, phys, (unsigned)r);
+        return NULL;
+    }
+    STAGE("mbufs ok: len=0x%zx phys=0x%lx va=%p", total, phys, addr);
     memset(addr, 0, total);
     return addr;
 }
@@ -2041,11 +2074,15 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
 int32_t sceGnmSubmitAndFlipCommandBuffers_hook(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
 {
     void *gd[GV_MAXE]; uint32_t gs[GV_MAXE]; void *gc[GV_MAXE]; uint32_t gcs[GV_MAXE];
+    static uint32_t s_boot_flips;   // the first submits are boot stages too (B01: starts that end before the first one)
+    uint32_t bf = s_boot_flips < 3 ? ++s_boot_flips : 0;
+    if (bf) STAGE("SubmitAndFlip #%u enter: count=%u handle=%u index=%u flipMode=%u", bf, count, handle, index, flipMode);
     uint32_t gn = gv_rewrite(count, dcb, dcbSz, ccb, ccbSz, gd, gs, gc, gcs, 1);
     if (gn) { count = gn; dcb = gd; dcbSz = gs; if (ccb) ccb = gc; if (ccbSz) ccbSz = gcs; }
     g_in_submit++;
     int32_t rc = flip_inner(count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
     g_in_submit--;
+    if (bf) STAGE("SubmitAndFlip #%u done = 0x%08x", bf, (unsigned)rc);
     gv_frame_end();
     return rc;
 }
@@ -2106,7 +2143,11 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
 
 int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void *const *addresses, int32_t bufferNum, const VoAttr *attr)
 {
-    BLOG("RegisterBuffers hook handle=%d start=%d num=%d", handle, startIndex, bufferNum);
+    STAGE("RegisterBuffers enter: handle=%d start=%d num=%d", handle, startIndex, bufferNum);
+    if (attr)
+        STAGE("  attr: fmt=0x%x tiling=%u aspect=%u %ux%u pitch=%u option=%u", attr->format, attr->tilingMode,
+              attr->aspectRatio, attr->width, attr->height, attr->pitchInPixel, attr->option);
+    for (int i = 0; addresses && i < bufferNum && i < 8; i++) STAGE("  buf[%d]=%p", startIndex + i, addresses[i]);
     lg("RegisterBuffers handle=%d start=%d num=%d\n", handle, startIndex, bufferNum);
     if (attr && startIndex == 0) { g_handle = handle; g_attr = *attr; }
     if (attr) {
@@ -2129,8 +2170,10 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
     }
     if (g_bench_enabled) {
         if (startIndex == 0) g_ngame = bufferNum;
-        return HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
-                             handle, startIndex, addresses, bufferNum, attr);
+        int32_t rb = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                                   handle, startIndex, addresses, bufferNum, attr);
+        STAGE("RegisterBuffers done (bench, unchanged) = 0x%08x", (unsigned)rb);
+        return rb;
     }
     // 1.4: Support 2..8 game display buffers (some engines register 4 buffers)
     if (attr && startIndex == 0 && bufferNum >= 2 && bufferNum <= 8 && addresses && g_mbuf_state >= 0) {
@@ -2147,6 +2190,13 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 if (diff >= 0x100000 && diff <= 0x4000000 && !(diff & 0x7FFF)) {
                     if (!one || diff < one) one = diff;
                 }
+            }
+            // B01: the VA gap between the game's buffers is not proof of the surface size (a gap may hold other
+            // objects: 0x1fb0000 = 31.7 MB per 1080p buffer was seen). Logged next to pitch * aligned height * 4.
+            {
+                size_t calc = (g_pitch >= 640 && g_bh >= 360) ? (size_t)g_pitch * (size_t)((g_bh + 63u) & ~63u) * 4u : 0;
+                STAGE("mbufs size: VA-gap stride 0x%zx, pitch*h*4 0x%zx%s", one, calc,
+                      one && calc && one > 2 * calc ? " (VA gap > 2x the surface: suspicious, extra memory is over-sized)" : "");
             }
             // Fallback stride calculation from pitch * aligned_height * 4 if game allocated buffers in separate pools
             if (!one && g_pitch >= 640 && g_bh >= 360) {
@@ -2201,6 +2251,8 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                                                              handle, base, ext + g_ngame, nm, attr);
                     lg("mbufs: %d extra buffer(s) of 0x%zx in a separate group at index %d: game = 0x%08x, ours = 0x%08x\n",
                        nm, one, base, (unsigned)r0, (unsigned)r1);
+                    STAGE("RegisterBuffers done (separate group at %d, %d x 0x%zx): game = 0x%08x, ours = 0x%08x", base, nm, one,
+                          (unsigned)r0, (unsigned)r1);
                     if (r0 >= 0 && r1 >= 0) {
                         g_mbase = base;
                         for (int i = 0; i < nm; i++) g_buf[base + i] = (uint64_t)(uintptr_t)ext[g_ngame + i];
@@ -2217,6 +2269,8 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                                           handle, startIndex, ext, g_ngame + nm, attr);
                 lg("mbufs: %d extra buffer(s) of 0x%zx at %p%s, game RegisterBuffers extended to %d = 0x%08x\n", nm, one, (void *)m,
                    g_pre_mem ? " (early)" : "", g_ngame + nm, (unsigned)r);
+                STAGE("RegisterBuffers done (extended to %d, %d x 0x%zx%s) = 0x%08x", g_ngame + nm, nm, one, g_pre_mem ? ", early" : "",
+                      (unsigned)r);
                 if (r == 0) {
                     for (int i = 0; i < nm; i++) g_buf[g_ngame + i] = (uint64_t)(uintptr_t)ext[g_ngame + i];
                     g_nbuf = g_ngame + nm;
@@ -2224,10 +2278,14 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                     return r;
                 }
             }
+            if (g_mbuf_state != 1)   // no own buffers: the game's registration goes through unchanged, frames stay native
+                lg("mbufs: no extra display buffers (stride 0x%zx) -> native, the game's registration unchanged\n", one);
         }
     }
-    return HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
-                         handle, startIndex, addresses, bufferNum, attr);
+    int32_t rn = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                               handle, startIndex, addresses, bufferNum, attr);
+    STAGE("RegisterBuffers done (unchanged%s) = 0x%08x", g_mbuf_state == -1 ? ", no extra buffers -> native" : "", (unsigned)rn);
+    return rn;
 }
 
 // ---- in-game L3+R3 (3s) menu & input swallowing on ScePadData ----
@@ -2546,8 +2604,11 @@ int32_t sceVideoOutSetFlipRate_hook(int32_t handle, int32_t rate)
     int m_raw = read_mode_raw();
     int want4 = (m_raw == 4 || m_raw == 6 || m_raw == 7 || m_raw == 8);
     lg("SetFlipRate handle=%d rate=%d%s\n", handle, rate, want4 ? " -> forced 0 (mode 4/8: 60 Hz output, we pace the game ourselves)" : "");
+    STAGE("SetFlipRate enter: handle=%d rate=%d%s", handle, rate, want4 ? " -> 0" : "");
     if (want4) rate = 0;
-    return HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), handle, rate);
+    int32_t r = HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), handle, rate);
+    STAGE("SetFlipRate done = 0x%08x", (unsigned)r);
+    return r;
 }
 
 s32 attr_public plugin_load(s32 argc, const char *argv[])
@@ -2560,7 +2621,8 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         klog("[bb_probe] inert: process title_id='%s' is not a CUSA game -> skipping hooks and allocations\n", g_title_id);
         return 0;
     }
-    BLOG("plugin_load enter title=%s", g_title_id);
+    STAGE("plugin_load enter: title=%s version=" VCFG_TRACE_VERSION " engine=classic direct memory=0x%zx", g_title_id,
+          (size_t)sceKernelGetDirectMemorySize());
 #if VCFG_BENCH
     if (!bench_bootstrap()) { BLOG("bench_bootstrap: inert"); return 0; }
     BLOG("bench_bootstrap ok");
@@ -2578,17 +2640,17 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         if (m == 8 && !g_bench_enabled) gv_load(alloc_dm);
         if (m >= 1 && m <= 8) {
             g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
-            BLOG("alloc gpu sz=0x%zx", (size_t)g_gpu_sz);
+            STAGE("alloc gpu sz=0x%zx (mode %d)", (size_t)g_gpu_sz, m);
             g_pre_gpu = alloc_dm(g_gpu_sz, g_gpu_sz, 0);
-            BLOG("alloc gpu -> %p", g_pre_gpu);
+            STAGE("alloc gpu -> %p", g_pre_gpu);
             { int ff = file_flags(); if (!g_bench_enabled && ff > 0 && (ff & 16)) { g_dump_mem = (uint8_t *)alloc_dm(DUMP_SZ, 0x10000, 0); klog("[bb_probe] dump memory: %p\n", (void *)g_dump_mem); } }
             if (m == 8) {
-                BLOG("alloc work sz=0x%zx garlic", (size_t)WORK_SZ);
+                STAGE("alloc work sz=0x%zx garlic", (size_t)WORK_SZ);
                 g_pre_work = alloc_dm(WORK_SZ, 0x10000, 3);
                 g_work_garlic = g_pre_work != NULL;
             }
             if (!g_pre_work && m >= 6) g_pre_work = alloc_dm(WORK_SZ, 0x10000, 0);
-            BLOG("alloc work -> %p garlic=%d", g_pre_work, (int)g_work_garlic);
+            STAGE("alloc work -> %p garlic=%d", g_pre_work, (int)g_work_garlic);
             klog("[bb_probe] early gpu/work memory: %p / %p\n", g_pre_gpu, g_pre_work);
         }
 #if VCFG_BENCH
@@ -2605,16 +2667,18 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
                 r = sceKernelAllocateDirectMemory(0, (long)sceKernelGetDirectMemorySize(), total, 0x200000, 3 /*WC_GARLIC*/, &phys);
                 if (r == 0) r = sceKernelMapDirectMemory(&addr, total, 0x33, 0, phys, 0x200000);
                 if (r == 0 && addr) { memset(addr, 0, total); g_pre_mem = addr; g_pre_size = total; }
+                STAGE("early display memory try %d: len=0x%zx align=0x200000 type=3 r=0x%08x%s", ti + 1, total, (unsigned)r,
+                      g_pre_mem ? " ok" : "");
             }
             klog("[bb_probe] early display-buffer memory: %s (size=0x%zx, r=0x%08x)\n", g_pre_mem ? "ok" : "FAILED", g_pre_size, (unsigned)r);
         }
     }
-    BLOG("hooking");
+    STAGE("hooking");
     HOOK32(sceGnmSubmitAndFlipCommandBuffers);
     HOOK32(sceVideoOutRegisterBuffers);
     HOOK32(sceVideoOutSetFlipRate);
     HOOK32(sceVideoOutSubmitFlip);
-    BLOG("hooks installed");
+    STAGE("hooks installed");
     {
         int ff = file_flags();
         if (ff > 0 && (ff & 128)) g_diag_hooks = 1;

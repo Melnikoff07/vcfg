@@ -34,14 +34,14 @@
 typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
-    { "CUSA07439", "vcfg12.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic38.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic38.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic38.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA07439", "vcfg13.prx", ENGINE_NEW, 0 },
+    { "CUSA08519", "vcfg_classic39.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic39.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic39.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg12.prx", "vcfg_classic38.prx" };
-static const char *k_exp_prx = "vcfg_classic38.prx";   // engine for experimental (not verified) titles
+static const char *k_files[] = { "vcfg13.prx", "vcfg_classic39.prx" };
+static const char *k_exp_prx = "vcfg_classic39.prx";   // engine for experimental (not verified) titles
 
 static FILE *g_log;
 static void vlog(const char *fmt, ...)
@@ -306,7 +306,7 @@ static int plugin_state(void)
         if (!st) break;
     }
     size_t n; unsigned char *ini = read_all(INI, &n);
-    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg12.prx"))) st = 2;
+    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg13.prx"))) st = 2;
     free(ini);
     return st;
 }
@@ -424,6 +424,16 @@ static void summarize(Buf *r, const char *id, const char *which, const char *t)
     if (!frame) bprintf(r, "    => stopped before the first frame was shown (loading): see the first lines of this trace\n");
 }
 
+// Last line of a text file (the classic boot stage file: how far a game start got before a crash).
+static int last_line(const char *t, size_t n, char *out, size_t on)
+{
+    while (n && (t[n - 1] == '\n' || t[n - 1] == '\r')) n--;
+    if (!n) return 0;
+    size_t b = n; while (b && t[b - 1] != '\n') b--;
+    size_t l = n - b; if (l >= on) l = on - 1;
+    memcpy(out, t + b, l); out[l] = 0; return 1;
+}
+
 // Trace files in CFGDIR for any title: also games the list does not show (external drive not listed, list full,
 // removed game), so the summary does not depend on the game scan.
 typedef struct { char id[12]; int prev; } TraceFile;
@@ -478,6 +488,13 @@ static void do_report(App *a)
         if (!d) { bprintf(&r, "%s: READ ERROR %s\n", tf[k].id, p); continue; }
         summarize(&r, tf[k].id, tf[k].prev ? "game start before" : "last game start", (const char *)d);
         free(d);
+        if (!tf[k].prev) {   // classic engine: crash-safe early stages of the last start (boot-<TITLE>.txt)
+            char bp[96], line[208]; size_t bn = 0;
+            snprintf(bp, sizeof(bp), CFGDIR "/boot-%s.txt", tf[k].id);
+            unsigned char *bd = read_all(bp, &bn);
+            if (bd && last_line((const char *)bd, bn, line, sizeof(line))) bprintf(&r, "    last early stage: %s\n", line);
+            free(bd);
+        }
         int listed = 0; for (int i = 0; i < a->ngames; i++) if (!strcmp(a->games[i].id, tf[k].id)) listed = 1;
         if (!listed && !tf[k].prev) bprintf(&r, "    (not in the app's game list)\n");
     }
@@ -508,6 +525,8 @@ static void do_report(App *a)
     for (int k = 0; k < nt; k++) {
         char p[96]; snprintf(p, sizeof(p), CFGDIR "/trace-%s%s.txt", tf[k].id, tf[k].prev ? ".prev" : "");
         bfile(&r, tf[k].prev ? "flight recorder, game start before" : "flight recorder, last game start", p, 64u << 10);
+        snprintf(p, sizeof(p), CFGDIR "/boot-%s.txt", tf[k].id);
+        if (!tf[k].prev && file_exists(p)) bfile(&r, "early start stages (classic), last game start", p, 32u << 10);
     }
     bfile(&r, "plugin log, last game start", CFGDIR "/probe.log", 1536u << 10);
     bfile(&r, "plugin log, the start before", CFGDIR "/probe.prev.log", 1024u << 10);
