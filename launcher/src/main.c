@@ -33,13 +33,13 @@ typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
     { "CUSA07439", "vcfg10.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic35.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic35.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic35.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA08519", "vcfg_classic36.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic36.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic36.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg10.prx", "vcfg_classic35.prx" };
-static const char *k_exp_prx = "vcfg_classic35.prx";   // engine for experimental (not verified) titles
+static const char *k_files[] = { "vcfg10.prx", "vcfg_classic36.prx" };
+static const char *k_exp_prx = "vcfg_classic36.prx";   // engine for experimental (not verified) titles
 
 static FILE *g_log;
 static void vlog(const char *fmt, ...)
@@ -88,25 +88,53 @@ static int sfo_str(const unsigned char *b, size_t n, const char *key, char *out,
     return 0;
 }
 // The app sandbox cannot read these folders (drwx------ root); main() wraps the calls in a GoldHEN jailbreak.
-static const char *const k_roots[] = { "", "/mnt/ext0", "/mnt/ext1" };   // internal drive, then extended storage (external HDD)
+static const char *const k_roots[] = { "", "/mnt/ext0", "/mnt/ext1", "/mnt/ext2", "/mnt/ext3" };   // internal drive, then extended storage (external HDD)
+#define NROOT ((int)(sizeof(k_roots) / sizeof(k_roots[0])))
+// Where a title's icon can be: appmeta (all internal titles), the title's own sce_sys on its drive, an installed patch.
+static const char *const k_icon_tpl[] = { "%s/user/appmeta/%s/icon0.png", "%s/user/appmeta/%s/icon0_08.png", "%s/user/app/%s/sce_sys/icon0.png",
+                                          "%s/user/app/%s/icon0.png", "%s/user/patch/%s/sce_sys/icon0.png", "%s/system_data/priv/appmeta/%s/icon0.png" };
+// Debug log aid: what is in a folder (names only), to learn the layout of extended storage from a tester's log.
+static void vlog_dir(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d) { vlog("  ls %s: cannot open\n", path); return; }
+    char line[400]; int len = snprintf(line, sizeof(line), "  ls %s:", path); int cnt = 0; struct dirent *e;
+    while ((e = readdir(d)) && cnt < 24) {
+        if (e->d_name[0] == '.') continue;
+        len += snprintf(line + len, sizeof(line) - (size_t)len, " %s", e->d_name); cnt++;
+        if (len > (int)sizeof(line) - 40) break;
+    }
+    closedir(d); vlog("%s\n", line);
+}
 static void load_meta(Game *g)
 {
     char p[160]; size_t n = 0; unsigned char *b = NULL;
-    for (int r = 0; r < 3 && !b; r++) {
+    for (int r = 0; r < NROOT && !b; r++) {
         snprintf(p, sizeof(p), "%s/user/appmeta/%s/param.sfo", k_roots[r], g->id); b = read_all(p, &n);
     }
     if (!b) { snprintf(p, sizeof(p), "/system_data/priv/appmeta/%s/param.sfo", g->id); b = read_all(p, &n); }
     if (b) { g->installed = 1; sfo_str(b, n, "TITLE", g->title, sizeof(g->title)); sfo_str(b, n, "APP_VER", g->version, sizeof(g->version)); free(b); }
-    for (int r = 0; r < 3; r++) {   // an installed update has the newer APP_VER
+    for (int r = 0; r < NROOT; r++) {   // an installed update has the newer APP_VER
         snprintf(p, sizeof(p), "%s/user/patch/%s/sce_sys/param.sfo", k_roots[r], g->id);
         if ((b = read_all(p, &n))) { sfo_str(b, n, "APP_VER", g->version, sizeof(g->version)); free(b); break; }
     }
-    for (int r = 0; r < 3 && !g->icon; r++) {
-        snprintf(p, sizeof(p), "%s/user/appmeta/%s/icon0.png", k_roots[r], g->id);
-        int w, h, ch; unsigned char *img = stbi_load(p, &w, &h, &ch, 4);
-        if (img) { g->icon = img; g->iw = w; g->ih = h; g->installed = 1; }
+    for (int r = 0; r < NROOT && !g->icon; r++) {
+        for (int t = 0; t < (int)(sizeof(k_icon_tpl) / sizeof(k_icon_tpl[0])) && !g->icon; t++) {
+            if (r && strstr(k_icon_tpl[t], "system_data")) continue;     // internal only
+            snprintf(p, sizeof(p), k_icon_tpl[t], k_roots[r], g->id);
+            int w, h, ch; unsigned char *img = stbi_load(p, &w, &h, &ch, 4);
+            if (img) { g->icon = img; g->iw = w; g->ih = h; g->installed = 1; vlog("game %s icon from %s\n", g->id, p); }
+        }
     }
-    for (int r = 0; r < 3 && !g->installed; r++) {
+    if (!g->icon) {   // no picture anywhere: record the folder layout for the log (load_meta runs once per title)
+        for (int r = 0; r < NROOT; r++) {
+            char d[160];
+            snprintf(d, sizeof(d), "%s/user", k_roots[r]); vlog_dir(d);
+            snprintf(d, sizeof(d), "%s/user/appmeta/%s", k_roots[r], g->id); vlog_dir(d);
+            snprintf(d, sizeof(d), "%s/user/app/%s", k_roots[r], g->id); vlog_dir(d);
+        }
+    }
+    for (int r = 0; r < NROOT && !g->installed; r++) {
         snprintf(p, sizeof(p), "%s/user/app/%s/app.json", k_roots[r], g->id); FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; }
     }
     // Last resort: a settings file (only written for installed games, see save_settings).
@@ -513,7 +541,7 @@ int main(void)
         load_meta(g);
     }
     // Every other installed game is listed as experimental (switched off until the user turns it on).
-    for (int r = 0; r < 3; r++) {
+    for (int r = 0; r < NROOT; r++) {
     char ap[48]; snprintf(ap, sizeof(ap), "%s/user/app", k_roots[r]);
     DIR *dir = opendir(ap);
     if (dir) {
