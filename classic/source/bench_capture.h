@@ -15,6 +15,7 @@ static size_t g_bench_plane;
 static uint8_t *g_bench_surfaces;
 static uint32_t *g_bench_tables;
 static int g_bench_started, g_bench_timing;
+static int g_bench_wait_go;  // marker start_flip == 1: sampling starts when LOG_DIR/bench_go appears (the owner is in the scene)
 static fg_config_t g_bench_profile;
 static VoAttr g_bench_attr;
 static uint32_t g_bench_hud;
@@ -23,43 +24,90 @@ static char g_bench_dir[160];
 static void bench_stop(const char *reason)
 {
     __atomic_store_n(&g_bench_state, BENCH_STOP, __ATOMIC_RELEASE);
-    lg("BENCH STOP %s; native flips continue, allocations retained\n", reason);
+    BLOG("BENCH STOP %s", reason);
+    klog("[bb_probe] BENCH STOP %s; native flips continue, allocations retained\n", reason);
+    if (g_flips > 0) lg("BENCH STOP %s; native flips continue, allocations retained\n", reason);  // lg() opens stdio files: only once the game runs
 }
 
 static int bench_bootstrap(void)
 {
     if (strcmp(g_title_id, "CUSA00557") && strcmp(g_title_id, "CUSA09171")) {
-        lg("BENCH inert: title not on the native-60 capture allowlist\n");
+        klog("[bb_probe] BENCH inert: title not on the native-60 capture allowlist\n");
         return 0;
     }
-    FILE *f = fopen(LOG_DIR "/bench_capture", "r");
-    if (!f) { lg("BENCH inert: bench_capture marker missing\n"); return 0; }
-    unsigned k = 240, m = 6, w = 1920;
-    int n = fscanf(f, "%u %u %u", &k, &m, &w); fclose(f);
-    if (n < 2 || k < 6 || k > 3600 || m < 1 || m > 64 || (w != 960 && w != 1920)) {
-        lg("BENCH inert: expected K M [width], K=6..3600 M=1..64 width=960/1920\n"); return 0;
+    // raw kernel I/O (like read_mode_raw): stdio inside plugin_load crashes the game
+    int mfd = sceKernelOpen(LOG_DIR "/bench_capture", 0 /*O_RDONLY*/, 0);
+    if (mfd < 0) { klog("[bb_probe] BENCH inert: bench_capture marker missing\n"); return 0; }
+    unsigned k = 240, m = 6, w = 1920, s = 0;  // s: first sample not before this flip (time to reach gameplay)
+    char mb[64] = {0};
+    long mn = (long)sceKernelRead(mfd, mb, sizeof(mb) - 1);
+    sceKernelClose(mfd);
+    if (mn < 0) mn = 0;
+    mb[mn] = 0;
+    int n = sscanf(mb, "%u %u %u %u", &k, &m, &w, &s);
+    if (n < 2 || k < 6 || k > 3600 || m < 1 || m > 64 || (n >= 3 && w != 960 && w != 1920) || s > 1000000u) {
+        klog("[bb_probe] BENCH inert: expected K M [width [start_flip]], K=6..3600 M=1..64 width=960/1920\n"); return 0;
     }
-    g_bench_interval = k; g_bench_limit = m; g_bench_width = w; g_bench_next = k > 120 ? k : 120;
+    g_bench_interval = k; g_bench_limit = m; g_bench_width = w; g_bench_next = s > 120u ? s : (k > 120 ? k : 120);
+    g_bench_wait_go = (s == 1u);
     g_bench_enabled = 1;
-    lg("BENCH build=capture-v1 K=%u M=%u requested_width=%u; no generated flips\n", k, m, w);
+    klog("[bb_probe] BENCH build=capture-v1 K=%u M=%u requested_width=%u; no generated flips\n", k, m, w);
     return 1;
+}
+
+// alloc_dm with the error codes in bench_boot.txt (the klog line of alloc_dm is easy to miss)
+static void *bench_alloc(size_t len, size_t align, int type)
+{
+    long phys = 0; void *addr = NULL;
+    int r = sceKernelAllocateDirectMemory(0, (long)sceKernelGetDirectMemorySize(), len, align, type, &phys);
+    BLOG("alloc len=0x%zx align=0x%zx type=%d -> allocate r=0x%08x", len, align, type, (unsigned)r);
+    if (r == 0) { r = sceKernelMapDirectMemory(&addr, len, 0x33, 0, phys, align); BLOG("  map r=0x%08x addr=%p", (unsigned)r, addr); }
+    if (r != 0 || !addr) return NULL;
+    memset(addr, 0, len);
+    return addr;
+}
+
+// flexible memory (separate pool from direct memory), mapped CPU rw + GPU rw
+static void *bench_alloc_flex(size_t len)
+{
+    void *addr = NULL;
+    int r = sceKernelMapFlexibleMemory(&addr, len, 0x33, 0);
+    BLOG("flex len=0x%zx -> map r=0x%08x addr=%p", len, (unsigned)r, addr);
+    if (r != 0 || !addr) return NULL;
+    memset(addr, 0, len);
+    return addr;
+}
+
+static void bench_mem_report(const char *when)
+{
+    long phys = 0; size_t sz = 0, fsz = 0;
+    int r1 = sceKernelAvailableDirectMemorySize(0, (off_t)sceKernelGetDirectMemorySize(), 0x10000, (off_t)(uintptr_t)&phys, (size_t)(uintptr_t)&sz);
+    int r2 = sceKernelAvailableFlexibleMemorySize((size_t)(uintptr_t)&fsz);
+    BLOG("mem %s: direct largest free block 0x%zx at 0x%lx (r=0x%08x), flexible available 0x%zx (r=0x%08x)", when, sz, phys, (unsigned)r1, fsz, (unsigned)r2);
 }
 
 static void bench_allocate(void)
 {
-    g_bench_surfaces = (uint8_t *)alloc_dm(2u * BENCH_SURFACE, 0x200000, 3);
+    bench_mem_report("before capture allocations");
+    g_bench_surfaces = (uint8_t *)bench_alloc(2u * BENCH_SURFACE, 0x200000, 3);
+    bench_mem_report("after surfaces");
     if (!g_bench_surfaces) { bench_stop("offscreen allocation failed"); return; }
-    for (int attempt = 0; attempt < 2; attempt++) {
+    // the game leaves little direct memory free (33 MB for 960 wide failed with 0x80020023 on CUSA00557): narrower crops
+    static const uint32_t widths[] = { 1920u, 960u, 640u, 480u, 320u, 240u };
+    for (unsigned wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        if (widths[wi] > g_bench_width) continue;
+        g_bench_width = widths[wi];
         g_bench_plane = (size_t)g_bench_width * 1080u * 8u;
         size_t bytes = (4u * g_bench_plane + 0x10000u + 0xffffu) & ~(size_t)0xffffu;
-        g_dump_mem = (uint8_t *)alloc_dm(bytes, 0x10000, 0);
+        g_dump_mem = (uint8_t *)bench_alloc(bytes, 0x10000, 0);
+        if (!g_dump_mem) g_dump_mem = (uint8_t *)bench_alloc(bytes, 0x10000, 3);  // onion pool exhausted: try garlic
+        if (!g_dump_mem) g_dump_mem = (uint8_t *)bench_alloc_flex(bytes);          // direct memory exhausted: flexible pool
         if (g_dump_mem) {
             g_bench_tables = (uint32_t *)(g_dump_mem + 4u * g_bench_plane);
-            lg("BENCH allocation width=%u height=1080 rgba16le plane=%zu bytes; scratch is never scanned out\n", g_bench_width, g_bench_plane);
+            BLOG("capture width settled at %u (plane 0x%zx)", g_bench_width, g_bench_plane);
+            klog("[bb_probe] BENCH allocation width=%u height=1080 rgba16le plane=%zu bytes; scratch is never scanned out\n", g_bench_width, g_bench_plane);
             return;
         }
-        if (g_bench_width == 960) break;
-        g_bench_width = 960;
     }
     bench_stop("dump allocation failed");
 }
@@ -137,14 +185,23 @@ static int32_t bench_flip(uint32_t count, void **dcb, uint32_t *sizes, void **cc
                           uint32_t handle, uint32_t index, uint32_t mode, int64_t arg, uint64_t now)
 {
     uint32_t state = __atomic_load_n(&g_bench_state, __ATOMIC_ACQUIRE);
+    if (g_flips == 0 || g_flips == 60 || g_flips == 119 || g_flips == 120) BLOG("bench_flip flips=%u state=%u started=%d", (unsigned)g_flips, state, g_bench_started);
     if (state >= BENCH_DONE || g_flips < 120) goto native;
     if (state == BENCH_WRITE) goto native;
     if (!g_bench_started) {
         g_bench_started = 1;
+        BLOG("bench_allocate begin width=%u", g_bench_width);
+        bench_allocate();
+        BLOG("bench_allocate done surfaces=%p dump=%p state=%u", (void *)g_bench_surfaces, (void *)g_dump_mem, __atomic_load_n(&g_bench_state, __ATOMIC_ACQUIRE));
+        if (__atomic_load_n(&g_bench_state, __ATOMIC_ACQUIRE) == BENCH_STOP) goto native;
         cfg_reload_from_disk(1); g_inject_on = 8; g_dump_req = 0;
         io_start(); gpu_init();
+        int bench_ff = file_flags();  // -1 = no inject file (the normal case); only letters other than d/D are a problem
+        BLOG("bench check: gpu_state=%d work=%p sh8=%d pack_off=%u dump=%p mode=%d preset=%d gv=%d flags=%d",
+             (int)g_gpu_state, (void *)g_work, (int)g_sh8_ok, (unsigned)g_bench_pack_off, (void *)g_dump_mem,
+             (int)g_cfg.mode, (int)g_cfg.preset, (int)g_cfg.game_vectors, bench_ff);
         if (g_gpu_state != 1 || !g_work || !g_sh8_ok || !g_bench_pack_off || !g_dump_mem ||
-            g_cfg.mode != 8 || g_cfg.preset != 0 || g_cfg.game_vectors || (file_flags() & ~48)) {
+            g_cfg.mode != 8 || g_cfg.preset != 0 || g_cfg.game_vectors || (bench_ff > 0 && (bench_ff & ~48))) {
             bench_stop("resources unavailable or profile is not mode8/QUALITY/no-vectors"); goto native;
         }
         g_bench_profile = g_cfg;
@@ -152,13 +209,25 @@ static int32_t bench_flip(uint32_t count, void **dcb, uint32_t *sizes, void **cc
                  (unsigned long long)sceKernelGetProcessTimeCounter());
         if (sceKernelMkdir(g_bench_dir, 0777) != 0) { bench_stop("unique run directory creation failed"); goto native; }
     }
+    if (g_bench_wait_go && state == BENCH_IDLE) {
+        if ((g_flips % 30u) == 0) {
+            int gfd = sceKernelOpen(LOG_DIR "/bench_go", 0 /*O_RDONLY*/, 0);
+            if (gfd >= 0) { sceKernelClose(gfd); g_bench_wait_go = 0; g_bench_next = g_flips; BLOG("bench_go seen at flip %u", (unsigned)g_flips); }
+        }
+        if (g_bench_wait_go) goto native;
+    }
     if (state == BENCH_WAIT) {
         if (g_flips - g_bench_first > 600u) bench_stop("GPU/IO completion timeout; no buffer reuse");
         goto native;
     }
     if (!g_fmt_supported || g_bw != 1920 || g_bh != 1080 || g_pitch != 1920 || g_attr.tilingMode > 1 ||
         handle != (uint32_t)g_handle || index >= (uint32_t)g_ngame || mode != 1u) {
-        bench_stop("unsupported/reconfigured scanout"); goto native;
+        static unsigned logged;
+        if (logged++ < 8) BLOG("scanout mismatch state=%u fmt_ok=%d bw=%u bh=%u pitch=%u tiling=%u handle=%u/%u index=%u/%d mode=%u flips=%u",
+                               state, (int)g_fmt_supported, (unsigned)g_bw, (unsigned)g_bh, (unsigned)g_pitch, (unsigned)g_attr.tilingMode,
+                               handle, (unsigned)g_handle, index, (int)g_ngame, mode, (unsigned)g_flips);
+        if (state == BENCH_IDLE) goto native;  // between triplets a odd flip (menu, loading, other mode) only postpones the next sample
+        bench_stop("unsupported/reconfigured scanout mid-triplet"); goto native;
     }
     if (state == BENCH_IDLE && (g_flips < g_bench_next || g_ema_frame_us > 18500u ||
         g_osd_real_fps_x10 < 550u || g_osd_real_fps_x10 > 620u)) goto native;

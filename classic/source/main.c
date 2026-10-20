@@ -308,6 +308,7 @@ void *alloc_dm(size_t len, size_t align, int type)
 
 static void gpu_init(void)
 {
+    BLOG("gpu_init enter pre_gpu=%p pre_work=%p", g_pre_gpu, g_pre_work);
     g_gpu_state = -1;
     {
         char hpath[96] = LOG_DIR "/hud";
@@ -394,6 +395,7 @@ static void gpu_init(void)
     g_mon = (volatile uint32_t *)((uint8_t *)addr + MON_OFF);
     g_gpu = (uint8_t *)addr;
     g_gpu_state = 1;
+    BLOG("gpu_init ok at %p work %p", addr, (void *)g_work);
     lg("gpu_init: ok at %p (%s), work %p\n", addr, g_pre_gpu ? "early" : "late", (void *)g_work);
 }
 
@@ -2104,6 +2106,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
 
 int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void *const *addresses, int32_t bufferNum, const VoAttr *attr)
 {
+    BLOG("RegisterBuffers hook handle=%d start=%d num=%d", handle, startIndex, bufferNum);
     lg("RegisterBuffers handle=%d start=%d num=%d\n", handle, startIndex, bufferNum);
     if (attr && startIndex == 0) { g_handle = handle; g_attr = *attr; }
     if (attr) {
@@ -2557,8 +2560,10 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         klog("[bb_probe] inert: process title_id='%s' is not a CUSA game -> skipping hooks and allocations\n", g_title_id);
         return 0;
     }
+    BLOG("plugin_load enter title=%s", g_title_id);
 #if VCFG_BENCH
-    if (!bench_bootstrap()) return 0;
+    if (!bench_bootstrap()) { BLOG("bench_bootstrap: inert"); return 0; }
+    BLOG("bench_bootstrap ok");
 #endif
 #if VCFG_2BUF_TEST
     if (tb_title()) {
@@ -2573,17 +2578,21 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         if (m == 8 && !g_bench_enabled) gv_load(alloc_dm);
         if (m >= 1 && m <= 8) {
             g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
+            BLOG("alloc gpu sz=0x%zx", (size_t)g_gpu_sz);
             g_pre_gpu = alloc_dm(g_gpu_sz, g_gpu_sz, 0);
+            BLOG("alloc gpu -> %p", g_pre_gpu);
             { int ff = file_flags(); if (!g_bench_enabled && ff > 0 && (ff & 16)) { g_dump_mem = (uint8_t *)alloc_dm(DUMP_SZ, 0x10000, 0); klog("[bb_probe] dump memory: %p\n", (void *)g_dump_mem); } }
             if (m == 8) {
+                BLOG("alloc work sz=0x%zx garlic", (size_t)WORK_SZ);
                 g_pre_work = alloc_dm(WORK_SZ, 0x10000, 3);
                 g_work_garlic = g_pre_work != NULL;
             }
             if (!g_pre_work && m >= 6) g_pre_work = alloc_dm(WORK_SZ, 0x10000, 0);
+            BLOG("alloc work -> %p garlic=%d", g_pre_work, (int)g_work_garlic);
             klog("[bb_probe] early gpu/work memory: %p / %p\n", g_pre_gpu, g_pre_work);
         }
 #if VCFG_BENCH
-        if (g_bench_enabled) bench_allocate();
+        // capture memory (~50 MB) is taken later, from bench_flip once the game runs: taking it here crashed the game (run d, 2026-10-20)
 #endif
         if ((m == 4 || m >= 6) && !g_bench_enabled) {
             // Try 16 MB first (2 mid buffers at 1080p for FG Fast 3-step pulldown), fall back to 8 MB (1 mid buffer)
@@ -2600,10 +2609,12 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
             klog("[bb_probe] early display-buffer memory: %s (size=0x%zx, r=0x%08x)\n", g_pre_mem ? "ok" : "FAILED", g_pre_size, (unsigned)r);
         }
     }
+    BLOG("hooking");
     HOOK32(sceGnmSubmitAndFlipCommandBuffers);
     HOOK32(sceVideoOutRegisterBuffers);
     HOOK32(sceVideoOutSetFlipRate);
     HOOK32(sceVideoOutSubmitFlip);
+    BLOG("hooks installed");
     {
         int ff = file_flags();
         if (ff > 0 && (ff & 128)) g_diag_hooks = 1;
