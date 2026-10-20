@@ -531,6 +531,8 @@ int main(void)
     } else vlog("cannot list %s\n", ap);
     }
     if (jrc == 0) vlog("unjailbreak rc=%d\n", sys_sdk_unjailbreak(&jb));
+    // Hide games that are not installed (plugins.ini keeps mapping them, see build_map).
+    { int k = 0; for (int i = 0; i < a->ngames; i++) if (a->games[i].installed) a->games[k++] = a->games[i]; a->ngames = k; }
     // Installed games first, keep the table order otherwise.
 #define RANK(g) ((g).installed * 2 + !(g).experimental)   // verified first, installed first
     for (int i = 1; i < a->ngames; i++) for (int j = i; j > 0 && RANK(a->games[j]) > RANK(a->games[j - 1]); j--) {
