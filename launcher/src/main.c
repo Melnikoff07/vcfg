@@ -34,14 +34,14 @@
 typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
-    { "CUSA07439", "vcfg15.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic41.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic41.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic41.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA07439", "vcfg16.prx", ENGINE_NEW, 0 },
+    { "CUSA08519", "vcfg_classic42.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic42.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic42.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg15.prx", "vcfg_classic41.prx" };
-static const char *k_exp_prx = "vcfg_classic41.prx";   // engine for experimental (not verified) titles
+static const char *k_files[] = { "vcfg16.prx", "vcfg_classic42.prx" };
+static const char *k_exp_prx = "vcfg_classic42.prx";   // engine for experimental (not verified) titles
 // Double-buffered titles that run best with the 2-BUFFER engine (virtual flip queue, tested on hardware 20.10): AUTO = 2-BUFFER.
 static const char *const k_auto_2buf[] = { "CUSA05571", "CUSA08809" };
 static int auto_2buf(const char *id)
@@ -337,7 +337,7 @@ static int plugin_state(void)
         if (!st) break;
     }
     size_t n; unsigned char *ini = read_all(INI, &n);
-    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg15.prx"))) st = 2;
+    if (st == 1 && (!ini || !strstr((char *)ini, PLUG "vcfg16.prx"))) st = 2;
     free(ini);
     return st;
 }
@@ -521,9 +521,9 @@ static void do_report(App *a)
         if (!d) { bprintf(&r, "%s: READ ERROR %s\n", tf[k].id, p); continue; }
         summarize(&r, tf[k].id, tf[k].prev ? "game start before" : "last game start", (const char *)d);
         free(d);
-        if (!tf[k].prev) {   // classic engine: crash-safe early stages of the last start (boot-<TITLE>.txt)
+        {   // classic engine: crash-safe early stages of that start (boot-<TITLE>.txt / .prev.txt)
             char bp[96], line[208]; size_t bn = 0;
-            snprintf(bp, sizeof(bp), CFGDIR "/boot-%s.txt", tf[k].id);
+            snprintf(bp, sizeof(bp), CFGDIR "/boot-%s%s.txt", tf[k].id, tf[k].prev ? ".prev" : "");
             unsigned char *bd = read_all(bp, &bn);
             if (bd && last_line((const char *)bd, bn, line, sizeof(line))) bprintf(&r, "    last early stage: %s\n", line);
             free(bd);
@@ -558,9 +558,9 @@ static void do_report(App *a)
     }
     for (int k = 0; k < nt; k++) {
         char p[96]; snprintf(p, sizeof(p), CFGDIR "/trace-%s%s.txt", tf[k].id, tf[k].prev ? ".prev" : "");
-        bfile(&r, tf[k].prev ? "flight recorder, game start before" : "flight recorder, last game start", p, 64u << 10);
-        snprintf(p, sizeof(p), CFGDIR "/boot-%s.txt", tf[k].id);
-        if (!tf[k].prev && file_exists(p)) bfile(&r, "early start stages (classic), last game start", p, 32u << 10);
+        bfile(&r, tf[k].prev ? "flight recorder, game start before" : "flight recorder, last game start", p, 96u << 10);
+        snprintf(p, sizeof(p), CFGDIR "/boot-%s%s.txt", tf[k].id, tf[k].prev ? ".prev" : "");
+        if (file_exists(p)) bfile(&r, tf[k].prev ? "early start stages (classic), game start before" : "early start stages (classic), last game start", p, 48u << 10);
     }
     bfile(&r, "plugin log, last game start", CFGDIR "/probe.log", 1536u << 10);
     bfile(&r, "plugin log, the start before", CFGDIR "/probe.prev.log", 1024u << 10);

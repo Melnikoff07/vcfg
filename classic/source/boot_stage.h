@@ -9,7 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define BOOT_STAGE_MAX 120
+#define BOOT_STAGE_MAX 200
 
 static int g_boot_lines = 0;
 
@@ -28,7 +28,13 @@ static void boot_stage(const char *fmt, ...)
     if (n <= 0) return;
     if ((size_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
     snprintf(path, sizeof(path), LOG_DIR "/boot-%s.txt", g_title_id);
-    if (g_boot_lines == 0) sceKernelMkdir(LOG_DIR, 0777);
+    if (g_boot_lines == 0) {   // the start before is kept as boot-<TITLE>.prev.txt (testers often start a game 2-3 times)
+        char prev[64];
+        snprintf(prev, sizeof(prev), LOG_DIR "/boot-%s.prev.txt", g_title_id);
+        sceKernelMkdir(LOG_DIR, 0777);
+        sceKernelUnlink(prev);
+        sceKernelRename(path, prev);
+    }
     int fd = sceKernelOpen(path, g_boot_lines == 0 ? 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/ : 0x209 /*O_WRONLY|O_CREAT|O_APPEND*/, 0666);
     if (fd < 0) { g_boot_lines = BOOT_STAGE_MAX; return; }
     sceKernelWrite(fd, line, (size_t)n);

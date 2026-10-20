@@ -170,18 +170,26 @@ static void log_open(void)
 #define VCFG_ENGINE "classic"
 #include "vcfg_trace.h"
 
+static volatile uint32_t g_lgw_lock;   // lg_write may run on the game's thread (sync window) and the io thread at once
 static void lg_write(const char *buf)
 {
+    while (__atomic_exchange_n(&g_lgw_lock, 1u, __ATOMIC_ACQUIRE)) sceKernelUsleep(50);
     klog("[bb_probe] %s", buf);
     vcfg_trace(buf);
     log_open();
     if (g_log) { fputs(buf, g_log); fflush(g_log); }
+    __atomic_store_n(&g_lgw_lock, 0u, __ATOMIC_RELEASE);
 }
 
 #define LGQ_N 32
 static char g_lgq[LGQ_N][384];
 static volatile uint32_t g_lgq_w = 0, g_lgq_r = 0, g_lgq_lock = 0, g_lgq_drop = 0;
 static volatile int g_lg_async = 0;
+// With the debug log on, the first seconds of a game start are written straight to disk on the calling thread (not
+// through the queue), so a crash during loading keeps every line. Later lines go through the queue as before.
+#define LG_SYNC_US 10000000ull
+static uint64_t g_boot_t0;
+static int lg_sync_window(void) { return g_log && g_boot_t0 && sceKernelGetProcessTime() - g_boot_t0 < LG_SYNC_US; }
 static int lgq_trylock(void)
 {
     for (int i = 0; i < 2000; i++)
@@ -198,7 +206,7 @@ void lg(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (g_lg_async) {
+    if (g_lg_async && !lg_sync_window()) {
         if (lgq_trylock()) {
             if (g_lgq_w - g_lgq_r < LGQ_N) { memcpy(g_lgq[g_lgq_w % LGQ_N], buf, sizeof(buf)); g_lgq_w++; } else g_lgq_drop++;
             lgq_unlock();
@@ -299,6 +307,7 @@ static size_t g_pre_size = 0;
 #include "two_buffer_test.h"
 #include "bench_state.h"
 #include "boot_stage.h"
+#include "debug_hooks.h"
 
 // Largest free direct-memory range for an alignment, for the logs: a refused allocation is a refused request (length,
 // alignment, type), not proof that no memory is left. OpenOrbis declares this call with by-value outputs, hence the cast.
@@ -315,7 +324,9 @@ void *alloc_dm(size_t len, size_t align, int type)
 {
     long phys = 0; void *addr = NULL;
     size_t total = sceKernelGetDirectMemorySize();
+    g_own_alloc++;
     int r = sceKernelAllocateDirectMemory(0, (long)total, len, align, type, &phys);
+    g_own_alloc--;
     int stage = r == 0 ? 2 : 1;
     if (r == 0) r = sceKernelMapDirectMemory(&addr, len, 0x33 /*CPU rw + GPU rw*/, 0, phys, align);
     if (r != 0 || !addr) {
@@ -1162,7 +1173,9 @@ static void *alloc_mbufs(size_t total)
 {
     long phys = 0; void *addr = NULL;
     size_t range = sceKernelGetDirectMemorySize();
+    g_own_alloc++;
     int r = sceKernelAllocateDirectMemory(0, (long)range, total, 0x200000, 3 /*WC_GARLIC*/, &phys);
+    g_own_alloc--;
     if (r != 0) {
         size_t av = dm_avail(0x200000);
         lg("mbufs: AllocateDirectMemory = 0x%08x (len 0x%zx align 0x200000 type 3 range 0..0x%zx, largest free 0x%zx)\n",
@@ -2663,6 +2676,8 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
     if (!bench_bootstrap()) { BLOG("bench_bootstrap: inert"); return 0; }
     BLOG("bench_bootstrap ok");
 #endif
+    g_boot_t0 = sceKernelGetProcessTime();
+    if (!g_bench_enabled) debug_hooks_install();   // only with the app's Debug log switch on
     g_vq_on = !g_bench_enabled && read_two_buffer_raw();
     if (g_vq_on || tb_title()) {   // virtual flip queue (two_buffer=1) or a test build on a test title
         HOOK32(sceVideoOutGetFlipStatus);
@@ -2705,7 +2720,9 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
             for (int ti = 0; ti < 2 && !g_pre_mem; ti++) {
                 long phys = 0; void *addr = NULL;
                 size_t total = try_sz[ti];
+                g_own_alloc++;
                 r = sceKernelAllocateDirectMemory(0, (long)sceKernelGetDirectMemorySize(), total, 0x200000, 3 /*WC_GARLIC*/, &phys);
+                g_own_alloc--;
                 if (r == 0) r = sceKernelMapDirectMemory(&addr, total, 0x33, 0, phys, 0x200000);
                 if (r == 0 && addr) { memset(addr, 0, total); g_pre_mem = addr; g_pre_size = total; }
                 STAGE("early display memory try %d: len=0x%zx align=0x200000 type=3 r=0x%08x%s", ti + 1, total, (unsigned)r,
@@ -2741,6 +2758,7 @@ s32 attr_public plugin_unload(s32 argc, const char *argv[])
     if (!g_bench_enabled) return 0;  // bootstrap may have returned without installing hooks
 #endif
     if (g_status_hooked) UNHOOK(sceVideoOutGetFlipStatus);
+    debug_hooks_remove();
 #if VCFG_2BUF_TEST
     if (g_tb_hooks) {
         UNHOOK(sceVideoOutAddFlipEvent);

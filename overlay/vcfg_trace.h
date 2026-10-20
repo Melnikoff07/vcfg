@@ -1,5 +1,5 @@
 // VCFG flight recorder: always on (also with the debug log off), tiny, per title.
-// LOG_DIR/trace-<TITLE>.txt = header + the first TRACE_HEAD log lines of this game start (load crashes happen
+// LOG_DIR/trace-<TITLE>.txt = header + the first TRACE_HEAD (200) log lines of this game start (load crashes happen
 // there) + the last TRACE_TAIL lines. Rewritten at most every 2 s and right away while the head fills up; the
 // previous game start is kept as trace-<TITLE>.prev.txt. The app's bug report reads both, so a crash can be
 // understood from the report alone. Include after LOG_DIR, g_title_id and klog are defined; call vcfg_trace()
@@ -18,8 +18,8 @@
 #ifndef VCFG_ENGINE
 #define VCFG_ENGINE "unknown"
 #endif
-#define TRACE_HEAD 80
-#define TRACE_TAIL 80
+#define TRACE_HEAD 200
+#define TRACE_TAIL 200
 #define TRACE_W 200
 
 static char g_tr_head[TRACE_HEAD][TRACE_W], g_tr_tail[TRACE_TAIL][TRACE_W];
