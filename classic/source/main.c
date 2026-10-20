@@ -1260,6 +1260,8 @@ static void safe_try_activate(uint32_t handle)
     g_safe_done = 1;
     STAGE("safe mode frame %u: check (title %s, %ux%u fmt=0x%x ngame=%d idx_hi=%d detected60=%d game_alloc_fail=%u)", g_flips,
           g_title_id, g_bw, g_bh, g_attr.format, g_ngame, g_game_idx_hi, g_detected_60fps, g_dbg_alloc_fail);
+    STAGE("safe mode frame %u: free direct memory: largest block for align 0x10000 = 0x%zx, 0x200000 = 0x%zx (pool 0x%zx)", g_flips,
+          dm_avail(0x10000), dm_avail(0x200000), (size_t)sceKernelGetDirectMemorySize());
     if (g_fg_off && !g_cfg.upscale && !g_cfg.overlay) { STAGE("safe mode: FG, Enhance and overlay all off -> nothing to set up"); return; }
     if (!g_fmt_supported) { char w[24]; snprintf(w, sizeof(w), "FMT 0x%x", g_attr.format); safe_refuse(w); return; }
     if (!fg_res_supported(g_bw, g_bh)) { char w[24]; snprintf(w, sizeof(w), "RES %ux%u", g_bw, g_bh); safe_refuse(w); return; }
@@ -2772,11 +2774,13 @@ int32_t sceVideoOutSetFlipRate_hook(int32_t handle, int32_t rate)
     int m_raw = read_mode_raw();
     int want4 = (m_raw == 4 || m_raw == 6 || m_raw == 7 || m_raw == 8);
     lg("SetFlipRate handle=%d rate=%d%s\n", handle, rate, (want4 && (!g_safe || g_safe_active)) ? " -> forced 0 (mode 4/8: 60 Hz output, we pace the game ourselves)" : "");
-    STAGE("SetFlipRate enter: handle=%d rate=%d%s", handle, rate, want4 ? " -> 0" : "");
+    static uint32_t s_sfr_n;   // some games call SetFlipRate every frame: only the first calls are boot stages (the 200-line boot file filled up with them)
+    int sfr_log = s_sfr_n < 4 ? (int)++s_sfr_n : 0;
+    if (sfr_log) STAGE("SetFlipRate enter: handle=%d rate=%d%s", handle, rate, want4 ? " -> 0" : "");
     g_game_flip_rate = rate;   // safe mode: the game's own rate stays until the late set-up succeeded
     if (want4 && (!g_safe || g_safe_active)) rate = 0;
     int32_t r = HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), handle, rate);
-    STAGE("SetFlipRate done = 0x%08x", (unsigned)r);
+    if (sfr_log) STAGE("SetFlipRate done = 0x%08x", (unsigned)r);
     return r;
 }
 
