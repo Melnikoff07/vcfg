@@ -1538,6 +1538,14 @@ static void tick(uint32_t n, uint32_t handle, uint32_t index, uint32_t mode)
             snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)");
             lg("auto-detect: game runs at %.1f fps (>= 48 fps) -> FrameGen auto-disabled (60 Hz output limit)\n", rfps);
         }
+        {   // Diagnostics only: log a change of the game's frame rate class (30 -> 60 on a menu, etc.)
+            static int rate_class;
+            int cls = sm_rfps >= 480u ? 60 : (sm_rfps < 400u ? 30 : 0);
+            if (n >= 30 && cls && cls != rate_class) {
+                if (rate_class) lg("rate change: %d -> %d fps class at flip %u (%.1f fps, detected_60=%d)\n", rate_class, cls, n, rfps, g_detected_60fps);
+                rate_class = cls;
+            }
+        }
         g_fps_win_t = now;
         g_fps_win_n = 0;
     }

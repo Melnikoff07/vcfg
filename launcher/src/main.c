@@ -402,10 +402,11 @@ static void summarize(Buf *r, const char *id, const char *which, const char *t)
     find_line(t, "version: ", v, sizeof(v)); find_line(t, "seconds since start: ", secs, sizeof(secs));
     int frame = strstr(t, "first SubmitAndFlip") || strstr(t, "A22_TITLE") || strstr(t, "gnm #1 ");
     int gpu = strstr(t, "gpu_init: ok") || strstr(t, "A20_ALLOC");
-    int fg = strstr(t, "mode4 #") || strstr(t, "kind=1") || strstr(t, "inject #");
+    int fg = strstr(t, "mode4 #") || strstr(t, "kind=1");
+    int post = strstr(t, "inject #") != NULL;   // our commands were injected (OSD / post pass): not proof of generated frames
     int menu = strstr(t, "menu opened") || strstr(t, "A20_MENU open=1");
-    bprintf(r, "%s, %s: %s | %s | first frame %s, GPU memory %s, FG frames %s, menu used %s\n", id, which, v, secs,
-            frame ? "yes" : "NO", gpu ? "yes" : "no", fg ? "yes" : "no", menu ? "yes" : "no");
+    bprintf(r, "%s, %s: %s | %s | first frame %s, GPU memory %s, FG frames %s, OSD/post injects %s, menu used %s\n", id, which, v, secs,
+            frame ? "yes" : "NO", gpu ? "yes" : "no", fg ? "yes" : "no", post ? "yes" : "no", menu ? "yes" : "no");
     static const char *keys[] = { "inert", "FAIL", "fail", "stop", "NATIVE_ONLY", "refus", "no memory", "dcb_unreadable" };
     int shown = 0;
     for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]) && shown < 4; k++)
