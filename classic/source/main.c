@@ -1209,6 +1209,104 @@ static int mbufs_ready(uint32_t handle)
     return g_mbuf_state == 1;
 }
 
+// ---- safe mode (titles not verified on hardware) ----
+// Such a title gets none of our memory, no changed RegisterBuffers and no forced flip rate while it starts: the plugin
+// only watches. After INJECT_AFTER_FLIPS frames safe_try_activate() checks what it saw and, only if everything is
+// fine, takes the memory and registers its extra display buffers as a separate group at the top of the 16 indices.
+// A refusal leaves the game exactly as it runs without the plugin ("INERT: SAFE ..." in the report).
+static int g_safe = 0;            // 1: the title is not verified, observe first
+static int g_safe_active = 0;     // 1: the late set-up succeeded, FG may run
+static int g_safe_done = 0;       // the one-time check ran (either result)
+static int32_t g_game_flip_rate = -1;
+
+static int is_verified_title(void)
+{
+    static const char *const k_ok[] = { "CUSA00207", "CUSA08519", "CUSA00411", "CUSA05571", "CUSA08809",
+                                        "CUSA00557", "CUSA09171", "CUSA13801", "CUSA11456" };
+    for (unsigned v = 0; v < sizeof(k_ok) / sizeof(k_ok[0]); v++)
+        if (!strcmp(g_title_id, k_ok[v])) return 1;
+    return 0;
+}
+
+static void safe_refuse(const char *why)
+{
+    snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: SAFE %s", why);
+    STAGE("safe mode frame %u: refused (%s) -> the game stays native", g_flips, why);
+    lg("safe mode: refused at frame %u (%s)\n", g_flips, why);
+}
+
+// Surface size of one game display buffer: the VA gap between the game's buffers if it looks like a surface, else
+// pitch * height * 4. 0 = unknown (the same rules as the early path in RegisterBuffers).
+static size_t safe_surface_stride(void)
+{
+    size_t one = 0;
+    for (int i = 0; i + 1 < g_ngame; i++) {
+        uintptr_t a0 = (uintptr_t)g_buf[i], a1 = (uintptr_t)g_buf[i + 1];
+        size_t diff = a1 > a0 ? (size_t)(a1 - a0) : (size_t)(a0 - a1);
+        if (diff >= 0x100000 && diff <= 0x4000000 && !(diff & 0x7FFF) && (!one || diff < one)) one = diff;
+    }
+    if (!one && g_pitch >= 640 && g_bh >= 360) {
+        size_t raw_sz = (size_t)g_pitch * (size_t)((g_bh + 63u) & ~63u) * 4u;
+        one = (raw_sz + 0x7FFFFu) & ~(size_t)0x7FFFFu;
+    }
+    return (one < 0x100000 || one > 0x4000000 || (one & 0x7FFF)) ? 0 : one;
+}
+
+// Called once on the game's flip thread at frame INJECT_AFTER_FLIPS, after the config was read.
+static void safe_try_activate(uint32_t handle)
+{
+    g_safe_done = 1;
+    STAGE("safe mode frame %u: check (title %s, %ux%u fmt=0x%x ngame=%d idx_hi=%d detected60=%d game_alloc_fail=%u)", g_flips,
+          g_title_id, g_bw, g_bh, g_attr.format, g_ngame, g_game_idx_hi, g_detected_60fps, g_dbg_alloc_fail);
+    if (g_fg_off && !g_cfg.upscale && !g_cfg.overlay) { STAGE("safe mode: FG, Enhance and overlay all off -> nothing to set up"); return; }
+    if (!g_fmt_supported) { char w[24]; snprintf(w, sizeof(w), "FMT 0x%x", g_attr.format); safe_refuse(w); return; }
+    if (g_bw != 1920 || g_bh != 1080) { char w[24]; snprintf(w, sizeof(w), "RES %ux%u", g_bw, g_bh); safe_refuse(w); return; }
+    if (g_ngame < 2 || g_ngame > 8) { safe_refuse("BUFFERS"); return; }
+    if (g_dbg_alloc_fail) { safe_refuse("GAME ALLOC FAILS"); return; }
+    if (g_detected_60fps && g_cfg.fps_lock != 30) { snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)"); return; }
+    size_t one = safe_surface_stride();
+    if (!one) { safe_refuse("SURFACE SIZE"); return; }
+    int hi = g_game_idx_hi > g_ngame ? g_game_idx_hi : g_ngame;
+    int want = g_ngame == 2 ? 6 : 3;
+    if (want > 16 - hi) want = 16 - hi;
+    if (want < 1) { safe_refuse("NO INDICES"); return; }
+    // gpu + work first (they decide whether FG can run at all), display buffers last
+    g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
+    g_pre_gpu = alloc_dm(g_gpu_sz, g_gpu_sz, 0);
+    if (!g_pre_gpu) { safe_refuse("NO GPU MEM"); return; }
+    g_pre_work = alloc_dm(WORK_SZ, 0x10000, 3);
+    g_work_garlic = g_pre_work != NULL;
+    if (!g_pre_work) g_pre_work = alloc_dm(WORK_SZ, 0x10000, 0);
+    if (!g_pre_work) { safe_refuse("NO WORK MEM"); return; }
+    uint8_t *m = NULL; int nm = 0;
+    for (int n = want; !m && n >= 1; n = (n == 6 ? 4 : n - 1)) {   // 6, 4, 3, 2, 1
+        m = (uint8_t *)alloc_mbufs((one * (size_t)n + 0x1FFFFFu) & ~(size_t)0x1FFFFFu);
+        if (m) nm = n;
+    }
+    if (!m) { safe_refuse("NO DISPLAY MEM"); return; }
+    int base = 16 - nm;   // top of the index range: the game's own indices stay free
+    if (base < hi) { safe_refuse("NO INDICES"); return; }
+    void *ext[8];
+    for (int i = 0; i < nm; i++) ext[i] = m + (size_t)i * one;
+    int32_t r1 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                               (int32_t)handle, base, ext, nm, &g_attr);
+    STAGE("safe mode RegisterBuffers (late group at %d, %d x 0x%zx) = 0x%08x", base, nm, one, (unsigned)r1);
+    if (r1 < 0) { safe_refuse("REGISTER FAILED"); return; }
+    for (int i = 0; i < nm; i++) g_buf[base + i] = (uint64_t)(uintptr_t)ext[i];
+    g_mbase = base;
+    g_nbuf = base + nm;
+    g_nmid = nm < 3 ? nm : 3;
+    g_pcopy_avail = (g_ngame == 2 && nm >= 4);
+    g_pcopy_k = nm >= 6 ? 3 : 2;
+    g_mbuf_state = 1;
+    int32_t rr = HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), (int32_t)handle, 0);
+    g_safe_active = 1;
+    g_inert_reason[0] = 0;
+    STAGE("safe mode activated at frame %u: nm=%d base=%d game flip rate was %d, SetFlipRate(0)=0x%08x", g_flips, nm, base,
+          (int)g_game_flip_rate, (unsigned)rr);
+    lg("safe mode: activated at frame %u (base=%d, extra=%d, SetFlipRate(0)=0x%08x)\n", g_flips, base, nm, (unsigned)rr);
+}
+
 static uint64_t g_pace_next = 0;
 static void pace_hz(uint32_t hz)
 {
@@ -1710,12 +1808,20 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
         }
         cfg_reload_from_disk(1);
         // 1.4: Verify compatibility & populate g_inert_reason if FG cannot run
+        char safe_reason[sizeof(g_inert_reason)];
+        if (g_safe && !g_safe_done) {
+            if (g_inject_on == 8) safe_try_activate(handle);
+            else safe_refuse("MODE");
+        }
+        memcpy(safe_reason, g_inert_reason, sizeof(safe_reason));
+        if (g_safe && !g_safe_active) g_inject_on = 0;   // unverified title that was refused: observe only
         if (!g_fmt_supported) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: HDR/FMT 0x%x", g_attr.format);
         else if (g_bw != 1920 || g_bh != 1080) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: RES %ux%u", g_bw, g_bh);
         else if (!mbufs_ready(handle)) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: NO MBUF (%d)", g_nbuf);
         else if (g_detected_60fps && g_cfg.fps_lock != 30) snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)");
         else g_inert_reason[0] = 0;
 
+        if (g_safe && !g_safe_active && safe_reason[0]) memcpy(g_inert_reason, safe_reason, sizeof(g_inert_reason));
         lg("injection mode %d (title %s, known=%d, fg_off=%d, preset=%d, sharpness=%d%%, enhance=%d, overlay=%d, inert='%s'), work memory %s\n",
            g_inject_on, g_title_id, g_known_game, g_fg_off, g_cfg.preset, g_cfg.sharpness, g_cfg.upscale, g_cfg.overlay,
            g_inert_reason, g_work_garlic ? "garlic" : "onion");
@@ -2225,7 +2331,8 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
         return rb;
     }
     // 1.4: Support 2..8 game display buffers (some engines register 4 buffers)
-    if (attr && startIndex == 0 && bufferNum >= 2 && bufferNum <= 8 && addresses && g_mbuf_state >= 0) {
+    if (g_safe && attr && startIndex == 0 && bufferNum >= 2 && bufferNum <= 8) g_ngame = bufferNum;   // observed only: see safe_try_activate()
+    if (attr && startIndex == 0 && bufferNum >= 2 && bufferNum <= 8 && addresses && g_mbuf_state >= 0 && !g_safe) {
         g_ngame = bufferNum;
         int m_raw = read_mode_raw();
         int want4 = (m_raw == 4 || m_raw == 6 || m_raw == 7 || m_raw == 8);
@@ -2654,7 +2761,8 @@ int32_t sceVideoOutSetFlipRate_hook(int32_t handle, int32_t rate)
     int want4 = (m_raw == 4 || m_raw == 6 || m_raw == 7 || m_raw == 8);
     lg("SetFlipRate handle=%d rate=%d%s\n", handle, rate, want4 ? " -> forced 0 (mode 4/8: 60 Hz output, we pace the game ourselves)" : "");
     STAGE("SetFlipRate enter: handle=%d rate=%d%s", handle, rate, want4 ? " -> 0" : "");
-    if (want4) rate = 0;
+    g_game_flip_rate = rate;   // safe mode: the game's own rate stays until the late set-up succeeded
+    if (want4 && (!g_safe || g_safe_active)) rate = 0;
     int32_t r = HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), handle, rate);
     STAGE("SetFlipRate done = 0x%08x", (unsigned)r);
     return r;
@@ -2693,6 +2801,8 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
 #endif
     {
         int m = g_bench_enabled ? 8 : read_mode_raw();
+        g_safe = !g_bench_enabled && !is_verified_title();
+        if (g_safe) { STAGE("safe mode: title %s is not verified -> no early memory, hooks only observe until frame %d", g_title_id, INJECT_AFTER_FLIPS); m = 0; }
         if (m == 8 && !g_bench_enabled) gv_load(alloc_dm);
         if (m >= 1 && m <= 8) {
             g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
