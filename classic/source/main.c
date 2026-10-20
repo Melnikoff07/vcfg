@@ -30,6 +30,7 @@ static volatile int g_opt_sharp = 0; // inject letter S: sharper cubic (C 0.75) 
 static volatile int g_opt_nostr = 0; // inject letter b: straddle guard in warp8 off (A/B)
 static volatile int g_opt_nocf = 0;  // inject letter k: confidence fallback off
 #include "fg8_table.h"
+#include "fg_res.h"
 #include "gv.h"
 #include "vov_glue.h"
 #include "menu_combo.h"
@@ -852,7 +853,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
                         | (cut_blocks8() << 16);
     uint32_t mid1_packed = (mid1_idx & 0x7FFFu) | ((t1_q16 & 0xFFFFu) << 16);
 
-    fill_table8(tb, P, C, M1, pitch, tidx, r, mid1_packed, base_flags, g_work, g_mon, stats);
+    fill_table8_wh(tb, P, C, M1, g_bw, g_bh, pitch, tidx, r, mid1_packed, base_flags, g_work, g_mon, stats);
 
     uint32_t rcas_con_bits = 0, rcas_flags1 = 0, osd_xy = 0, osd_wh1 = 0;
     uint32_t mask1 = two_mids ? 1u /*mid1 only; mid2+cur done in pass 2*/ : 3u /*mid1 + cur*/;
@@ -866,6 +867,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     for (int i = 0; i < 5; i++) *(volatile uint64_t *)(slotb + 0x910 + i * 8) = 0;
     for (int i = 0; i < 7; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
 #define DISPATCH(x, y) do { *p++ = PKT3(0x15, 4, 1); *p++ = (x); *p++ = (y); *p++ = 1; *p++ = 1; } while (0)
+    const FgDim D = fg_dim(g_bw, g_bh);   // 1080p: the literals that stood here (30 x 68, 240 x 135, ...), see fg_res.h
     *p++ = PKT3(0x46, 1, 0); *p++ = 0x0000002E;
     *p++ = PKT3(0x46, 1, 0); *p++ = 0x00000407;
     *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)lbl2; *p++ = 0x40000000u | ((uint32_t)(lbl2 >> 32) & 0xFFFFu); *p++ = seq; *p++ = 0;
@@ -878,24 +880,24 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     gv_fill_table(tb, seq, slot);
     *p++ = PKT3(0x76, 4, 1); *p++ = 0x207; *p++ = 64; *p++ = 1; *p++ = 1;
     *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl; *p++ = (uint32_t)(tbl >> 32);
-    SET_PASS(g_sh8_off[0], PYR8_RSRC1, PYR8_RSRC2);   DISPATCH(30, 68);
+    SET_PASS(g_sh8_off[0], PYR8_RSRC1, PYR8_RSRC2);   DISPATCH(D.px, D.py);
     PASS_BARRIER();
     TS_EOP(1);
-    SET_PASS(g_sh8_off[1], ME3_RSRC1, ME3_RSRC2);     DISPATCH(30, 17);
+    SET_PASS(g_sh8_off[1], ME3_RSRC1, ME3_RSRC2);     DISPATCH(D.m3x, D.m3y);
     PASS_BARRIER(); TS2(0);
-    SET_PASS(g_sh8_off[2], ME2_RSRC1, ME2_RSRC2);     DISPATCH(15, 34);
+    SET_PASS(g_sh8_off[2], ME2_RSRC1, ME2_RSRC2);     DISPATCH(D.m2x, D.m2y);
     PASS_BARRIER(); TS2(1);
     SET_PASS(g_sh8_off[7], GM8_RSRC1, GM8_RSRC2);     DISPATCH(1, 1);
     PASS_BARRIER();
     SET_PASS(g_sh8_off[8], FGS8_RSRC1, FGS8_RSRC2);   DISPATCH(32, 1);
     PASS_BARRIER(); TS2(2);
-    SET_PASS(g_sh8_off[3], ME1_RSRC1, ME1_RSRC2);     DISPATCH(30, 68);
+    SET_PASS(g_sh8_off[3], ME1_RSRC1, ME1_RSRC2);     DISPATCH(D.px, D.py);
     PASS_BARRIER(); TS2(3);
-    SET_PASS(g_sh8_off[9], MF8_RSRC1, MF8_RSRC2);     DISPATCH(30, 68);
+    SET_PASS(g_sh8_off[9], MF8_RSRC1, MF8_RSRC2);     DISPATCH(D.px, D.py);
     PASS_BARRIER();
     if (gv_pass_active()) {
         p = gv_emit_ts(p, slot, 2);
-        SET_PASS(g_sh8_off[10], GV8_RSRC1, GV8_RSRC2);  DISPATCH(30, 68);
+        SET_PASS(g_sh8_off[10], GV8_RSRC1, GV8_RSRC2);  DISPATCH(D.px, D.py);
         PASS_BARRIER();
         p = gv_emit_after_gv8(p, seq, slot);
         p = gv_emit_ts(p, slot, 3);
@@ -915,10 +917,10 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     PASS_BARRIER(); TS2(4);
     if (gv_warp_active()) { SET_PASS(g_sh8_off[12], WARP8G_RSRC1, WARP8G_RSRC2); }
     else { SET_PASS(g_sh8_off[5], WARP8_RSRC1, WARP8_RSRC2); }
-    DISPATCH(240, 135);
+    DISPATCH(D.wx, D.wy);
     PASS_BARRIER(); TS2(5);
     if (rcas_flags1) {
-        SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(240, 135);
+        SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy);
         PASS_BARRIER();
     }
     // post_mid_only: the real frame gets the profile's Enhance AA WITHOUT sharpening (Enhance off = real untouched), so
@@ -934,7 +936,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
             fill_table8_ext(tbr, g_gpu, slotb, 0u /*con 0 = no sharpening*/, 2u /*cur*/ | ((uint32_t)enh << 2), 0u, 0u);
             *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; // inv scalar cache
             *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tblr; *p++ = (uint32_t)(tblr >> 32);
-            SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(240, 135);
+            SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy);
             PASS_BARRIER();
             *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
             *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl; *p++ = (uint32_t)(tbl >> 32);
@@ -942,7 +944,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     }
     if (gv_viz_active()) {
         PASS_BARRIER();
-        SET_PASS(g_sh8_off[13], GVZ8_RSRC1, GVZ8_RSRC2); DISPATCH(61, 35);
+        SET_PASS(g_sh8_off[13], GVZ8_RSRC1, GVZ8_RSRC2); DISPATCH(D.zx, D.zy);
     }
     if (osd_wh1) {
         PASS_BARRIER();
@@ -955,7 +957,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         uint32_t *tb2 = (uint32_t *)(slotb + SLOT_TB2_OFF);
         uint64_t tbl2 = (uint64_t)(uintptr_t)tb2;
         memcpy(tb2, tb, 140 * sizeof(uint32_t));
-        make_t(tb2 + 16, M2, 1920, 1080, pitch, tidx); // T#out = M2
+        make_t(tb2 + 16, M2, g_bw, g_bh, pitch, tidx); // T#out = M2
         tb2[29] = (mid2_idx & 0x7FFFu) | 0x8000u /*skip_st*/ | ((t2_q16 & 0xFFFFu) << 16);
         uint32_t rcas_con2 = 0, rcas_flags2 = 0, osd_wh2 = (osd_wh1 & 0x00FFFFFFu) | (3u << 24);
         calc_rcas_params(post_mid_only() ? 1u /*mid2 only*/ : 3u /*mid2 + cur*/, &rcas_con2, &rcas_flags2);
@@ -971,10 +973,10 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         PASS_BARRIER();
         if (gv_warp_active()) { SET_PASS(g_sh8_off[12], WARP8G_RSRC1, WARP8G_RSRC2); }
         else { SET_PASS(g_sh8_off[5], WARP8_RSRC1, WARP8_RSRC2); }
-        DISPATCH(240, 135);
+        DISPATCH(D.wx, D.wy);
         PASS_BARRIER();
         if (rcas_flags2) {
-            SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(240, 135);
+            SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy);
             PASS_BARRIER();
         }
         if (osd_wh1) {
@@ -987,7 +989,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     if (g_dump_req && g_dump_mem && !g_bench_offscreen) {
         PASS_BARRIER();
         make_v(tb + 88, (uint64_t)(uintptr_t)g_dump_mem, 3 * 960 * 1080 * 4 + 163200);
-        SET_PASS(g_sh8_off[6], DUMP8_RSRC1, DUMP8_RSRC2); DISPATCH(120, 135);
+        SET_PASS(g_sh8_off[6], DUMP8_RSRC1, DUMP8_RSRC2); DISPATCH(D.dx, D.dy);
         {
             uint64_t dl = (uint64_t)(uintptr_t)(g_gpu + DUMP_DONE_OFF);
             *(volatile uint64_t *)(g_gpu + DUMP_DONE_OFF) = 0;
@@ -1001,15 +1003,15 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         uint32_t *tb3 = (uint32_t *)(slotb + OSD_SLOT_OFF);   // old text-grid OSD area, unused since the bitmap overlay
         uint64_t tbl3 = (uint64_t)(uintptr_t)tb3;
         memset(tb3, 0, 0x60);
-        make_t(tb3 + 8, C, 1920, 1080, pitch, tidx);
-        make_t(tb3 + 16, copy_dst, 1920, 1080, pitch, tidx);
+        make_t(tb3 + 8, C, g_bw, g_bh, pitch, tidx);
+        make_t(tb3 + 16, copy_dst, g_bw, g_bh, pitch, tidx);
         int32_t fr3 = insert_wait_flip_done(p, 7, vo_handle, copy_idx);
         if (fr3 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
         p += 7;
         PASS_BARRIER();
         *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; // inv scalar cache
         *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl3; *p++ = (uint32_t)(tbl3 >> 32);
-        SET_PASS(g_sh8_off[16], PCOPY8_RSRC1, PCOPY8_RSRC2); DISPATCH(240, 135);
+        SET_PASS(g_sh8_off[16], PCOPY8_RSRC1, PCOPY8_RSRC2); DISPATCH(D.wx, D.wy);
         PASS_BARRIER();
     }
     TS2(6);
@@ -1260,7 +1262,7 @@ static void safe_try_activate(uint32_t handle)
           g_title_id, g_bw, g_bh, g_attr.format, g_ngame, g_game_idx_hi, g_detected_60fps, g_dbg_alloc_fail);
     if (g_fg_off && !g_cfg.upscale && !g_cfg.overlay) { STAGE("safe mode: FG, Enhance and overlay all off -> nothing to set up"); return; }
     if (!g_fmt_supported) { char w[24]; snprintf(w, sizeof(w), "FMT 0x%x", g_attr.format); safe_refuse(w); return; }
-    if (g_bw != 1920 || g_bh != 1080) { char w[24]; snprintf(w, sizeof(w), "RES %ux%u", g_bw, g_bh); safe_refuse(w); return; }
+    if (!fg_res_supported(g_bw, g_bh)) { char w[24]; snprintf(w, sizeof(w), "RES %ux%u", g_bw, g_bh); safe_refuse(w); return; }
     if (g_ngame < 2 || g_ngame > 8) { safe_refuse("BUFFERS"); return; }
     if (g_dbg_alloc_fail) { safe_refuse("GAME ALLOC FAILS"); return; }
     if (g_detected_60fps && g_cfg.fps_lock != 30) { snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)"); return; }
@@ -1816,7 +1818,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
         memcpy(safe_reason, g_inert_reason, sizeof(safe_reason));
         if (g_safe && !g_safe_active) g_inject_on = 0;   // unverified title that was refused: observe only
         if (!g_fmt_supported) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: HDR/FMT 0x%x", g_attr.format);
-        else if (g_bw != 1920 || g_bh != 1080) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: RES %ux%u", g_bw, g_bh);
+        else if (!fg_res_supported(g_bw, g_bh)) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: RES %ux%u", g_bw, g_bh);
         else if (!mbufs_ready(handle)) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: NO MBUF (%d)", g_nbuf);
         else if (g_detected_60fps && g_cfg.fps_lock != 30) snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)");
         else g_inert_reason[0] = 0;
@@ -1827,7 +1829,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
            g_inert_reason, g_work_garlic ? "garlic" : "onion");
         if (g_inject_on >= 6) mon_start();
         gv_set_display(g_buf, g_nbuf, g_bw, g_bh);
-        gv_start(g_inject_on == 8 && g_bw == 1920 && g_bh == 1080);
+        gv_start(g_inject_on == 8 && fg_res_supported(g_bw, g_bh));
     }
 
     if (g_inject_on && g_flips >= INJECT_AFTER_FLIPS && count >= 1 && count <= (gv_armed() ? GV_MAXE - 1u : 6u) && dcb && dcbSz && index < (uint32_t)g_nbuf) {
@@ -1945,7 +1947,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                 uint32_t hold_mid_us = 0;
 
                 int can_fg8 = (g_inject_on == 8 && g_work && g_sh8_ok && g_fmt_supported &&
-                               g_bw == 1920 && g_bh == 1080 && g_prev_idx < game_idx_end() && mbufs_ready(handle));
+                               fg_res_supported(g_bw, g_bh) && g_prev_idx < game_idx_end() && mbufs_ready(handle));
                 int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);
 
                 if (can_fg8 && want_fg) {
