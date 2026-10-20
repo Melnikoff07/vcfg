@@ -761,6 +761,27 @@ static uint32_t cut_blocks8(void)
     return g_cut_blocks8;
 }
 
+// Per-title "post-process the generated frame only": LOG_DIR/post_mid_only_<TITLE> exists -> while frames are generated,
+// Sharpness / Enhance AA run on the mid frame(s) only and never on the game's real frame. The real frame is processed
+// IN PLACE and that buffer is the next pair's P, so the warp blended a sharpened A with a raw B and then sharpened the mid
+// again (A's half twice); the displayed real frames were sharpened too, so the mid stayed softer than its neighbours
+// (offline, 12 CUSA00557 triplets at Sharpness 100: mid/real detail 0.79 in-place vs 1.03 mid-only, PSNR +0.73 dB,
+// TCE -8 %). In-place also lets a tile read neighbour pixels already sharpened by another workgroup (frame-to-frame
+// edge flicker on the 8-px tile grid of the real frame). With Enhance AA on, the real frame still gets Enhance AA, without
+// sharpening (pass after rcas8 below). The overlay/menu still go to every frame. No file = unchanged.
+static int g_mid_only = -1;
+static int post_mid_only(void)
+{
+    if (g_mid_only < 0) {
+        char p[96]; snprintf(p, sizeof(p), LOG_DIR "/post_mid_only_%s", g_title_id);
+        int fd = sceKernelOpen(p, 0 /*O_RDONLY*/, 0);
+        g_mid_only = fd >= 0 ? 1 : 0;
+        if (fd >= 0) sceKernelClose(fd);
+        lg("post-process target: %s\n", g_mid_only ? "generated frames only (post_mid_only file)" : "generated + real (default)");
+    }
+    return g_mid_only;
+}
+
 static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M1, uint64_t M2,
                                 uint32_t pitch, uint32_t tidx, uint32_t nbytes, uint32_t slot, uint32_t seq,
                                 const uint32_t *nop64, int32_t vo_handle, uint32_t mid1_idx, uint32_t mid2_idx,
@@ -788,7 +809,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
 
     uint32_t rcas_con_bits = 0, rcas_flags1 = 0, osd_xy = 0, osd_wh1 = 0;
     uint32_t mask1 = two_mids ? 1u /*mid1 only; mid2+cur done in pass 2*/ : 3u /*mid1 + cur*/;
-    calc_rcas_params(mask1, &rcas_con_bits, &rcas_flags1);
+    calc_rcas_params(post_mid_only() ? 1u /*mid1 only*/ : mask1, &rcas_con_bits, &rcas_flags1);
     if (g_sh8_off[15]) osd_build_slot(slotb + OSD_SLOT_OFF, &osd_xy, &osd_wh1, mask1);
     fill_table8_ext(tb, g_gpu, slotb, rcas_con_bits, rcas_flags1, osd_xy, osd_wh1);
 
@@ -852,6 +873,25 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(240, 135);
         PASS_BARRIER();
     }
+    // post_mid_only: the real frame gets the profile's Enhance AA WITHOUT sharpening (Enhance off = real untouched), so
+    // the aliasing that crawls on edges is smoothed the same way in real and generated frames, and the sharpening only
+    // compensates the generated frame's softness. Separate table in the tb2 region (only FG Fast's mid2 uses it; in that
+    // mode this pass is skipped). Runs after the warp has read the raw C, before the overlay is drawn.
+    if (post_mid_only() && !two_mids && g_sh8_off[14]) {
+        int enh = g_cfg.upscale < 0 ? 0 : (g_cfg.upscale > 2 ? 2 : g_cfg.upscale);
+        if (enh > 0) {
+            uint32_t *tbr = (uint32_t *)(slotb + SLOT_TB2_OFF);
+            uint64_t tblr = (uint64_t)(uintptr_t)tbr;
+            memcpy(tbr, tb, 140 * sizeof(uint32_t));
+            fill_table8_ext(tbr, g_gpu, slotb, 0u /*con 0 = no sharpening*/, 2u /*cur*/ | ((uint32_t)enh << 2), 0u, 0u);
+            *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; // inv scalar cache
+            *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tblr; *p++ = (uint32_t)(tblr >> 32);
+            SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(240, 135);
+            PASS_BARRIER();
+            *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+            *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl; *p++ = (uint32_t)(tbl >> 32);
+        }
+    }
     if (gv_viz_active()) {
         PASS_BARRIER();
         SET_PASS(g_sh8_off[13], GVZ8_RSRC1, GVZ8_RSRC2); DISPATCH(61, 35);
@@ -870,7 +910,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         make_t(tb2 + 16, M2, 1920, 1080, pitch, tidx); // T#out = M2
         tb2[29] = (mid2_idx & 0x7FFFu) | 0x8000u /*skip_st*/ | ((t2_q16 & 0xFFFFu) << 16);
         uint32_t rcas_con2 = 0, rcas_flags2 = 0, osd_wh2 = (osd_wh1 & 0x00FFFFFFu) | (3u << 24);
-        calc_rcas_params(3u /*mid2 + cur*/, &rcas_con2, &rcas_flags2);
+        calc_rcas_params(post_mid_only() ? 1u /*mid2 only*/ : 3u /*mid2 + cur*/, &rcas_con2, &rcas_flags2);
         fill_table8_ext(tb2, g_gpu, slotb, rcas_con2, rcas_flags2, osd_xy, osd_wh1 ? osd_wh2 : 0u);
 
         int32_t fr2 = sceGnmInsertWaitFlipDone(p, 7, vo_handle, mid2_idx);
