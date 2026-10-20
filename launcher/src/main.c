@@ -88,24 +88,28 @@ static int sfo_str(const unsigned char *b, size_t n, const char *key, char *out,
     return 0;
 }
 // The app sandbox cannot read these folders (drwx------ root); main() wraps the calls in a GoldHEN jailbreak.
+static const char *const k_roots[] = { "", "/mnt/ext0", "/mnt/ext1" };   // internal drive, then extended storage (external HDD)
 static void load_meta(Game *g)
 {
-    char p[128]; size_t n = 0;
-    snprintf(p, sizeof(p), "/system_data/priv/appmeta/%s/param.sfo", g->id);
-    unsigned char *b = read_all(p, &n);
-    if (!b) { snprintf(p, sizeof(p), "/user/appmeta/%s/param.sfo", g->id); b = read_all(p, &n); }
-    if (b) { g->installed = 1; sfo_str(b, n, "TITLE", g->title, sizeof(g->title)); sfo_str(b, n, "APP_VER", g->version, sizeof(g->version)); free(b); }
-    snprintf(p, sizeof(p), "/user/patch/%s/sce_sys/param.sfo", g->id);   // an installed update has the newer APP_VER
-    if ((b = read_all(p, &n))) { sfo_str(b, n, "APP_VER", g->version, sizeof(g->version)); free(b); }
-    snprintf(p, sizeof(p), "/user/appmeta/%s/icon0.png", g->id);
-    int w, h, ch; unsigned char *img = stbi_load(p, &w, &h, &ch, 4);
-    if (img) { g->icon = img; g->iw = w; g->ih = h; g->installed = 1; }
-    if (!g->installed) { snprintf(p, sizeof(p), "/user/app/%s/app.json", g->id); FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; } }
-    // Games on extended (external HDD) storage have no appmeta here: look at the extended mounts, then at a settings file
-    // (it is only written for installed games, see save_settings).
-    for (int e = 0; e < 2 && !g->installed; e++) {
-        snprintf(p, sizeof(p), "/mnt/ext%d/user/app/%s/app.json", e, g->id); FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; }
+    char p[160]; size_t n = 0; unsigned char *b = NULL;
+    for (int r = 0; r < 3 && !b; r++) {
+        snprintf(p, sizeof(p), "%s/user/appmeta/%s/param.sfo", k_roots[r], g->id); b = read_all(p, &n);
     }
+    if (!b) { snprintf(p, sizeof(p), "/system_data/priv/appmeta/%s/param.sfo", g->id); b = read_all(p, &n); }
+    if (b) { g->installed = 1; sfo_str(b, n, "TITLE", g->title, sizeof(g->title)); sfo_str(b, n, "APP_VER", g->version, sizeof(g->version)); free(b); }
+    for (int r = 0; r < 3; r++) {   // an installed update has the newer APP_VER
+        snprintf(p, sizeof(p), "%s/user/patch/%s/sce_sys/param.sfo", k_roots[r], g->id);
+        if ((b = read_all(p, &n))) { sfo_str(b, n, "APP_VER", g->version, sizeof(g->version)); free(b); break; }
+    }
+    for (int r = 0; r < 3 && !g->icon; r++) {
+        snprintf(p, sizeof(p), "%s/user/appmeta/%s/icon0.png", k_roots[r], g->id);
+        int w, h, ch; unsigned char *img = stbi_load(p, &w, &h, &ch, 4);
+        if (img) { g->icon = img; g->iw = w; g->ih = h; g->installed = 1; }
+    }
+    for (int r = 0; r < 3 && !g->installed; r++) {
+        snprintf(p, sizeof(p), "%s/user/app/%s/app.json", k_roots[r], g->id); FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; }
+    }
+    // Last resort: a settings file (only written for installed games, see save_settings).
     if (!g->installed) { snprintf(p, sizeof(p), CFGDIR "/config-%s.ini", g->id); FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; } }
     vlog("game %s installed=%d version=%s title='%s' icon=%dx%d\n", g->id, g->installed, g->version, g->title, g->iw, g->ih);
 }
@@ -509,12 +513,14 @@ int main(void)
         load_meta(g);
     }
     // Every other installed game is listed as experimental (switched off until the user turns it on).
-    DIR *dir = opendir("/user/app");
+    for (int r = 0; r < 3; r++) {
+    char ap[48]; snprintf(ap, sizeof(ap), "%s/user/app", k_roots[r]);
+    DIR *dir = opendir(ap);
     if (dir) {
         struct dirent *e;
         while ((e = readdir(dir)) && a->ngames < (int)(sizeof(a->games) / sizeof(a->games[0]))) {
             if (strncmp(e->d_name, "CUSA", 4) || strlen(e->d_name) != 9) continue;
-            int known = 0; for (int i = 0; i < NSUP; i++) if (!strcmp(k_sup[i].id, e->d_name)) known = 1;
+            int known = 0; for (int i = 0; i < a->ngames; i++) if (!strcmp(a->games[i].id, e->d_name)) known = 1;
             if (known) continue;
             Game *g = &a->games[a->ngames++]; memset(g, 0, sizeof(*g));
             snprintf(g->id, sizeof(g->id), "%s", e->d_name); g->engine = ENGINE_CLASSIC; g->experimental = 1;
@@ -522,7 +528,8 @@ int main(void)
             if (!g->installed) a->ngames--;
         }
         closedir(dir);
-    } else vlog("cannot list /user/app\n");
+    } else vlog("cannot list %s\n", ap);
+    }
     if (jrc == 0) vlog("unjailbreak rc=%d\n", sys_sdk_unjailbreak(&jb));
     // Installed games first, keep the table order otherwise.
 #define RANK(g) ((g).installed * 2 + !(g).experimental)   // verified first, installed first
