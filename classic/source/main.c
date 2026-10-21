@@ -287,6 +287,45 @@ static int g_work_garlic = 0;
 
 static int32_t g_handle = -1;
 static VoAttr g_attr;
+// Tile mode index of the T# descriptors we build for the game's output surfaces. tilingMode 0 (TILE) has always been index 10 (display 2D thin) and
+// works on the base PS4. On a PS4 Pro (Neo mode) our writes (generated frames, overlay) come out in 128 px wide column garbage, so the layout there
+// does not match. TEST build: on Neo the index sweeps through the candidates (15 s each, logged) unless tile_sweep=0; tile_idx=N in config-<TITLE>.ini
+// pins one index (any console), tile_sweep=1 forces the sweep. Remove once the right Neo mode is known.
+static volatile int g_tile_override = -1, g_tile_sweep = -1;   // sweep: -1 auto (Neo only), 0 off, 1 on
+static uint32_t tile_idx_now(void)
+{
+    uint32_t base = (g_attr.tilingMode == 0) ? 10u : 8u;
+    static int neo = -1; if (neo < 0) neo = sceKernelIsNeoMode() ? 1 : 0;
+    if (g_tile_override >= 0) return (uint32_t)g_tile_override;
+    int sw = g_tile_sweep < 0 ? 0 : g_tile_sweep;   // default off; L3 + D-pad Left/Right (tile_hotkey) steps the index instead
+    if (!sw || g_attr.tilingMode != 0) return base;
+    static const uint32_t cand[] = { 10u, 14u, 13u, 9u, 12u, 11u };
+    uint64_t sec = sceKernelGetProcessTime() / 1000000ull;
+    uint32_t idx = cand[(sec / 15u) % (sizeof(cand) / sizeof(cand[0]))];
+    static uint32_t last = 0xFFFFu;
+    if (idx != last) { last = idx; lg("tile sweep: idx=%u at process time %llu s (neo=%d)\n", idx, (unsigned long long)sec, neo); }
+    return idx;
+}
+#define TILE_N 6
+static const uint32_t k_tile_cand[TILE_N] = { 10u, 14u, 13u, 9u, 12u, 11u };
+static void tile_file(char *p, size_t n) { snprintf(p, n, LOG_DIR "/tile_%s", g_title_id); }
+static void tile_load(void)   // the index a tester picked with the hotkey, kept per game
+{
+    char p[96]; tile_file(p, sizeof(p)); FILE *f = fopen(p, "r"); if (!f) return;
+    int v = -1; if (fscanf(f, "%d", &v) == 1 && v >= 0 && v < 32) g_tile_override = v;
+    fclose(f); lg("tile index %d loaded from %s\n", v, p);
+}
+static void tile_hotkey(int dir)   // L3 + D-pad Right / Left while no menu is open: next / previous candidate, saved at once
+{
+    uint32_t cur = tile_idx_now(); int pos = 0;
+    for (int i = 0; i < TILE_N; i++) if (k_tile_cand[i] == cur) pos = i;
+    pos = (pos + dir + TILE_N) % TILE_N;
+    g_tile_sweep = 0; g_tile_override = (int)k_tile_cand[pos];
+    char p[96]; tile_file(p, sizeof(p)); FILE *f = fopen(p, "w"); if (f) { fprintf(f, "%d\n", g_tile_override); fclose(f); }
+    snprintf(g_osd_toast, sizeof(g_osd_toast), "TILE %d", g_tile_override);
+    g_osd_toast_until = sceKernelGetProcessTime() + 2500000ull;
+    lg("tile hotkey: idx=%d (saved to %s)\n", g_tile_override, p);
+}
 static int g_mbuf_state = 0; // 0 untried, 1 ok, -1 failed
 static void *g_mbuf_mem = NULL;
 static int g_nmid = 3;
@@ -700,12 +739,15 @@ static char g_vov_title[48];
 static int vov_ready(void)
 {
     if (g_vov_state) return g_vov_state > 0;
-    void *mem = alloc_dm(VOV_MEM_SZ + 0xFFFFu & ~0xFFFFu, 0x10000, 0 /*WB_ONION*/);
+    size_t vsz = (VOV_MEM_SZ + 0xFFFFu) & ~(size_t)0xFFFFu;
+    void *mem = alloc_dm(vsz, 0x10000, 0 /*WB_ONION*/);
+    if (!mem) { vsz = (4u * VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu; mem = alloc_dm(vsz, 0x10000, 0); }
+    if (!mem) { vsz = (2u * VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu; mem = alloc_dm(vsz, 0x10000, 0); }   // fewer bitmaps, fits tight-memory games
     if (!mem) { g_vov_state = -1; lg("overlay: no memory, menu disabled\n"); return 0; }
-    vov_init((uint8_t *)mem);
+    vov_init_size((uint8_t *)mem, vsz);
     vov_read_title(g_vov_title, sizeof(g_vov_title));
     if (!g_vov_title[0]) vov_cpy(g_vov_title, g_title_id, sizeof(g_vov_title));
-    lg("overlay: ready at %p, title '%s'\n", mem, g_vov_title);
+    lg("overlay: ready at %p, %u KB (%u bitmaps), title '%s'\n", mem, (unsigned)(vsz >> 10), (unsigned)(vsz / VOV_BUF_SZ < VOV_NBUF ? vsz / VOV_BUF_SZ : VOV_NBUF), g_vov_title);
     g_vov_state = 1;
     return 1;
 }
@@ -1171,6 +1213,8 @@ static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
                 else if (strcmp(key, "two_buffer") == 0) c->two_buffer = (val != 0);
                 else if (strcmp(key, "hud_protect") == 0) c->hud_protect = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "game_vectors") == 0) c->game_vectors = (val != 0);
+                else if (strcmp(key, "tile_idx") == 0) g_tile_override = val < 0 ? -1 : (val > 31 ? 31 : val);
+                else if (strcmp(key, "tile_sweep") == 0) g_tile_sweep = val ? 1 : 0;
                 else if (strcmp(key, "fps_lock") == 0) c->fps_lock = (val == 20 || val == 30 || val == 60) ? val : 0;
                 else if (strcmp(key, "menu_hold_ms") == 0) c->menu_hold_ms = val < 500 ? 500 : (val > 10000 ? 10000 : val);
                 else if (strcmp(key, "menu_opacity") == 0) c->menu_opacity = val < 20 ? 20 : (val > 100 ? 100 : val);
@@ -1224,8 +1268,20 @@ static int read_mode_raw(void)
     }
     return have ? c.mode : 8;
 }
-// two_buffer=1 in config.ini / config-<TITLE>.ini (the app writes it for the "2-BUFFER" engine choice): read once at start,
-// it decides whether the status hook of the virtual flip queue is installed at all.
+// two_buffer / present_copy in config.ini / config-<TITLE>.ini: read once at start,
+// decides whether the virtual flip queue and present-copy buffer extension are enabled.
+static int read_present_copy_raw(void)
+{
+    fg_config_t c;
+    cfg_defaults(&c);
+    parse_ini_file(LOG_DIR "/config.ini", &c, NULL);
+    if (g_title_id[0] && strcmp(g_title_id, "UNKNOWN") != 0) {
+        char gpath[96];
+        snprintf(gpath, sizeof(gpath), LOG_DIR "/config-%s.ini", g_title_id);
+        parse_ini_file(gpath, &c, NULL);
+    }
+    return c.present_copy; // 0 = Auto, 1 = 2-Buffer (Force On), 2 = Standard (Force Off)
+}
 static int read_two_buffer_raw(void)
 {
     fg_config_t c;
@@ -1236,8 +1292,10 @@ static int read_two_buffer_raw(void)
         snprintf(gpath, sizeof(gpath), LOG_DIR "/config-%s.ini", g_title_id);
         parse_ini_file(gpath, &c, NULL);
     }
-    if (!strcmp(g_title_id, "CUSA17419")) return 1;
-    return c.two_buffer;
+    if (c.present_copy == 2) return 0;   // STANDARD buffer mode forced: no virtual queue
+    if (c.present_copy == 1 || c.two_buffer) return 1;
+    if (!strcmp(g_title_id, "CUSA17419") || !strcmp(g_title_id, "CUSA05571") || !strcmp(g_title_id, "CUSA08809")) return 1;
+    return 0;
 }
 
 static void *alloc_mbufs(size_t total)
@@ -1395,7 +1453,8 @@ static void safe_try_activate(uint32_t handle)
     size_t one = safe_surface_stride();
     if (!one) { safe_refuse("SURFACE SIZE"); return; }
     int hi = g_game_idx_hi > g_ngame ? g_game_idx_hi : g_ngame;
-    int want = g_ngame == 2 ? 6 : 3;
+    int want_pcopy = (g_cfg.present_copy == 1) || (g_cfg.present_copy == 0 && g_ngame == 2);
+    int want = want_pcopy ? 6 : 3;
     if (want > 16 - hi) want = 16 - hi;
     if (want < 1) { safe_refuse("NO INDICES"); return; }
     // Use early pre-reserved buffers if they survived boot; otherwise try late allocation.
@@ -1433,7 +1492,7 @@ static void safe_try_activate(uint32_t handle)
     g_mbase = base;
     g_nbuf = base + nm;
     g_nmid = nm < 3 ? nm : 3;
-    g_pcopy_avail = (g_ngame == 2 && nm >= 4);
+    g_pcopy_avail = (want_pcopy && nm >= 4);
     g_pcopy_k = nm >= 6 ? 3 : 2;
     g_mbuf_state = 1;
     int32_t rr = HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), (int32_t)handle, 0);
@@ -1961,6 +2020,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
         if (g_safe && !g_safe_active) g_inject_on = 0;   // unverified title that was refused: observe only
         if (!g_fmt_supported) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: HDR/FMT 0x%x", g_attr.format);
         else if (!fg_res_supported(g_bw, g_bh)) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: RES %ux%u", g_bw, g_bh);
+        if (g_bw > 1920 || g_bh > 1080) lg("output %ux%u is larger than 1920x1080: no OSD, no post pass, nothing is written to the game frames\n", g_bw, g_bh);
         else if (!mbufs_ready(handle)) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: NO MBUF (%d)", g_nbuf);
         else if (g_detected_60fps && g_cfg.fps_lock != 30) snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)");
         else g_inert_reason[0] = 0;
@@ -1969,6 +2029,9 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
         lg("injection mode %d (title %s, known=%d, fg_off=%d, preset=%d, sharpness=%d%%, enhance=%d, overlay=%d, inert='%s'), work memory %s\n",
            g_inject_on, g_title_id, g_known_game, g_fg_off, g_cfg.preset, g_cfg.sharpness, g_cfg.upscale, g_cfg.overlay,
            g_inert_reason, g_work_garlic ? "garlic" : "onion");
+        lg("console: neo=%d, output %ux%u pitch %u tiling %u, tile index %u, overlay bitmaps %u\n", (int)sceKernelIsNeoMode(), g_bw, g_bh, g_pitch, (unsigned)g_attr.tilingMode, (unsigned)(g_attr.tilingMode == 0 ? 10u : 8u), (unsigned)VOV_NBUF);
+        tile_load();
+        lg("tile index: override %d, sweep %d (sweep default off; L3 + D-pad Left/Right changes the index in game)\n", (int)g_tile_override, (int)g_tile_sweep);
         if (g_inject_on >= 6) mon_start();
         gv_set_display(g_buf, g_nbuf, g_bw, g_bh);
         gv_start(g_inject_on == 8 && fg_res_supported(g_bw, g_bh));
@@ -2096,8 +2159,8 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                 if (can_fg8 && want_fg) {
                     g_inert_reason[0] = 0;
                     uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
-                    uint32_t tidx = (g_attr.tilingMode == 0) ? 10u : 8u;
-                    int pcopy = g_pcopy_avail && g_cfg.present_copy != 2;   // auto and on: available only for 2-buffer games
+                    uint32_t tidx = tile_idx_now();
+                    int pcopy = g_pcopy_avail && g_cfg.present_copy != 2;   // auto and on: available when 4..6 buffers allocated
                     g_pcopy_on = pcopy;
                     uint32_t mi1 = pcopy ? (uint32_t)g_mbase + (g_flips % (uint32_t)g_pcopy_k) : (uint32_t)g_mbase + (g_flips % (uint32_t)g_nmid);
                     uint32_t mi2 = (uint32_t)g_mbase + ((g_flips + 1u) % (uint32_t)g_nmid);
@@ -2202,17 +2265,18 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                                         t1_q16, t2_q16, two_mids, force_repeat, pcopy ? g_buf[ci] : 0ull, ci);
                     flip_idx = mi1;
                     second_flip = 1;
-                } else if (g_inject_on == 8 && g_sh8_ok && g_fmt_supported && g_bw >= 640 && g_bh >= 360) {
-                    // 1.4: Native / Post-only path (FG off in menu, or 720p/900p/60fps game): draw OSD menu/overlay + RCAS/Enhance on cur
+                } else if (g_inject_on == 8 && g_sh8_ok && g_fmt_supported && g_bw >= 640 && g_bh >= 360 && g_bw <= 1920 && g_bh <= 1080) {
+                    // 1.4: Native / Post-only path (FG off in menu, or 720p/900p/60fps game): draw OSD menu/overlay + RCAS/Enhance on cur.
+                    // Only up to 1920x1080: the passes were never verified on larger surfaces (PS4 Pro 1440p/2160p output showed garbage bands), so nothing is written there.
                     uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
-                    uint32_t tidx = (g_attr.tilingMode == 0) ? 10u : 8u;
+                    uint32_t tidx = tile_idx_now();
                     n = build_dcb_post8(mine, g_buf[index], g_bw, g_bh, g_pitch, tidx, px * 4, slot, g_flips, tail);
                 } else if ((g_inject_on == 4 || g_inject_on == 6 || g_inject_on == 7) && g_prev_idx < game_idx_end() && mbufs_ready(handle)) {
                     uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
                     uint32_t mi = (uint32_t)g_mbase + (g_flips % (uint32_t)g_nmid);
                     if (g_inject_on >= 6 && g_work && g_bw >= 1280 && (g_bw % 640) == 0 && g_bh == g_bw * 9 / 16 && g_bw / 640 <= 4)
                         n = build_dcb_flow(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi], g_bw, g_bh, g_pitch,
-                                           (g_attr.tilingMode == 0) ? 10u : 8u, px * 4, slot, g_flips, tail,
+                                           tile_idx_now(), px * 4, slot, g_flips, tail,
                                            (int32_t)handle, mi, g_inject_on >= 7);
                     else
                         n = build_dcb_ghost(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi], (px + 63) / 64, px * 4, slot, g_flips, tail);
@@ -2224,7 +2288,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     n = build_dcb_ghost(mine, prev, g_buf[index], g_buf[index], (px + 63) / 64, px * 4, slot, g_flips, tail);
                 } else if (g_inject_on == 5) {
                     uint32_t px = g_pitch * ((g_bh + 63u) & ~63u);
-                    uint32_t tidx = (g_attr.tilingMode == 0) ? 10u : 8u;
+                    uint32_t tidx = tile_idx_now();
                     n = build_dcb_rect(mine, g_buf[index], g_bw, g_bh, g_pitch, tidx, 32, 16, px * 4, slot, g_flips, tail);
                 } else if (g_inject_on == 1) {
                     if ((g_flips & 7) == 1 && !g_pend_seq) {
@@ -2522,10 +2586,17 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 lg("mbufs: unexpected buffer stride 0x%zx, not extending\n", one);
                 one = 0;
             }
+            if (!fg_res_supported(g_bw, g_bh)) {
+                lg("mbufs: output %ux%u not supported by FG -> not allocating extra display buffers\n", g_bw, g_bh);
+                STAGE("mbufs skipped: unsupported resolution %ux%u", g_bw, g_bh);
+                one = 0;
+            }
+            int pcopy_cfg = read_present_copy_raw();   // 0 = Auto, 1 = 2-Buffer (present copy forced), 2 = Standard (off)
+            int want_pcopy = (pcopy_cfg == 1) || (pcopy_cfg == 0 && g_ngame == 2);
             uint8_t *m = NULL;
             int nm = 0;
             int max_extra = 16 - g_ngame;
-            int cap_extra = (g_ngame == 2) ? 6 : 3;
+            int cap_extra = want_pcopy ? 6 : 3;
             if (max_extra > cap_extra) max_extra = cap_extra;
             if (one && g_pre_mem) {
                 nm = (int)(g_pre_size / one);
@@ -2536,15 +2607,17 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 m = (uint8_t *)alloc_mbufs((one * (size_t)want + 0x1FFFFFu) & ~(size_t)0x1FFFFFu);
                 if (m) nm = want;
             }
-            // Double-buffered game: one mid buffer + two present-copy buffers (more memory taken here, outside the
-            // early block, only for such games).
+            // Double-buffered game (or forced 2-Buffer mode): mid buffers + present-copy buffers.
             uint8_t *m2 = NULL; int nm2 = 0;
-            for (int want = 6; g_ngame == 2 && m && !m2 && want >= 4; want -= 2) {
+            STAGE("pcopy gate: ngame=%d pcopy_cfg=%d want_pcopy=%d m=%p nm=%d one=0x%zx pre=%p pre_size=0x%zx max_extra=%d",
+                  g_ngame, pcopy_cfg, want_pcopy, (void *)m, nm, one, g_pre_mem, g_pre_size, max_extra);
+            for (int want = 6; want_pcopy && m && !m2 && want >= 4; want -= 2) {
                 if (nm >= want) break;
                 size_t need2 = (one * (size_t)(want - nm) + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
                 m2 = (uint8_t *)alloc_mbufs(need2);
                 if (m2) nm2 = want - nm;
             }
+            STAGE("pcopy gate done: nm=%d nm2=%d m2=%p", nm, nm2, (void *)m2);
             g_nmid = nm > 0 ? nm : 1;
             if (m && nm >= 1) {
                 void *ext[16];
@@ -2552,7 +2625,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 for (int i = 0; i < nm; i++) ext[g_ngame + i] = m + (size_t)i * one;
                 for (int i = 0; i < nm2; i++) ext[g_ngame + nm + i] = m2 + (size_t)i * one;
                 nm += nm2;
-                g_pcopy_avail = (g_ngame == 2 && nm >= 4);
+                g_pcopy_avail = (want_pcopy && nm >= 4);
                 g_pcopy_k = nm >= 6 ? 3 : 2;
                 static const char *k_verified[] = { "CUSA00207", "CUSA08519", "CUSA00411", "CUSA05571", "CUSA08809",
                                                     "CUSA00557", "CUSA09171", "CUSA13801", "CUSA11456", "CUSA17419", "CUSA00918" };
@@ -2685,6 +2758,8 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
     }
     g_pad_last_ts = latest->timestamp;
     g_pad_last_raw = raw_btn;
+    { static uint32_t tile_prev; uint32_t te = raw_btn & ~tile_prev; tile_prev = raw_btn;
+      if (!g_menu_open && (raw_btn & PAD_L3) && (te & (PAD_RIGHT | PAD_LEFT))) tile_hotkey((te & PAD_RIGHT) ? 1 : -1); }
 
     if (!g_menu_open) {
         if (now < g_pad_swallow_until) {

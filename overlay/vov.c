@@ -10,9 +10,11 @@ typedef struct { uint8_t *pix; uint32_t *pal; unsigned w, h; int npairs; uint8_t
 
 static uint8_t *g_mem;
 static size_t g_buf_sz = VOV_BUF_SZ;   // bytes per buffer
-static unsigned g_nbuf = 2, g_max_h = VOV_MAX_H;
+static unsigned g_nbuf = VOV_NBUF, g_max_h = VOV_MAX_H;
 static int g_cur;                 // buffer drawn last
-static uint32_t g_hash[2];        // content hash per buffer
+static uint32_t g_hash[VOV_NBUF]; // content hash per buffer (0 = empty)
+static uint32_t g_used[VOV_NBUF]; // pick() tick of the last use per buffer (least recently used is redrawn)
+static uint32_t g_tick;
 
 static void bset(void *d, int v, size_t n) { uint8_t *p = (uint8_t *)d; while (n--) *p++ = (uint8_t)v; }
 static size_t slen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
@@ -59,7 +61,7 @@ static uint32_t to_hdr(uint32_t rgb)   // sRGB (BT.709) -> BT.2020 linear, UI wh
     }
     return out;
 }
-void vov_set_hdr(int on) { g_hdr = on; g_hash[0] = g_hash[1] = 0; }   // redraw with the other encoding
+void vov_set_hdr(int on) { g_hdr = on; for (unsigned i = 0; i < VOV_NBUF; i++) g_hash[i] = 0; }   // redraw with the other encoding
 
 static uint32_t pack(uint32_t rgb, unsigned a) { return ((g_hdr ? to_hdr(rgb) : rgb) & 0xFFFFFFu) | (uint32_t)a << 24; }
 
@@ -191,11 +193,16 @@ static uint32_t hash(const void *p, size_t n)
 }
 
 static const uint8_t *g_last;
-void vov_init(uint8_t *mem) { g_mem = mem; g_buf_sz = VOV_BUF_SZ; g_nbuf = 2; g_max_h = VOV_MAX_H; g_cur = 0; g_hash[0] = g_hash[1] = 0; g_last = 0; }
+void vov_init(uint8_t *mem)
+{
+    g_mem = mem; g_buf_sz = VOV_BUF_SZ; g_nbuf = VOV_NBUF; g_max_h = VOV_MAX_H; g_cur = 0; g_tick = 0; g_last = 0;
+    for (unsigned i = 0; i < VOV_NBUF; i++) { g_hash[i] = 0; g_used[i] = 0; }
+}
 void vov_init_size(uint8_t *mem, size_t size)
 {
     if (size >= VOV_MEM_SZ) { vov_init(mem); return; }
     vov_init(mem);
+    if (size >= 2u * VOV_BUF_SZ) { g_nbuf = (unsigned)(size / VOV_BUF_SZ); return; }   // fewer full buffers (less margin against a deep queue)
     g_nbuf = 1; g_buf_sz = size;
     size_t h = (size - VOV_PAL_SZ) / VOV_W;
     g_max_h = (unsigned)(h > VOV_MAX_H ? VOV_MAX_H : h) & ~15u;
@@ -203,11 +210,14 @@ void vov_init_size(uint8_t *mem, size_t size)
 const uint8_t *vov_pal_ptr(void) { return g_last; }
 const uint8_t *vov_pix_ptr(void) { return g_last ? g_last + VOV_PAL_SZ : 0; }
 
-static int pick(uint32_t h)  // returns buffer to use; draws needed when its hash differs
+static int pick(uint32_t h)  // returns buffer to use; draws needed when its hash is 0 (a recycled, least recently used buffer)
 {
-    if (g_hash[g_cur] == h) return g_cur;
-    if (g_nbuf > 1) g_cur ^= 1;
-    g_hash[g_cur] = 0; return g_cur;
+    if (g_nbuf <= 1) { if (g_hash[g_cur] == h) return g_cur; g_hash[g_cur] = 0; return g_cur; }
+    g_tick++;
+    for (unsigned i = 0; i < g_nbuf; i++) if (g_hash[i] == h) { g_used[i] = g_tick; g_cur = (int)i; return g_cur; }
+    unsigned v = 0;
+    for (unsigned i = 1; i < g_nbuf; i++) if (g_used[i] < g_used[v]) v = i;
+    g_cur = (int)v; g_hash[v] = 0; g_used[v] = g_tick; return g_cur;
 }
 
 // Small pixel mark from the launcher (top right of the header).

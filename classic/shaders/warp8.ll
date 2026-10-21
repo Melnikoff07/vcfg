@@ -590,7 +590,10 @@ merge:
   %bg1 = fcmp olt float %es, 0.25
   %nfgk = xor i1 %hasfg, true
   %bg2 = and i1 %bg0, %bg1
-  %bg3 = and i1 %bg2, %nfgk
+  %bg2x = and i1 %bg2, %nfgk
+  ; 2.24: static-colour fallback only where the two motion-compensated samples disagree (emov > 0.25); PC ablation, 12 triplets: every frame better, dark spots -5.8 %
+  %bge = fcmp ogt float %emov, 0.25
+  %bg3 = and i1 %bg2x, %bge
   %bgs0a = fsub float %dmv, %es
   %bgs0 = fsub float %bgs0a, 0x3FBF5C2900000000
   %bgs1 = fmul float %bgs0, 4.0

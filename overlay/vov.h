@@ -10,7 +10,9 @@
 #define VOV_PIX_SZ   (VOV_W * VOV_MAX_H)  // one bitmap
 #define VOV_PAL_SZ   1024u                // 256 x BGRA8
 #define VOV_BUF_SZ   (VOV_PAL_SZ + VOV_PIX_SZ)
-#define VOV_MEM_SZ   (2u * VOV_BUF_SZ)    // double buffered: the GPU may still read the previous one
+#define VOV_NBUF     10u                  // ring of bitmaps: the GPU executes the frames still queued (up to ~6 flips) long after the CPU built them,
+                                          // so a bitmap must stay untouched for that many later frames (2 buffers tore the panel under a deep queue)
+#define VOV_MEM_SZ   (VOV_NBUF * VOV_BUF_SZ)
 
 enum { VOV_TEXT, VOV_TOGGLE, VOV_SEGMENTS };   // value kinds: plain text, ON/OFF pill, 0..100 as six squares
 

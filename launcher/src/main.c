@@ -1,7 +1,7 @@
 // VCFG launcher, console side: video output, controller, files. Drawing and screens live in ui.c / app.c.
 // Settings files (read by the plugins at the next game start):
 //   new engine:     /data/bb_probe/vcfg.ini              enabled, preset, sharp, enhance, overlay, opacity
-//   classic engine: /data/bb_probe/config-<TITLE>.ini    framegen, preset, sharpness, enhance, overlay, menu_opacity
+//   classic engine: /data/bb_probe/config-<TITLE>.ini    framegen, preset, sharpness, enhance, overlay, menu_opacity, two_buffer, present_copy
 //   launcher:       /data/bb_probe/vcfg_launcher.ini     defaults and overlay style
 #include <stdint.h>
 #include <stdio.h>
@@ -35,14 +35,16 @@ typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
     { "CUSA07439", "vcfg16.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic42.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic42.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic42.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA08519", "vcfg_classic45.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic45.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic45.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA17419", "vcfg_alt_06.prx", ENGINE_CLASSIC_ALT, 0 },
+    { "CUSA00918", "vcfg_alt_06.prx", ENGINE_CLASSIC_ALT, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg16.prx", "vcfg_classic42.prx", "vcfg_alt_05.prx" };
-// Double-buffered titles that run best with the 2-BUFFER engine (virtual flip queue, tested on hardware 20.10): AUTO = 2-BUFFER.
-static const char *const k_auto_2buf[] = { "CUSA05571", "CUSA08809" };
+static const char *k_files[] = { "vcfg16.prx", "vcfg_classic45.prx", "vcfg_alt_06.prx" };
+// Double-buffered titles that run best with 2-BUFFER present copy + virtual flip queue: AUTO = 2-BUFFER.
+static const char *const k_auto_2buf[] = { "CUSA05571", "CUSA08809", "CUSA17419" };
 static int auto_2buf(const char *id)
 {
     for (unsigned i = 0; i < sizeof(k_auto_2buf) / sizeof(k_auto_2buf[0]); i++) if (!strcmp(id, k_auto_2buf[i])) return 1;
@@ -56,6 +58,7 @@ static int auto_alt(const char *id)
 }
 #define MAPMAX 176   // plugins.ini sections we manage: the verified table + every game in the list (App.games)
 #define ENGFILE CFGDIR "/vcfg_engines.ini"   // the player's engine choice per game: CUSAxxxxx=<SEL_*>, AUTO not written
+#define BUFFILE CFGDIR "/vcfg_buffers.ini"   // the player's buffer mode choice per game: CUSAxxxxx=<BUF_*>, AUTO not written
 static const char *prx_of(int engine)
 {
     if (engine == ENGINE_NEW) return k_files[0];
@@ -103,9 +106,9 @@ static int write_verified(const char *path, const void *d, size_t n)
 // ---- game metadata from the console (title from param.sfo, icon0.png) ----
 static int sfo_str(const unsigned char *b, size_t n, const char *key, char *out, size_t on)
 {
-    if (n < 20 || memcmp(b, "\0PSF", 4)) return 0;
+    if (n < 20 || *(const uint32_t *)b != 0x46535000u) return 0;
     uint32_t keys = *(const uint32_t *)(b + 8), data = *(const uint32_t *)(b + 12), cnt = *(const uint32_t *)(b + 16);
-    for (uint32_t i = 0; i < cnt && 20 + i * 16 + 16 <= n; i++) {
+    for (uint32_t i = 0; i < cnt && 20 + (i + 1) * 16 <= n; i++) {
         const unsigned char *e = b + 20 + i * 16;
         uint16_t ko = *(const uint16_t *)e; uint32_t len = *(const uint32_t *)(e + 4), doff = *(const uint32_t *)(e + 12);
         if (keys + ko >= n || data + doff + len > n) continue;
@@ -138,11 +141,66 @@ static void vlog_dir(const char *path)
     }
     closedir(d); vlog("%s\n", line);
 }
+// Folder layout snapshot for the bug report (taken inside the jailbreak window: the report is built later without it).
+// Names only. Shows where an external drive keeps its games, which neither of us can see from here.
+static char g_layout[8192]; static int g_layout_n;
+static void layout_put(const char *fmt, ...)
+{
+    if (g_layout_n >= (int)sizeof(g_layout) - 2) return;
+    va_list ap; va_start(ap, fmt); int n = vsnprintf(g_layout + g_layout_n, sizeof(g_layout) - (size_t)g_layout_n, fmt, ap); va_end(ap);
+    if (n > 0) g_layout_n += n < (int)sizeof(g_layout) - g_layout_n ? n : (int)sizeof(g_layout) - g_layout_n - 1;
+}
+static void layout_ls(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d) { layout_put("%s: cannot open (errno %d)\n", path, errno); return; }
+    layout_put("%s:", path); int cnt = 0, total = 0; struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        total++; if (cnt < 40) { layout_put(" %s", e->d_name); cnt++; }
+    }
+    closedir(d); layout_put(" (%d entries)\n", total);
+}
+static void layout_snapshot(void)
+{
+    g_layout_n = 0; g_layout[0] = 0;
+    layout_ls("/mnt");
+    for (int r = 1; r < NROOT; r++) {
+        char d[96];
+        layout_ls(k_roots[r]);
+        snprintf(d, sizeof(d), "%s/user", k_roots[r]); layout_ls(d);
+        snprintf(d, sizeof(d), "%s/user/app", k_roots[r]); layout_ls(d);
+        snprintf(d, sizeof(d), "%s/user/appmeta", k_roots[r]); layout_ls(d);
+    }
+    for (int r = 1; r < NROOT; r++) {   // what a game folder on an external drive holds, and the other top folders
+        char d[160];
+        for (int i = 0; i < NSUP; i++) {
+            snprintf(d, sizeof(d), "%s/user/app/%s", k_roots[r], k_sup[i].id); DIR *x = opendir(d); if (x) { closedir(x); layout_ls(d); }
+            snprintf(d, sizeof(d), "%s/user/patch/%s", k_roots[r], k_sup[i].id); x = opendir(d); if (x) { closedir(x); layout_ls(d); }
+        }
+        snprintf(d, sizeof(d), "%s/system_data", k_roots[r]); layout_ls(d);
+        snprintf(d, sizeof(d), "%s/user/addcont", k_roots[r]); layout_ls(d);
+    }
+    // Where each supported title is found: 1 = folder exists.
+    static const char *const subs[] = { "user/app", "user/appmeta", "user/patch" };
+    for (int i = 0; i < NSUP; i++) {
+        layout_put("%s:", k_sup[i].id);
+        for (int r = 0; r < NROOT; r++) for (int t = 0; t < 3; t++) {
+            char d[160]; snprintf(d, sizeof(d), "%s/%s/%s", k_roots[r], subs[t], k_sup[i].id);
+            DIR *x = opendir(d); layout_put(" %s=%d", d, x ? 1 : 0); if (x) closedir(x);
+        }
+        layout_put("\n");
+    }
+}
+
 static void load_meta(Game *g)
 {
     char p[160]; size_t n = 0; unsigned char *b = NULL;
     for (int r = 0; r < NROOT && !b; r++) {
         snprintf(p, sizeof(p), "%s/user/appmeta/%s/param.sfo", k_roots[r], g->id); b = read_all(p, &n);
+    }
+    for (int r = 0; r < NROOT && !b; r++) {   // extended storage keeps no appmeta: the title may sit in the game's own sce_sys
+        snprintf(p, sizeof(p), "%s/user/app/%s/sce_sys/param.sfo", k_roots[r], g->id); b = read_all(p, &n);
     }
     if (!b) { snprintf(p, sizeof(p), "/system_data/priv/appmeta/%s/param.sfo", g->id); b = read_all(p, &n); }
     if (b) { g->installed = 1; sfo_str(b, n, "TITLE", g->title, sizeof(g->title)); sfo_str(b, n, "APP_VER", g->version, sizeof(g->version)); free(b); }
@@ -168,6 +226,12 @@ static void load_meta(Game *g)
     }
     for (int r = 0; r < NROOT && !g->installed; r++) {
         snprintf(p, sizeof(p), "%s/user/app/%s/app.json", k_roots[r], g->id); FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; }
+    }
+    // Extended storage (external HDD) has an empty user/appmeta, so a non-empty game folder there is the only sign of an installed game.
+    for (int r = 1; r < NROOT && !g->installed; r++) {
+        char d[160]; snprintf(d, sizeof(d), "%s/user/app/%s", k_roots[r], g->id);
+        DIR *x = opendir(d);
+        if (x) { struct dirent *e; while ((e = readdir(x))) if (e->d_name[0] != '.') { g->installed = 1; break; } closedir(x); }
     }
     // Last resort: a settings file (only written for installed games, see save_settings).
     if (!g->installed) { snprintf(p, sizeof(p), CFGDIR "/config-%s.ini", g->id); FILE *f = fopen(p, "rb"); if (f) { fclose(f); g->installed = 1; } }
@@ -200,6 +264,12 @@ static void load_settings(App *a)
         a->games[i].eng_sel = (v >= 0 && v < SEL_COUNT) ? v : SEL_AUTO;
     }
     free(e);
+    unsigned char *bf = read_all(BUFFILE, &n);
+    for (int i = 0; i < a->ngames; i++) {
+        int v = bf ? ini_int((const char *)bf, a->games[i].id, BUF_AUTO) : BUF_AUTO;
+        a->games[i].buf_sel = (v >= 0 && v < BUF_COUNT) ? v : BUF_AUTO;
+    }
+    free(bf);
     for (int i = 0; i < a->ngames; i++) {
         Game *g = &a->games[i]; g->s = a->defaults; if (g->testing || g->experimental) g->s.fg = 0;
         if (uses_vcfg_ini(g)) {
@@ -231,6 +301,13 @@ static void save_settings(App *a)
                 en += (size_t)snprintf(eb + en, sizeof(eb) - en, "%s=%d\n", a->games[i].id, a->games[i].eng_sel);
         if (en) write_all(ENGFILE, eb, en); else remove(ENGFILE);
     }
+    {
+        static char bb[MAPMAX * 16]; size_t bn = 0;
+        for (int i = 0; i < a->ngames; i++)
+            if (a->games[i].buf_sel != BUF_AUTO && bn + 16 < sizeof(bb))
+                bn += (size_t)snprintf(bb + bn, sizeof(bb) - bn, "%s=%d\n", a->games[i].id, a->games[i].buf_sel);
+        if (bn) write_all(BUFFILE, bb, bn); else remove(BUFFILE);
+    }
     for (int i = 0; i < a->ngames; i++) {
         Game *g = &a->games[i]; Settings *s = &g->s;
         if (!g->installed) continue;
@@ -239,9 +316,11 @@ static void save_settings(App *a)
                      s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo);
             write_all(CFGDIR "/vcfg.ini", buf, strlen(buf));
         } else {
+            int bmode = game_buf(g);
+            int pcopy = (g->buf_sel == BUF_2BUF) ? 1 : (g->buf_sel == BUF_STD) ? 2 : 0;
             snprintf(path, sizeof(path), CFGDIR "/config-%s.ini", g->id);
-            snprintf(buf, sizeof(buf), "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\nmenu_combo=%u\ntwo_buffer=%d\n",
-                     s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo, game_engine(g) == ENGINE_CLASSIC_2BUF);
+            snprintf(buf, sizeof(buf), "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\nmenu_combo=%u\ntwo_buffer=%d\npresent_copy=%d\n",
+                     s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo, bmode == BUF_2BUF, pcopy);
             write_all(path, buf, strlen(buf));
             if (s->fg) {
                 snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id); remove(path);
@@ -253,7 +332,7 @@ static void save_settings(App *a)
 }
 
 // ---- plugins.ini: point our titles at our files; keep foreign lines; [default] stays last ----
-// Verified titles always get their plugin. Experimental titles get the classic engine only while switched on;
+// Verified titles always get their plugin. Experimental titles get the selected engine only while switched on;
 // switched off, their section is dropped when nothing else is left in it (an empty section would block [default]).
 typedef struct { char id[12]; const char *prx; int keep_empty; } Map;
 static Map g_map[MAPMAX]; static int g_nmap;
@@ -355,6 +434,11 @@ static int plugin_state(void)
     free(ini);
     return st;
 }
+// "Turned off" marker: the app installs and maps the plugin by itself at every start, so a plain Square (remove from plugins.ini) was undone
+// by the next start. While this file exists the app neither installs nor maps anything; Cross (install) removes it.
+#define OFFFILE CFGDIR "/vcfg_off"
+static int is_off(void) { FILE *f = fopen(OFFFILE, "rb"); if (f) { fclose(f); return 1; } return 0; }
+static void set_off(int on) { if (on) write_all(OFFFILE, "1\n", 2); else remove(OFFFILE); }
 static int do_ini(App *a, int install)
 {
     size_t n = 0; unsigned char *ini = read_all(INI, &n);
@@ -369,6 +453,7 @@ static int do_ini(App *a, int install)
 }
 static void do_install(App *a)
 {
+    set_off(0);
     sceKernelMkdir("/data/GoldHEN/plugins", 0777); sceKernelMkdir(CFGDIR, 0777);
     for (int i = 0; i < (int)(sizeof(k_files) / sizeof(k_files[0])); i++) {
         char src[96], dst[96], m[96]; size_t n;
@@ -380,6 +465,32 @@ static void do_install(App *a)
         if (rc) return;
     }
     do_ini(a, 1);
+    a->plugin_state = plugin_state();
+}
+
+// Delete every VCFG file: the plugins.ini mapping (backed up first), the plugin files, settings, traces and logs. The app stays off until Cross.
+static int clean_dir(const char *dir, const char *const *prefixes, int np, const char *suffix)
+{
+    DIR *d = opendir(dir); if (!d) return 0; int n = 0; struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        int hit = 0; for (int i = 0; i < np; i++) if (!strncmp(e->d_name, prefixes[i], strlen(prefixes[i]))) hit = 1;
+        if (hit && suffix) { size_t l = strlen(e->d_name), q = strlen(suffix); if (l < q || strcmp(e->d_name + l - q, suffix)) hit = 0; }
+        if (!hit) continue;
+        char p[192]; snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+        if (remove(p) == 0) n++;
+    }
+    closedir(d); return n;
+}
+static void do_clean(App *a)
+{
+    do_ini(a, 0);
+    static const char *const plug[] = { "vcfg" };
+    int np = clean_dir("/data/GoldHEN/plugins", plug, 1, ".prx");
+    static const char *const cfg[] = { "config-", "trace-", "boot-", "probe", "vcfg", "debug_log", "inject", "hud", "pace_timer", "scan_", "dump_", "summary", "safe-", "tile_" };
+    int nc = clean_dir(CFGDIR, cfg, (int)(sizeof(cfg) / sizeof(cfg[0])), NULL);
+    set_off(1);
+    char m[96]; snprintf(m, sizeof(m), "DELETED %d PLUGIN FILES AND %d SETTINGS/LOG FILES. VCFG IS OFF.", np, nc); addlog(a, m);
     a->plugin_state = plugin_state();
 }
 
@@ -396,13 +507,12 @@ static uint64_t exp_sig(const App *a)
 static uint64_t g_exp_written;
 static void remap_if_changed(App *a)
 {
+    if (is_off()) return;   // turned off: plugins.ini stays without VCFG
     if (exp_sig(a) == g_exp_written) return;
     if (!do_ini(a, 1)) g_exp_written = exp_sig(a);
 }
 
 // ---- debug log switch and bug report ----
-// The plugins write /data/bb_probe/probe.log only while CFGDIR/debug_log exists (one file per game start, the
-// previous one is kept as probe.prev.log). The report collects what a bug report needs into one text file.
 #define VCFG_STR2(x) #x
 #define VCFG_STR(x) VCFG_STR2(x)
 #ifdef VCFG_VER
@@ -468,10 +578,33 @@ static void summarize(Buf *r, const char *id, const char *which, const char *t)
         size_t l = (size_t)(e - b); if (l >= sizeof(line)) l = sizeof(line) - 1; memcpy(line, b, l); line[l] = 0;
         bprintf(r, "    last line: %s\n", line);
     }
-    if (!frame) bprintf(r, "    => stopped before the first frame was shown (loading): see the first lines of this trace\n");
 }
-
-// Last line of a text file (the classic boot stage file: how far a game start got before a crash).
+// Every trace-<TITLE>.txt and trace-<TITLE>.prev.txt in CFGDIR, sorted by title ID (not only the app's game list).
+typedef struct { char id[12]; int prev; } TraceFile;
+static int list_traces(TraceFile *out, int cap, int *err)
+{
+    *err = 0;
+    DIR *d = opendir(CFGDIR);
+    if (!d) { *err = errno; return 0; }
+    int n = 0; struct dirent *e;
+    while ((e = readdir(d)) && n < cap) {
+        if (strncmp(e->d_name, "trace-", 6)) continue;
+        size_t l = strlen(e->d_name); int prev = 0; const char *suf = ".txt";
+        if (l > 9 && !strcmp(e->d_name + l - 9, ".prev.txt")) { prev = 1; suf = ".prev.txt"; }
+        else if (l <= 4 || strcmp(e->d_name + l - 4, ".txt")) continue;
+        size_t idl = l - 6 - strlen(suf);
+        if (idl < 4 || idl >= sizeof(out[0].id)) continue;
+        memcpy(out[n].id, e->d_name + 6, idl); out[n].id[idl] = 0; out[n].prev = prev; n++;
+    }
+    closedir(d);
+    for (int i = 1; i < n; i++) for (int j = i; j > 0; j--) {
+        int c = strcmp(out[j].id, out[j - 1].id);
+        if (c > 0 || (c == 0 && out[j].prev >= out[j - 1].prev)) break;
+        TraceFile t = out[j]; out[j] = out[j - 1]; out[j - 1] = t;
+    }
+    return n;
+}
+// Last non-empty line of a text buffer (used for boot-<TITLE>.txt: the last stage reached before a start stopped).
 static int last_line(const char *t, size_t n, char *out, size_t on)
 {
     while (n && (t[n - 1] == '\n' || t[n - 1] == '\r')) n--;
@@ -480,36 +613,10 @@ static int last_line(const char *t, size_t n, char *out, size_t on)
     size_t l = n - b; if (l >= on) l = on - 1;
     memcpy(out, t + b, l); out[l] = 0; return 1;
 }
-
-// Trace files in CFGDIR for any title: also games the list does not show (external drive not listed, list full,
-// removed game), so the summary does not depend on the game scan.
-typedef struct { char id[12]; int prev; } TraceFile;
-static int list_traces(TraceFile *out, int cap, int *err)
-{
-    int n = 0; *err = 0;
-    DIR *d = opendir(CFGDIR); if (!d) { *err = errno ? errno : -1; return 0; }
-    struct dirent *e;
-    while ((e = readdir(d)) && n < cap) {
-        const char *s = e->d_name;   // trace-CUSAxxxxx.txt / trace-CUSAxxxxx.prev.txt
-        if (strncmp(s, "trace-CUSA", 10) || strlen(s) < 19) continue;
-        int prev;
-        if (!strcmp(s + 15, ".txt")) prev = 0; else if (!strcmp(s + 15, ".prev.txt")) prev = 1; else continue;
-        snprintf(out[n].id, sizeof(out[n].id), "%.9s", s + 6); out[n].prev = prev; n++;
-    }
-    closedir(d);
-    for (int i = 1; i < n; i++) for (int j = i; j > 0; j--) {   // by title, the last start before the one before
-        int c = strcmp(out[j - 1].id, out[j].id);
-        if (c < 0 || (c == 0 && out[j - 1].prev <= out[j].prev)) break;
-        TraceFile t = out[j]; out[j] = out[j - 1]; out[j - 1] = t;
-    }
-    return n;
-}
-
 static void do_report(App *a)
 {
     Buf r = { malloc(4u << 20), 0, 4u << 20 };
-    if (!r.b) { addlog(a, "NO MEMORY FOR THE REPORT"); return; }
-    r.b[0] = 0;
+    if (!r.b) { addlog(a, "OUT OF MEMORY FOR REPORT"); return; }
     time_t now = time(NULL);
     OrbisKernelSwVersion sw; memset(&sw, 0, sizeof(sw)); sw.Size = sizeof(sw);
     int swr = sceKernelGetSystemSwVersion(&sw);
@@ -524,6 +631,8 @@ static void do_report(App *a)
         else bprintf(&r, "%s/user/app: cannot list (errno %d)\n", k_roots[i], s->err);
     }
     bprintf(&r, "games in the list: %d (room for %d)\n", a->ngames, (int)(sizeof(a->games) / sizeof(a->games[0])));
+    bprintf(&r, "\n==== storage layout (names only; where an external drive keeps its games) ====\n");
+    bput(&r, g_layout, strlen(g_layout));   // not bprintf("%s"): that truncates at 511 characters
 
     static TraceFile tf[128]; int terr = 0, nt = list_traces(tf, 128, &terr);
     bprintf(&r, "\n==== summary (flight recorder, trace-<TITLE>.txt, %d files in " CFGDIR ") ====\n", nt);
@@ -553,9 +662,9 @@ static void do_report(App *a)
     bprintf(&r, "\n==== games ====\n");
     for (int i = 0; i < a->ngames; i++) {
         const Game *g = &a->games[i];
-        bprintf(&r, "%s version=%s installed=%d experimental=%d fg=%d preset=%d sharp=%d enhance=%d overlay=%d engine_choice=%d engine=%d title='%s'\n", g->id,
+        bprintf(&r, "%s version=%s installed=%d experimental=%d fg=%d preset=%d sharp=%d enhance=%d overlay=%d engine_choice=%d engine=%d buf_choice=%d buf=%d title='%s'\n", g->id,
                 g->version[0] ? g->version : "?", g->installed, g->experimental, g->s.fg, g->s.preset, g->s.sharp, g->s.enhance,
-                g->s.overlay, g->eng_sel, game_engine(g), g->title);
+                g->s.overlay, g->eng_sel, game_engine(g), g->buf_sel, game_buf(g), g->title);
     }
     bprintf(&r, "\n==== plugin files ====\n");
     for (int i = 0; i < (int)(sizeof(k_files) / sizeof(k_files[0])); i++) {
@@ -566,6 +675,7 @@ static void do_report(App *a)
     bfile(&r, "launcher settings", CFGDIR "/vcfg_launcher.ini", 8u << 10);
     bfile(&r, "new engine settings", CFGDIR "/vcfg.ini", 8u << 10);
     bfile(&r, "engine choice per game", ENGFILE, 8u << 10);
+    bfile(&r, "buffer choice per game", BUFFILE, 8u << 10);
     for (int i = 0; i < a->ngames; i++) {
         char p[96]; snprintf(p, sizeof(p), CFGDIR "/config-%s.ini", a->games[i].id);
         if (file_exists(p)) bfile(&r, "game settings", p, 8u << 10);
@@ -654,7 +764,7 @@ int main(void)
     vlog("jailbreak rc=%d\n", jrc);
     for (int i = 0; i < NSUP; i++) {
         Game *g = &a->games[a->ngames++];
-        snprintf(g->id, sizeof(g->id), "%s", k_sup[i].id); g->engine = k_sup[i].engine; g->testing = k_sup[i].testing;
+        snprintf(g->id, sizeof(g->id), "%s", k_sup[i].id); g->engine = k_sup[i].engine; g->def_buf = auto_2buf(k_sup[i].id) ? BUF_2BUF : BUF_STD; g->testing = k_sup[i].testing;
         load_meta(g);
     }
     // Every other installed game is listed as experimental (switched off until the user turns it on).
@@ -673,7 +783,8 @@ int main(void)
             if (a->ngames >= (int)(sizeof(a->games) / sizeof(a->games[0]))) { sr->full++; continue; }   // counted, shown in the report
             Game *g = &a->games[a->ngames++]; memset(g, 0, sizeof(*g));
             snprintf(g->id, sizeof(g->id), "%s", e->d_name);
-            g->engine = auto_2buf(e->d_name) ? ENGINE_CLASSIC_2BUF : auto_alt(e->d_name) ? ENGINE_CLASSIC_ALT : ENGINE_CLASSIC;
+            g->engine = auto_alt(e->d_name) ? ENGINE_CLASSIC_ALT : ENGINE_CLASSIC;
+            g->def_buf = auto_2buf(e->d_name) ? BUF_2BUF : BUF_STD;
             g->experimental = 1;
             load_meta(g);
             if (!g->installed) { a->ngames--; sr->not_installed++; } else sr->added++;
@@ -684,6 +795,7 @@ int main(void)
         vlog("scan %s: CUSA folders %d, new %d, already listed %d, not installed %d, list full %d\n", ap, sr->found, sr->added,
              sr->known, sr->not_installed, sr->full);
     }
+    layout_snapshot();
     if (jrc == 0) vlog("unjailbreak rc=%d\n", sys_sdk_unjailbreak(&jb));
     // Hide games that are not installed (plugins.ini keeps mapping them, see build_map).
     { int k = 0; for (int i = 0; i < a->ngames; i++) if (a->games[i].installed) a->games[k++] = a->games[i]; a->ngames = k; }
@@ -696,7 +808,8 @@ int main(void)
     a->debug_log = file_exists(CFGDIR "/debug_log");
     g_exp_written = exp_sig(a);
     a->plugin_state = plugin_state();
-    if (a->plugin_state != 1) { addlog(a, a->plugin_state ? "UPDATING PLUGINS" : "INSTALLING PLUGINS"); do_install(a); }
+    if (is_off()) addlog(a, "VCFG IS TURNED OFF. CROSS TURNS IT ON.");
+    else if (a->plugin_state != 1) { addlog(a, a->plugin_state ? "UPDATING PLUGINS" : "INSTALLING PLUGINS"); do_install(a); }
 
     if (video_init()) { vlog("video init failed\n"); quit(); }
     int uid = 0; sceUserServiceInitialize(NULL); sceUserServiceGetInitialUser(&uid);
@@ -718,7 +831,8 @@ int main(void)
         if (edge) {
             int act = app_input(a, edge); redraw = 1;
             if (act == ACT_INSTALL) do_install(a);
-            else if (act == ACT_REMOVE) { do_ini(a, 0); a->plugin_state = plugin_state(); }
+            else if (act == ACT_REMOVE) { do_ini(a, 0); set_off(1); a->plugin_state = plugin_state(); }
+            else if (act == ACT_CLEAN) do_clean(a);
             else if (act == ACT_DEBUG) do_debug_toggle(a);
             else if (act == ACT_REPORT) do_report(a);
             else if (act == ACT_SAVE) { save_settings(a); remap_if_changed(a); }

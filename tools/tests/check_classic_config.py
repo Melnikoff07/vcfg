@@ -34,7 +34,8 @@ extern int sscanf(const char *, const char *, ...);
 extern int strcmp(const char *, const char *);
 extern size_t strlen(const char *);
 extern void *memcpy(void *, const void *, size_t);
-static int g_known_game, g_detected_60fps;
+static int g_known_game, g_detected_60fps, g_tile_override = -1, g_tile_sweep;
+static void tile_load(int idx) { (void)idx; }
 static const char *input;
 static int sceKernelOpen(const char *p, int f, int m) { return input ? 1 : -1; }
 static long sceKernelRead(int fd, void *p, size_t n) {
@@ -60,6 +61,8 @@ int main(void) {
     if (c.present_copy != 0) return 5;
     input="present_copy=99\\n"; parse_ini_file("title", &c, 0);
     if (c.present_copy != 2) return 6;
+    input="two_buffer=1\\n"; parse_ini_file("title", &c, 0);
+    if (c.two_buffer != 1) return 7;
     return 0;
 }
 ''', encoding='utf-8')
