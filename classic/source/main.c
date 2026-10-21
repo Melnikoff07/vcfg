@@ -871,6 +871,7 @@ static uint32_t cut_blocks8(void)
             unsigned v = 0;
             if (n > 0 && sscanf(b, "%u", &v) == 1 && v >= 1000u && v <= 8160u) g_cut_blocks8 = v / 8u;
         }
+        if (!g_cut_blocks8 && !strcmp(g_title_id, "CUSA17419")) g_cut_blocks8 = 4800u / 8u;
         lg("scene-change threshold: %u blocks (%s)\n", g_cut_blocks8 ? g_cut_blocks8 * 8u : 3264u, g_cut_blocks8 ? p : "default");
     }
     return g_cut_blocks8;
@@ -2031,7 +2032,8 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                             if (cn != 0xFFFFFFFFu) {
                                 g_st_n++; g_st_cut_sum += cn; g_st_fg_sum += fgn;
                                 if (cn > g_st_cut_max) g_st_cut_max = cn;
-                                if (cn > CUT_BLOCKS) g_st_cuts++;
+                                uint32_t cb_thr = cut_blocks8() ? cut_blocks8() * 8u : CUT_BLOCKS;
+                                if (cn > cb_thr) g_st_cuts++;
                                 if (fgn) g_st_fgf++;
                                 if (stv[4] == 1u) g_st_fades++;
                                 g_st_gmx = (int32_t)stv[1]; g_st_gmy = (int32_t)stv[2];
@@ -2164,7 +2166,8 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                         if (t1_q16 > 42598u) t1_q16 = 42598u; // 0.65
                         // Only when the game itself is slow: the 15 ms hold sleeps in the game's thread, so applying it to a
                         // game that needs ~26 ms per frame kept it below 26 fps for good (CUSA05571: 24-25 fps).
-                        if (tot_us > 38000u && g_cpu_ema_us > 30000u) {
+                        // Never sleep 15 ms on 2-buffer games (g_ngame == 2), where CPU time includes flip-queue waits.
+                        if (g_ngame != 2 && tot_us > 38000u && g_cpu_ema_us > 30000u) {
                             // Distribute extra vblanks evenly between mid and cur when game drops below 30 fps (e.g. 25 fps -> 50)
                             uint32_t half_us = tot_us >> 1;
                             int32_t extra_q16 = (int32_t)(((uint64_t)(half_us > 16683u ? half_us - 16683u : 0u) << 16) / 16683ull);
@@ -2534,12 +2537,11 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 if (m) nm = want;
             }
             // Double-buffered game: one mid buffer + two present-copy buffers (more memory taken here, outside the
-            // early block, only when >= 128 MB of 2MB-aligned DirectMemory remains free for the game after m2).
+            // early block, only for such games).
             uint8_t *m2 = NULL; int nm2 = 0;
             for (int want = 6; g_ngame == 2 && m && !m2 && want >= 4; want -= 2) {
                 if (nm >= want) break;
                 size_t need2 = (one * (size_t)(want - nm) + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
-                if (dm_avail(0x200000) < need2 + (128ull << 20)) continue;
                 m2 = (uint8_t *)alloc_mbufs(need2);
                 if (m2) nm2 = want - nm;
             }
@@ -2553,7 +2555,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 g_pcopy_avail = (g_ngame == 2 && nm >= 4);
                 g_pcopy_k = nm >= 6 ? 3 : 2;
                 static const char *k_verified[] = { "CUSA00207", "CUSA08519", "CUSA00411", "CUSA05571", "CUSA08809",
-                                                    "CUSA00557", "CUSA09171", "CUSA13801" };
+                                                    "CUSA00557", "CUSA09171", "CUSA13801", "CUSA11456", "CUSA17419", "CUSA00918" };
                 int verified = 0;
                 for (unsigned v = 0; v < sizeof(k_verified) / sizeof(k_verified[0]); v++) if (!strcmp(g_title_id, k_verified[v])) verified = 1;
                 if (!verified && 16 - nm > g_ngame) {

@@ -40,7 +40,7 @@ static const Supported k_sup[] = {
     { "CUSA00207", "vcfg_classic42.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg16.prx", "vcfg_classic42.prx", "vcfg_alt_04.prx" };
+static const char *k_files[] = { "vcfg16.prx", "vcfg_classic42.prx", "vcfg_alt_05.prx" };
 // Double-buffered titles that run best with the 2-BUFFER engine (virtual flip queue, tested on hardware 20.10): AUTO = 2-BUFFER.
 static const char *const k_auto_2buf[] = { "CUSA05571", "CUSA08809" };
 static int auto_2buf(const char *id)
