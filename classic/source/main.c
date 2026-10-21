@@ -1235,6 +1235,7 @@ static int read_two_buffer_raw(void)
         snprintf(gpath, sizeof(gpath), LOG_DIR "/config-%s.ini", g_title_id);
         parse_ini_file(gpath, &c, NULL);
     }
+    if (!strcmp(g_title_id, "CUSA17419")) return 1;
     return c.two_buffer;
 }
 
@@ -2521,7 +2522,8 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
             uint8_t *m = NULL;
             int nm = 0;
             int max_extra = 16 - g_ngame;
-            if (max_extra > 3) max_extra = 3;   // (2-buffer games may get up to 6 below)
+            int cap_extra = (g_ngame == 2) ? 6 : 3;
+            if (max_extra > cap_extra) max_extra = cap_extra;
             if (one && g_pre_mem) {
                 nm = (int)(g_pre_size / one);
                 if (nm > max_extra) nm = max_extra;
@@ -2997,14 +2999,14 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         // capture memory (~50 MB) is taken later, from bench_flip once the game runs: taking it here crashed the game (run d, 2026-10-20)
 #endif
         if ((m == 4 || m >= 6) && !g_bench_enabled) {
-            // Try 16 MB first when FG Fast asked for 2 mid buffers, else 8 MB (1 mid buffer).
+            // Try 32 MB first (4 x 8 MB for 2-buffer present copy), then 16 MB, then 8 MB (1 mid buffer).
             // Place at the top of the DirectMemory pool so the game's lowest-first arena remains contiguous from 0 upward.
+            // If a non-arena game needs part of this back at boot, the Memory Valve shrinks 32 MB -> 8 MB automatically.
             size_t dm_sz = sceKernelGetDirectMemorySize();
-            const size_t try_sz[2] = { g_cfg.preset == 1 ? 0x1000000u : 0x800000u, 0x800000u };
+            const size_t try_sz[3] = { 0x2000000u, 0x1000000u, 0x800000u };
             int r = -1;
-            for (int ti = 0; ti < 2 && !g_pre_mem; ti++) {
+            for (int ti = 0; ti < 3 && !g_pre_mem; ti++) {
                 size_t total = try_sz[ti];
-                if (ti > 0 && total == try_sz[0]) continue;
                 long hi_s = dm_sz > total ? (long)(dm_sz - total) : 0;
                 for (int hi = (hi_s > 0 ? 1 : 0); hi >= 0 && !g_pre_mem; hi--) {
                     long phys = 0; void *addr = NULL;

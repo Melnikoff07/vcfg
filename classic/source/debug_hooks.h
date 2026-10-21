@@ -55,6 +55,32 @@ int32_t sceVideoOutClose_hook(int32_t h)
     STAGE("game VideoOutClose done = 0x%08x", (unsigned)r);
     return r;
 }
+static void shrink_early_mem_to_8mb(void)
+{
+    if (!g_pre_mem || g_pre_size <= 0x800000u) return;
+    size_t keep = 0x800000u;
+    size_t drop = g_pre_size - keep;
+    long new_phys = g_pre_mem_phys + (long)drop;
+    int um = sceKernelMunmap(g_pre_mem, g_pre_size);
+    int rr = um == 0 ? sceKernelReleaseDirectMemory(g_pre_mem_phys, drop) : -1;
+    void *new_va = NULL;
+    g_own_alloc++;
+    int mr = (um == 0 && rr == 0) ? sceKernelMapDirectMemory(&new_va, keep, 0x33, 0, new_phys, 0x200000) : -1;
+    g_own_alloc--;
+    if (mr == 0 && new_va) {
+        STAGE("memory valve: shrunk display 0x%zx -> 0x%zx (released phys=0x%lx..0x%lx, kept phys=0x%lx va=%p)",
+              g_pre_size, keep, g_pre_mem_phys, new_phys, new_phys, new_va);
+        g_pre_mem = new_va;
+        g_pre_mem_phys = new_phys;
+        g_pre_size = keep;
+    } else {
+        if (um == 0) sceKernelReleaseDirectMemory(new_phys, keep);
+        g_pre_mem = NULL;
+        g_pre_mem_phys = 0;
+        g_pre_size = 0;
+    }
+}
+
 int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t align, int type, long *phys)
 {
     int32_t r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
@@ -65,13 +91,13 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
             r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                               s, e, len, align, type, phys);
         }
-        // Arena shaving: if a game requests a >= 1 GB 2MB-aligned arena at boot and is short by <= 18 MB because of
-        // our FG reservation at the top of the pool, allocate the available contiguous range and alias the tail on map.
+        // Arena shaving: if a game requests a >= 1 GB 2MB-aligned arena at boot and is short by <= 36 MB because of
+        // our FG reservation at the top of the pool, allocate the available contiguous range and map FlexibleMemory on the tail.
         if ((uint32_t)r == 0x80020023u && !g_shave_orig_len && len >= 0x40000000u && align == 0x200000u &&
             (g_pre_mem || g_pre_work)) {
             off_t av_start = 0;
             size_t av = dm_avail_range(s, e, align, &av_start);
-            if (av < len && len - av <= 0x1200000u && av >= 0x400000u) {
+            if (av < len && len - av <= 0x2400000u && av >= 0x400000u) {
                 int32_t sr = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                                            s, e, av, align, type, phys);
                 if (sr == 0 && phys) {
@@ -85,7 +111,12 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
                 }
             }
         }
-        // Memory valve: if the allocation still failed, yield our early FG buffers step by step and retry.
+        // Memory valve: if the allocation still failed, first shrink display 32 MB -> 8 MB, then yield remaining FG buffers step by step.
+        if ((uint32_t)r == 0x80020023u && g_pre_mem && g_pre_size > 0x800000u) {
+            shrink_early_mem_to_8mb();
+            r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
+                              s, e, len, align, type, phys);
+        }
         if ((uint32_t)r == 0x80020023u && g_pre_mem) {
             release_early_mem();
             r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
