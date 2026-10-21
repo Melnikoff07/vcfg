@@ -334,9 +334,7 @@ static void crash_sig_handler(int sig, void *info, void *uctx)
         if (g_flips < INJECT_AFTER_FLIPS && g_vo_submit_flips < INJECT_AFTER_FLIPS) {
             int next_shave = g_cfg.shave_mode;
             int next_reg = g_cfg.reg_mode;
-            if (g_shave_orig_len > 0 && g_cfg.shave_mode == 0) {
-                next_shave = 1;
-            } else if (g_cfg.shave_mode < 2 || g_cfg.reg_mode < 2) {
+            if (g_cfg.shave_mode < 2 || g_cfg.reg_mode < 2) {
                 next_shave = 2;
                 next_reg = 2;
             }
@@ -613,7 +611,7 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
 
     int32_t r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                               s, e, len, align, type, phys);
-    if (!g_own_alloc && (uint32_t)r == 0x80020023u && g_flips == 0 && g_gpu_state == 0 && g_mbuf_state <= 0) {
+    if (!g_own_alloc && (uint32_t)r == 0x80020023u && g_flips == 0 && g_gpu_state == 0) {
         if (g_dump_mem) {
             release_early_dump();
             r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
@@ -630,36 +628,49 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
         }
         // Step 2: If the game requested a specific physical subrange [s, e) that overlaps g_pre_mem while other
         // DirectMemory outside [s, e) is still free, relocate g_pre_mem outside [s, e) and retry.
-        if ((uint32_t)r == 0x80020023u && g_pre_mem && relocate_early_mem_outside(s, e)) {
+        if ((uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && g_pre_mem && relocate_early_mem_outside(s, e)) {
             r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                               s, e, len, align, type, phys);
         }
-        // Step 3: For sub-1GB allocations (multi-arena games like CUSA04529 4th arena 0x2f400000, or sequential chunk
-        // allocators), shrink g_pre_mem 32 MB -> 8 MB AND immediately retry so we only shave if still needed!
-        if ((uint32_t)r == 0x80020023u && len < 0x40000000u && g_pre_mem && g_pre_size > 0x800000u) {
+        // Step 3: For sub-1GB allocations (multi-arena games like CUSA04529/CUSA10249 4th arena, or sequential chunk
+        // allocators), shrink g_pre_mem 32 MB -> 8 MB. Only retry unshaved if doing so will not starve the post-arena
+        // 6 MB (0x600000) allocation in multi-arena engines (3+ boot allocations before RegisterBuffers).
+        if ((uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && len < 0x40000000u && g_pre_mem && g_pre_size > 0x800000u) {
             shrink_early_mem_to(0x800000u);
-            r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
-                              s, e, len, align, type, phys);
+            size_t av_post = dm_avail_range(s, e, eff_align, NULL);
+            int need_post_reserve = (g_cfg.shave_mode != 1 && g_dbg_allocs >= 2 &&
+                                     len >= 0x10000000u && av_post < len + 0x600000u);
+            if (!need_post_reserve) {
+                r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
+                                  s, e, len, align, type, phys);
+            }
         }
         // Step 4: Multi-block & sequential-chunk Arena Shaving:
         // - Single-arena games (len >= 1 GB, e.g. CUSA17419): shave up to 36 MB while keeping 32 MB g_pre_mem intact.
-        // - Multi-arena games (len >= 256 MB, e.g. CUSA04529 0x2f400000): if the arena would consume 100% of remaining
-        //   2MB-aligned DirectMemory, reserve 8 MB (0x800000) in DirectMemory for post-arena allocations (Alloc 5).
-        // - Sequential chunk allocators (len >= 4 MB, any alignment): shave the final chunk(s) that collide with our
-        //   8 MB g_pre_mem (up to SHAVE_MAX entries and up to 36 MB total shaved) and back the shaved tail with FlexibleMemory.
+        // - Multi-arena games (len >= 256 MB, e.g. CUSA04529 0x2f400000 / CUSA10249 0x2f800000): if the arena would
+        //   leave < 6..8 MB of 2MB-aligned DirectMemory, reserve 6..8 MB in DirectMemory for Alloc 5 (0x600000).
+        // - Sequential chunk allocators & post-RegisterBuffers boot allocations (len >= 4 MB): shave the chunk(s)
+        //   and back the shaved tail with FlexibleMemory.
         if ((uint32_t)r == 0x80020023u && g_cfg.shave_mode != 1 && g_shave_n < SHAVE_MAX && len >= 0x400000u &&
-            (g_pre_mem || g_pre_work)) {
+            (g_pre_mem || g_pre_work || g_mbuf_state == 1)) {
             off_t av_start = 0;
             size_t shave_av = dm_avail_range(s, e, eff_align, &av_start);
             size_t reserve = 0;
             size_t already_shaved = total_shaved_bytes();
             size_t max_total_shave = (len >= 0x40000000u) ? 0x2400000u : (g_pre_size ? g_pre_size + 0x400000u : 0x800000u);
-            if (len >= 0x10000000u && len < 0x40000000u && shave_av >= 0x1000000u && shave_av <= len && len - shave_av < 0x800000u) {
-                reserve = 0x800000u - (len - shave_av);
-                shave_av -= reserve;
-                if (max_total_shave < (len - shave_av) + already_shaved)
+            if (len >= 0x10000000u && len < 0x40000000u && shave_av >= 0x1000000u) {
+                if (shave_av <= len && len - shave_av < 0x800000u) {
+                    reserve = 0x800000u - (len - shave_av);
+                    shave_av -= reserve;
+                } else if (shave_av > len && shave_av < len + 0x600000u && g_dbg_allocs >= 2) {
+                    reserve = (len + 0x600000u) - shave_av;
+                    shave_av = len - reserve;
+                }
+                if (reserve && max_total_shave < (len - shave_av) + already_shaved)
                     max_total_shave = (len - shave_av) + already_shaved;
             }
+            if (g_mbuf_state == 1 && max_total_shave < already_shaved + 0x800000u)
+                max_total_shave = already_shaved + 0x800000u;
             if (shave_av < len && (len - shave_av) <= 0x2400000u &&
                 already_shaved + (len - shave_av) <= max_total_shave) {
                 if (shave_av >= 0x4000u) {
@@ -673,9 +684,9 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
                               g_shave_n, len, shave_av, *phys, len - shave_av, reserve);
                     }
                 } else if (shave_av == 0 && g_pre_mem && len <= g_pre_size &&
-                           already_shaved + len <= g_pre_size &&
+                           (already_shaved + len <= g_pre_size || (g_mbuf_state == 1 && already_shaved + len <= 0x1000000u)) &&
                            !(g_shave_last_probe_s == s && g_shave_last_probe_e == e && g_shave_last_probe_len > len)) {
-                    // Exact final chunk (e.g. 8 MB or 4 MB chunk) when 0 bytes of unallocated DirectMemory remain outside
+                    // Exact final chunk (e.g. 8 MB or 6 MB chunk) when 0 bytes of unallocated DirectMemory remain outside
                     // g_pre_mem, and not a descending-size probe loop: synthesize a tail-only shave entry backed by
                     // FlexibleMemory on MapDirectMemory while keeping g_pre_mem intact for scanout.
                     long syn_phys = g_pre_mem_phys + (long)already_shaved;
@@ -688,18 +699,19 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
                 }
             }
         }
-        // Step 5: Memory valve fallback if the allocation still failed.
-        if ((uint32_t)r == 0x80020023u && g_pre_mem && g_pre_size > 0x800000u) {
+        // Step 5: Memory valve fallback if the allocation still failed (only before RegisterBuffers).
+        if ((uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && g_pre_mem && g_pre_size > 0x800000u) {
             shrink_early_mem_to(0x800000u);
             r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                               s, e, len, align, type, phys);
         }
         // Only sacrifice the final 8 MB g_pre_mem if:
-        // (a) we have not already compensated the game for >= g_pre_size via Arena Shaving (otherwise the game is
+        // (a) RegisterBuffers has not yet claimed g_pre_mem (g_mbuf_state <= 0),
+        // (b) we have not already compensated the game for >= g_pre_size via Arena Shaving (otherwise the game is
         //     probing past 100% of total DirectMemory and would fail natively anyway), AND
-        // (b) releasing g_pre_size can actually satisfy the requested len in [s, e) (never destroy g_pre_mem for an
+        // (c) releasing g_pre_size can actually satisfy the requested len in [s, e) (never destroy g_pre_mem for an
         //     impossible oversize probe).
-        if ((uint32_t)r == 0x80020023u && g_pre_mem && total_shaved_bytes() < g_pre_size) {
+        if ((uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && g_pre_mem && total_shaved_bytes() < g_pre_size) {
             size_t cur_av = dm_avail_range(s, e, eff_align, NULL);
             if (cur_av + g_pre_size >= len) {
                 release_early_mem();

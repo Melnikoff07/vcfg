@@ -64,13 +64,14 @@ typedef struct {
     int shave_mode;      // 0 = auto (Valve+Shave), 1 = Valve only (no Shave), 2 = Late alloc (no early alloc at boot)
     int reg_mode;        // 0 = auto (inline extend + auto-reloc), 1 = separate group at top (16-N), 2 = deferred (frame 120)
     int post_mid;        // 0 = auto, 1 = generated mid frames only, 2 = generated + real frames
+    int manual_mode;     // 0 = auto (algorithm), 1 = manual dev overrides active in config-<TITLE>.ini
 } fg_config_t;
 
 static char g_title_id[16] = "UNKNOWN";
 static int g_known_game = 0;
 static int g_is_game_proc = 1;
-static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0 };
-static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0 };
+static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0 };
+static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0 };
 static volatile int g_last_pace_pre = 1;
 static volatile int g_menu_open = 0, g_menu_sel = 0, g_cfg_save_req = 0;
 static volatile uint64_t g_osd_toast_until = 0;
@@ -1287,9 +1288,10 @@ static void cfg_defaults(fg_config_t *c)
     c->shave_mode     = 0;
     c->reg_mode       = 0;
     c->post_mid       = 0;
+    c->manual_mode    = 0;
 }
 
-static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
+static int parse_ini_file_ex(const char *path, fg_config_t *c, uint32_t *hash_io, int is_adapt)
 {
     int fd = sceKernelOpen(path, 0 /*O_RDONLY*/, 0);
     if (fd < 0) return 0;
@@ -1299,6 +1301,8 @@ static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
     if (n <= 0) return 0;
     buf[n] = 0;
     if (hash_io) *hash_io = fnv1a_bytes(*hash_io, buf, (size_t)n);
+    int file_manual = is_adapt ? 1 : 0;
+    int raw_pace = -1, raw_shave = -1, raw_reg = -1, raw_post = -1;
     char *p = buf;
     while (*p) {
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
@@ -1319,10 +1323,11 @@ static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
                 else if (strcmp(key, "upscale_factor") == 0) c->upscale_factor = val < 50 ? 50 : (val > 100 ? 100 : val);
                 else if (strcmp(key, "present_copy") == 0) c->present_copy = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "two_buffer") == 0) c->two_buffer = (val != 0);
-                else if (strcmp(key, "pace_order") == 0) c->pace_order = val < 0 ? 0 : (val > 3 ? 3 : val);
-                else if (strcmp(key, "shave_mode") == 0) c->shave_mode = val < 0 ? 0 : (val > 2 ? 2 : val);
-                else if (strcmp(key, "reg_mode") == 0) c->reg_mode = val < 0 ? 0 : (val > 2 ? 2 : val);
-                else if (strcmp(key, "post_mid") == 0) c->post_mid = val < 0 ? 0 : (val > 2 ? 2 : val);
+                else if (strcmp(key, "manual_mode") == 0) { c->manual_mode = (val != 0); file_manual = (val != 0); }
+                else if (strcmp(key, "pace_order") == 0) raw_pace = val < 0 ? 0 : (val > 3 ? 3 : val);
+                else if (strcmp(key, "shave_mode") == 0) raw_shave = val < 0 ? 0 : (val > 2 ? 2 : val);
+                else if (strcmp(key, "reg_mode") == 0) raw_reg = val < 0 ? 0 : (val > 2 ? 2 : val);
+                else if (strcmp(key, "post_mid") == 0) raw_post = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "hud_protect") == 0) c->hud_protect = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "game_vectors") == 0) c->game_vectors = (val != 0);
                 else if (strcmp(key, "tile_idx") == 0) g_tile_override = val < 0 ? -1 : (val > 31 ? 31 : val);
@@ -1338,7 +1343,18 @@ static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
         if (!saved) break;
         p = eol + 1;
     }
+    if (file_manual) {
+        if (raw_pace >= 0)  c->pace_order = raw_pace;
+        if (raw_shave >= 0) c->shave_mode = raw_shave;
+        if (raw_reg >= 0)   c->reg_mode   = raw_reg;
+        if (raw_post >= 0)  c->post_mid   = raw_post;
+    }
     return 1;
+}
+
+static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
+{
+    return parse_ini_file_ex(path, c, hash_io, 0);
 }
 
 static void cfg_apply_live(const fg_config_t *c, const char *reason)
@@ -1407,8 +1423,41 @@ static int read_two_buffer_raw(void)
     }
     if (c.present_copy == 2) return 0;   // STANDARD buffer mode forced: no virtual queue
     if (c.present_copy == 1 || c.two_buffer) return 1;
-    if (vcfg_in_family(g_title_id, "CUSA17419") || vcfg_in_family(g_title_id, "CUSA05571") || vcfg_in_family(g_title_id, "CUSA08809")) return 1;
+    if (vcfg_in_family(g_title_id, "CUSA17419") || vcfg_in_family(g_title_id, "CUSA05571") ||
+        vcfg_in_family(g_title_id, "CUSA08809") || vcfg_in_family(g_title_id, "CUSA14209") ||
+        vcfg_in_family(g_title_id, "CUSA36375")) return 1;
     return 0;
+}
+
+// Clear stale adapt-<TITLE>.ini / safe-<TITLE>.state / safe-<TITLE>.boot when the plugin version changes so games
+// that hit a boot issue on an older version automatically get a clean run under the new version.
+static void check_title_version_upgrade(void)
+{
+    if (!g_title_id[0] || strncmp(g_title_id, "CUSA", 4) != 0) return;
+    char vpath[96], buf[32] = {0};
+    snprintf(vpath, sizeof(vpath), LOG_DIR "/vcfg_ver_%s", g_title_id);
+    int fd = sceKernelOpen(vpath, 0 /*O_RDONLY*/, 0);
+    if (fd >= 0) {
+        long n = (long)sceKernelRead(fd, buf, sizeof(buf) - 1);
+        sceKernelClose(fd);
+        if (n > 0) {
+            while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
+            if (strcmp(buf, VCFG_TRACE_VERSION) == 0) return;
+        }
+    }
+    char p[96];
+    snprintf(p, sizeof(p), LOG_DIR "/adapt-%s.ini", g_title_id);
+    sceKernelUnlink(p);
+    snprintf(p, sizeof(p), LOG_DIR "/safe-%s.state", g_title_id);
+    sceKernelUnlink(p);
+    snprintf(p, sizeof(p), LOG_DIR "/safe-%s.boot", g_title_id);
+    sceKernelUnlink(p);
+    sceKernelMkdir(LOG_DIR, 0777);
+    int wfd = sceKernelOpen(vpath, 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0666);
+    if (wfd >= 0) {
+        sceKernelWrite(wfd, VCFG_TRACE_VERSION "\n", strlen(VCFG_TRACE_VERSION) + 1);
+        sceKernelClose(wfd);
+    }
 }
 
 static void apply_adapt_ini(fg_config_t *c, uint32_t *hash_io)
@@ -1418,7 +1467,7 @@ static void apply_adapt_ini(fg_config_t *c, uint32_t *hash_io)
     cfg_defaults(&ac);
     char apath[96];
     snprintf(apath, sizeof(apath), LOG_DIR "/adapt-%s.ini", g_title_id);
-    if (!parse_ini_file(apath, &ac, hash_io)) return;
+    if (!parse_ini_file_ex(apath, &ac, hash_io, 1)) return;
     if (ac.shave_mode > c->shave_mode) c->shave_mode = ac.shave_mode;
     if (ac.reg_mode   > c->reg_mode)   c->reg_mode   = ac.reg_mode;
     if (c->pace_order == 0 && ac.pace_order > 0) c->pace_order = ac.pace_order;
@@ -1551,8 +1600,9 @@ static void safe_refuse(const char *why)
         STAGE("safe mode: state saved -> the next start takes its memory early (a start that does not reach frame %d is then given up)", INJECT_AFTER_FLIPS);
     }
 }
-// Surface size of one game display buffer: the VA gap between the game's buffers if it looks like a surface, else
-// pitch * height * 4. 0 = unknown (the same rules as the early path in RegisterBuffers).
+// Surface size of one game display buffer: the VA gap between the game's buffers if it matches a single surface,
+// clamped to pitch * aligned_height * 4 so interleaved depth/GBuffer allocations (e.g. CUSA14209 / CUSA36375 16 MB gap,
+// CUSA32836 31.7 MB gap) never over-size our scanout buffers.
 static size_t safe_surface_stride(void)
 {
     size_t one = 0;
@@ -1561,9 +1611,10 @@ static size_t safe_surface_stride(void)
         size_t diff = a1 > a0 ? (size_t)(a1 - a0) : (size_t)(a0 - a1);
         if (diff >= 0x100000 && diff <= 0x4000000 && !(diff & 0x7FFF) && (!one || diff < one)) one = diff;
     }
-    if (!one && g_pitch >= 640 && g_bh >= 360) {
+    if (g_pitch >= 640 && g_bh >= 360) {
         size_t raw_sz = (size_t)g_pitch * (size_t)((g_bh + 63u) & ~63u) * 4u;
-        one = (raw_sz + 0x7FFFFu) & ~(size_t)0x7FFFFu;
+        size_t surf_sz = (raw_sz + 0x7FFFFu) & ~(size_t)0x7FFFFu;
+        if (surf_sz >= 0x100000 && (!one || one > surf_sz)) one = surf_sz;
     }
     return (one < 0x100000 || one > 0x4000000 || (one & 0x7FFF)) ? 0 : one;
 }
@@ -1576,7 +1627,7 @@ static void safe_try_activate(uint32_t handle)
           g_title_id, g_bw, g_bh, g_attr.format, g_ngame, g_game_idx_hi, g_detected_60fps, g_dbg_alloc_fail);
     STAGE("safe mode frame %u: free direct memory: largest block for align 0x10000 = 0x%zx, 0x200000 = 0x%zx (pool 0x%zx)", g_flips,
           dm_avail(0x10000), dm_avail(0x200000), (size_t)sceKernelGetDirectMemorySize());
-    if (g_fg_off && !g_cfg.upscale && !g_cfg.overlay) {
+    if (g_fg_off && !g_cfg.upscale && !g_cfg.overlay && !g_detected_60fps) {
         STAGE("safe mode: FG, Enhance and overlay all off -> nothing to set up");
         release_early_mem(); release_early_work(); release_early_gpu();
         return;
@@ -1584,11 +1635,6 @@ static void safe_try_activate(uint32_t handle)
     if (!g_fmt_supported) { char w[24]; snprintf(w, sizeof(w), "FMT 0x%x", g_attr.format); safe_refuse(w); return; }
     if (!fg_res_supported(g_bw, g_bh)) { char w[24]; snprintf(w, sizeof(w), "RES %ux%u", g_bw, g_bh); safe_refuse(w); return; }
     if (g_ngame < 2 || g_ngame > 8) { safe_refuse("BUFFERS"); return; }
-    if (g_detected_60fps && g_cfg.fps_lock != 30) {
-        snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)");
-        release_early_mem(); release_early_work(); release_early_gpu();
-        return;
-    }
     size_t one = safe_surface_stride();
     if (!one) { safe_refuse("SURFACE SIZE"); return; }
     int hi = g_game_idx_hi > g_ngame ? g_game_idx_hi : g_ngame;
@@ -1633,9 +1679,9 @@ static void safe_try_activate(uint32_t handle)
     for (int i = 0; i < nm; i++) g_buf[base + i] = (uint64_t)(uintptr_t)ext[i];
     g_mbase = base;
     g_nbuf = base + nm;
-    g_nmid = nm < 3 ? nm : 3;
-    g_pcopy_avail = (want_pcopy && nm >= 4);
-    g_pcopy_k = nm >= 6 ? 3 : 2;
+    g_pcopy_avail = (want_pcopy && nm >= 2);
+    g_pcopy_k = nm >= 6 ? 3 : (nm >= 4 ? 2 : 1);
+    g_nmid = g_pcopy_avail ? g_pcopy_k : (nm < 3 ? nm : 3);
     g_mbuf_state = 1;
     int32_t rr = HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), (int32_t)handle, 0);
     g_safe_active = 1;
@@ -1766,10 +1812,13 @@ static void cfg_save_game_ini(void)
     fprintf(f, "upscale_factor = %d\n", c.upscale_factor);
     fprintf(f, "present_copy = %d\n", c.present_copy);
     fprintf(f, "two_buffer = %d\n", c.two_buffer);
-    if (c.pace_order) fprintf(f, "pace_order = %d\n", c.pace_order);
-    if (c.shave_mode) fprintf(f, "shave_mode = %d\n", c.shave_mode);
-    if (c.reg_mode) fprintf(f, "reg_mode = %d\n", c.reg_mode);
-    if (c.post_mid) fprintf(f, "post_mid = %d\n", c.post_mid);
+    fprintf(f, "manual_mode = %d\n", c.manual_mode);
+    if (c.manual_mode) {
+        if (c.pace_order) fprintf(f, "pace_order = %d\n", c.pace_order);
+        if (c.shave_mode) fprintf(f, "shave_mode = %d\n", c.shave_mode);
+        if (c.reg_mode)   fprintf(f, "reg_mode = %d\n", c.reg_mode);
+        if (c.post_mid)   fprintf(f, "post_mid = %d\n", c.post_mid);
+    }
     if (g_tile_override >= 0) fprintf(f, "tile_idx = %d\n", (int)g_tile_override);
     fprintf(f, "hud_protect = %d\n", c.hud_protect);
     fprintf(f, "game_vectors = %d\n", c.game_vectors);
@@ -2182,19 +2231,28 @@ static void tick(uint32_t n, uint32_t handle, uint32_t index, uint32_t mode)
         uint32_t prev_rfps = __atomic_load_n(&g_osd_real_fps_x10, __ATOMIC_ACQUIRE);
         uint32_t sm_rfps = prev_rfps ? (prev_rfps + cur_rfps) / 2u : cur_rfps;
         __atomic_store_n(&g_osd_real_fps_x10, sm_rfps, __ATOMIC_RELEASE);
-        // 1.4: Auto-detect 60 fps games during warmup (flips 30..120) before FG pacing begins.
-        // Skip if the game explicitly requested a 30/20 Hz lock via sceVideoOutSetFlipRate(handle, >=1).
-        if (n >= 60 && n <= INJECT_AFTER_FLIPS && sm_rfps >= 480u && !g_detected_60fps && g_game_flip_rate <= 0) {
+        // 1.4: Auto-detect 60 fps games during warmup (flips 60..120) before FG pacing begins.
+        // Ignore uncapped loading spin-loops (> 75 fps, e.g. CUSA15090 at 754 fps) and games that explicitly set flipRate >= 1.
+        if (n >= 60 && n <= INJECT_AFTER_FLIPS && sm_rfps >= 480u && sm_rfps <= 750u && !g_detected_60fps && g_game_flip_rate <= 0) {
             g_detected_60fps = 1;
             snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)");
-            lg("auto-detect: game runs at %.1f fps (>= 48 fps) -> FrameGen auto-disabled (60 Hz output limit)\n", rfps);
+            lg("auto-detect: game runs at %.1f fps (48..75 fps) -> FrameGen auto-disabled (60 Hz output limit)\n", rfps);
         }
-        {   // Diagnostics only: log a change of the game's frame rate class (30 -> 60 on a menu, etc.)
+        {   // Track frame rate class transitions (e.g. 60 fps menu/splash -> 30 fps gameplay) and auto-re-enable FG.
             static int rate_class;
-            int cls = sm_rfps >= 480u ? 60 : (sm_rfps < 400u ? 30 : 0);
+            static int low_fps_wins;
+            int cls = (sm_rfps >= 480u && sm_rfps <= 750u) ? 60 : (sm_rfps >= 120u && sm_rfps < 400u ? 30 : 0);
+            if (cls == 30) low_fps_wins++;
+            else if (cls == 60) low_fps_wins = 0;
             if (n >= 30 && cls && cls != rate_class) {
                 if (rate_class) lg("rate change: %d -> %d fps class at flip %u (%.1f fps, detected_60=%d)\n", rate_class, cls, n, rfps, g_detected_60fps);
                 rate_class = cls;
+            }
+            if (g_detected_60fps && n > INJECT_AFTER_FLIPS && low_fps_wins >= 2) {
+                g_detected_60fps = 0;
+                g_inert_reason[0] = 0;
+                g_last_disk_hash = 0;
+                lg("auto-detect: game dropped to %.1f fps (30 fps class) -> FrameGen auto-enabled\n", rfps);
             }
         }
         g_fps_win_t = now;
@@ -3196,17 +3254,17 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 }
             }
             // B01: the VA gap between the game's buffers is not proof of the surface size (a gap may hold other
-            // objects: 0x1fb0000 = 31.7 MB per 1080p buffer was seen). Logged next to pitch * aligned height * 4.
-            {
-                size_t calc = (g_pitch >= 640 && g_bh >= 360) ? (size_t)g_pitch * (size_t)((g_bh + 63u) & ~63u) * 4u : 0;
-                STAGE("mbufs size: VA-gap stride 0x%zx, pitch*h*4 0x%zx%s", one, calc,
-                      one && calc && one > 2 * calc ? " (VA gap > 2x the surface: suspicious, extra memory is over-sized)" : "");
-            }
-            // Fallback stride calculation from pitch * aligned_height * 4 if game allocated buffers in separate pools
-            if (!one && g_pitch >= 640 && g_bh >= 360) {
-                size_t raw_sz = (size_t)g_pitch * (size_t)((g_bh + 63u) & ~63u) * 4u;
-                one = (raw_sz + 0x7FFFFu) & ~(size_t)0x7FFFFu;
-                lg("mbufs: non-contiguous game buffers, computed surface size 0x%zx from %ux%u (pitch %u)\n", one, g_bw, g_bh, g_pitch);
+            // objects: 0x1000000 = 16 MB in CUSA14209/CUSA36375, 0x1fb0000 = 31.7 MB in CUSA32836).
+            // Clamp `one` to the true single-surface size `pitch * aligned_height * 4` rounded up to 512 KB.
+            if (g_pitch >= 640 && g_bh >= 360) {
+                size_t calc = (size_t)g_pitch * (size_t)((g_bh + 63u) & ~63u) * 4u;
+                size_t surf_sz = (calc + 0x7FFFFu) & ~(size_t)0x7FFFFu;
+                STAGE("mbufs size: VA-gap stride 0x%zx, pitch*h*4 0x%zx (surf_sz 0x%zx)%s", one, calc, surf_sz,
+                      one > surf_sz ? " -> clamped to surf_sz" : "");
+                if (surf_sz >= 0x100000 && (!one || one > surf_sz)) {
+                    one = surf_sz;
+                    lg("mbufs: using computed surface size 0x%zx from %ux%u (pitch %u)\n", one, g_bw, g_bh, g_pitch);
+                }
             }
             if (one < 0x100000 || one > 0x4000000 || (one & 0x7FFF)) {
                 lg("mbufs: unexpected buffer stride 0x%zx, not extending\n", one);
@@ -3258,8 +3316,9 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 g_ext_nm = nm <= 8 ? nm : 8;
                 for (int i = 0; i < g_ext_nm; i++) g_ext_va[i] = ext[g_ngame + i];
                 g_ext_attr = *attr;
-                g_pcopy_avail = (want_pcopy && nm >= 4);
-                g_pcopy_k = nm >= 6 ? 3 : 2;
+                g_pcopy_avail = (want_pcopy && nm >= 2);
+                g_pcopy_k = nm >= 6 ? 3 : (nm >= 4 ? 2 : 1);
+                if (g_pcopy_avail) g_nmid = g_pcopy_k;
                 if (g_cfg.reg_mode == 1 && 16 - nm >= g_ngame) {
                     int base = 16 - nm;
                     int32_t r0 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
@@ -3648,6 +3707,7 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
     }
     g_is_neo = sceKernelIsNeoMode() ? 1 : 0;
     g_t_is_neo = (uint32_t)g_is_neo;
+    check_title_version_upgrade();
     load_early_adapt_cfg();
     STAGE("plugin_load enter: title=%s (family=%s) version=" VCFG_TRACE_VERSION " engine=classic neo=%d dm=0x%zx shave_mode=%d reg_mode=%d pace_order=%d post_mid=%d",
           g_title_id, vcfg_title_family(g_title_id), (int)g_is_neo, (size_t)sceKernelGetDirectMemorySize(),

@@ -490,6 +490,9 @@ static void test_flex_gpu_fallback_and_alignment(void)
     release_early_gpu();
     release_early_work();
     ASSERT(g_pre_gpu == NULL && g_pre_work == NULL);
+
+    void *gv_mem = alloc_gv_dm(0x10000u, 0x10000u, 0);
+    ASSERT(gv_mem != NULL);
 }
 
 static void test_top_packing_and_shrink_retry(void)
@@ -547,6 +550,30 @@ static void test_multi_arena_shave_and_post_reserve(void)
     ASSERT(sceKernelMapDirectMemory(&va_alloc5, 0x400000u, 0x33, 0, p3, 0x200000u) == 0);
     ASSERT(va_alloc5 != NULL);
     ASSERT(g_sim_map_dm_calls == dm_maps_before + 1);
+
+    // CUSA10249 exact 5-allocation pattern (4 arenas leaving only 2 MB unshaved + post-RegisterBuffers 6 MB Alloc 5):
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+
+    long a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x8000000u, 0x200000u, 3, &a1) == 0);
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x4000000u, 0x200000u, 0, &a2) == 0);
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x4600000u, 0x200000u, 3, &a3) == 0);
+    // Remaining before g_pre_mem (after shrinking 32 MB -> 8 MB) is 0x2F200000.
+    // Arena 4 requests 0x2F000000 (which would leave only 0x200000 = 2 MB unshaved, starving Alloc 5 = 0x600000).
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x2F000000u, 0x200000u, 3, &a4) == 0);
+    ASSERT(g_pre_mem != NULL && g_pre_size == 0x800000u);
+    ASSERT(g_shave_n == 1);
+    ASSERT(g_shaves[0].real_len == 0x2EC00000u);
+    ASSERT(g_shaves[0].orig_len == 0x2F000000u);
+
+    // RegisterBuffers runs before Alloc 5 in CUSA10249 (setting g_mbuf_state = 1):
+    g_mbuf_state = 1;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x600000u, 0x200000u, 0, &a5) == 0);
+    void *va_a5 = NULL;
+    ASSERT(sceKernelMapDirectMemory(&va_a5, 0x600000u, 0x2, 0, a5, 0x200000u) == 0);
+    ASSERT(va_a5 != NULL);
 }
 
 static void test_sequential_chunks_and_slice_maps(void)

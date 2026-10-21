@@ -48,13 +48,29 @@ static const Supported k_sup[] = {
     { "CUSA17419", "vcfg_alt_16.prx", ENGINE_CLASSIC_ALT, 0 },
     { "CUSA00918", "vcfg_alt_16.prx", ENGINE_CLASSIC_ALT, 0 },
     { "CUSA04529", "vcfg_alt_16.prx", ENGINE_CLASSIC_ALT, 0 },
+    { "CUSA11456", "vcfg_alt_16.prx", ENGINE_CLASSIC_ALT, 0 },
+    { "CUSA05571", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA08809", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00557", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA09171", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA13801", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA14209", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA16734", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA10454", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA11100", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA12054", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA15090", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA18723", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA36375", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
 static const char *k_files[] = { "vcfg16.prx", "vcfg_classic51.prx", "vcfg_alt_16.prx" };
 // Double-buffered titles that run best with 2-BUFFER present copy + virtual flip queue: AUTO = 2-BUFFER.
 static int auto_2buf(const char *id)
 {
-    return vcfg_in_family(id, "CUSA05571") || vcfg_in_family(id, "CUSA08809") || vcfg_in_family(id, "CUSA17419");
+    return vcfg_in_family(id, "CUSA05571") || vcfg_in_family(id, "CUSA08809") ||
+           vcfg_in_family(id, "CUSA17419") || vcfg_in_family(id, "CUSA14209") ||
+           vcfg_in_family(id, "CUSA36375");
 }
 static int auto_alt(const char *id)
 {
@@ -66,7 +82,7 @@ static const Supported *sup_for_title(const char *id)
     for (int i = 0; i < NSUP; i++) if (!strcmp(fam, k_sup[i].id)) return &k_sup[i];
     return NULL;
 }
-#define MAPMAX 256   // plugins.ini sections we manage: the verified table + regional aliases + every game in the list (App.games)
+#define MAPMAX 512   // plugins.ini sections we manage: the verified table + regional aliases + every game in the list (App.games)
 #define ENGFILE CFGDIR "/vcfg_engines.ini"   // the player's engine choice per game: CUSAxxxxx=<SEL_*>, AUTO not written
 #define BUFFILE CFGDIR "/vcfg_buffers.ini"   // the player's buffer mode choice per game: CUSAxxxxx=<BUF_*>, AUTO not written
 static const char *prx_of(int engine)
@@ -135,9 +151,18 @@ static const char *const k_roots[] = { "", "/mnt/ext0", "/mnt/ext1", "/mnt/ext2"
 // What the game scan saw on each root, for the bug report (an external drive that cannot be listed, a full list).
 typedef struct { int listed, err, found, added, known, not_installed, full; } ScanRoot;
 static ScanRoot g_scan[NROOT];
-// Where a title's icon can be: appmeta (all internal titles), the title's own sce_sys on its drive, an installed patch.
-static const char *const k_icon_tpl[] = { "%s/user/appmeta/%s/icon0.png", "%s/user/appmeta/%s/icon0_08.png", "%s/user/app/%s/sce_sys/icon0.png",
-                                          "%s/user/app/%s/icon0.png", "%s/user/patch/%s/sce_sys/icon0.png", "%s/system_data/priv/appmeta/%s/icon0.png" };
+// Where a title's icon can be: appmeta (internal or external sub-folder), the title's own sce_sys on its drive, an installed patch.
+static const char *const k_icon_tpl[] = {
+    "%s/user/appmeta/%s/icon0.png",
+    "%s/user/appmeta/%s/icon0_08.png",
+    "%s/user/appmeta/external/%s/icon0.png",
+    "%s/user/appmeta/external/%s/icon0_08.png",
+    "%s/user/app/%s/sce_sys/icon0.png",
+    "%s/user/app/%s/icon0.png",
+    "%s/user/patch/%s/sce_sys/icon0.png",
+    "%s/system_data/priv/appmeta/%s/icon0.png",
+    "%s/system_data/priv/appmeta/external/%s/icon0.png"
+};
 // Debug log aid: what is in a folder (names only), to learn the layout of extended storage from a tester's log.
 static void vlog_dir(const char *path)
 {
@@ -175,6 +200,8 @@ static void layout_snapshot(void)
 {
     g_layout_n = 0; g_layout[0] = 0;
     layout_ls("/mnt");
+    layout_ls("/user/appmeta/external");
+    layout_ls("/system_data/priv/appmeta/external");
     for (int r = 1; r < NROOT; r++) {
         char d[96];
         layout_ls(k_roots[r]);
@@ -209,10 +236,12 @@ static void load_meta(Game *g)
     for (int r = 0; r < NROOT && !b; r++) {
         snprintf(p, sizeof(p), "%s/user/appmeta/%s/param.sfo", k_roots[r], g->id); b = read_all(p, &n);
     }
-    for (int r = 0; r < NROOT && !b; r++) {   // extended storage keeps no appmeta: the title may sit in the game's own sce_sys
+    if (!b) { snprintf(p, sizeof(p), "/user/appmeta/external/%s/param.sfo", g->id); b = read_all(p, &n); }
+    for (int r = 0; r < NROOT && !b; r++) {   // extended storage keeps no appmeta on /mnt/ext*: check game sce_sys or internal appmeta/external
         snprintf(p, sizeof(p), "%s/user/app/%s/sce_sys/param.sfo", k_roots[r], g->id); b = read_all(p, &n);
     }
     if (!b) { snprintf(p, sizeof(p), "/system_data/priv/appmeta/%s/param.sfo", g->id); b = read_all(p, &n); }
+    if (!b) { snprintf(p, sizeof(p), "/system_data/priv/appmeta/external/%s/param.sfo", g->id); b = read_all(p, &n); }
     if (b) { g->installed = 1; sfo_str(b, n, "TITLE", g->title, sizeof(g->title)); sfo_str(b, n, "APP_VER", g->version, sizeof(g->version)); free(b); }
     for (int r = 0; r < NROOT; r++) {   // an installed update has the newer APP_VER
         snprintf(p, sizeof(p), "%s/user/patch/%s/sce_sys/param.sfo", k_roots[r], g->id);
@@ -571,16 +600,16 @@ static void load_settings(App *a)
             if (b) {
                 const char *s = (const char *)b;
                 g->s = (Settings){ ini_int(s, "framegen", g->experimental ? 0 : 1), ini_int(s, "preset", 0), ini_int(s, "sharpness", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
-                int mm = ini_int(s, "manual_mode", -1);
-                int sm = ini_int(s, "shave_mode", 0); if (sm > g->dev.shave_mode) g->dev.shave_mode = sm;
-                int rm = ini_int(s, "reg_mode", 0);   if (rm > g->dev.reg_mode)   g->dev.reg_mode   = rm;
-                int po = ini_int(s, "pace_order", 0); if (po > 0) g->dev.pace_order = po;
-                int pm = ini_int(s, "post_mid", 0);   if (pm > 0) g->dev.post_mid   = pm;
-                g->dev.fps_lock   = lock_to_dev(ini_int(s, "fps_lock", 30));
-                g->dev.tile_mode  = tile_to_dev(ini_int(s, "tile_idx", -1));
-                if (mm >= 0) g->dev.manual_mode = mm;
-                else if (sm > 0 || rm > 0 || po > 0 || pm > 0 || g->dev.fps_lock > 0 || g->dev.tile_mode > 0)
-                    g->dev.manual_mode = 1;
+                int mm = ini_int(s, "manual_mode", 0);
+                if (mm > 0) g->dev.manual_mode = 1;
+                if (g->dev.manual_mode) {
+                    int sm = ini_int(s, "shave_mode", 0); if (sm > g->dev.shave_mode) g->dev.shave_mode = sm;
+                    int rm = ini_int(s, "reg_mode", 0);   if (rm > g->dev.reg_mode)   g->dev.reg_mode   = rm;
+                    int po = ini_int(s, "pace_order", 0); if (po > 0) g->dev.pace_order = po;
+                    int pm = ini_int(s, "post_mid", 0);   if (pm > 0) g->dev.post_mid   = pm;
+                    g->dev.fps_lock   = lock_to_dev(ini_int(s, "fps_lock", 30));
+                    g->dev.tile_mode  = tile_to_dev(ini_int(s, "tile_idx", -1));
+                }
                 free(b);
             }
         }
@@ -855,6 +884,7 @@ static int do_ini(App *a, int install)
     addlog(a, rc ? "CANNOT WRITE PLUGINS.INI" : (install ? "PLUGINS.INI BACKED UP, GAMES MAPPED" : "VCFG REMOVED FROM PLUGINS.INI"));
     return rc;
 }
+static int clean_dir(const char *dir, const char *const *prefixes, int np, const char *suffix);
 static void do_install(App *a)
 {
     set_off(0);
@@ -868,6 +898,9 @@ static void do_install(App *a)
         snprintf(m, sizeof(m), rc ? "CANNOT WRITE %s" : "COPIED %s (%zu KB)", k_files[i], n / 1024); addlog(a, m);
         if (rc) return;
     }
+    // Clear stale self-adapt / safe-watchdog state files from previous plugin versions on install/update:
+    static const char *const stale_pfx[] = { "adapt-", "safe-", "vcfg_ver_" };
+    clean_dir(CFGDIR, stale_pfx, 3, NULL);
     do_ini(a, 1);
     a->plugin_state = plugin_state();
 }
@@ -982,7 +1015,7 @@ static void summarize(Buf *r, const char *id, const char *which, const char *t)
         bprintf(r, "    last line: %s\n", line);
     }
 }
-// Every trace-<TITLE>.txt and trace-<TITLE>.prev.txt in CFGDIR, sorted by title ID (not only the app's game list).
+// Every trace-<TITLE>[.prev].txt and boot-<TITLE>[.prev].txt in CFGDIR, sorted by title ID (not only the app's game list).
 typedef struct { char id[12]; int prev; } TraceFile;
 static int list_traces(TraceFile *out, int cap, int *err)
 {
@@ -991,13 +1024,21 @@ static int list_traces(TraceFile *out, int cap, int *err)
     if (!d) { *err = errno; return 0; }
     int n = 0; struct dirent *e;
     while ((e = readdir(d)) && n < cap) {
-        if (strncmp(e->d_name, "trace-", 6)) continue;
+        size_t pfx = 0;
+        if (!strncmp(e->d_name, "trace-", 6)) pfx = 6;
+        else if (!strncmp(e->d_name, "boot-", 5)) pfx = 5;
+        else continue;
         size_t l = strlen(e->d_name); int prev = 0; const char *suf = ".txt";
         if (l > 9 && !strcmp(e->d_name + l - 9, ".prev.txt")) { prev = 1; suf = ".prev.txt"; }
         else if (l <= 4 || strcmp(e->d_name + l - 4, ".txt")) continue;
-        size_t idl = l - 6 - strlen(suf);
+        size_t idl = l - pfx - strlen(suf);
         if (idl < 4 || idl >= sizeof(out[0].id)) continue;
-        memcpy(out[n].id, e->d_name + 6, idl); out[n].id[idl] = 0; out[n].prev = prev; n++;
+        char id[12];
+        memcpy(id, e->d_name + pfx, idl); id[idl] = 0;
+        int dup = 0;
+        for (int k = 0; k < n; k++) if (!strcmp(out[k].id, id) && out[k].prev == prev) { dup = 1; break; }
+        if (dup) continue;
+        memcpy(out[n].id, id, sizeof(out[n].id)); out[n].prev = prev; n++;
     }
     closedir(d);
     for (int i = 1; i < n; i++) for (int j = i; j > 0; j--) {
@@ -1130,8 +1171,12 @@ static void check_auto_send_crashes(App *a)
         char p[96];
         snprintf(p, sizeof(p), CFGDIR "/boot-%s.txt", g->id);
         if (file_exists(p)) bfile(&b, "boot stages", p, 32u << 10);
+        snprintf(p, sizeof(p), CFGDIR "/boot-%s.prev.txt", g->id);
+        if (file_exists(p)) bfile(&b, "boot stages (prev)", p, 24u << 10);
         snprintf(p, sizeof(p), CFGDIR "/trace-%s.txt", g->id);
-        if (file_exists(p)) bfile(&b, "flight recorder", p, 64u << 10);
+        if (file_exists(p)) bfile(&b, "flight recorder", p, 48u << 10);
+        snprintf(p, sizeof(p), CFGDIR "/trace-%s.prev.txt", g->id);
+        if (file_exists(p)) bfile(&b, "flight recorder (prev)", p, 24u << 10);
         snprintf(p, sizeof(p), CFGDIR "/adapt-%s.ini", g->id);
         if (file_exists(p)) bfile(&b, "adapt recipe", p, 8u << 10);
         snprintf(p, sizeof(p), CFGDIR "/config-%s.ini", g->id);
@@ -1200,9 +1245,13 @@ static void do_report(App *a)
         char p[96]; size_t n = 0;
         snprintf(p, sizeof(p), CFGDIR "/trace-%s%s.txt", tf[k].id, tf[k].prev ? ".prev" : "");
         unsigned char *d = read_all(p, &n);
-        if (!d) { bprintf(&r, "%s: READ ERROR %s\n", tf[k].id, p); continue; }
-        summarize(&r, tf[k].id, tf[k].prev ? "game start before" : "last game start", (const char *)d);
-        free(d);
+        if (d) {
+            summarize(&r, tf[k].id, tf[k].prev ? "game start before" : "last game start", (const char *)d);
+            free(d);
+        } else {
+            bprintf(&r, "%s, %s: boot-only log (no trace-%s%s.txt written before exit)\n",
+                    tf[k].id, tf[k].prev ? "game start before" : "last game start", tf[k].id, tf[k].prev ? ".prev" : "");
+        }
         {   // classic engine: crash-safe early stages of that start (boot-<TITLE>.txt / .prev.txt)
             char bp[96], line[208]; size_t bn = 0;
             snprintf(bp, sizeof(bp), CFGDIR "/boot-%s%s.txt", tf[k].id, tf[k].prev ? ".prev" : "");
@@ -1245,7 +1294,7 @@ static void do_report(App *a)
     }
     for (int k = 0; k < nt; k++) {
         char p[96]; snprintf(p, sizeof(p), CFGDIR "/trace-%s%s.txt", tf[k].id, tf[k].prev ? ".prev" : "");
-        bfile(&r, tf[k].prev ? "flight recorder, game start before" : "flight recorder, last game start", p, 96u << 10);
+        if (file_exists(p)) bfile(&r, tf[k].prev ? "flight recorder, game start before" : "flight recorder, last game start", p, 96u << 10);
         snprintf(p, sizeof(p), CFGDIR "/boot-%s%s.txt", tf[k].id, tf[k].prev ? ".prev" : "");
         if (file_exists(p)) bfile(&r, tf[k].prev ? "early start stages (classic), game start before" : "early start stages (classic), last game start", p, 48u << 10);
     }
@@ -1487,7 +1536,11 @@ int main(void)
     g_exp_written = exp_sig(a);
     a->plugin_state = plugin_state();
     if (is_off()) addlog(a, "VCFG IS TURNED OFF. CROSS TURNS IT ON.");
-    else if (a->plugin_state != 1) { addlog(a, a->plugin_state ? "UPDATING PLUGINS" : "INSTALLING PLUGINS"); do_install(a); }
+    else if (a->plugin_state != 1) {
+        addlog(a, a->plugin_state ? "UPDATING PLUGINS" : "INSTALLING PLUGINS");
+        do_install(a);
+        load_settings(a);
+    }
     check_auto_send_crashes(a);
 
     if (video_init()) { vlog("video init failed\n"); quit(); }
