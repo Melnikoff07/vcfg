@@ -40,7 +40,7 @@ static const Supported k_sup[] = {
     { "CUSA00207", "vcfg_classic42.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg16.prx", "vcfg_classic42.prx", "vcfg_alt_02.prx" };
+static const char *k_files[] = { "vcfg16.prx", "vcfg_classic42.prx", "vcfg_alt_03.prx" };
 // Double-buffered titles that run best with the 2-BUFFER engine (virtual flip queue, tested on hardware 20.10): AUTO = 2-BUFFER.
 static const char *const k_auto_2buf[] = { "CUSA05571", "CUSA08809" };
 static int auto_2buf(const char *id)
@@ -243,6 +243,10 @@ static void save_settings(App *a)
             snprintf(buf, sizeof(buf), "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\nmenu_combo=%u\ntwo_buffer=%d\n",
                      s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo, game_engine(g) == ENGINE_CLASSIC_2BUF);
             write_all(path, buf, strlen(buf));
+            if (s->fg) {
+                snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id); remove(path);
+                snprintf(path, sizeof(path), CFGDIR "/safe-%s.boot", g->id); remove(path);
+            }
         }
     }
     vlog("settings saved\n");

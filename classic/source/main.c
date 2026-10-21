@@ -1294,7 +1294,7 @@ static int32_t g_game_flip_rate = -1;
 static int is_verified_title(void)
 {
     static const char *const k_ok[] = { "CUSA00207", "CUSA08519", "CUSA00411", "CUSA05571", "CUSA08809",
-                                        "CUSA00557", "CUSA09171", "CUSA13801", "CUSA11456" };
+                                        "CUSA00557", "CUSA09171", "CUSA13801", "CUSA11456", "CUSA17419", "CUSA00918" };
     for (unsigned v = 0; v < sizeof(k_ok) / sizeof(k_ok[0]); v++)
         if (!strcmp(g_title_id, k_ok[v])) return 1;
     return 0;
@@ -1915,6 +1915,10 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
         lg("first SubmitAndFlip: count=%u flipMode=%u title=%s\n", count, flipMode, g_title_id);
         lg("CLASSIC_BUILD version=%s test=%d target=%d two_buffer=%d status_hook=%d\n", VCFG_TRACE_VERSION, VCFG_2BUF_TEST, tb_title(),
            g_vq_on, g_status_hooked);
+    }
+    if (g_flips == 3 && g_safe_early) {
+        safe_marker(2);
+        STAGE("safe mode: boot allocations and first 3 flips succeeded -> boot marker removed");
     }
     if (g_rel_t) {
         uint64_t us = sceKernelGetProcessTime() - g_rel_t;
