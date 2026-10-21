@@ -19,7 +19,7 @@
 #define GVL_NOSPLICE 0x40u  // 'q' never insert anything into the game's submits: end-of-frame copies in our DCB only
 // merged build (v1.14)
 #define GVL_ANCHOR  0x80u   // 'a' experiment: anchor (silhouette) penalty in warp8g, also without game vectors (off by default)
-#define GVL_WIDE    0x200u  // 'W' calibration mode: walk budget 15 ms per frame and no CPU watchdog (RDR2: a frame is ~100k dwords = 6 ms)
+#define GVL_WIDE    0x200u  // 'W' calibration mode: walk budget 15 ms per frame and no CPU watchdog (CUSA03041: a frame is ~100k dwords = 6 ms)
 #define GVL_VIZ     0x100u  // 'z' debug view: 4 panels (game buffer, our flow, agreement, depth) on generated frames
 
 // plugin_load: allocate the memory (only if 'v'), read title id. Returns 1 if the subsystem is armed.

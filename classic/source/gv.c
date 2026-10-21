@@ -10,6 +10,7 @@
 #include "gvcal.h"
 
 void lg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));   // main.c (queued, IO thread writes)
+static int g_gv_neo = 0;
 
 #define GV_DIR      "/data/bb_probe"
 #define GV_PROF_DIR GV_DIR "/profiles"
@@ -68,9 +69,11 @@ typedef struct {
     pm4_desc_t vd; uint32_t vord, swz;
     pm4_desc_t vcap, zcap;           // merged build: descriptors for the capture T# (tile / pitch from the game's T#)
     int cap_fixed; uint64_t vfix; uint32_t vfw, vfh;   // end-of-frame copy at a fixed address (no tracking)
+    uint64_t vscan_addr; uint32_t vscan_w, vscan_h;    // non-aliased scan base address fallback for huge-DCB games
     int depth_on; pm4_desc_t zd; uint64_t zaddr; uint32_t zw, zh; int zrev;
     int apply, warp, sent, jitter;
     float ax, ay, bx, by; uint32_t sx, sy;
+    uint32_t cal_w, cal_h; int drs_scale;
     uint32_t biasg, biasz;
     float vax, vay, vbx, vby;        // merged build: decode of the 'z' view (calibrated a, b, or a robust normalisation)
 } gv_cfg_t;
@@ -93,19 +96,20 @@ static void cfg_read(gv_cfg_t *o)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// CPU-readable / GPU-readable checks (sceKernelQueryMemoryProtection, cached for one frame)
+// CPU-readable / GPU-readable checks (sceKernelVirtualQuery + sceKernelQueryMemoryProtection, cached for one frame)
 #define PROT_CPU_READ 0x01
 #define PROT_GPU_READ 0x10
+#define GV_MC_MAX     64u
 typedef struct { uintptr_t s, e; int32_t prot; } mrange_t;
-static mrange_t g_mc[16]; static uint32_t g_mcn = 0, g_mq = 0, g_mq_fail = 0;
+static mrange_t g_mc[GV_MC_MAX]; static uint32_t g_mcn = 0, g_mq = 0, g_mq_fail = 0;
 static int mem_ok(uintptr_t a, size_t n, int32_t need)
 {
     uintptr_t e = a + n;
-    if (!a || e < a) return 0;
+    if (!a || !n || a < 0x100000u || e < a || e > (1ull << 47)) return 0;
     uintptr_t cur = a;
-    for (int guard = 0; guard < 8 && cur < e; guard++) {
+    for (int guard = 0; guard < 32 && cur < e; guard++) {
         int hit = 0;
-        for (uint32_t i = 0; i < g_mcn && i < 16; i++)
+        for (uint32_t i = 0; i < g_mcn && i < GV_MC_MAX; i++)
             if (cur >= g_mc[i].s && cur < g_mc[i].e) {
                 if ((g_mc[i].prot & need) != need) return 0;
                 cur = g_mc[i].e; hit = 1; break;
@@ -113,10 +117,26 @@ static int mem_ok(uintptr_t a, size_t n, int32_t need)
         if (hit) continue;
         void *s = NULL, *en = NULL; int32_t prot = 0;
         g_mq++;
-        // [HYP] returns non-zero for an unmapped address and [start, end) of the mapping that contains it
-        if (sceKernelQueryMemoryProtection((void *)cur, &s, &en, &prot) != 0) { g_mq_fail++; return 0; }
-        if ((uintptr_t)s > cur || (uintptr_t)en <= cur) { g_mq_fail++; return 0; }
-        g_mc[g_mcn % 16] = (mrange_t){ (uintptr_t)s, (uintptr_t)en, prot };
+        OrbisKernelVirtualQueryInfo vq;
+        memset(&vq, 0, sizeof(vq));
+        if (sceKernelVirtualQuery((const void *)cur, 0, &vq, sizeof(vq)) == 0 &&
+            (uintptr_t)vq.unk01 <= cur && (uintptr_t)vq.unk02 > cur) {
+            s = vq.unk01;
+            en = vq.unk02;
+            prot = vq.isCommitted ? (int32_t)vq.unk04 : 0;
+            if (vq.isCommitted && !prot) {
+                void *ps = NULL, *pe = NULL; int32_t pprot = 0;
+                if (sceKernelQueryMemoryProtection((void *)cur, &ps, &pe, &pprot) == 0) prot = pprot;
+            }
+        } else if (sceKernelQueryMemoryProtection((void *)cur, &s, &en, &prot) != 0 ||
+                   (uintptr_t)s > cur || (uintptr_t)en <= cur) {
+            // Cache negative dword at cur so repeated checks of the same unmapped pointer do not repeat syscalls
+            g_mc[g_mcn % GV_MC_MAX] = (mrange_t){ cur, cur + 4u, 0 };
+            g_mcn++;
+            g_mq_fail++;
+            return 0;
+        }
+        g_mc[g_mcn % GV_MC_MAX] = (mrange_t){ (uintptr_t)s, (uintptr_t)en, prot };
         g_mcn++;
         if ((prot & need) != need) return 0;
         cur = (uintptr_t)en;
@@ -181,8 +201,9 @@ static int mk_t_target(uint32_t *t, uint64_t a, const pm4_desc_t *d, uint32_t w,
     uint32_t dfmt, nfmt;
     if (d->depth) {
         if (d->fmt == 3) { dfmt = 4; nfmt = 7; }          // Z32F -> IMG_DATA_FORMAT_32, FLOAT
+        else if (d->fmt == 2) { dfmt = 20; nfmt = 0; }    // Z24 -> IMG_DATA_FORMAT_8_24, UNORM
         else if (d->fmt == 1) { dfmt = 2; nfmt = 0; }     // Z16 -> 16, UNORM
-        else return 0;                                    // Z24: no matching texture format, skip
+        else return 0;
     } else {
         dfmt = d->fmt; nfmt = d->num == 6 ? 9u : d->num;
         if (nfmt == 4 || nfmt == 5) return 0;             // UINT / SINT: image_load returns raw integers
@@ -193,7 +214,9 @@ static int mk_t_target(uint32_t *t, uint64_t a, const pm4_desc_t *d, uint32_t w,
     t[2] = (w - 1u) | ((h - 1u) << 14);
     t[3] = 4u | (5u << 3) | (6u << 6) | (7u << 9) | ((d->tile & 0x1Fu) << 20) | (9u << 28);   // XYZW, tile index, 2D
     t[4] = (d->pitch - 1u) << 13;
-    t[5] = t[6] = t[7] = 0;
+    t[5] = 0;
+    t[6] = (g_gv_neo > 0 && d->tile != 8u) ? (1u << 24) : 0u;   // PS4 Pro neo=1 16-pipe alt_tile_mode
+    t[7] = 0;
     return 1;
 }
 
@@ -223,24 +246,31 @@ static uint32_t *emit_capture(uint32_t *p, int k, uint64_t a, const pm4_desc_t *
     volatile uint32_t *st = (volatile uint32_t *)GVO(GVO_CSTAT + (uint32_t)k * 16u);
     st[0] = st[1] = st[2] = st[3] = 0;
     mk_v(tb + 12, GVA(st), 16);
-    float sx = (float)w / (float)g_dw, sy = (float)h / (float)g_dh;
+    // gvc8 steps px in 0..1919 (480*4) and py in 0..1079 (270*4), so scale relative to the 1920x1080 reference grid
+    float sx = (float)w / 1920.0f, sy = (float)h / 1080.0f;
     tb[16] = mode; tb[17] = swz; memcpy(&tb[18], &sx, 4); memcpy(&tb[19], &sy, 4);
     uint32_t fs = ++g_fseq; if (!fs) fs = ++g_fseq;
     g_ring_seq[k] = fs;
     volatile uint64_t *lb = clbl(k);
     lb[0] = 0; lb[1] = 0;
     uint64_t l0 = GVA(&lb[0]), l1 = GVA(&lb[1]), tbl = GVA(tb), pgm = GVA(g_gpu_ + g_off_gvc8);
-    // flush the colour / depth metadata caches (as Mesa does on GFX7 before a CB / DB surface is read as a texture)
-    *p++ = PKT3(0x46, 1, 0); *p++ = d->depth ? 0x0000002Cu : 0x0000002Eu;   // FLUSH_AND_INV_DB_META / _CB_META
-    *p++ = PKT3(0x46, 1, 0); *p++ = 0x00000407;                              // CS_PARTIAL_FLUSH
-    // end-of-pipe label + wait: every draw before this point has retired (same recipe as build_dcb_flow8)
-    *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)l0; *p++ = 0x40000000u | ((uint32_t)(l0 >> 32) & 0xFFFFu); *p++ = fs; *p++ = 0;
-    *p++ = PKT3(0x3C, 6, 0); *p++ = 0x13; *p++ = (uint32_t)l0; *p++ = (uint32_t)(l0 >> 32); *p++ = fs; *p++ = 0xFFFFFFFFu; *p++ = 0x0A;
+    if (rest || d->depth) {
+        // flush the colour / depth metadata caches (at EOF build_dcb_flow8 already flushed CB_META + drained EOP)
+        *p++ = PKT3(0x46, 1, 0); *p++ = d->depth ? 0x0000002Cu : 0x0000002Eu;   // FLUSH_AND_INV_DB_META / _CB_META
+    }
+    if (rest) {
+        *p++ = PKT3(0x46, 1, 0); *p++ = 0x00000407;                              // CS_PARTIAL_FLUSH
+        // end-of-pipe label + wait: every draw before this point has retired (only needed when spliced mid-frame)
+        *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)l0; *p++ = 0x40000000u | ((uint32_t)(l0 >> 32) & 0xFFFFu); *p++ = fs; *p++ = 0;
+        *p++ = PKT3(0x3C, 6, 0); *p++ = 0x13; *p++ = (uint32_t)l0; *p++ = (uint32_t)(l0 >> 32); *p++ = fs; *p++ = 0xFFFFFFFFu; *p++ = 0x0A;
+    }
     // CB0..7 + DB dest base, CB + DB action over the target (CP_COHER_CNTL bits 6..14, 25, 26; bit 31 as the game's
-    // own 0x82003FC0), then L2 write-back + invalidate and L1 invalidate (0x80C40000), scalar cache (0x88400000)
+    // own 0x82003FC0), then L1/scalar invalidate (at EOF build_dcb_flow8 already wrote back L2).
     *p++ = PKT3(0x58, 6, 0); *p++ = 0x86007FC0u; *p++ = (uint32_t)((size + 255u) >> 8); *p++ = 0;
     *p++ = (uint32_t)(a >> 8); *p++ = (uint32_t)(a >> 40); *p++ = 0x0A;
-    *p++ = PKT3(0x58, 6, 0); *p++ = 0x80C40000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+    if (rest) {
+        *p++ = PKT3(0x58, 6, 0); *p++ = 0x80C40000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+    }
     *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
     *p++ = PKT3(0x76, 4, 1); *p++ = 0x207; *p++ = 64; *p++ = 1; *p++ = 1;                         // NUM_THREAD 64,1,1
     *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl; *p++ = (uint32_t)(tbl >> 32);   // USER_DATA_0..1
@@ -302,6 +332,23 @@ static int gv_ini_check(const char *path, int *mode_io, int *gv_io)
     return 1;
 }
 
+static void *(*g_gv_alloc)(size_t, size_t, int) = NULL;
+
+static int gv_ensure_mem(void)
+{
+    if (g_gvw && g_gvo) return 1;
+    if (!g_gv_alloc) return 0;
+    if (!g_gvw) g_gvw = (uint8_t *)g_gv_alloc(GVW_SZ, 0x10000, 3 /*WC_GARLIC*/);
+    if (!g_gvw) g_gvw = (uint8_t *)g_gv_alloc(GVW_SZ, 0x10000, 0);
+    if (!g_gvo) g_gvo = (uint8_t *)g_gv_alloc(GVO_SZ, 0x10000, 0 /*WB_ONION*/);
+    if (!g_gvw || !g_gvo) {
+        lg("GV: memory unavailable (gvw=%p gvo=%p), velocity off\n", (void *)g_gvw, (void *)g_gvo);
+        return 0;
+    }
+    lg("GV: memory ready (late), gvw=%p gvo=%p\n", (void *)g_gvw, (void *)g_gvo);
+    return 1;
+}
+
 int gv_load(void *(*alloc)(size_t, size_t, int))
 {
     {   // title id + app version for the profile and per-game config name (GoldHEN SDK: current process)
@@ -318,7 +365,7 @@ int gv_load(void *(*alloc)(size_t, size_t, int))
             for (int i = 0; i < 6; i++) if (g_appver[i] && (g_appver[i] < 32 || g_appver[i] > 126)) g_appver[i] = '?';
         }
     }
-    int mode = 8, want = 0;
+    int mode = 8, want = 1;
     int fd = sceKernelOpen(GV_DIR "/inject", 0, 0);
     char b[16] = { 0 };
     long n = fd >= 0 ? (long)sceKernelRead(fd, b, 15) : 0;
@@ -331,20 +378,15 @@ int gv_load(void *(*alloc)(size_t, size_t, int))
         snprintf(cpath, sizeof(cpath), GV_DIR "/config-%s.ini", g_title);
         gv_ini_check(cpath, &mode, &want);
     }
-    if (mode != 8 || !want) return 0;
-    g_gvw = (uint8_t *)alloc(GVW_SZ, 0x10000, 3 /*WC_GARLIC*/);
-    if (!g_gvw) g_gvw = (uint8_t *)alloc(GVW_SZ, 0x10000, 0);
-    g_gvo = (uint8_t *)alloc(GVO_SZ, 0x10000, 0 /*WB_ONION*/);
-    if (!g_gvw || !g_gvo) {
-        klog("[bb_probe] gv: memory unavailable (%p %p), velocity off\n", (void *)g_gvw, (void *)g_gvo);
-        g_gvw = NULL; g_gvo = NULL;
-        return 0;
-    }
+    (void)want;
+    if (mode != 8) return 0;
+    g_gv_alloc = alloc;
     memset(&R, 0, sizeof(R));
     R.pf.readable = pm4_readable; R.pf.clock = pm4_clock;
     R.pf.budget_us = 3000; R.pf.max_dwords = 8u << 20;
+    g_gv_neo = sceKernelIsNeoMode() ? 1 : 0;
     g_armed = 1;
-    klog("[bb_probe] gv: armed, title %s ver %s, gvw %p gvo %p\n", g_title, g_appver, (void *)g_gvw, (void *)g_gvo);
+    klog("[bb_probe] gv: armed (deferred alloc), title %s ver %s\n", g_title, g_appver);
     return 1;
 }
 int gv_armed(void) { return g_armed; }
@@ -353,7 +395,7 @@ static volatile int g_started = 0;
 void gv_set_shaders(uint8_t *gpu, uint32_t o_gv8, uint32_t o_gvc8, uint32_t o_warp8g, uint32_t o_gvz8)
 {
     g_gpu_ = gpu; gv_off_gv8 = o_gv8; g_off_gvc8 = o_gvc8; gv_off_warp8g = o_warp8g; g_off_gvz8 = o_gvz8;
-    if (g_started && g_gpu_ && g_off_gvc8 && gv_off_gv8 && gv_off_warp8g) g_live = 1;
+    if (g_started && g_gpu_ && g_off_gvc8 && gv_off_gv8 && gv_off_warp8g && gv_ensure_mem()) g_live = 1;
 }
 void gv_set_display(const uint64_t *bufs, int n, uint32_t w, uint32_t h)
 {
@@ -368,7 +410,8 @@ void gv_set_letters(uint32_t l) { g_letters = l; }
 enum { ST_OFF, ST_SCAN, ST_CAL, ST_TRIAL, ST_ACTIVE, ST_NONE };
 static const char *st_name[] = { "off", "scan", "calibrating", "trial", "active", "none" };
 typedef struct { pm4_desc_t d; uint32_t ord, swz; int score; int state; char why[80];
-                 int tok; uint32_t ttile, tpitch; } cand_t;   // state: 0 new 1 ok -1 rej -2 soft; tok: game T# tile/pitch
+                 int tok; uint32_t ttile, tpitch;
+                 uint64_t base; uint32_t w, h, flags; } cand_t;   // state: 0 new 1 ok -1 rej -2 soft; tok: game T# tile/pitch
 static struct {
     int st;
     cand_t cand[12]; int ncand, cur;
@@ -377,7 +420,7 @@ static struct {
     int have_prof; gvcal_result_t prof; cand_t prof_cand; char prof_capture[8];
     int depth_ok; pm4_desc_t zd, zcap; uint64_t zaddr; uint32_t zw, zh; int zrev;
     uint32_t snaps, snaps_inf, snap_wait, fails, passes, trial_n;
-    uint32_t scans, rescans, last_scan_frame;
+    uint32_t scans, rescans, last_scan_frame, last_scan_draws, cand_frame0;
     uint64_t t_log, t_req;
     uint32_t val_ok, val_bad, val_n;
     uint32_t emerg_bad, emerg_good; int shadow;
@@ -394,7 +437,7 @@ void gv_start(int mode8)
     S.cfg.biasg = 48; S.cfg.biasz = 96;
     S.st = ST_OFF;
     g_started = 1;
-    if (g_gpu_ && g_off_gvc8 && gv_off_gv8 && gv_off_warp8g) g_live = 1;   // else when gpu_init hands the shaders over
+    if (g_gpu_ && g_off_gvc8 && gv_off_gv8 && gv_off_warp8g && gv_ensure_mem()) g_live = 1;   // else when gpu_init hands the shaders over
     lg("GV start: title %s version %s, profile %s/%s.ini\n", g_title, g_appver, GV_PROF_DIR, g_title);
 }
 
@@ -415,7 +458,10 @@ static void frame_begin(void)
     if (track) { R.pf.trk_desc = R.cfg.vd; R.pf.trk_ordinal = R.cfg.vord; }
     R.pf.ndisplay = (uint32_t)g_ndisp;
     for (int i = 0; i < g_ndisp; i++) R.pf.display[i] = g_disp[i];
-    R.pf.budget_us = (g_letters & GVL_WIDE) ? 15000u : (scan ? 10000u : 1500u);   // preserve 'W' 15 ms budget on scan frames too
+    // Allow 10 ms budget on the first 8 tracking frames of a candidate so large-DCB games (e.g. CUSA08519: 118k dwords)
+    // can lock in the O(1) fast-track (R.addr_same >= 8) instead of aborting at 1.5 ms on every frame.
+    uint32_t trk_budget = (track && R.addr_same < 8u && R.walk_n < 12u) ? 10000u : 1500u;
+    R.pf.budget_us = (g_letters & GVL_WIDE) ? 15000u : (scan ? 10000u : trk_budget);
     pm4_frame_begin(&R.pf);
     R.frames++;
 }
@@ -445,7 +491,8 @@ uint32_t gv_rewrite(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], u
             R.fast_end_idx * 4u < R.fast_sz) {
             const uint32_t *pe = (const uint32_t *)dcb[R.fast_entry];
             uint64_t sz_need = (uint64_t)R.cfg.vcap.pitch * R.cfg.vcap.alloc_h * pm4_cb_bpp(R.cfg.vcap.fmt);
-            if (pe[0] == R.fast_dw0 && pe[R.fast_end_idx] == R.fast_dw_end &&
+            if (!((uintptr_t)pe & 3u) && mem_ok((uintptr_t)pe, R.fast_sz, PROT_CPU_READ) &&
+                pe[0] == R.fast_dw0 && pe[R.fast_end_idx] == R.fast_dw_end &&
                 sz_need && mem_ok((uintptr_t)R.last_addr, (size_t)sz_need, PROT_GPU_READ)) {
                 R.pf.trk.written = 1; R.pf.trk.aliased = 0; R.pf.trk.addr = R.last_addr;
                 R.pf.trk.w = R.vw ? R.vw : g_dw; R.pf.trk.h = R.vh ? R.vh : g_dh;
@@ -548,10 +595,13 @@ uint32_t *gv_emit_eof(uint32_t *p, uint32_t seq, uint32_t slot)
         uint64_t a = 0; uint32_t w = 0, h = 0; int mode = -1;
         if (R.vcaptured) {
             if (R.val) { a = R.vaddr; w = R.vw; h = R.vh; mode = 2; }          // compare spliced copy with eof
-        } else if ((R.mode & PM4_TRACK) && !R.incomplete && !R.pf.abort && R.pf.trk.written && !R.pf.trk.aliased) {
+        } else if ((R.mode & PM4_TRACK) && R.pf.trk.written && !R.pf.trk.aliased &&
+                   ((!R.incomplete && !R.pf.abort) || (R.pf.abort == PM4_ABORT_TIME && c->vscan_addr != 0))) {
             a = R.pf.trk.addr; w = R.pf.trk.w; h = R.pf.trk.h; mode = 0;
         } else if (c->cap_fixed) {
             a = c->vfix; w = c->vfw; h = c->vfh; mode = 0;
+        } else if (c->vscan_addr && (R.wd_track_off || R.pf.abort == PM4_ABORT_TIME)) {
+            a = c->vscan_addr; w = c->vscan_w; h = c->vscan_h; mode = 0;
         } else if (R.mode & PM4_TRACK) {
             if (!R.pf.trk.written) R.not_written++;
         }
@@ -568,7 +618,7 @@ uint32_t *gv_emit_eof(uint32_t *p, uint32_t seq, uint32_t slot)
         if (R.vcaptured && R.vaddr && !R.pf.trk.aliased && R.vaddr == R.last_addr) R.addr_same++;
         else { R.addr_same = 0; R.last_addr = (R.vcaptured && !R.pf.trk.aliased) ? R.vaddr : 0; }
     }
-    if (c->depth_on && c->zaddr) {
+    if (c->depth_on && c->apply && c->zaddr) {
         int k = ring_take();
         uint32_t *q = k >= 0 ? emit_capture(p, k, c->zaddr, &c->zcap, c->zw, c->zh, 1, 0, NULL) : NULL;
         if (q) { p = q; R.eof_zslot = k; } else if (k >= 0) g_ring_seq[k] = 0;
@@ -616,7 +666,13 @@ void gv_fill_table(uint32_t *tb, uint32_t seq, uint32_t slot)
     }
     mk_v(tb + 100, GVA(g_gvw + GVW_G), CELLS_W * CELLS_H * 16);
     mk_v(tb + 104, GVA(g_gvw + GVW_Z), CELLS_W * CELLS_H * 8);
-    memcpy(tb + 108, &c->ax, 4); memcpy(tb + 109, &c->ay, 4); memcpy(tb + 110, &c->bx, 4); memcpy(tb + 111, &c->by, 4);
+    float ax = c->ax, ay = c->ay, bx = c->bx, by = c->by;
+    if (c->drs_scale && c->cal_w && c->cal_h && R.vw >= 320u && R.vh >= 180u &&
+        (R.vw != c->cal_w || R.vh != c->cal_h)) {
+        ax *= (float)c->cal_w / (float)R.vw;
+        ay *= (float)c->cal_h / (float)R.vh;
+    }
+    memcpy(tb + 108, &ax, 4); memcpy(tb + 109, &ay, 4); memcpy(tb + 110, &bx, 4); memcpy(tb + 111, &by, 4);
     tb[112] = f; tb[113] = c->sx; tb[114] = c->sy; tb[115] = (c->biasg & 1023u) | ((c->biasz & 1023u) << 16);
     mk_v(tb + 116, GVA(GVO(GVO_SNAP)), GV_NB * 40);
     volatile uint32_t *gs = (volatile uint32_t *)GVO(GVO_GSTAT + slot * 16u);
@@ -731,6 +787,8 @@ static void prof_write(const char *state, const cand_t *c, const gvcal_result_t 
                 r->ax, r->bx, r->ay, r->by, r->r2x, r->r2y, r->jit_x, r->jit_y);
         fprintf(f, "sentinel=%d\nsent_x=0x%08x\nsent_y=0x%08x\nunits=%s\nframes=%u\nblocks=%u\n", r->sentinel, r->sent_x,
                 r->sent_y, r->units, r->frames, r->blocks);
+        if (r->cal_w && r->cal_h)
+            fprintf(f, "cal_w=%u\ncal_h=%u\ndrs_scale=%d\n", r->cal_w, r->cal_h, r->drs_scale);
     }
     for (int i = 0; i < S.ncand; i++)
         if (S.cand[i].state == -1) {
@@ -776,6 +834,9 @@ static int prof_read(void)
         else if (sscanf(line, "sentinel=%u", &u) == 1) S.prof.sentinel = (int)u;
         else if (sscanf(line, "sent_x=%x", &u) == 1) S.prof.sent_x = u;
         else if (sscanf(line, "sent_y=%x", &u) == 1) S.prof.sent_y = u;
+        else if (sscanf(line, "cal_w=%u", &u) == 1) S.prof.cal_w = u;
+        else if (sscanf(line, "cal_h=%u", &u) == 1) S.prof.cal_h = u;
+        else if (sscanf(line, "drs_scale=%u", &u) == 1) S.prof.drs_scale = (int)u;
     }
     fclose(f);
     if (!okv) { lg("GV profile %s: unknown version, ignored\n", path); return 0; }
@@ -793,18 +854,28 @@ static void cfg_for(const cand_t *c, const gvcal_result_t *r, int apply)
     else { g->vax = g->vay = 1.0f; g->vbx = g->vby = 0.0f; }
     g->vel_on = c != NULL;
     g->cap_fixed = 0;                        // a new candidate / profile is tracked again
+    g->vscan_addr = 0; g->vscan_w = g->vscan_h = 0;
+    R.wd_track_off = 0; R.wd_gpu = 0; R.addr_same = 0; R.last_addr = 0;
+    R.walk_us_sum = R.walk_n = R.walk_us_max = R.wd_hits = 0;
     if (c) {
         g->vd = c->d; g->vord = c->ord; g->swz = c->swz;
         g->vcap = c->d;
         if (c->tok & 1) g->vcap.tile = c->ttile;
         if ((c->tok & 2) && c->tpitch && c->tpitch * 2u >= c->d.pitch && c->tpitch <= c->d.pitch * 2u) g->vcap.pitch = c->tpitch;
+        if (!(c->flags & PM4RT_ALIASED) && c->base && c->w && c->h) {
+            g->vscan_addr = c->base; g->vscan_w = c->w; g->vscan_h = c->h;
+        }
     }
     g->apply = apply; g->warp = apply;
     if (r) {
         g->ax = r->ax; g->ay = r->ay; g->bx = r->bx; g->by = r->by;
         g->sent = r->sentinel; g->sx = r->sent_x; g->sy = r->sent_y;
         g->jitter = r->jit_x > 0.25f || r->jit_y > 0.25f;
-    } else { g->ax = g->ay = 1.0f; g->bx = g->by = 0.0f; g->sent = 0; g->jitter = 0; }
+        g->cal_w = r->cal_w; g->cal_h = r->cal_h; g->drs_scale = r->drs_scale;
+    } else {
+        g->ax = g->ay = 1.0f; g->bx = g->by = 0.0f; g->sent = 0; g->jitter = 0;
+        g->cal_w = g->cal_h = 0; g->drs_scale = 0;
+    }
     g->depth_on = S.depth_ok; g->zd = S.zd; g->zcap = S.zcap; g->zaddr = S.zaddr; g->zw = S.zw; g->zh = S.zh; g->zrev = S.zrev;
     cfg_publish(g);
 }
@@ -819,6 +890,7 @@ static void start_candidate(int i)
 {
     S.cur = i;
     S.t_cand = sceKernelGetProcessTime();
+    S.cand_frame0 = R.frames;
     gvcal_reset(&S.cal);
     S.snaps = S.snaps_inf = S.snap_wait = 0;
     char nm[80]; cand_name(&S.cand[i], nm, sizeof(nm));
@@ -875,6 +947,7 @@ static void process_scan(void)
 {
     pm4_frame_t *f = &g_scan;
     S.scans++;
+    S.last_scan_draws = f->draws;
     if (f->abort && f->abort != 99) {
         lg("GV scan %u incomplete (abort %d at %u dwords, %u us): retrying\n", S.scans, f->abort, f->abort_at_dw, f->us);
     }
@@ -883,11 +956,18 @@ static void process_scan(void)
     lg("GV scan %u: %u dw, %u packets, %u IBs (%u unreadable), %u draws, %u dispatches, %u passes, %u targets, %u T# hits, "
        "%u us -> scan_%u.txt\n", S.scans, f->dwords, f->packets, f->ibs, f->ib_unreadable, f->draws, f->dispatches,
        f->passes, f->nrt, f->tsharp_hits, f->us, S.scans % 8u);
-    // In multi-submit games (RDR2), if g_scan_state=1 was armed mid-frame right before the 256B flip DCB,
+    // In multi-submit games (CUSA03041), if g_scan_state=1 was armed mid-frame right before the 256B flip DCB,
     // the scan only sees the flip submit (~1083 dw, <=2 draws, 1 target). Retry immediately on the next full frame!
     if (f->draws < 16u && S.scans <= 4u) {
         lg("GV scan %u saw only %u draws (mid-frame flip submit): scheduling immediate full-frame retry\n", S.scans, f->draws);
         g_scan_state = 1;
+        return;
+    }
+    // Menu / loading screen with too few draws (< 64): do not waste calibration time on 2D UI targets; re-scan in ~6s
+    if (f->draws < 64u) {
+        S.last_scan_frame = R.frames;
+        if (S.st == ST_SCAN) S.st = ST_NONE;
+        lg("GV: menu/loading scene (%u draws < 64): waiting for 3D scene\n", f->draws);
         return;
     }
     // depth: best scoring DB target
@@ -896,7 +976,7 @@ static void process_scan(void)
         if (f->rt[i].d.depth && f->rt[i].score >= 50 && (bz < 0 || f->rt[i].score > f->rt[bz].score)) bz = (int)i;
     if (bz >= 0) {
         const pm4_rt_t *z = &f->rt[bz];
-        S.depth_ok = !(z->flags & PM4RT_MSAA) && (z->d.fmt == 3 || z->d.fmt == 1);
+        S.depth_ok = !(z->flags & PM4RT_MSAA) && (z->d.fmt == 3 || z->d.fmt == 2 || z->d.fmt == 1);
         S.zd = z->d; S.zaddr = z->base; S.zw = z->w; S.zh = z->h;
         S.zcap = z->d;
         {   // the game's own T# of this depth buffer (tile index / pitch), if it was sampled
@@ -912,7 +992,20 @@ static void process_scan(void)
            pm4_fmt_name(1, z->d.fmt), z->w, z->h, z->d.tile, z->draws, rev, fwd, S.zrev ? "reversed" : "normal",
            (z->flags & PM4RT_COMPRESSED) ? " (HTILE: valid only if the game decompressed it before the end of the frame)" : "");
     }
-    if (S.st != ST_SCAN) { if (S.cfg.vel_on) cfg_depth_update(); return; }
+    if (S.st != ST_SCAN) {
+        if (S.cfg.vel_on) {
+            for (uint32_t i = 0; i < f->nrt; i++) {
+                const pm4_rt_t *r = &f->rt[i];
+                if (pm4_desc_eq(&r->d, &S.cfg.vd) && r->ordinal == S.cfg.vord && !(r->flags & PM4RT_ALIASED) && r->base && r->w && r->h) {
+                    S.cfg.vscan_addr = r->base; S.cfg.vscan_w = r->w; S.cfg.vscan_h = r->h;
+                    S.prof_cand.base = r->base; S.prof_cand.w = r->w; S.prof_cand.h = r->h; S.prof_cand.flags = r->flags;
+                    break;
+                }
+            }
+            cfg_depth_update();
+        }
+        return;
+    }
     // keep this session's hard rejections out of the new list
     for (int i = 0; i < S.ncand && S.nrej < 12; i++) if (S.cand[i].state == -1) S.rej[S.nrej++] = S.cand[i];
     // velocity candidates: colour targets, score >= 30, best first; RGBA16 twice (xy and zw)
@@ -921,8 +1014,9 @@ static void process_scan(void)
         for (uint32_t i = 0; i < f->nrt && S.ncand < 12; i++) {
             const pm4_rt_t *r = &f->rt[i];
             if (r->d.depth || r->score < 30 || r->d.num == 4 || r->d.num == 5) continue;
+            if (!(r->nch == 2 || (r->nch == 4 && r->bpp >= 8))) continue;
             if (pass == 1 && !(r->nch == 4 && r->bpp == 8)) continue;
-            cand_t c = { r->d, r->ordinal, (uint32_t)pass, r->score - pass * 5, 0, "", 0, 0, 0 };
+            cand_t c = { r->d, r->ordinal, (uint32_t)pass, r->score - pass * 5, 0, "", 0, 0, 0, r->base, r->w, r->h, r->flags };
             if (pm4_rt_game_tsharp(r, &c.ttile, &c.tpitch)) c.tok = 3;
             int dup = 0;
             for (int j = 0; j < S.nrej; j++) if (pm4_desc_eq(&S.rej[j].d, &c.d) && S.rej[j].ord == c.ord && S.rej[j].swz == c.swz) dup = 1;
@@ -1031,9 +1125,9 @@ static void log_status(void)
     if (R.gpu_n && g_gpu_rate > 0) {
         double cap = (double)R.gpu_cap / R.gpu_n / g_gpu_rate * 1000.0, gv = (double)R.gpu_gv / R.gpu_n / g_gpu_rate * 1000.0;
         lg("GV GPU time per frame: copies %.3f ms + gv8 %.3f ms (warp8g extra is inside the warp figure of the pass line)\n", cap, gv);
-        // GPU budget watchdog (+0.5 ms for the whole subsystem): first the per-pixel part, then everything
-        if (cap + gv > 0.4 && !R.wd_gpu && !(g_letters & GVL_WIDE)) { R.wd_gpu = 1; lg("GV GPU watchdog: %.2f ms, warp8g per-pixel game vectors OFF\n", cap + gv); }
-        else if (cap + gv > 0.5 && R.wd_gpu && S.st != ST_NONE && !(g_letters & GVL_WIDE)) {
+        // GPU budget watchdog: only enforced once active, with realistic budget for 1080p velocity + depth copies
+        if (S.st == ST_ACTIVE && cap + gv > 3.0 && !R.wd_gpu && !(g_letters & GVL_WIDE)) { R.wd_gpu = 1; lg("GV GPU watchdog: %.2f ms, warp8g per-pixel game vectors OFF\n", cap + gv); }
+        else if (S.st == ST_ACTIVE && cap + gv > 4.0 && R.wd_gpu && !(g_letters & GVL_WIDE)) {
             lg("GV GPU watchdog: %.2f ms over budget: velocity subsystem OFF for this session\n", cap + gv);
             S.st = ST_NONE; S.rescans = 3; S.depth_ok = 0; cfg_for(NULL, NULL, 0);
         }
@@ -1101,11 +1195,21 @@ void gv_io_tick(void)
             lg("GV profile loaded: %s, a %.5g %.5g b %.4g %.4g, sentinel %d: validating (hybrid off until 3 checks pass)\n", nm,
                S.prof.ax, S.prof.ay, S.prof.bx, S.prof.by, S.prof.sentinel);
             S.t_cand = now;
+            S.cand_frame0 = R.frames;
             cfg_for(&S.prof_cand, &S.prof, 0);
             g_scan_state = 1;   // one scan anyway: depth target + the table for the log
         } else g_scan_state = 1;
     }
-    if ((L & GVL_SCAN) && !(S.letters_seen & GVL_SCAN) && g_scan_state == 0) { g_scan_state = 1; lg("GV scan requested (s)\n"); }
+    if ((L & GVL_RECAL) && !(S.letters_seen & GVL_RECAL)) {
+        S.st = ST_SCAN; S.nrej = 0; S.rescans = 0; S.have_prof = 0;
+        cfg_for(NULL, NULL, 0); g_scan_state = 1;
+        lg("GV recalibrate requested (r)\n");
+    }
+    if (L & GVL_RECAL) S.letters_seen |= GVL_RECAL; else S.letters_seen &= ~GVL_RECAL;
+    if ((L & GVL_SCAN) && !(S.letters_seen & GVL_SCAN) && g_scan_state == 0) {
+        if (S.st == ST_NONE) { S.st = ST_SCAN; S.nrej = 0; }
+        g_scan_state = 1; lg("GV scan requested (s)\n");
+    }
     if (L & GVL_SCAN) S.letters_seen |= GVL_SCAN; else S.letters_seen &= ~GVL_SCAN;
     if ((L & GVL_DUMP) && !(S.letters_seen & GVL_DUMP)) do_dump();
     if (!(L & GVL_DUMP)) S.letters_seen &= ~GVL_DUMP;
@@ -1115,25 +1219,32 @@ void gv_io_tick(void)
     if (!S.shadow && S.emerg_bad >= 60) { S.shadow = 1; lg("GV: game vectors disagree with the image in 60 frames: shadow mode (flow only)\n"); }
     if (S.shadow && S.emerg_good >= 60) { S.shadow = 0; lg("GV: agreement back: hybrid on again\n"); }
     if (now - S.t_log > 4000000) { S.t_log = now; log_status(); }
-    // per-frame tracking stopped by the watchdog: if the target always sat at the same address, copy it there
-    if (R.wd_track_off && S.cfg.vel_on && !S.cfg.cap_fixed && R.addr_same >= 12 && R.last_addr) {
-        S.cfg.cap_fixed = 1; S.cfg.vfix = R.last_addr; S.cfg.vfw = R.vw; S.cfg.vfh = R.vh;
+    // per-frame tracking stopped by the watchdog: if the target always sat at the same address (or scan found a non-aliased base), copy it there
+    if (R.wd_track_off && S.cfg.vel_on && !S.cfg.cap_fixed &&
+        ((R.addr_same >= 8 && R.last_addr) || S.cfg.vscan_addr != 0)) {
+        S.cfg.cap_fixed = 1;
+        S.cfg.vfix = (R.addr_same >= 8 && R.last_addr) ? R.last_addr : S.cfg.vscan_addr;
+        S.cfg.vfw = R.vw ? R.vw : S.cfg.vscan_w;
+        S.cfg.vfh = R.vh ? R.vh : S.cfg.vscan_h;
         cfg_publish(&S.cfg);
-        lg("GV: tracking off, target address %010llx stable for 300 frames: end-of-frame copy at that address\n",
-           (unsigned long long)R.last_addr);
+        lg("GV: tracking off, using fixed end-of-frame copy at address %010llx (%ux%u)\n",
+           (unsigned long long)S.cfg.vfix, S.cfg.vfw, S.cfg.vfh);
     }
-    // nothing captured for 20 s (target not written, aliased and not cuttable, unreadable memory): give up on it
+    // nothing captured for 10 s (target not written, aliased and not cuttable, unreadable memory): give up on it
     if ((S.st == ST_CAL || S.st == ST_TRIAL) && S.snaps == 0 && S.t_cand && now > S.t_cand) {
-        if (R.walked < 10) S.t_cand = now;   // loading screen / no frames walked yet: hold timeout clock
-        else if (now - S.t_cand > 20000000u) {
+        if (R.frames < S.cand_frame0 + 15u || (S.st == ST_TRIAL && S.last_scan_draws < 64u)) {
+            S.t_cand = now;   // loading screen / menu / no frames rendered yet: hold timeout clock
+            if (S.st == ST_TRIAL && S.last_scan_draws < 64u && g_scan_state == 0 && R.frames > S.last_scan_frame + 180u)
+                g_scan_state = 1;
+        } else if (now - S.t_cand > 10000000u) {
             if (S.st == ST_CAL) {
                 cand_t *c = &S.cand[S.cur];
                 c->state = -2;
-                snprintf(c->why, sizeof(c->why), "never captured in 20 s (not written %u / uncuttable %u in the last window)", R.not_written, R.uncuttable);
+                snprintf(c->why, sizeof(c->why), "never captured in 10 s (not written %u / uncuttable %u in the last window)", R.not_written, R.uncuttable);
                 lg("GV rejected candidate %d: %s\n", S.cur + 1, c->why);
                 next_candidate();
             } else {
-                lg("GV profile target never captured in 20 s: scanning\n");
+                lg("GV profile target never captured in 10 s: scanning\n");
                 S.st = ST_SCAN; cfg_for(NULL, NULL, 0); g_scan_state = 1; S.t_cand = 0;
             }
         }
@@ -1154,6 +1265,7 @@ void gv_io_tick(void)
         if (S.st == ST_CAL && (g_letters & GVL_VIZ) && (S.snaps % 8u) == 1u) view_norm(g_snapcopy);
         if (S.st == ST_CAL) {
             gvcal_frame_t fo;
+            gvcal_set_res(&S.cal, R.vw ? R.vw : S.cand[S.cur].d.pitch, R.vh ? R.vh : S.cand[S.cur].d.alloc_h);
             int inf = gvcal_add(&S.cal, g_snapcopy, &fo);
             S.snaps_inf += (uint32_t)inf;
             int d = gvcal_decide(&S.cal, &S.res);
@@ -1173,7 +1285,7 @@ void gv_io_tick(void)
                 S.prof = S.res; S.prof_cand = *c; S.have_prof = 1;
                 S.st = ST_ACTIVE; S.fails = 0;
                 cfg_for(c, &S.res, 1);
-            } else if (d == -1 || S.snaps > 600) {
+            } else if (d == -1 || S.snaps > 120) {
                 c->state = d == -1 ? (S.res.soft ? -2 : -1) : -2;
                 snprintf(c->why, sizeof(c->why), "%s", d == -1 ? S.res.reason : "timeout (not enough motion)");
                 lg("GV rejected candidate %d: %s\n", S.cur + 1, c->why);
@@ -1201,7 +1313,10 @@ void gv_io_tick(void)
         break;
     }
     case ST_NONE:
-        if (R.frames > S.last_scan_frame + 3600u && S.rescans < 3) {   // the scene may change (menus, cutscenes)
+        if (S.last_scan_draws < 64u && R.frames > S.last_scan_frame + 180u) {
+            S.st = ST_SCAN; g_scan_state = 1;
+            lg("GV re-scan after intro/loading screen (prev scan had %u draws)\n", S.last_scan_draws);
+        } else if (R.frames > S.last_scan_frame + 3600u && S.rescans < 3) {   // the scene may change (menus, cutscenes)
             S.rescans++;
             for (int i = 0; i < S.ncand; i++) if (S.cand[i].state == -2) S.cand[i].state = 0;   // soft rejections again
             S.st = ST_SCAN; g_scan_state = 1;

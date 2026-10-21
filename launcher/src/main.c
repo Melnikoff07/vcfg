@@ -11,6 +11,12 @@
 #include <stdarg.h>
 #include <dirent.h>
 #include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/Pad.h>
@@ -36,15 +42,15 @@ typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
     { "CUSA07439", "vcfg16.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic50.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic50.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic50.prx", ENGINE_CLASSIC_BB, 0 },
-    { "CUSA17419", "vcfg_alt_15.prx", ENGINE_CLASSIC_ALT, 0 },
-    { "CUSA00918", "vcfg_alt_15.prx", ENGINE_CLASSIC_ALT, 0 },
-    { "CUSA04529", "vcfg_alt_15.prx", ENGINE_CLASSIC_ALT, 0 },
+    { "CUSA08519", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic51.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA17419", "vcfg_alt_16.prx", ENGINE_CLASSIC_ALT, 0 },
+    { "CUSA00918", "vcfg_alt_16.prx", ENGINE_CLASSIC_ALT, 0 },
+    { "CUSA04529", "vcfg_alt_16.prx", ENGINE_CLASSIC_ALT, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg16.prx", "vcfg_classic50.prx", "vcfg_alt_15.prx" };
+static const char *k_files[] = { "vcfg16.prx", "vcfg_classic51.prx", "vcfg_alt_16.prx" };
 // Double-buffered titles that run best with 2-BUFFER present copy + virtual flip queue: AUTO = 2-BUFFER.
 static int auto_2buf(const char *id)
 {
@@ -253,6 +259,28 @@ static int ini_int(const char *text, const char *key, int def)
     }
     return def;
 }
+static void ini_str(const char *text, const char *key, char *out, size_t cap, const char *def)
+{
+    snprintf(out, cap, "%s", def ? def : "");
+    if (!text) return;
+    size_t kl = strlen(key);
+    for (const char *p = text; *p;) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!strncmp(p, key, kl) && (p[kl] == '=' || p[kl] == ' ')) {
+            p += kl;
+            while (*p == ' ' || *p == '\t' || *p == '=') p++;
+            size_t i = 0;
+            while (p[i] && p[i] != '\r' && p[i] != '\n' && p[i] != ';' && p[i] != '#') i++;
+            while (i > 0 && (p[i - 1] == ' ' || p[i - 1] == '\t')) i--;
+            if (i >= cap) i = cap - 1;
+            memcpy(out, p, i);
+            out[i] = 0;
+            return;
+        }
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+}
 static int file_exists(const char *p) { FILE *f = fopen(p, "rb"); if (f) fclose(f); return f != NULL; }
 static const int k_dev_locks[4] = { 30, 20, 60, 0 };
 static const int k_dev_tiles[7] = { -1, 10, 14, 13, 9, 12, 11 };
@@ -266,17 +294,216 @@ static int tile_to_dev(int ti)
     for (int i = 1; i < 7; i++) if (k_dev_tiles[i] == ti) return i;
     return 0;
 }
+static int kv_uint_after(const char *s, const char *key, unsigned def)
+{
+    const char *p = strstr(s, key);
+    if (!p) return (int)def;
+    return atoi(p + strlen(key));
+}
+static void add_tail_lines(DevCfg *d, const char *src)
+{
+    if (!src || !*src) return;
+    const char *lines[64];
+    int lens[64];
+    int cnt = 0;
+    const char *p = src;
+    while (*p && cnt < 64) {
+        while (*p == '\r' || *p == '\n' || *p == ' ') p++;
+        if (!*p) break;
+        const char *e = p;
+        while (*e && *e != '\r' && *e != '\n') e++;
+        if (e - p >= 4) {
+            lines[cnt] = p;
+            lens[cnt] = (int)(e - p);
+            cnt++;
+        }
+        p = e;
+    }
+    int start = cnt > 4 ? cnt - 4 : 0;
+    for (int i = start; i < cnt && d->n_tail < 4; i++) {
+        int l = lens[i] < 78 ? lens[i] : 78;
+        memcpy(d->log_tail[d->n_tail], lines[i], (size_t)l);
+        d->log_tail[d->n_tail][l] = 0;
+        d->n_tail++;
+    }
+}
 static void refresh_dev_status(Game *g)
 {
-    char path[96]; size_t n = 0;
+    char path[96]; size_t n = 0, bn = 0, tn = 0;
+    DevCfg *d = &g->dev;
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id);
     unsigned char *sb = read_all(path, &n);
-    g->dev.safe_state = (sb && n >= 1 && sb[0] >= '0' && sb[0] <= '2') ? (sb[0] - '0') : 0;
+    d->safe_state = (sb && n >= 1 && sb[0] >= '0' && sb[0] <= '2') ? (sb[0] - '0') : 0;
     free(sb);
     snprintf(path, sizeof(path), CFGDIR "/adapt-%s.ini", g->id);
-    g->dev.has_adapt = file_exists(path);
+    d->has_adapt = file_exists(path);
     snprintf(path, sizeof(path), CFGDIR "/crash-%s.txt", g->id);
-    g->dev.has_crash = file_exists(path);
+    unsigned char *cb = read_all(path, &n);
+    d->has_crash = cb != NULL;
+
+    snprintf(path, sizeof(path), CFGDIR "/boot-%s.txt", g->id);
+    unsigned char *bb = read_all(path, &bn);
+    if (!bb || bn < 8) {
+        free(bb);
+        snprintf(path, sizeof(path), CFGDIR "/boot-%s.prev.txt", g->id);
+        bb = read_all(path, &bn);
+    }
+    snprintf(path, sizeof(path), CFGDIR "/trace-%s.txt", g->id);
+    unsigned char *tb = read_all(path, &tn);
+    if (!tb || tn < 8) {
+        free(tb);
+        snprintf(path, sizeof(path), CFGDIR "/trace-%s.prev.txt", g->id);
+        tb = read_all(path, &tn);
+    }
+
+    d->diag_kind = DIAG_NONE;
+    d->rec_row = 0;
+    d->n_tail = 0;
+    snprintf(d->diag_cause, sizeof(d->diag_cause), "NO CRASH RECORDED");
+    snprintf(d->diag_stage, sizeof(d->diag_stage), "READY FOR TEST");
+    snprintf(d->diag_advice, sizeof(d->diag_advice), "DEFAULT SETTINGS ARE OK");
+    snprintf(d->diag_detail, sizeof(d->diag_detail),
+             "No crash or error log found for %s. Launch the game with SQUARE; if it exits or stutters, return here for automatic log analysis.",
+             g->id);
+    snprintf(d->step1, sizeof(d->step1), "1. Press SQUARE to launch %s with current settings.", g->id);
+    snprintf(d->step2, sizeof(d->step2), "2. If a crash occurs, open 05 DEV and press CIRCLE.");
+    snprintf(d->step3, sizeof(d->step3), "3. Press R2 to auto-apply the Advisor fix.");
+
+    const char *cs = cb ? (const char *)cb : "";
+    const char *bs = bb ? (const char *)bb : "";
+    const char *ts = tb ? (const char *)tb : "";
+
+    if (cb) add_tail_lines(d, cs);
+    if (d->n_tail < 4 && tb) add_tail_lines(d, ts);
+    if (d->n_tail < 4 && bb) add_tail_lines(d, bs);
+
+    if (cb) {
+        const char *sig = strstr(cs, "SIGBUS") ? "SIGBUS" :
+                          strstr(cs, "SIGILL") ? "SIGILL" :
+                          strstr(cs, "SIGABRT") ? "SIGABRT" : "SIGSEGV";
+        unsigned flips = (unsigned)kv_uint_after(cs, "flips=", 0);
+        int in_sub     = kv_uint_after(cs, "in_submit=", 0);
+        int afail      = kv_uint_after(cs, "alloc_fail=", 0);
+        int oom = afail > 0 || strstr(cs, "AllocateDirectMemory") || strstr(cs, "MapDirectMemory") ||
+                  strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory");
+        if (oom) {
+            d->diag_kind = DIAG_OOM_BOOT;
+            d->rec_row = d->shave_mode < 2 ? 2 : 1;
+            snprintf(d->diag_cause, sizeof(d->diag_cause), "%s: GPU / DIRECT MEM OOM", sig);
+            snprintf(d->diag_stage, sizeof(d->diag_stage), "VRAM EXHAUSTED AT FLIP %u", flips);
+            snprintf(d->diag_advice, sizeof(d->diag_advice),
+                     d->shave_mode < 2 ? "MEMORY HOOK -> LATE (F120) / ALT" : "ENGINE -> ALT (LOW VRAM)");
+            snprintf(d->diag_detail, sizeof(d->diag_detail),
+                     "Game ran out of DirectMemory (%s at flip %u, alloc_fail=%d). Early 64MB shave conflicted with engine boot pools.",
+                     sig, flips, afail);
+            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to set Memory Hook -> LATE (F120).");
+            snprintf(d->step2, sizeof(d->step2), "2. Or set Engine / Buffers -> ALT (LOW VRAM).");
+            snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to re-test the game.");
+        } else if (flips == 0 || strstr(cs, "RegisterBuffers")) {
+            d->diag_kind = DIAG_BOOT_EARLY;
+            d->rec_row = d->shave_mode < 2 ? 2 : 3;
+            snprintf(d->diag_cause, sizeof(d->diag_cause), "%s BEFORE FIRST FRAME", sig);
+            snprintf(d->diag_stage, sizeof(d->diag_stage), "EARLY BOOT / BUFFER REG HOOK");
+            snprintf(d->diag_advice, sizeof(d->diag_advice),
+                     d->shave_mode < 2 ? "MEMORY HOOK -> LATE (FRAME 120)" : "BUFFER REG -> DEFERRED (F120)");
+            snprintf(d->diag_detail, sizeof(d->diag_detail),
+                     "Crash (%s) occurred during engine initialization before frame 1. Hooking DirectMemory or RegisterBuffers too early broke startup.",
+                     sig);
+            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to defer Memory Hook / Buffer Reg to F120.");
+            snprintf(d->step2, sizeof(d->step2), "2. If crash persists, set Buffer Reg -> TOP GROUP.");
+            snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to test boot stability.");
+        } else if (in_sub || strstr(cs, "SubmitAndFlip") || strstr(cs, "SubmitDone") || strstr(cs, "VideoOutSubmitFlip")) {
+            d->diag_kind = DIAG_FLIP_STALL;
+            d->rec_row = 4;
+            snprintf(d->diag_cause, sizeof(d->diag_cause), "%s IN FLIP SUBMIT (F%u)", sig, flips);
+            snprintf(d->diag_stage, sizeof(d->diag_stage), "SUBMIT / VBLANK PACER CONFLICT");
+            snprintf(d->diag_advice, sizeof(d->diag_advice),
+                     d->pace_order != 2 ? "FLIP PACING -> POST-SUBMIT" : "FLIP PACING -> TIMER (PAIR)");
+            snprintf(d->diag_detail, sizeof(d->diag_detail),
+                     "Crash (%s at flip %u, in_submit=%d) inside GNM / VideoOut flip submission. Game's command buffer pacer collided with pre-submit FG dispatch.",
+                     sig, flips, in_sub);
+            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to switch Flip Pacing -> POST-SUBMIT.");
+            snprintf(d->step2, sizeof(d->step2), "2. If stutter occurs, try Flip Pacing -> TIMER (PAIR).");
+            snprintf(d->step3, sizeof(d->step3), "3. Try Post Target -> MID ONLY if HUD flickers.");
+        } else {
+            d->diag_kind = DIAG_REG_CONFLICT;
+            d->rec_row = d->shave_mode == 0 ? 2 : 3;
+            snprintf(d->diag_cause, sizeof(d->diag_cause), "%s AT FLIP %u", sig, flips);
+            snprintf(d->diag_stage, sizeof(d->diag_stage), "MID-GAME ARENA / REG CONFLICT");
+            snprintf(d->diag_advice, sizeof(d->diag_advice),
+                     d->shave_mode == 0 ? "MEMORY HOOK -> VALVE ONLY / LATE" : "BUFFER REG -> TOP GROUP (16-N)");
+            snprintf(d->diag_detail, sizeof(d->diag_detail),
+                     "Mid-session fault (%s at flip %u). Engine re-allocated display buffers or hit reduced memory arena limits.",
+                     sig, flips);
+            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to set Memory Hook -> VALVE ONLY.");
+            snprintf(d->step2, sizeof(d->step2), "2. Set Buffer Reg -> TOP GROUP (16-N) for UE4/RE.");
+            snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to verify stability.");
+        }
+    } else if (d->safe_state > 0) {
+        d->diag_kind = DIAG_BOOT_EARLY;
+        d->rec_row = d->safe_state >= 2 ? 2 : 3;
+        snprintf(d->diag_cause, sizeof(d->diag_cause),
+                 d->safe_state >= 2 ? "REPEATED BOOT ABORT -> PASSIVE" : "PREVIOUS BOOT STOPPED EARLY");
+        snprintf(d->diag_stage, sizeof(d->diag_stage),
+                 d->safe_state >= 2 ? "FG PAUSED BY SAFE WATCHDOG" : "AUTO-DEFERRED TO FRAME 120");
+        snprintf(d->diag_advice, sizeof(d->diag_advice),
+                 d->shave_mode < 2 ? "MEMORY HOOK -> LATE (FRAME 120)" : "BUFFER REG -> DEFERRED (F120)");
+        snprintf(d->diag_detail, sizeof(d->diag_detail),
+                 "Watchdog detected %s before frame 120 (safe_state=%d). VCFG automatically stepped down to prevent boot loops.",
+                 d->safe_state >= 2 ? "2+ incomplete boots and paused FG" : "an incomplete boot and deferred hooks", d->safe_state);
+        snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply LATE (F120) hook & clear watchdog.");
+        snprintf(d->step2, sizeof(d->step2), "2. Or press TRIANGLE to restore AUTO (ALGORITHM).");
+        snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch and test.");
+    } else if (strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory") || strstr(ts, "alloc_fail")) {
+        d->diag_kind = DIAG_OOM_BOOT;
+        d->rec_row = 2;
+        snprintf(d->diag_cause, sizeof(d->diag_cause), "GPU WORK MEMORY ALLOC FAILED");
+        snprintf(d->diag_stage, sizeof(d->diag_stage), "NOT ENOUGH FREE DIRECT MEMORY");
+        snprintf(d->diag_advice, sizeof(d->diag_advice), "MEMORY HOOK -> VALVE+SHAVE / ALT");
+        snprintf(d->diag_detail, sizeof(d->diag_detail),
+                 "Game booted without crashing, but VCFG could not allocate DirectMemory for optical flow textures (dmem_FAIL in log).");
+        snprintf(d->step1, sizeof(d->step1), "1. Set Memory Hook -> VALVE+SHAVE (64M) and Save.");
+        snprintf(d->step2, sizeof(d->step2), "2. Or set Engine / Buffers -> ALT (LOW VRAM).");
+        snprintf(d->step3, sizeof(d->step3), "3. Re-launch with SQUARE.");
+    } else if ((strstr(bs, "count=2 ") || strstr(ts, "count=2 ")) && game_buf(g) != BUF_2BUF &&
+               (strstr(ts, "inert") || strstr(ts, "no mid") || strstr(bs, "pcopy=0"))) {
+        d->diag_kind = DIAG_2BUF_NEEDED;
+        d->rec_row = 1;
+        snprintf(d->diag_cause, sizeof(d->diag_cause), "2-BUFFER GAME WITHOUT PCOPY");
+        snprintf(d->diag_stage, sizeof(d->diag_stage), "ONLY 2 DISPLAY BUFFERS REGISTERED");
+        snprintf(d->diag_advice, sizeof(d->diag_advice), "PRESS R2: ENABLE 2-BUFFER + TOP REG");
+        snprintf(d->diag_detail, sizeof(d->diag_detail),
+                 "Log shows count=2 display buffers without extra mid-buffer slots. Standard 3-buffer ring cannot insert generated frames.");
+        snprintf(d->step1, sizeof(d->step1), "1. Press R2 to enable 2-BUFFER pcopy + TOP GROUP.");
+        snprintf(d->step2, sizeof(d->step2), "2. Keep Flip Pacing -> TIMER (PAIR) or POST-SUBMIT.");
+        snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch.");
+    } else if (strstr(ts, "mode4 #") || strstr(ts, "vout fg #") || strstr(bs, "gnm #100") || strstr(bs, "flip #100")) {
+        d->diag_kind = DIAG_OK;
+        d->rec_row = 0;
+        snprintf(d->diag_cause, sizeof(d->diag_cause), "LAST SESSION RAN NORMALLY");
+        snprintf(d->diag_stage, sizeof(d->diag_stage), "FG PIPELINE ACTIVE & VERIFIED");
+        snprintf(d->diag_advice, sizeof(d->diag_advice), "TUNE PACING / TILE IF VISUAL BUGS");
+        snprintf(d->diag_detail, sizeof(d->diag_detail),
+                 "Last session of %s reached steady-state 60Hz frame generation with no crashes. Only change parameters if you notice judder or tile garbling.",
+                 g->id);
+        snprintf(d->step1, sizeof(d->step1), "1. Micro-stutter? Try Flip Pacing -> TIMER or POST-SUBMIT.");
+        snprintf(d->step2, sizeof(d->step2), "2. Garbled blocks? Cycle Tile Mode (0x0D / 0x0E / LINEAR).");
+        snprintf(d->step3, sizeof(d->step3), "3. Uncapped 35-45 FPS? Set FPS Lock -> 30 FPS.");
+    } else if (bb || tb) {
+        d->diag_kind = DIAG_INERT;
+        d->rec_row = 4;
+        snprintf(d->diag_cause, sizeof(d->diag_cause), "NO FG FRAMES GENERATED YET");
+        snprintf(d->diag_stage, sizeof(d->diag_stage), "GAME EXITED EARLY OR INERT PATH");
+        snprintf(d->diag_advice, sizeof(d->diag_advice), "TRY FLIP PACING OR 2-BUFFER MODE");
+        snprintf(d->diag_detail, sizeof(d->diag_detail),
+                 "Boot log exists for %s, but no generated frames were recorded before exit. Game may use custom flip queue or exited on intro.",
+                 g->id);
+        snprintf(d->step1, sizeof(d->step1), "1. Press R2 to switch Flip Pacing -> POST-SUBMIT.");
+        snprintf(d->step2, sizeof(d->step2), "2. Or try Engine / Buffers -> CLASSIC / 2-BUF.");
+        snprintf(d->step3, sizeof(d->step3), "3. Play past the main menu and re-check logs.");
+    }
+
+    free(cb); free(bb); free(tb);
 }
 static void load_settings(App *a)
 {
@@ -286,7 +513,26 @@ static void load_settings(App *a)
     a->defaults = (Settings){ ini_int(t, "fg", 1), ini_int(t, "preset", 0), ini_int(t, "sharp", 40), ini_int(t, "enhance", 1), ini_int(t, "overlay", 0) };
     a->overlay_pos = ini_int(t, "overlay_pos", 4); a->overlay_opacity = ini_int(t, "overlay_opacity", 80);
     a->menu_combo = menu_combo_sanitize((uint32_t)ini_int(t, "menu_combo", (int)MENU_COMBO_DEFAULT));   // preset or recorded mask, else L3 + R3
+    a->dark_theme = ini_int(t, "dark_theme", 1);
+    a->net_telemetry = ini_int(t, "auto_send", 1);
+    ini_str(t, "telemetry_host", a->telemetry_host, sizeof(a->telemetry_host), "62.60.230.108");
+    if (!a->telemetry_host[0]) snprintf(a->telemetry_host, sizeof(a->telemetry_host), "62.60.230.108");
+    a->telemetry_port = ini_int(t, "telemetry_port", 8765);
+    if (a->telemetry_port <= 0) a->telemetry_port = 8765;
     free(l);
+    unsigned char *tl = read_all(CFGDIR "/telemetry.ini", &n);
+    if (!tl) tl = read_all("/data/vcfg_telemetry.ini", &n);
+    if (tl) {
+        const char *ts = (const char *)tl;
+        char thost[64] = "";
+        ini_str(ts, "host", thost, sizeof(thost), "");
+        if (!thost[0]) ini_str(ts, "telemetry_host", thost, sizeof(thost), "");
+        if (thost[0]) snprintf(a->telemetry_host, sizeof(a->telemetry_host), "%s", thost);
+        int tp = ini_int(ts, "port", ini_int(ts, "telemetry_port", 0));
+        if (tp > 0) a->telemetry_port = tp;
+        a->net_telemetry = ini_int(ts, "auto_send", a->net_telemetry);
+        free(tl);
+    }
     unsigned char *e = read_all(ENGFILE, &n);
     for (int i = 0; i < a->ngames; i++) {
         int v = e ? ini_int((const char *)e, a->games[i].id, SEL_AUTO) : SEL_AUTO;
@@ -302,7 +548,7 @@ static void load_settings(App *a)
     for (int i = 0; i < a->ngames; i++) {
         Game *g = &a->games[i]; g->s = a->defaults; if (g->testing || g->experimental) g->s.fg = 0;
         memset(&g->dev, 0, sizeof(g->dev));
-        refresh_dev_status(g);
+        if (g->eng_sel != SEL_AUTO || g->buf_sel != BUF_AUTO) g->dev.manual_mode = 1;
         snprintf(path, sizeof(path), CFGDIR "/adapt-%s.ini", g->id);
         unsigned char *ab = read_all(path, &n);
         if (ab) {
@@ -313,33 +559,52 @@ static void load_settings(App *a)
             free(ab);
         }
         if (uses_vcfg_ini(g)) {
-            unsigned char *b = read_all(CFGDIR "/vcfg.ini", &n); if (!b) continue;
-            const char *s = (const char *)b;
-            g->s = (Settings){ ini_int(s, "enabled", 1), ini_int(s, "preset", 0), ini_int(s, "sharp", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
-            free(b);
+            unsigned char *b = read_all(CFGDIR "/vcfg.ini", &n);
+            if (b) {
+                const char *s = (const char *)b;
+                g->s = (Settings){ ini_int(s, "enabled", 1), ini_int(s, "preset", 0), ini_int(s, "sharp", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
+                free(b);
+            }
         } else {
             snprintf(path, sizeof(path), CFGDIR "/config-%s.ini", g->id);
-            unsigned char *b = read_all(path, &n); if (!b) continue;
-            const char *s = (const char *)b;
-            g->s = (Settings){ ini_int(s, "framegen", g->experimental ? 0 : 1), ini_int(s, "preset", 0), ini_int(s, "sharpness", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
-            int sm = ini_int(s, "shave_mode", 0); if (sm > 0) g->dev.shave_mode = sm;
-            int rm = ini_int(s, "reg_mode", 0);   if (rm > 0) g->dev.reg_mode   = rm;
-            int po = ini_int(s, "pace_order", 0); if (po > 0) g->dev.pace_order = po;
-            int pm = ini_int(s, "post_mid", 0);   if (pm > 0) g->dev.post_mid   = pm;
-            g->dev.fps_lock   = lock_to_dev(ini_int(s, "fps_lock", 30));
-            g->dev.tile_mode  = tile_to_dev(ini_int(s, "tile_idx", -1));
-            free(b);
+            unsigned char *b = read_all(path, &n);
+            if (b) {
+                const char *s = (const char *)b;
+                g->s = (Settings){ ini_int(s, "framegen", g->experimental ? 0 : 1), ini_int(s, "preset", 0), ini_int(s, "sharpness", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
+                int mm = ini_int(s, "manual_mode", -1);
+                int sm = ini_int(s, "shave_mode", 0); if (sm > g->dev.shave_mode) g->dev.shave_mode = sm;
+                int rm = ini_int(s, "reg_mode", 0);   if (rm > g->dev.reg_mode)   g->dev.reg_mode   = rm;
+                int po = ini_int(s, "pace_order", 0); if (po > 0) g->dev.pace_order = po;
+                int pm = ini_int(s, "post_mid", 0);   if (pm > 0) g->dev.post_mid   = pm;
+                g->dev.fps_lock   = lock_to_dev(ini_int(s, "fps_lock", 30));
+                g->dev.tile_mode  = tile_to_dev(ini_int(s, "tile_idx", -1));
+                if (mm >= 0) g->dev.manual_mode = mm;
+                else if (sm > 0 || rm > 0 || po > 0 || pm > 0 || g->dev.fps_lock > 0 || g->dev.tile_mode > 0)
+                    g->dev.manual_mode = 1;
+                free(b);
+            }
         }
+        refresh_dev_status(g);
     }
 }
 static void save_settings(App *a)
 {
-    char buf[640], path[96];
+    char buf[768], path[96];
     sceKernelMkdir(CFGDIR, 0777);
     const unsigned combo = menu_combo_sanitize(a->menu_combo);   // validated mask, written to every file the plugins read
-    snprintf(buf, sizeof(buf), "fg=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\noverlay_pos=%d\noverlay_opacity=%d\nmenu_combo=%u\n",
-             a->defaults.fg, a->defaults.preset, a->defaults.sharp, a->defaults.enhance, a->defaults.overlay, a->overlay_pos, a->overlay_opacity, combo);
+    snprintf(buf, sizeof(buf),
+             "fg=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\noverlay_pos=%d\noverlay_opacity=%d\nmenu_combo=%u\n"
+             "dark_theme=%d\nauto_send=%d\ntelemetry_host=%s\ntelemetry_port=%d\n",
+             a->defaults.fg, a->defaults.preset, a->defaults.sharp, a->defaults.enhance, a->defaults.overlay,
+             a->overlay_pos, a->overlay_opacity, combo, a->dark_theme,
+             a->net_telemetry, a->telemetry_host, a->telemetry_port > 0 ? a->telemetry_port : 8765);
     write_all(CFGDIR "/vcfg_launcher.ini", buf, strlen(buf));
+    for (int i = 0; i < a->ngames; i++) {
+        if (!a->games[i].dev.manual_mode) {
+            a->games[i].eng_sel = SEL_AUTO;
+            a->games[i].buf_sel = BUF_AUTO;
+        }
+    }
     {
         static char eb[MAPMAX * 16]; size_t en = 0;
         for (int i = 0; i < a->ngames; i++)
@@ -363,15 +628,19 @@ static void save_settings(App *a)
             write_all(CFGDIR "/vcfg.ini", buf, strlen(buf));
         } else {
             int bmode = game_buf(g);
-            int pcopy = (g->buf_sel == BUF_2BUF) ? 1 : (g->buf_sel == BUF_STD) ? 2 : 0;
-            int lk = k_dev_locks[d->fps_lock >= 0 && d->fps_lock < 4 ? d->fps_lock : 0];
-            int ti = k_dev_tiles[d->tile_mode >= 0 && d->tile_mode < 7 ? d->tile_mode : 0];
+            int pcopy = d->manual_mode ? ((g->buf_sel == BUF_2BUF) ? 1 : (g->buf_sel == BUF_STD) ? 2 : 0) : 0;
+            int sm = d->manual_mode ? d->shave_mode : 0;
+            int rm = d->manual_mode ? d->reg_mode   : 0;
+            int po = d->manual_mode ? d->pace_order : 0;
+            int pm = d->manual_mode ? d->post_mid   : 0;
+            int lk = d->manual_mode ? k_dev_locks[d->fps_lock >= 0 && d->fps_lock < 4 ? d->fps_lock : 0] : 30;
+            int ti = d->manual_mode ? k_dev_tiles[d->tile_mode >= 0 && d->tile_mode < 7 ? d->tile_mode : 0] : -1;
             snprintf(path, sizeof(path), CFGDIR "/config-%s.ini", g->id);
             snprintf(buf, sizeof(buf),
                      "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\nmenu_combo=%u\n"
-                     "two_buffer=%d\npresent_copy=%d\nshave_mode=%d\nreg_mode=%d\npace_order=%d\npost_mid=%d\nfps_lock=%d\ntile_idx=%d\n",
+                     "manual_mode=%d\ntwo_buffer=%d\npresent_copy=%d\nshave_mode=%d\nreg_mode=%d\npace_order=%d\npost_mid=%d\nfps_lock=%d\ntile_idx=%d\n",
                      s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo,
-                     bmode == BUF_2BUF, pcopy, d->shave_mode, d->reg_mode, d->pace_order, d->post_mid, lk, ti);
+                     d->manual_mode, bmode == BUF_2BUF, pcopy, sm, rm, po, pm, lk, ti);
             write_all(path, buf, strlen(buf));
             snprintf(path, sizeof(path), CFGDIR "/tile_%s", g->id);
             if (ti >= 0) { char tb[16]; snprintf(tb, sizeof(tb), "%d\n", ti); write_all(path, tb, strlen(tb)); }
@@ -386,11 +655,14 @@ static void save_settings(App *a)
     vlog("settings saved\n");
 }
 static void addlog(App *a, const char *msg);
+static void remap_if_changed(App *a);
 static void do_reset_dev(App *a)
 {
     if (!a->ngames) return;
     Game *g = &a->games[a->sel];
     char path[96];
+    g->eng_sel = SEL_AUTO;
+    g->buf_sel = BUF_AUTO;
     memset(&g->dev, 0, sizeof(g->dev));
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id); remove(path);
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.boot", g->id);  remove(path);
@@ -398,8 +670,53 @@ static void do_reset_dev(App *a)
     snprintf(path, sizeof(path), CFGDIR "/crash-%s.txt", g->id);  remove(path);
     snprintf(path, sizeof(path), CFGDIR "/tile_%s", g->id);       remove(path);
     save_settings(a);
+    remap_if_changed(a);
     refresh_dev_status(g);
-    snprintf(a->status, sizeof(a->status), "RESET DEV & ADAPT STATE FOR %s", g->id);
+    snprintf(a->status, sizeof(a->status), "AUTO (ALGORITHM) RESTORED FOR %s", g->id);
+    addlog(a, a->status);
+}
+static void do_apply_advice(App *a)
+{
+    if (!a->ngames) return;
+    Game *g = &a->games[a->sel];
+    DevCfg *d = &g->dev;
+    char path[96];
+    d->manual_mode = 1;
+    int target_row = d->rec_row > 0 ? d->rec_row : (a->row >= 1 && a->row <= 7 ? a->row : 2);
+    if (d->diag_kind == DIAG_OOM_BOOT) {
+        if (d->shave_mode < 2) { d->shave_mode = 2; target_row = 2; }
+        if (game_engine(g) != ENGINE_CLASSIC_ALT && g->engine != ENGINE_NEW) g->eng_sel = SEL_ALT;
+    } else if (d->diag_kind == DIAG_BOOT_EARLY) {
+        if (d->shave_mode < 2) { d->shave_mode = 2; target_row = 2; }
+        else { d->reg_mode = 2; target_row = 3; }
+    } else if (d->diag_kind == DIAG_2BUF_NEEDED) {
+        g->buf_sel = BUF_2BUF;
+        if (d->reg_mode == 0) d->reg_mode = 1;
+        target_row = 1;
+    } else if (d->diag_kind == DIAG_FLIP_STALL || d->diag_kind == DIAG_INERT) {
+        d->pace_order = (d->pace_order == 2) ? 3 : 2;
+        target_row = 4;
+    } else if (d->diag_kind == DIAG_REG_CONFLICT) {
+        if (d->shave_mode == 0) { d->shave_mode = 1; target_row = 2; }
+        else { d->reg_mode = (d->reg_mode == 1) ? 2 : 1; target_row = 3; }
+    } else {
+        if (target_row == 1) { int p = (game_pipe_preset(g) + 1) % 6; game_set_pipe_preset(g, p); }
+        else if (target_row == 2) d->shave_mode = (d->shave_mode + 1) % 3;
+        else if (target_row == 3) d->reg_mode = (d->reg_mode + 1) % 3;
+        else if (target_row == 4) d->pace_order = (d->pace_order + 1) % 4;
+        else if (target_row == 5) d->post_mid = (d->post_mid + 1) % 3;
+        else if (target_row == 6) d->fps_lock = (d->fps_lock + 1) % 4;
+        else if (target_row == 7) d->tile_mode = (d->tile_mode + 1) % 7;
+    }
+    g->s.fg = 1;
+    a->row = target_row;
+    snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id); remove(path);
+    snprintf(path, sizeof(path), CFGDIR "/safe-%s.boot", g->id);  remove(path);
+    snprintf(path, sizeof(path), CFGDIR "/crash-%s.txt", g->id);  remove(path);
+    save_settings(a);
+    remap_if_changed(a);
+    refresh_dev_status(g);
+    snprintf(a->status, sizeof(a->status), "CUSTOM FIX APPLIED & SAVED FOR %s!", g->id);
     addlog(a, a->status);
 }
 
@@ -699,6 +1016,162 @@ static int last_line(const char *t, size_t n, char *out, size_t on)
     size_t l = n - b; if (l >= on) l = on - 1;
     memcpy(out, t + b, l); out[l] = 0; return 1;
 }
+static uint32_t fnv1a_buf(const void *data, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) h = (h ^ p[i]) * 16777619u;
+    return h ? h : 1u;
+}
+
+static int net_send_report(const char *host, int port, const char *title_id, const char *kind,
+                           const char *body, size_t len, char *id_out, size_t id_cap)
+{
+    if (id_out && id_cap) id_out[0] = 0;
+    if (!host || !host[0] || !body || !len) return -1;
+    if (port <= 0 || port > 65535) port = 8765;
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) return -2;
+
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return -3;
+
+    // Non-blocking connect with 2.5s timeout so offline VPS never freezes the UI
+    int fl = fcntl(s, F_GETFL, 0);
+    if (fl >= 0) fcntl(s, F_SETFL, fl | O_NONBLOCK);
+    int rc = connect(s, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc < 0 && errno != EINPROGRESS) { close(s); return -4; }
+    if (rc < 0) {
+        fd_set wfds; FD_ZERO(&wfds); FD_SET(s, &wfds);
+        struct timeval tv = { 2, 500000 };
+        if (select(s + 1, NULL, &wfds, NULL, &tv) <= 0) { close(s); return -5; }
+        int so_err = 0; socklen_t slen = sizeof(so_err);
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, &so_err, &slen) < 0 || so_err != 0) { close(s); return -6; }
+    }
+    if (fl >= 0) fcntl(s, F_SETFL, fl & ~O_NONBLOCK);
+    struct timeval tv_io = { 3, 0 };
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv_io, sizeof(tv_io));
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv_io, sizeof(tv_io));
+
+    size_t send_len = len > (500u << 10) ? (500u << 10) : len;
+    char hdr[512];
+    int hlen = snprintf(hdr, sizeof(hdr),
+                        "POST /api/v1/report HTTP/1.1\r\n"
+                        "Host: %s:%d\r\n"
+                        "User-Agent: VCFG-PS4/%s\r\n"
+                        "Content-Type: text/plain; charset=utf-8\r\n"
+                        "X-VCFG-Title: %s\r\n"
+                        "X-VCFG-Kind: %s\r\n"
+                        "X-VCFG-Version: %s\r\n"
+                        "Content-Length: %zu\r\n"
+                        "Connection: close\r\n\r\n",
+                        host, port, VCFG_VERSION,
+                        (title_id && title_id[0]) ? title_id : "GLOBAL",
+                        (kind && kind[0]) ? kind : "manual",
+                        VCFG_VERSION, send_len);
+    if (send(s, hdr, (size_t)hlen, 0) != hlen) { close(s); return -7; }
+    size_t off = 0;
+    while (off < send_len) {
+        size_t chunk = send_len - off > 16384 ? 16384 : send_len - off;
+        ssize_t nw = send(s, body + off, chunk, 0);
+        if (nw <= 0) { close(s); return -8; }
+        off += (size_t)nw;
+    }
+
+    char resp[512];
+    ssize_t nr = recv(s, resp, sizeof(resp) - 1, 0);
+    close(s);
+    if (nr <= 0) return -9;
+    resp[nr] = 0;
+    if (!strstr(resp, "200")) return -10;
+    const char *hash = strchr(resp, '#');
+    if (hash && id_out && id_cap >= 8) {
+        size_t k = 0;
+        hash++;
+        while (hash[k] && ((hash[k] >= '0' && hash[k] <= '9') || (hash[k] >= 'A' && hash[k] <= 'F') || (hash[k] >= 'a' && hash[k] <= 'f')) && k + 1 < id_cap && k < 8) {
+            id_out[k] = hash[k];
+            k++;
+        }
+        id_out[k] = 0;
+    }
+    return 0;
+}
+
+static void check_auto_send_crashes(App *a)
+{
+    if (!a->net_telemetry || !a->telemetry_host[0]) return;
+    size_t sn = 0;
+    unsigned char *sent_raw = read_all(CFGDIR "/sent_crashes.ini", &sn);
+    char sent_buf[2048];
+    if (sent_raw && sn < sizeof(sent_buf)) { memcpy(sent_buf, sent_raw, sn); sent_buf[sn] = 0; }
+    else sent_buf[0] = 0;
+    free(sent_raw);
+
+    int sent_any = 0;
+    char last_id[16] = "", last_tid[16] = "";
+    for (int i = 0; i < a->ngames; i++) {
+        Game *g = &a->games[i];
+        char cp[96]; snprintf(cp, sizeof(cp), CFGDIR "/crash-%s.txt", g->id);
+        size_t cn = 0;
+        unsigned char *cb = read_all(cp, &cn);
+        if (!cb || !cn) { free(cb); continue; }
+        int h_val = (int)(fnv1a_buf(cb, cn) & 0x7FFFFFFFu);
+        free(cb);
+        if (ini_int(sent_buf, g->id, 0) == h_val) continue;
+
+        Buf b = { malloc(256u << 10), 0, 256u << 10 };
+        if (!b.b) break;
+        bprintf(&b, "VCFG AUTO CRASH REPORT\nTitle: %s\nVersion: %s\n", g->id, VCFG_VERSION);
+        bfile(&b, "crash dump", cp, 32u << 10);
+        char p[96];
+        snprintf(p, sizeof(p), CFGDIR "/boot-%s.txt", g->id);
+        if (file_exists(p)) bfile(&b, "boot stages", p, 32u << 10);
+        snprintf(p, sizeof(p), CFGDIR "/trace-%s.txt", g->id);
+        if (file_exists(p)) bfile(&b, "flight recorder", p, 64u << 10);
+        snprintf(p, sizeof(p), CFGDIR "/adapt-%s.ini", g->id);
+        if (file_exists(p)) bfile(&b, "adapt recipe", p, 8u << 10);
+        snprintf(p, sizeof(p), CFGDIR "/config-%s.ini", g->id);
+        if (file_exists(p)) bfile(&b, "game config", p, 8u << 10);
+
+        char rep_id[16] = "";
+        int rc = net_send_report(a->telemetry_host, a->telemetry_port, g->id, "crash", b.b, b.n, rep_id, sizeof(rep_id));
+        free(b.b);
+        vlog("auto-send crash %s -> rc=%d id=%s\n", g->id, rc, rep_id);
+        if (rc == 0) {
+            size_t cur = strlen(sent_buf);
+            if (cur + 32 < sizeof(sent_buf))
+                snprintf(sent_buf + cur, sizeof(sent_buf) - cur, "%s=%d\n", g->id, h_val);
+            snprintf(last_id, sizeof(last_id), "%s", rep_id);
+            snprintf(last_tid, sizeof(last_tid), "%s", g->id);
+            sent_any++;
+        } else {
+            break; // VPS unreachable right now, stop trying remaining files
+        }
+    }
+    if (sent_any > 0) {
+        write_all(CFGDIR "/sent_crashes.ini", sent_buf, strlen(sent_buf));
+        char msg[96];
+        snprintf(msg, sizeof(msg), "AUTO-SENT CRASH %s TO VPS (#%s)", last_tid, last_id[0] ? last_id : "OK");
+        addlog(a, msg);
+        snprintf(a->status, sizeof(a->status), "%s", msg);
+    }
+}
+
+static void do_telemetry_toggle(App *a)
+{
+    a->net_telemetry = !a->net_telemetry;
+    save_settings(a);
+    snprintf(a->status, sizeof(a->status), "NET CRASH AUTO-SEND: %s (%s)",
+             a->net_telemetry ? "ON" : "OFF",
+             a->telemetry_host[0] ? a->telemetry_host : "set host in /data/bb_probe/telemetry.ini");
+    addlog(a, a->status);
+    if (a->net_telemetry && a->telemetry_host[0]) check_auto_send_crashes(a);
+}
+
 static void do_report(App *a)
 {
     Buf r = { malloc(4u << 20), 0, 4u << 20 };
@@ -794,8 +1267,24 @@ static void do_report(App *a)
         if (!write_all(p, r.b, r.n)) { snprintf(m, sizeof(m), "ALSO ON THE USB STICK: %s", p); addlog(a, m); usb = 1; }
     }
     if (jrc == 0) sys_sdk_unjailbreak(&jb);
-    if (!usb) addlog(a, "NO USB STICK: TAKE THE FILE OVER FTP");
-    snprintf(a->status, sizeof(a->status), "ATTACH VCFG_REPORT.TXT TO THE ISSUE ON GITHUB.");
+    if (!usb) addlog(a, "NO USB STICK: SAVED TO /DATA/VCFG_REPORT.TXT");
+
+    if (a->telemetry_host[0]) {
+        const char *tid = (a->ngames && a->sel >= 0 && a->sel < a->ngames) ? a->games[a->sel].id : "GLOBAL";
+        char rep_id[16] = "";
+        int nrc = net_send_report(a->telemetry_host, a->telemetry_port, tid, "manual", r.b, r.n, rep_id, sizeof(rep_id));
+        if (nrc == 0) {
+            snprintf(m, sizeof(m), "REPORT SENT TO VPS! ID: #%s", rep_id[0] ? rep_id : "OK");
+            addlog(a, m);
+            snprintf(a->status, sizeof(a->status), "%s", m);
+        } else {
+            snprintf(m, sizeof(m), "VPS UPLOAD FAILED (ERR %d) - SAVED LOCALLY", nrc);
+            addlog(a, m);
+            snprintf(a->status, sizeof(a->status), "%s", m);
+        }
+    } else {
+        snprintf(a->status, sizeof(a->status), "SAVED /DATA/VCFG_REPORT.TXT (SET host IN telemetry.ini FOR VPS UPLOAD)");
+    }
     free(r.b);
 }
 
@@ -830,11 +1319,108 @@ static uint8_t *font_file(const char *name)
     char p[128]; size_t n; snprintf(p, sizeof(p), "/app0/assets/fonts/%s", name);
     uint8_t *b = read_all(p, &n); if (!b) vlog("font missing %s\n", p); return b;
 }
+static int g_uid = 0;
 static void quit(void)
 {
     if (g_log) { fclose(g_log); g_log = NULL; }
     if (sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_SYSTEM_SERVICE) == 0) sceSystemServiceLoadExec("exit", NULL);
     for (;;) sceKernelUsleep(1000000);
+}
+static void do_launch_game(App *a, Canvas *c, uint32_t *back)
+{
+    if (!a->ngames) return;
+    Game *g = &a->games[a->sel];
+    if (!g->installed) {
+        snprintf(a->status, sizeof(a->status), "%s IS NOT INSTALLED.", g->id);
+        return;
+    }
+    save_settings(a);
+    remap_if_changed(a);
+    snprintf(a->status, sizeof(a->status), "SAVED. LAUNCHING %s...", g->id);
+    app_draw(c, a);
+    present(back);
+
+    // Must be jailbroken BEFORE calling SceLncService IPC, otherwise SceLncService rejects with 0x8094000F!
+    struct jailbreak_backup jb;
+    memset(&jb, 0, sizeof(jb));
+    int jrc = sys_sdk_jailbreak(&jb);
+
+    int h_sys = sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_SYSTEM_SERVICE);
+    int m = sceKernelLoadStartModule("/system/common/lib/libSceSystemService.sprx", 0, NULL, 0, NULL, NULL);
+    int (*p_init)(void) = NULL;
+    int (*p_launch)(const char *, const char **, void *) = NULL;
+    int (*p_sys)(const char *, const char **, void *) = NULL;
+
+    if (m >= 0) {
+        sceKernelDlsym(m, "sceLncUtilInitialize", (void **)&p_init);
+        sceKernelDlsym(m, "sceLncUtilLaunchApp", (void **)&p_launch);
+        sceKernelDlsym(m, "sceSystemServiceLaunchApp", (void **)&p_sys);
+    }
+    // In libSceSystemService.sprx, sceSystemServiceLaunchApp (vaddr 0x4600) calls sceLncUtilLaunchApp (vaddr 0x58b0)
+    // via a near E8 call at +0x41, and sceLncUtilInitialize (vaddr 0x5890) sits 0x20 bytes before sceLncUtilLaunchApp.
+    if (p_sys && (!p_launch || !p_init)) {
+        const uint8_t *code = (const uint8_t *)(uintptr_t)p_sys;
+        for (int off = 0x28; off <= 0x58; off++) {
+            if (code[off] == 0xE8) {
+                int32_t rel = 0;
+                memcpy(&rel, code + off + 1, 4);
+                if (rel > 0x800 && rel < 0x3000) {
+                    const uint8_t *cand = code + off + 5 + rel;
+                    if (cand[0] == 0x48 && cand[1] == 0x89 && cand[2] == 0xD1) {
+                        if (!p_launch) p_launch = (int (*)(const char *, const char **, void *))(uintptr_t)cand;
+                        const uint8_t *init_cand = cand - 0x20;
+                        if (!p_init && init_cand[0] == 0x48 && init_cand[1] == 0x8D && init_cand[2] == 0x3D)
+                            p_init = (int (*)(void))(uintptr_t)init_cand;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    int init_rc = p_init ? p_init() : -1;
+
+    // Hardware SceLncService IPC expects a 24-byte (0x18) packed parameter struct:
+    typedef struct __attribute__((packed)) {
+        uint32_t size;
+        int32_t  user_id;
+        uint32_t app_opt;
+        uint64_t crash_report;
+        uint32_t check_flag;
+    } LncParam24;
+
+    LncParam24 p24;
+    memset(&p24, 0, sizeof(p24));
+    p24.size = sizeof(p24); // 24 (0x18)
+    p24.user_id = g_uid;
+
+    LncAppParam p32;
+    memset(&p32, 0, sizeof(p32));
+    p32.size = sizeof(p32); // 32 (0x20)
+    p32.user_id = g_uid;
+
+    int rc = -1;
+    if (p_launch) {
+        rc = p_launch(g->id, NULL, &p24);
+        if (rc < 0) rc = p_launch(g->id, NULL, &p32);
+    }
+    if (rc < 0) {
+        typedef int (*LaunchAppFn)(const char *, const char **, void *);
+        LaunchAppFn fn_sys = p_sys ? p_sys : (LaunchAppFn)(uintptr_t)&sceSystemServiceLaunchApp;
+        rc = fn_sys(g->id, NULL, NULL);
+        if (rc < 0) rc = fn_sys(g->id, NULL, &p24);
+    }
+
+    vlog("launch %s: jb=%d h_sys=%d m=%d p_init=%p(rc=0x%x) p_launch=%p rc=0x%08x\n",
+         g->id, jrc, h_sys, m, (void *)(uintptr_t)p_init, (unsigned)init_rc, (void *)(uintptr_t)p_launch, (unsigned)rc);
+    if (rc >= 0) {
+        if (g_log) fflush(g_log);
+        sceKernelUsleep(1500000);
+        return;
+    }
+    if (jrc == 0) sys_sdk_unjailbreak(&jb);
+    snprintf(a->status, sizeof(a->status), "CANNOT LAUNCH %s (0x%08X)", g->id, (unsigned)rc);
+    addlog(a, a->status);
 }
 
 int main(void)
@@ -902,9 +1488,10 @@ int main(void)
     a->plugin_state = plugin_state();
     if (is_off()) addlog(a, "VCFG IS TURNED OFF. CROSS TURNS IT ON.");
     else if (a->plugin_state != 1) { addlog(a, a->plugin_state ? "UPDATING PLUGINS" : "INSTALLING PLUGINS"); do_install(a); }
+    check_auto_send_crashes(a);
 
     if (video_init()) { vlog("video init failed\n"); quit(); }
-    int uid = 0; sceUserServiceInitialize(NULL); sceUserServiceGetInitialUser(&uid);
+    int uid = 0; sceUserServiceInitialize(NULL); sceUserServiceGetInitialUser(&uid); g_uid = uid;
     scePadInit(); int pad = scePadOpen(uid, 0, 0, NULL);
     vlog("pad=%d uid=%d\n", pad, uid);
 
@@ -926,9 +1513,12 @@ int main(void)
             else if (act == ACT_REMOVE) { do_ini(a, 0); set_off(1); a->plugin_state = plugin_state(); }
             else if (act == ACT_CLEAN) do_clean(a);
             else if (act == ACT_DEBUG) do_debug_toggle(a);
+            else if (act == ACT_TELEMETRY_TOGGLE) do_telemetry_toggle(a);
             else if (act == ACT_REPORT) do_report(a);
             else if (act == ACT_RESET_DEV) do_reset_dev(a);
+            else if (act == ACT_APPLY_ADVICE) do_apply_advice(a);
             else if (act == ACT_SAVE) { save_settings(a); remap_if_changed(a); }
+            else if (act == ACT_LAUNCH) do_launch_game(a, &c, back);
             else if (act == ACT_SAVE_EXIT) {
                 save_settings(a); remap_if_changed(a);
                 snprintf(a->status, sizeof(a->status), "SAVED. START A GAME, HOLD THE MENU HOTKEY FOR 3 S.");

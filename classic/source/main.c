@@ -277,7 +277,7 @@ _Static_assert(DCB8_OFF + 4 * DCB8_SZ <= GPU_SZ, "mode 8 DCB areas do not fit GP
 static volatile uint32_t *g_mon = NULL;
 static uint32_t g_sh8_off[17];         // code offsets in g_gpu: 0..9 pyr8..mf8, 10..13 gv8..gvz8, 14 rcas8, 15 osd8, 16 pcopy8
 #define STATS_OFF 0x960u
-#define CUT_BLOCKS 3264u
+#define CUT_BLOCKS 5600u
 static uint32_t g_st_n = 0, g_st_cut_max = 0, g_st_cuts = 0, g_st_fgf = 0, g_st_fades = 0;
 static uint64_t g_st_cut_sum = 0, g_st_fg_sum = 0;
 static int32_t g_st_gmx = 0, g_st_gmy = 0;
@@ -360,9 +360,38 @@ static long g_pre_gpu_phys = 0, g_pre_work_phys = 0, g_pre_mem_phys = 0, g_dump_
 #include "bench_state.h"
 #include "boot_stage.h"
 
+#define FLEX_GPU_MAX 8
+typedef struct {
+    void *aligned_va;
+    void *raw_va;
+    size_t raw_sz;
+} FlexGpuSlot;
+static FlexGpuSlot g_flex_gpu_slots[FLEX_GPU_MAX];
+
 static void free_dm_block(void **va, long *phys, size_t *sz, const char *tag)
 {
     if (!*va || !*sz) return;
+    if (*phys < 0) {
+        void *unmap_va = *va;
+        size_t unmap_sz = (*sz + 0x3FFFu) & ~(size_t)0x3FFFu;
+        for (int i = 0; i < FLEX_GPU_MAX; i++) {
+            if (g_flex_gpu_slots[i].aligned_va == *va) {
+                unmap_va = g_flex_gpu_slots[i].raw_va;
+                unmap_sz = g_flex_gpu_slots[i].raw_sz;
+                g_flex_gpu_slots[i].aligned_va = NULL;
+                g_flex_gpu_slots[i].raw_va = NULL;
+                g_flex_gpu_slots[i].raw_sz = 0;
+                break;
+            }
+        }
+        int um = sceKernelMunmap(unmap_va, unmap_sz);
+        STAGE("memory valve: released flex %s va=%p (raw=%p len=0x%zx) unmap=0x%08x",
+              tag, *va, unmap_va, unmap_sz, (unsigned)um);
+        *va = NULL;
+        *phys = 0;
+        *sz = 0;
+        return;
+    }
     int um = sceKernelMunmap(*va, *sz);
     int rr = um == 0 ? sceKernelReleaseDirectMemory(*phys, *sz) : -1;
     STAGE("memory valve: released %s va=%p phys=0x%lx len=0x%zx unmap=0x%08x release=0x%08x",
@@ -402,6 +431,59 @@ static size_t dm_avail(size_t align)
     return dm_avail_range(0, (long)sceKernelGetDirectMemorySize(), align, NULL);
 }
 
+// Allocate GPU-accessible memory from FlexibleMemory (prot 0x33 = PROT_CPU_RW | PROT_GPU_RW) so g_gpu, g_work, and
+// overlay bitmaps consume 0 bytes of DirectMemory when DirectMemory is exhausted or tight.
+// Verifies 256-byte shader alignment (SH_PGM_LO/HI_CS), 32-byte descriptor table alignment, 8-byte EOP label alignment,
+// and 48-bit GPU virtual address range for V# descriptors.
+static void *alloc_flex_gpu(size_t sz, size_t align)
+{
+    if (!sz) return NULL;
+    if (align < 0x4000u) align = 0x4000u;
+    if (align & (align - 1u)) {
+        size_t p2 = 0x4000u;
+        while (p2 < align) p2 <<= 1;
+        align = p2;
+    }
+    size_t sz_al = (sz + 0x3FFFu) & ~(size_t)0x3FFFu;
+    void *raw = NULL;
+    size_t map_sz = sz_al;
+    g_own_alloc++;
+    int32_t r = sceKernelMapFlexibleMemory(&raw, map_sz, 0x33 /*PROT_CPU_RW | PROT_GPU_RW*/, 0);
+    if (r == 0 && raw && (((uintptr_t)raw & (align - 1u)) != 0)) {
+        sceKernelMunmap(raw, map_sz);
+        raw = NULL;
+        map_sz = sz_al + align - 0x4000u;
+        r = sceKernelMapFlexibleMemory(&raw, map_sz, 0x33 /*PROT_CPU_RW | PROT_GPU_RW*/, 0);
+    }
+    g_own_alloc--;
+    if (r != 0 || !raw) {
+        STAGE("alloc_flex_gpu FAILED: sz=0x%zx align=0x%zx r=0x%08x", sz, align, (unsigned)r);
+        return NULL;
+    }
+    uintptr_t raw_u = (uintptr_t)raw;
+    uintptr_t aligned_u = (raw_u + align - 1u) & ~(uintptr_t)(align - 1u);
+    // Verify 256-byte shader code alignment, 8-byte EOP alignment, and 48-bit V# GPU VA range:
+    if ((aligned_u & 0xFFu) != 0 || (aligned_u >> 48) != 0 || ((aligned_u + sz_al - 1u) >> 48) != 0) {
+        sceKernelMunmap(raw, map_sz);
+        STAGE("alloc_flex_gpu FAILED alignment/VA check: raw=%p aligned=0x%lx sz=0x%zx", raw, (unsigned long)aligned_u, sz);
+        return NULL;
+    }
+    void *aligned = (void *)aligned_u;
+    for (int i = 0; i < FLEX_GPU_MAX; i++) {
+        if (!g_flex_gpu_slots[i].aligned_va) {
+            g_flex_gpu_slots[i].aligned_va = aligned;
+            g_flex_gpu_slots[i].raw_va = raw;
+            g_flex_gpu_slots[i].raw_sz = map_sz;
+            break;
+        }
+    }
+    record_flex_vmap(aligned, sz_al, -1L, 0x33, 0);
+    memset(aligned, 0, sz);
+    STAGE("alloc_flex_gpu ok: sz=0x%zx align=0x%zx va=%p (raw=%p map_sz=0x%zx, 0 DirectMemory bytes)",
+          sz, align, aligned, raw, map_sz);
+    return aligned;
+}
+
 static void *alloc_dm_range(long s, long e, size_t len, size_t align, int type, long *phys_out)
 {
     long phys = 0; void *addr = NULL;
@@ -412,6 +494,14 @@ static void *alloc_dm_range(long s, long e, size_t len, size_t align, int type, 
     g_own_alloc--;
     if (r != 0 || !addr) {
         if (stage == 2) sceKernelReleaseDirectMemory(phys, len);
+        size_t dm_sz = sceKernelGetDirectMemorySize();
+        if (s == 0 && (size_t)e >= dm_sz) {
+            void *flex = alloc_flex_gpu(len, align);
+            if (flex) {
+                if (phys_out) *phys_out = -1L;
+                return flex;
+            }
+        }
         size_t av = dm_avail(align);
         klog("[bb_probe] alloc_dm(0x%zx) failed 0x%08x\n", len, (unsigned)r);
         STAGE("alloc_dm FAILED at %s: len=0x%zx align=0x%zx type=%d range=0x%lx..0x%lx r=0x%08x largest free=0x%zx",
@@ -428,6 +518,15 @@ void *alloc_dm(size_t len, size_t align, int type);
 void *alloc_dm(size_t len, size_t align, int type)
 {
     return alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), len, align, type, NULL);
+}
+
+static void *alloc_gv_dm(size_t len, size_t align, int type)
+{
+    if (dm_avail(0x200000) < (64ull << 20)) {
+        void *flex = alloc_flex_gpu(len, align);
+        if (flex) return flex;
+    }
+    return alloc_dm(len, align, type);
 }
 
 static void *alloc_work_early(size_t wsz, int type)
@@ -449,9 +548,11 @@ static void *alloc_work_early(size_t wsz, int type)
         void *w = alloc_dm_range(g_pre_mem_phys - 0x200000L, g_pre_mem_phys, wsz, 0x10000, type, &g_pre_work_phys);
         if (w) { g_pre_work_sz = wsz; return w; }
     }
-    // 3. Fallback: anywhere in the pool.
+    // 3. Fallback: anywhere in the pool (or FlexibleMemory via alloc_flex_gpu if DirectMemory is exhausted).
     void *w = alloc_dm_range(0, (long)dm_sz, wsz, 0x10000, type, &g_pre_work_phys);
-    if (w) g_pre_work_sz = wsz;
+    if (w) { g_pre_work_sz = wsz; return w; }
+    w = alloc_flex_gpu(wsz, 0x10000);
+    if (w) { g_pre_work_phys = -1L; g_pre_work_sz = wsz; }
     return w;
 }
 
@@ -917,7 +1018,7 @@ static uint32_t cut_blocks8(void)
             if (n > 0 && sscanf(b, "%u", &v) == 1 && v >= 1000u && v <= 8160u) g_cut_blocks8 = v / 8u;
         }
         if (!g_cut_blocks8 && vcfg_in_family(g_title_id, "CUSA17419")) g_cut_blocks8 = 4800u / 8u;
-        lg("scene-change threshold: %u blocks (%s)\n", g_cut_blocks8 ? g_cut_blocks8 * 8u : 3264u, g_cut_blocks8 ? p : "default");
+        lg("scene-change threshold: %u blocks (%s)\n", g_cut_blocks8 ? g_cut_blocks8 * 8u : CUT_BLOCKS, g_cut_blocks8 ? p : "default");
     }
     return g_cut_blocks8;
 }
@@ -936,13 +1037,8 @@ static int post_mid_only(void)
     if (g_cfg.post_mid == 1) return 1;
     if (g_cfg.post_mid == 2) return 0;
     if (g_mid_only < 0) {
-        char p[96]; snprintf(p, sizeof(p), LOG_DIR "/post_mid_only_%s", g_title_id);
-        int fd = sceKernelOpen(p, 0 /*O_RDONLY*/, 0);
-        g_mid_only = fd >= 0 ? 1 : 0;
-        if (fd >= 0) sceKernelClose(fd);
-        if (!g_mid_only && vcfg_in_family(g_title_id, "CUSA04529"))
-            g_mid_only = 1;
-        lg("post-process target: %s\n", g_mid_only ? "generated frames only (post_mid_only)" : "generated + real (default)");
+        g_mid_only = 1;
+        lg("post-process target: generated frames only (default, keeps real C/P unmodified)\n");
     }
     return g_mid_only;
 }
@@ -1045,7 +1141,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     // the aliasing that crawls on edges is smoothed the same way in real and generated frames, and the sharpening only
     // compensates the generated frame's softness. Separate table in the tb2 region (only FG Fast's mid2 uses it; in that
     // mode this pass is skipped). Runs after the warp has read the raw C, before the overlay is drawn.
-    if (post_mid_only() && !g_mem_tight && !two_mids && !g_bench_offscreen && g_sh8_off[14]) {
+    if (g_cfg.post_mid == 2 && post_mid_only() && !g_mem_tight && !two_mids && !g_bench_offscreen && g_sh8_off[14]) {
         int enh = g_cfg.upscale < 0 ? 0 : (g_cfg.upscale > 2 ? 2 : g_cfg.upscale);
         if (enh > 0) {
             uint32_t *tbr = (uint32_t *)(slotb + SLOT_TB2_OFF);
@@ -1179,7 +1275,7 @@ static void cfg_defaults(fg_config_t *c)
     c->upscale        = 0;
     c->upscale_factor = 100;
     c->hud_protect    = 1;
-    c->game_vectors   = 0;
+    c->game_vectors   = 1;
     c->fps_lock       = 30;
     c->menu_hold_ms   = 3000;
     c->menu_opacity   = 80;
@@ -1323,8 +1419,8 @@ static void apply_adapt_ini(fg_config_t *c, uint32_t *hash_io)
     char apath[96];
     snprintf(apath, sizeof(apath), LOG_DIR "/adapt-%s.ini", g_title_id);
     if (!parse_ini_file(apath, &ac, hash_io)) return;
-    if (c->shave_mode == 0 && ac.shave_mode > 0) c->shave_mode = ac.shave_mode;
-    if (c->reg_mode   == 0 && ac.reg_mode   > 0) c->reg_mode   = ac.reg_mode;
+    if (ac.shave_mode > c->shave_mode) c->shave_mode = ac.shave_mode;
+    if (ac.reg_mode   > c->reg_mode)   c->reg_mode   = ac.reg_mode;
     if (c->pace_order == 0 && ac.pace_order > 0) c->pace_order = ac.pace_order;
     if (c->post_mid   == 0 && ac.post_mid   > 0) c->post_mid   = ac.post_mid;
 }
@@ -1501,16 +1597,8 @@ static void safe_try_activate(uint32_t handle)
     int want = want_pcopy ? (hi_res ? 4 : 6) : (hi_res ? 2 : 3);
     if (want > 16 - hi) want = 16 - hi;
     if (want < 1) { safe_refuse("NO INDICES"); return; }
-    // Use early pre-reserved buffers if they survived boot; otherwise try late allocation.
-    g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
-    if (!g_pre_gpu) g_pre_gpu = alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
-    if (!g_pre_gpu) { safe_refuse("NO GPU MEM"); return; }
-    if (!g_pre_work) {
-        g_pre_work = alloc_work_early(WORK_SZ_8, 3);
-        g_work_garlic = g_pre_work != NULL;
-    }
-    if (!g_pre_work) g_pre_work = alloc_work_early(WORK_SZ_8, 0);
-    if (!g_pre_work) { safe_refuse("NO WORK MEM"); return; }
+    // Allocate display buffers (m) FIRST before g_pre_gpu / g_pre_work so our 2MB-aligned scanout allocation never
+    // competes with GPU/work buffers (which can fall back to FlexibleMemory via alloc_flex_gpu).
     uint8_t *m = NULL; int nm = 0;
     if (g_pre_mem && g_pre_size >= one) {
         m = (uint8_t *)g_pre_mem;
@@ -1524,6 +1612,16 @@ static void safe_try_activate(uint32_t handle)
         if (m) nm = n;
     }
     if (!m) { safe_refuse("NO DISPLAY MEM"); return; }
+    // Use early pre-reserved buffers if they survived boot; otherwise try late allocation (with FlexibleMemory fallback).
+    g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
+    if (!g_pre_gpu) g_pre_gpu = alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+    if (!g_pre_gpu) { safe_refuse("NO GPU MEM"); return; }
+    if (!g_pre_work) {
+        g_pre_work = alloc_work_early(WORK_SZ_8, 3);
+        g_work_garlic = (g_pre_work != NULL && g_pre_work_phys >= 0);
+    }
+    if (!g_pre_work) g_pre_work = alloc_work_early(WORK_SZ_8, 0);
+    if (!g_pre_work) { safe_refuse("NO WORK MEM"); return; }
     int base = 16 - nm;   // top of the index range: the game's own indices stay free
     if (base < hi) { safe_refuse("NO INDICES"); return; }
     void *ext[8];
@@ -1571,6 +1669,11 @@ static volatile int g_last_real_buf = -1;
 static uint32_t g_hist[2][4];
 static uint32_t g_mon_missed = 0, g_pace_timeouts = 0, g_pace_resync = 0, g_pace_fix = 0, g_mon_gaps = 0;
 static volatile uint64_t g_rel_t = 0;
+static volatile uint64_t g_vblank_t_us = 0;
+static volatile uint64_t g_vblank_cnt = 0;
+static uint64_t g_last_submit_enter_t = 0;
+static uint64_t g_vo_last_submit_enter_t = 0;
+static uint32_t g_pll_shortened = 0;
 static volatile uint32_t g_cpu_n = 0, g_cpu_sum_us = 0, g_cpu_max_us = 0;
 static uint32_t g_cpu_ema_us = 0;   // game time release -> next submit (its own work, without our waits)
 
@@ -1697,7 +1800,7 @@ static void *io_thread(void *arg)
         if (__atomic_exchange_n(&g_cfg_save_req, 0, __ATOMIC_ACQ_REL)) cfg_save_game_ini();
         if (g_inject_on == 8) gv_io_tick();
         poll_n++;
-        if (!no_flip_logged && poll_n == 5000 && g_flips == 0) {
+        if (!no_flip_logged && poll_n == 5000 && g_flips == 0 && g_vo_submit_flips == 0) {
             no_flip_logged = 1;
             snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: NO GNM FLIP");
             lg("inert: no flip hook (0 flips after 10 s; game does not call sceGnmSubmitAndFlipCommandBuffers, voSubmitFlips=%u)\n",
@@ -1744,7 +1847,10 @@ static void *mon_thread(void *arg)
         memset(&fs, 0, sizeof(fs));
         memset(&vs, 0, sizeof(vs));
         if (read_flip_status(g_handle, &fs) != 0) continue;
-        sceVideoOutGetVblankStatus(g_handle, &vs);
+        if (sceVideoOutGetVblankStatus(g_handle, &vs) == 0 && vs.processTime) {
+            __atomic_store_n(&g_vblank_t_us, vs.processTime, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_vblank_cnt, vs.count, __ATOMIC_RELEASE);
+        }
         __atomic_store_n(&g_cur_pending_flips, (uint32_t)(fs.flipPendingNum > 0 ? fs.flipPendingNum : 0), __ATOMIC_RELEASE);
         __atomic_store_n(&g_cur_gcq, (uint32_t)(fs.gcQueueNum > 0 ? fs.gcQueueNum : 0), __ATOMIC_RELEASE);
         if (fs.flipPendingNum > pend_max) pend_max = fs.flipPendingNum;
@@ -1863,9 +1969,68 @@ static void mon_start(void)
     lg("cadence monitor thread: 0x%08x\n", (unsigned)r);
 }
 
+#define PLL_LEAD_US 1200u
+
+static uint32_t vblank_period_us(void)
+{
+    uint32_t hz10 = (g_last_hz_x10 > 400u && g_last_hz_x10 < 800u) ? g_last_hz_x10 : 599u;
+    uint32_t vb_us = (10000000u + (hz10 >> 1)) / hz10;
+    return (vb_us >= 10000u && vb_us <= 25000u) ? vb_us : 16683u;
+}
+
+// Compute microseconds remaining until the upcoming vblank edge using mon_thread's vs.processTime
+// (with direct sceVideoOutGetVblankStatus fallback if mon_thread has not sampled within 2 vblanks).
+static uint32_t vblank_to_next_edge_us(int32_t handle, uint64_t now_us, uint32_t *out_vb_us)
+{
+    uint32_t vb_us = vblank_period_us();
+    if (out_vb_us) *out_vb_us = vb_us;
+    uint64_t vt = __atomic_load_n(&g_vblank_t_us, __ATOMIC_ACQUIRE);
+    if ((!vt || now_us > vt + (uint64_t)vb_us * 2ull) && handle >= 0) {
+        VoVblankStatus vs;
+        memset(&vs, 0, sizeof(vs));
+        if (sceVideoOutGetVblankStatus(handle, &vs) == 0 && vs.processTime) {
+            vt = vs.processTime;
+            __atomic_store_n(&g_vblank_t_us, vt, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_vblank_cnt, vs.count, __ATOMIC_RELEASE);
+        }
+    }
+    if (!vt || now_us <= vt) return vb_us >> 1;
+    uint32_t phase_us = (uint32_t)((now_us - vt) % (uint64_t)vb_us);
+    uint32_t rem_us = vb_us - phase_us;
+    return rem_us ? rem_us : vb_us;
+}
+
+// Vblank-Phase-Aware Adaptive Hold (PRE-SUBMIT PLL):
+// Uses the vblank timestamp tracked by mon_thread (vs.processTime / sceVideoOutGetVblankStatus)
+// and elapsed CPU frame interval (now - last_submit_enter_t) so that when a game frame arrives
+// late in the 2-vblank window (e.g. 23..28 fps, 36..43 ms frame time), the pre-submit sleep
+// automatically shortens to target the upcoming vblank edge (guaranteeing mid is latched on the
+// next vblank without delaying the game's CPU thread past that vblank).
+static uint32_t pll_adaptive_hold_us(int32_t handle, uint64_t now_us, uint64_t dt_enter_us, uint32_t req_hold_us)
+{
+    uint32_t vb_us = 16683u;
+    uint32_t to_next_vb_us = vblank_to_next_edge_us(handle, now_us, &vb_us);
+    uint32_t win_2vb_us = vb_us * 2u;
+    uint32_t target_edge_us = (dt_enter_us > 0 && dt_enter_us < (uint64_t)vb_us)
+                              ? (to_next_vb_us + vb_us)
+                              : to_next_vb_us;
+    uint32_t vb_budget_us = (target_edge_us > PLL_LEAD_US) ? (target_edge_us - PLL_LEAD_US) : 0u;
+
+    uint32_t rem_2vb_us = 0u;
+    if (dt_enter_us > 0 && dt_enter_us < (uint64_t)win_2vb_us) {
+        rem_2vb_us = (uint32_t)((uint64_t)win_2vb_us - dt_enter_us);
+    }
+
+    uint32_t hold_us = req_hold_us;
+    if (hold_us > rem_2vb_us) hold_us = rem_2vb_us;
+    if (hold_us > vb_budget_us) hold_us = vb_budget_us;
+    if (hold_us < req_hold_us) g_pll_shortened++;
+    return hold_us;
+}
+
 static uint64_t g_dbl_frames = 0;
 static int64_t g_pace_off = 0;
-static void pace_vblank(int prev2_real, int prev_real, int cur_real)
+static void pace_vblank_ex(int prev2_real, int prev_real, int cur_real, int32_t handle, uint64_t dt_enter_us, int pace_pre)
 {
     if (!g_mon_on) { pace_30(); return; }
     g_dbl_frames++;
@@ -1882,8 +2047,17 @@ static void pace_vblank(int prev2_real, int prev_real, int cur_real)
         return;
     }
     uint64_t t0 = sceKernelGetProcessTime();
+    uint64_t max_wait_us = 60000ull;
+    if (pace_pre && dt_enter_us > 0 && __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) <= 1u) {
+        max_wait_us = pll_adaptive_hold_us(handle, t0, dt_enter_us, 60000u);
+    }
     while ((int64_t)*cnt < target) {
-        if (sceKernelGetProcessTime() - t0 > 60000) {
+        uint64_t el = sceKernelGetProcessTime() - t0;
+        if (el >= max_wait_us && __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) <= 1u) {
+            g_pace_off = (int64_t)*cnt - ((int64_t)g_dbl_frames - step);
+            break;
+        }
+        if (el > 60000ull) {
             g_pace_off = (int64_t)*cnt - ((int64_t)g_dbl_frames - step);
             g_pace_timeouts++;
             break;
@@ -1903,6 +2077,10 @@ static void pace_vblank(int prev2_real, int prev_real, int cur_real)
     }
     g_rel_t = sceKernelGetProcessTime();
 }
+static void pace_vblank(int prev2_real, int prev_real, int cur_real)
+{
+    pace_vblank_ex(prev2_real, prev_real, cur_real, g_handle, 0ull, 0);
+}
 
 // VCFG timer pacing for FG pairs, per title (LOG_DIR/pace_timer_<TITLE> exists): releases the game once per pair
 // period (2 refreshes at the measured rate) from the previous release, instead of waiting until its previous real
@@ -1910,7 +2088,7 @@ static void pace_vblank(int prev2_real, int prev_real, int cur_real)
 // 4-deep flip queue and ran at 24-25 fps. +2 ms on the next release while 3+ flips are pending (drift).
 static int g_pace_timer = -1;
 static uint64_t g_pair_next;
-static void pace_pair(void)
+static void pace_pair_ex(int32_t handle, uint64_t dt_enter_us, int pace_pre)
 {
     if (!g_freq) return;
     uint32_t hz10 = g_last_hz_x10 > 400u && g_last_hz_x10 < 800u ? g_last_hz_x10 : 599u;
@@ -1919,18 +2097,43 @@ static void pace_pair(void)
     if (!g_pair_next || now > g_pair_next + period * 3) { g_pair_next = now + period; g_rel_t = sceKernelGetProcessTime(); return; }
     if (now < g_pair_next) {
         uint64_t us = (g_pair_next - now) * 1000000ull / g_freq;
+        if (pace_pre && dt_enter_us > 0) {
+            uint32_t pll_us = pll_adaptive_hold_us(handle, sceKernelGetProcessTime(), dt_enter_us, (uint32_t)us);
+            if (pll_us < us) {
+                us = pll_us;
+                g_pair_next = now + (uint64_t)us * g_freq / 1000000ull;
+            }
+        }
         if (us > 1500) sceKernelUsleep((uint32_t)(us - 1000));
         while (sceKernelGetProcessTimeCounter() < g_pair_next) { }
         now = sceKernelGetProcessTimeCounter();
     }
     g_pair_next += period;
-    if (g_pair_next <= now) g_pair_next = now + period;
-    if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= 3u) g_pair_next += g_freq / 500u;   // drain: +2 ms
+    if (g_pair_next <= now) {
+        if (pace_pre) {
+            uint32_t vb_us = 16683u;
+            uint32_t to_next_vb_us = vblank_to_next_edge_us(handle, sceKernelGetProcessTime(), &vb_us);
+            uint32_t align_us = (to_next_vb_us > PLL_LEAD_US) ? (to_next_vb_us - PLL_LEAD_US + vb_us) : vb_us;
+            g_pair_next = now + (uint64_t)align_us * g_freq / 1000000ull;
+        } else {
+            g_pair_next = now + period;
+        }
+    }
+    uint32_t drain_thr = g_pcopy_on ? 5u : (pace_pre ? 3u : 4u);
+    if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= drain_thr) g_pair_next += g_freq / 500u;   // drain: +2 ms
     g_rel_t = sceKernelGetProcessTime();
 }
+static void pace_pair(void) { pace_pair_ex(g_handle, 0ull, 0); }
 static int pace_timer_on(void)
 {
     if (g_cfg.pace_order == 3) return 1;
+    if (g_cfg.pace_order == 0 && (g_pcopy_on || vcfg_in_family(g_title_id, "CUSA05571"))) {
+        if (g_pace_timer < 0) {
+            g_pace_timer = 1;
+            lg("pacing: timer (auto for pcopy/%s)\n", g_title_id);
+        }
+        return 1;
+    }
     if (g_pace_timer < 0) {
         char p[96]; snprintf(p, sizeof(p), LOG_DIR "/pace_timer_%s", g_title_id);
         FILE *f = fopen(p, "r"); g_pace_timer = f != NULL; if (f) fclose(f);
@@ -2074,14 +2277,28 @@ static void vout_fg_ctx_init(uint32_t handle, int from_vout)
     gv_start(g_inject_on == 8 && fg_res_supported(g_bw, g_bh));
 }
 
-static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
+static int32_t gnm_submit_and_flip_raw(int has_wl, uint32_t workload, uint32_t count, void *dcb[], uint32_t *dcbSz,
+                                       void *ccb[], uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
+{
+    if (has_wl) {
+        return HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffersForWorkload,
+                             int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
+                             workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+    }
+    return HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
+                         int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
+                         count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+}
+
+static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
 {
     uint64_t t_hook_in = sceKernelGetProcessTime();
+    uint64_t dt_enter_us = g_last_submit_enter_t ? (t_hook_in - g_last_submit_enter_t) : 33366ull;
     if (index < 16u) __atomic_store_n(&g_sub_t[index], t_hook_in, __ATOMIC_RELEASE);
     uint64_t prev_flip_t = g_last;
     g_flips++;
     if (g_flips == 1) {
-        lg("first SubmitAndFlip: count=%u flipMode=%u title=%s\n", count, flipMode, g_title_id);
+        lg("first SubmitAndFlip%s: count=%u flipMode=%u title=%s\n", has_wl ? "ForWorkload" : "", count, flipMode, g_title_id);
         lg("CLASSIC_BUILD version=%s test=%d target=%d two_buffer=%d status_hook=%d\n", VCFG_TRACE_VERSION, VCFG_2BUF_TEST, tb_title(),
            g_vq_on, g_status_hooked);
     }
@@ -2120,7 +2337,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
             uint32_t last = count - 1;
             uint32_t nd = dcbSz[last] / 4;
             const uint32_t *tail = nd >= 64 ? (const uint32_t *)dcb[last] + (nd - 64) : NULL;
-            // GTA V (CUSA00411): the same 64-dword flip packet but its second dword is 0x68750778 instead of 0x68750777
+            // CUSA00411: the same 64-dword flip packet but its second dword is 0x68750778 instead of 0x68750777
             if (tail && tail[0] == 0xC03E1000u && (tail[1] >> 8) == 0x687507u) {
                 uint32_t slot = g_flips & 3;
                 int dcb8 = g_inject_on == 8 && g_gpu_sz == GPU_SZ;
@@ -2372,9 +2589,8 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
 
                 if (n == 0) {
                     // Nothing injected (e.g. Native mode with OSD/RCAS off, or first frame before g_prev_idx is valid)
-                    int32_t rc0 = HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
-                                         int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
-                                         count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+                    g_last_submit_enter_t = sceKernelGetProcessTime();
+                    int32_t rc0 = gnm_submit_and_flip_raw(has_wl, workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 30 && !g_detected_60fps && want_fg) pace_hz(30);
                     return rc0;
@@ -2425,30 +2641,42 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                 static int last_show = -1;                  // with present copy the shown real buffers are the copies
                 int pace_pre = (g_cfg.pace_order == 1) ? 1 : (g_cfg.pace_order == 2) ? 0 : (!g_pcopy_on);
                 g_last_pace_pre = pace_pre;
+                if (hold_mid_us > 0) {
+                    if (pace_pre) {
+                        if (g_inject_on >= 7 && second_flip) hold_mid_us = 0;
+                        else hold_mid_us = pll_adaptive_hold_us((int32_t)handle, sceKernelGetProcessTime(), dt_enter_us, hold_mid_us);
+                    } else {
+                        uint32_t vb_us = 16683u;
+                        uint32_t to_vb = vblank_to_next_edge_us((int32_t)handle, sceKernelGetProcessTime(), &vb_us);
+                        if (to_vb + 1500u < hold_mid_us) { hold_mid_us = to_vb + 1500u; g_pll_shortened++; }
+                    }
+                }
                 uint64_t t_p0 = sceKernelGetProcessTime(), t_p1 = t_p0;
                 if (pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
-                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair();
+                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex((int32_t)handle, dt_enter_us, 1);
                     else if (g_inject_on >= 7 && second_flip) {
                         int shown = (int)show_idx, pp1 = show_idx != index ? last_show : pace_p1;
-                        pace_vblank(show_idx != index ? -1 : pace_p2, pp1, shown);
+                        pace_vblank_ex(show_idx != index ? -1 : pace_p2, pp1, shown, (int32_t)handle, dt_enter_us, 1);
                         last_show = shown;
                     }
                     else if (second_flip) pace_30();
+                    if (hold_mid_us > 0) {
+                        uint32_t pre_hold = pll_adaptive_hold_us((int32_t)handle, sceKernelGetProcessTime(), dt_enter_us, hold_mid_us);
+                        if (pre_hold > 200u) sceKernelUsleep(pre_hold);
+                        hold_mid_us = 0;
+                    }
                     t_p1 = sceKernelGetProcessTime();
                 }
                 uint64_t t_s1 = t_p1;
-                int32_t rc = HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
-                                     int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
-                                     ncount, d2, s2, ccb ? c2 : ccb, ccbSz ? cs2 : ccbSz, handle, flip_idx, flipMode, flipArg);
+                g_last_submit_enter_t = t_s1;
+                int32_t rc = gnm_submit_and_flip_raw(has_wl, workload, ncount, d2, s2, ccb ? c2 : ccb, ccbSz ? cs2 : ccbSz, handle, flip_idx, flipMode, flipArg);
                 uint64_t t_s1e = sceKernelGetProcessTime(), t_hold = t_s1e, t_s2e = t_s1e;
                 if (third_flip) {
                     void *dm2[1] = { fb2 };
                     uint32_t sm2[1] = { 64 * 4 };
-                    HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
-                                  int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
-                                  1, dm2, sm2, NULL, NULL, handle, mid2_flip_idx, flipMode, flipArg);
+                    gnm_submit_and_flip_raw(has_wl, workload, 1, dm2, sm2, NULL, NULL, handle, mid2_flip_idx, flipMode, flipArg);
                 }
                 if (second_flip) {
                     if (hold_mid_us > 0) sceKernelUsleep(hold_mid_us);
@@ -2464,19 +2692,17 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                             lg("FLIP_ARGS mid=%lld real=%lld mid_buf=%u real_buf=%u\n", (long long)flipArg,
                                (long long)real_arg, flip_idx, show_idx);
                     }
-                    int32_t r2 = HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
-                                     int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
-                                     1, d3, s3, NULL, NULL, handle, show_idx, flipMode, real_arg);
+                    int32_t r2 = gnm_submit_and_flip_raw(has_wl, workload, 1, d3, s3, NULL, NULL, handle, show_idx, flipMode, real_arg);
                     t_s2e = sceKernelGetProcessTime();
                     if (g_flips < INJECT_AFTER_FLIPS + 12) lg("mode4 #%u: gnm flip(mid idx %u)=0x%08x, gnm flip(cur idx %u)=0x%08x\n", g_flips, flip_idx, (unsigned)rc, index, (unsigned)r2);
                 }
                 if (!pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
-                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair();
+                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex((int32_t)handle, dt_enter_us, 0);
                     else if (g_inject_on >= 7 && second_flip) {
                         int shown = (int)show_idx, pp1 = show_idx != index ? last_show : pace_p1;
-                        pace_vblank(show_idx != index ? -1 : pace_p2, pp1, shown);
+                        pace_vblank_ex(show_idx != index ? -1 : pace_p2, pp1, shown, (int32_t)handle, dt_enter_us, 0);
                         last_show = shown;
                     }
                     else if (second_flip) pace_30();
@@ -2490,9 +2716,9 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
                     a_pace += pace_pre ? (t_p1 - t_p0) : (t_end - t_s2e); a_n++;
                     if (a_n >= 60) {
                         double k = 1.0 / 1000.0 / (double)a_n;
-                        lg("HOOK ms per FG frame: build %.1f submit %.1f hold %.1f flip2 %.1f pace %.1f total %.1f | game own %.1f | pending %u\n",
+                        lg("HOOK ms per FG frame: build %.1f submit %.1f hold %.1f flip2 %.1f pace %.1f total %.1f | game own %.1f | pending %u pll %u\n",
                            a_build * k, a_sub * k, a_hold * k, a_flip2 * k, a_pace * k, (a_build + a_sub + a_hold + a_flip2 + a_pace) * k,
-                           g_cpu_ema_us / 1000.0, __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE));
+                           g_cpu_ema_us / 1000.0, __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE), g_pll_shortened);
                         a_build = a_sub = a_hold = a_flip2 = a_pace = a_n = 0;
                     }
                 }
@@ -2519,15 +2745,19 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
         }
     }
 #endif
-    return HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
-                         int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
-                         count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+    g_last_submit_enter_t = sceKernelGetProcessTime();
+    return gnm_submit_and_flip_raw(has_wl, workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
 }
 
 #include "vout_trace.h"
 
 int32_t sceGnmSubmitAndFlipCommandBuffers_hook(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
 {
+    if (g_in_submit) {
+        return HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
+                             int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
+                             count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+    }
     void *gd[GV_MAXE]; uint32_t gs[GV_MAXE]; void *gc[GV_MAXE]; uint32_t gcs[GV_MAXE];
     tb_on_game_submit();            // test builds: the status poll that let the game out of its wait
     static uint32_t s_boot_flips;   // the first submits are boot stages too (B01: starts that end before the first one)
@@ -2536,7 +2766,7 @@ int32_t sceGnmSubmitAndFlipCommandBuffers_hook(uint32_t count, void *dcb[], uint
     uint32_t gn = gv_rewrite(count, dcb, dcbSz, ccb, ccbSz, gd, gs, gc, gcs, 1);
     if (gn) { count = gn; dcb = gd; dcbSz = gs; if (ccb) ccb = gc; if (ccbSz) ccbSz = gcs; }
     g_in_submit++;
-    int32_t rc = flip_inner(count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+    int32_t rc = flip_inner_ex(0, 0, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
     g_in_submit--;
     if (bf) STAGE("SubmitAndFlip #%u done = 0x%08x", bf, (unsigned)rc);
     gv_frame_end();
@@ -2556,9 +2786,13 @@ static volatile uint32_t g_vo_sub_w = 0;
 
 int32_t sceGnmSubmitCommandBuffers_hook(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz)
 {
+    if (g_in_submit) {
+        return HOOK_CONTINUE(sceGnmSubmitCommandBuffers, int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *),
+                             count, dcb, dcbSz, ccb, ccbSz);
+    }
     void *gd[GV_MAXE]; uint32_t gs[GV_MAXE]; void *gc[GV_MAXE]; uint32_t gcs[GV_MAXE];
-    uint32_t gn = g_in_submit ? 0u : gv_rewrite(count, dcb, dcbSz, ccb, ccbSz, gd, gs, gc, gcs, 0);
-    if (!g_in_submit && count >= 1 && dcb && dcbSz) {
+    uint32_t gn = gv_rewrite(count, dcb, dcbSz, ccb, ccbSz, gd, gs, gc, gcs, 0);
+    if (count >= 1 && dcb && dcbSz) {
         uint32_t wi = __atomic_fetch_add(&g_vo_sub_w, 1u, __ATOMIC_ACQ_REL) % VO_SUB_RING_N;
         g_vo_sub_ring[wi].ts_us = sceKernelGetProcessTime();
         g_vo_sub_ring[wi].count = count;
@@ -2584,23 +2818,63 @@ static void wl_count(int k, const char *name)
     if (g_in_submit) { g_wl_nested[k]++; return; }
     uint32_t n = ++g_wl_direct[k];
     if (n == 1 || (n % 600u) == 0)
-        lg("DIAG: the game calls %s directly (%u calls, %u nested in ours): those submits bypass frame generation and the "
-           "scanner\n", name, n, g_wl_nested[k]);
+        lg("DIAG: the game calls %s directly (%u calls, %u nested in ours): routed into FG/scanner pipeline\n",
+           name, n, g_wl_nested[k]);
 }
 int32_t sceGnmSubmitCommandBuffersForWorkload_hook(uint32_t workload, uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz)
 {
     wl_count(0, "sceGnmSubmitCommandBuffersForWorkload");
-    return HOOK_CONTINUE(sceGnmSubmitCommandBuffersForWorkload,
-                         int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *),
-                         workload, count, dcb, dcbSz, ccb, ccbSz);
+    if (g_in_submit) {
+        return HOOK_CONTINUE(sceGnmSubmitCommandBuffersForWorkload,
+                             int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *),
+                             workload, count, dcb, dcbSz, ccb, ccbSz);
+    }
+    void *gd[GV_MAXE]; uint32_t gs[GV_MAXE]; void *gc[GV_MAXE]; uint32_t gcs[GV_MAXE];
+    uint32_t gn = gv_rewrite(count, dcb, dcbSz, ccb, ccbSz, gd, gs, gc, gcs, 0);
+    if (count >= 1 && dcb && dcbSz) {
+        uint32_t wi = __atomic_fetch_add(&g_vo_sub_w, 1u, __ATOMIC_ACQ_REL) % VO_SUB_RING_N;
+        g_vo_sub_ring[wi].ts_us = sceKernelGetProcessTime();
+        g_vo_sub_ring[wi].count = count;
+        g_vo_sub_ring[wi].last_sz = dcbSz[count - 1];
+        g_vo_sub_ring[wi].last_dcb = (uintptr_t)dcb[count - 1];
+    }
+    if (g_vt_on && count >= 1 && count <= 16 && dcb && dcbSz)
+        vt_rec(VT_SUBMIT, count, dcbSz[count - 1], ccbSz ? ccbSz[count - 1] : 0, (uint32_t)(uintptr_t)dcb[count - 1], (const uint32_t *)dcb[count - 1], dcbSz[count - 1]);
+    int32_t rc;
+    g_in_submit++;
+    if (gn)
+        rc = HOOK_CONTINUE(sceGnmSubmitCommandBuffersForWorkload,
+                           int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *),
+                           workload, gn, gd, gs, ccb ? gc : NULL, ccbSz ? gcs : NULL);
+    else
+        rc = HOOK_CONTINUE(sceGnmSubmitCommandBuffersForWorkload,
+                           int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *),
+                           workload, count, dcb, dcbSz, ccb, ccbSz);
+    g_in_submit--;
+    return rc;
 }
 int32_t sceGnmSubmitAndFlipCommandBuffersForWorkload_hook(uint32_t workload, uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[],
                                                           uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
 {
     wl_count(1, "sceGnmSubmitAndFlipCommandBuffersForWorkload");
-    return HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffersForWorkload,
-                         int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
-                         workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+    if (g_in_submit) {
+        return HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffersForWorkload,
+                             int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
+                             workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+    }
+    void *gd[GV_MAXE]; uint32_t gs[GV_MAXE]; void *gc[GV_MAXE]; uint32_t gcs[GV_MAXE];
+    tb_on_game_submit();
+    static uint32_t s_wl_boot_flips;
+    uint32_t bf = s_wl_boot_flips < 3 ? ++s_wl_boot_flips : 0;
+    if (bf) STAGE("SubmitAndFlipForWorkload #%u enter: wl=%u count=%u handle=%u index=%u flipMode=%u", bf, workload, count, handle, index, flipMode);
+    uint32_t gn = gv_rewrite(count, dcb, dcbSz, ccb, ccbSz, gd, gs, gc, gcs, 1);
+    if (gn) { count = gn; dcb = gd; dcbSz = gs; if (ccb) ccb = gc; if (ccbSz) ccbSz = gcs; }
+    g_in_submit++;
+    int32_t rc = flip_inner_ex(1, workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+    g_in_submit--;
+    if (bf) STAGE("SubmitAndFlipForWorkload #%u done = 0x%08x", bf, (unsigned)rc);
+    gv_frame_end();
+    return rc;
 }
 
 // Submit our standalone compute DCB via sceGnmSubmitCommandBuffers for decoupled VideoOutSubmitFlip games.
@@ -2642,6 +2916,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
     }
 
     uint64_t t_hook_in = sceKernelGetProcessTime();
+    uint64_t dt_enter_us = g_vo_last_submit_enter_t ? (t_hook_in - g_vo_last_submit_enter_t) : 33366ull;
     uint32_t u_idx = (uint32_t)index;
     if (u_idx < 16u) __atomic_store_n(&g_sub_t[u_idx], t_hook_in, __ATOMIC_RELEASE);
     uint64_t prev_flip_t = g_last;
@@ -2757,10 +3032,40 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
             g_prev_idx = u_idx;
 
             if (n > 0) {
+                static int vo_last_show = -1;
+                int pace_pre = (g_cfg.pace_order == 1) ? 1 : (g_cfg.pace_order == 2) ? 0 : (!g_pcopy_on);
+                g_last_pace_pre = pace_pre;
+                if (hold_mid_us > 0) {
+                    if (pace_pre) {
+                        hold_mid_us = pll_adaptive_hold_us(handle, sceKernelGetProcessTime(), dt_enter_us, hold_mid_us);
+                    } else {
+                        uint32_t vb_us = 16683u;
+                        uint32_t to_vb = vblank_to_next_edge_us(handle, sceKernelGetProcessTime(), &vb_us);
+                        if (to_vb + 1500u < hold_mid_us) { hold_mid_us = to_vb + 1500u; g_pll_shortened++; }
+                    }
+                }
+                if (pace_pre) {
+                    if (g_cfg.fps_lock == 20) pace_hz(20);
+                    else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
+                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex(handle, dt_enter_us, 1);
+                    else if (g_inject_on >= 7 && second_flip) {
+                        int shown = (int)show_idx, pp1 = show_idx != u_idx ? vo_last_show : pace_p1;
+                        pace_vblank_ex(show_idx != u_idx ? -1 : pace_p2, pp1, shown, handle, dt_enter_us, 1);
+                        vo_last_show = shown;
+                    } else if (second_flip) {
+                        pace_30();
+                    }
+                    if (hold_mid_us > 0) {
+                        uint32_t pre_hold = pll_adaptive_hold_us(handle, sceKernelGetProcessTime(), dt_enter_us, hold_mid_us);
+                        if (pre_hold > 200u) sceKernelUsleep(pre_hold);
+                        hold_mid_us = 0;
+                    }
+                }
+                g_vo_last_submit_enter_t = sceKernelGetProcessTime();
                 int32_t s_rc = vout_submit_dcb(mine, n);
                 if (vf == INJECT_AFTER_FLIPS || (vf % 600u) == 0)
-                    lg("vout inject #%u: dcb=%u dw submit=0x%08x flip_idx=%u show_idx=%u pcopy=%d\n",
-                       vf, n, (unsigned)s_rc, flip_idx, show_idx, g_pcopy_on);
+                    lg("vout inject #%u: dcb=%u dw submit=0x%08x flip_idx=%u show_idx=%u pcopy=%d pace_pre=%d\n",
+                       vf, n, (unsigned)s_rc, flip_idx, show_idx, g_pcopy_on, pace_pre);
                 int32_t vr1 = HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t),
                                             handle, (int32_t)flip_idx, mode, arg);
                 if (third_flip) {
@@ -2775,16 +3080,19 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                         lg("vout fg #%u: flip(mid %u)=0x%08x flip(real %u)=0x%08x\n",
                            vf, flip_idx, (unsigned)vr1, show_idx, (unsigned)vr2);
                 }
-                if (g_cfg.fps_lock == 20) pace_hz(20);
-                else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
-                else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair();
-                else if (g_inject_on >= 7 && second_flip) {
-                    static int vo_last_show = -1;
-                    int shown = (int)show_idx, pp1 = show_idx != u_idx ? vo_last_show : pace_p1;
-                    pace_vblank(show_idx != u_idx ? -1 : pace_p2, pp1, shown);
-                    vo_last_show = shown;
+                if (!pace_pre) {
+                    if (g_cfg.fps_lock == 20) pace_hz(20);
+                    else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
+                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex(handle, dt_enter_us, 0);
+                    else if (g_inject_on >= 7 && second_flip) {
+                        int shown = (int)show_idx, pp1 = show_idx != u_idx ? vo_last_show : pace_p1;
+                        pace_vblank_ex(show_idx != u_idx ? -1 : pace_p2, pp1, shown, handle, dt_enter_us, 0);
+                        vo_last_show = shown;
+                    } else if (second_flip) {
+                        pace_30();
+                    }
                 } else if (second_flip) {
-                    pace_30();
+                    g_rel_t = sceKernelGetProcessTime();
                 }
                 gv_frame_end();
                 if (g_vt_hooked && g_vt_n >= VT_N) vt_dump();
@@ -2793,6 +3101,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
         }
     }
 #endif
+    g_vo_last_submit_enter_t = sceKernelGetProcessTime();
     int32_t vr = HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t), handle, index, mode, arg);
     if (g_vt_hooked && g_vt_n >= VT_N) vt_dump();
     return vr;
@@ -2912,8 +3221,8 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
             int want_pcopy = (pcopy_cfg == 1) || (pcopy_cfg == 0 && g_ngame == 2);
             int hi_res = (g_bw > 1920 || g_bh > 1080);
             // If Memory Valve or Arena Shaving already fired at boot, the game is tight on DirectMemory:
-            // use only g_pre_mem and never allocate extra mbufs from the kernel pool (preserves the shaved reserve).
-            int mem_tight = (g_shave_orig_len > 0) || (g_pre_mem && g_pre_size < 0x2000000u);
+            // use g_pre_mem if present, or at most 1 mid buffer from the preserved 8 MB reserve when g_pre_mem is NULL.
+            int mem_tight = (g_shave_orig_len > 0) || g_mem_tight || (g_pre_mem && g_pre_size < 0x2000000u);
             uint8_t *m = NULL;
             int nm = 0;
             int max_extra = 16 - g_ngame;
@@ -2924,7 +3233,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 if (nm > max_extra) nm = max_extra;
                 if (nm >= 1) m = (uint8_t *)g_pre_mem;
             }
-            for (int want = max_extra; one && !m && !mem_tight && want >= 1; want--) {
+            for (int want = (mem_tight ? 1 : max_extra); one && !m && want >= 1; want--) {
                 m = (uint8_t *)alloc_mbufs((one * (size_t)want + 0x1FFFFFu) & ~(size_t)0x1FFFFFu);
                 if (m) nm = want;
             }
@@ -3310,6 +3619,7 @@ static void pad_poll_start(void)
 
 int32_t sceVideoOutSetFlipRate_hook(int32_t handle, int32_t rate)
 {
+    if (g_dbg_hooks) crash_handlers_install();
     if (g_bench_enabled) return HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), handle, rate);
     int m_raw = read_mode_raw();
     int want4 = (m_raw == 4 || m_raw == 6 || m_raw == 7 || m_raw == 8);
@@ -3365,11 +3675,8 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
 #endif
     {
         int m = g_bench_enabled ? 8 : read_mode_raw();
-        if (!g_bench_enabled && g_cfg.reg_mode == 2) {
-            g_safe = 1;
-            STAGE("dev override: reg_mode=2 -> deferring RegisterBuffers/SetFlipRate to frame %d", INJECT_AFTER_FLIPS);
-        } else if (!g_bench_enabled && !is_verified_title()) {
-            // Progressive self-adapting boot pipeline for unverified titles:
+        if (!g_bench_enabled) {
+            // Progressive self-adapting boot pipeline for all titles:
             //   state 0 (default): full universal early pipeline (g_safe=0: inline RegisterBuffers + auto-relocate + SetFlipRate(0))
             //   state 1: deferred late separate-group RegisterBuffers/SetFlipRate at frame INJECT_AFTER_FLIPS (g_safe=1)
             //   state 2: passive native observation only (g_safe=1, g_safe_never=1, m=0)
@@ -3385,11 +3692,12 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
                 g_safe_never = 1;
                 m = 0;
                 STAGE("safe mode: title %s is in passive state=2 -> no early memory, hooks only observe", g_title_id);
-            } else if (st == 1) {
+            } else if (st == 1 || g_cfg.reg_mode == 2) {
                 g_safe = 1;
                 g_safe_early = 1;
                 safe_marker(1);
-                STAGE("safe mode: title %s in state=1 -> deferred RegisterBuffers/SetFlipRate to frame %d", g_title_id, INJECT_AFTER_FLIPS);
+                STAGE("safe mode: title %s in state=%d (reg_mode=%d) -> deferred RegisterBuffers/SetFlipRate to frame %d",
+                      g_title_id, st, g_cfg.reg_mode, INJECT_AFTER_FLIPS);
             } else {
                 g_safe = 0;
                 g_safe_early = 1;
@@ -3402,27 +3710,14 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         if (late_alloc) {
             STAGE("dev override: shave_mode=2 (LATE ALLOC) -> skipping all early DirectMemory allocations in plugin_load");
         }
-        if (m == 8 && !g_bench_enabled && !late_alloc) gv_load(alloc_dm);
-        if (m >= 1 && m <= 8 && !late_alloc) {
-            g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
-            STAGE("alloc gpu sz=0x%zx (mode %d)", (size_t)g_gpu_sz, m);
-            g_pre_gpu = alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
-            STAGE("alloc gpu -> %p", g_pre_gpu);
-            {
-                int ff = file_flags();
-                if (!g_bench_enabled && ff > 0 && (ff & 16)) {
-                    g_dump_mem = (uint8_t *)alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), DUMP_SZ, 0x10000, 0, &g_dump_phys);
-                    klog("[bb_probe] dump memory: %p\n", (void *)g_dump_mem);
-                }
-            }
-        }
+        if (m == 8 && !g_bench_enabled) gv_load(alloc_gv_dm);
 #if VCFG_BENCH
         // capture memory (~50 MB) is taken later, from bench_flip once the game runs: taking it here crashed the game (run d, 2026-10-20)
 #endif
         if ((m == 4 || m >= 6) && !g_bench_enabled && !late_alloc) {
-            // Try 32 MB first (4 x 8 MB for 2-buffer present copy), then 16 MB, then 8 MB (1 mid buffer).
-            // Place at the top of the DirectMemory pool so the game's lowest-first arena remains contiguous from 0 upward.
-            // If a non-arena game needs part of this back at boot, the Memory Valve shrinks 32 MB -> 8 MB automatically.
+            // Allocate g_pre_mem FIRST at the top of the DirectMemory pool before g_pre_gpu and g_pre_work so
+            // physical address 0x0 remains 100% unfragmented and g_pre_gpu + g_pre_work can pack together into the
+            // single 2 MB page immediately below g_pre_mem_phys.
             size_t dm_sz = sceKernelGetDirectMemorySize();
             const size_t try_sz[3] = { 0x2000000u, 0x1000000u, 0x800000u };
             int r = -1;
@@ -3452,21 +3747,41 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
             }
             klog("[bb_probe] early display-buffer memory: %s (size=0x%zx, r=0x%08x)\n", g_pre_mem ? "ok" : "FAILED", g_pre_size, (unsigned)r);
         }
+        if (m >= 1 && m <= 8 && !late_alloc) {
+            g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
+            STAGE("alloc gpu sz=0x%zx (mode %d)", (size_t)g_gpu_sz, m);
+            if (g_pre_mem && g_pre_mem_phys >= 0x200000L) {
+                g_pre_gpu = alloc_dm_range(g_pre_mem_phys - 0x200000L, g_pre_mem_phys, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+            }
+            if (!g_pre_gpu) {
+                g_pre_gpu = alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+            }
+            STAGE("alloc gpu -> %p (phys=0x%lx)", g_pre_gpu, g_pre_gpu_phys);
+            {
+                int ff = file_flags();
+                if (!g_bench_enabled && ff > 0 && (ff & 16)) {
+                    g_dump_mem = (uint8_t *)alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), DUMP_SZ, 0x10000, 0, &g_dump_phys);
+                    klog("[bb_probe] dump memory: %p\n", (void *)g_dump_mem);
+                }
+            }
+        }
         if (m >= 6 && !late_alloc) {
             size_t wsz = (m == 8) ? WORK_SZ_8 : WORK_SZ;
             if (m == 8) {
                 STAGE("alloc work sz=0x%zx garlic", wsz);
                 g_pre_work = alloc_work_early(wsz, 3);
-                g_work_garlic = g_pre_work != NULL;
+                g_work_garlic = (g_pre_work != NULL && g_pre_work_phys >= 0);
             }
             if (!g_pre_work) g_pre_work = alloc_work_early(wsz, 0);
-            STAGE("alloc work -> %p garlic=%d", g_pre_work, (int)g_work_garlic);
+            STAGE("alloc work -> %p (phys=0x%lx) garlic=%d", g_pre_work, g_pre_work_phys, (int)g_work_garlic);
             klog("[bb_probe] early gpu/work memory: %p / %p\n", g_pre_gpu, g_pre_work);
         }
     }
     STAGE("hooking");
     HOOK32(sceGnmSubmitAndFlipCommandBuffers);
     HOOK32(sceGnmSubmitCommandBuffers);
+    HOOK32(sceGnmSubmitCommandBuffersForWorkload);
+    HOOK32(sceGnmSubmitAndFlipCommandBuffersForWorkload);
     HOOK32(sceVideoOutRegisterBuffers);
     HOOK32(sceVideoOutSetFlipRate);
     HOOK32(sceVideoOutSubmitFlip);
@@ -3479,11 +3794,6 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         g_vt_hooked = 1;
         HOOK32(sceGnmSubmitDone);
         STAGE("voutrace armed: records the game's submits and flips from VideoOut flip %d (%d events)", VT_START_FLIP, VT_N);
-    }
-    if (g_diag_hooks) {
-        HOOK32(sceGnmSubmitCommandBuffersForWorkload);
-        HOOK32(sceGnmSubmitAndFlipCommandBuffersForWorkload);
-        klog("[bb_probe] diagnostic hooks on the ForWorkload submit variants installed\n");
     }
     return 0;
 }
@@ -3505,11 +3815,12 @@ s32 attr_public plugin_unload(s32 argc, const char *argv[])
 #endif
     UNHOOK(sceGnmSubmitAndFlipCommandBuffers);
     UNHOOK(sceGnmSubmitCommandBuffers);
+    UNHOOK(sceGnmSubmitCommandBuffersForWorkload);
+    UNHOOK(sceGnmSubmitAndFlipCommandBuffersForWorkload);
     UNHOOK(sceVideoOutRegisterBuffers);
     UNHOOK(sceVideoOutSetFlipRate);
     UNHOOK(sceVideoOutSubmitFlip);
     if (g_vt_hooked) UNHOOK(sceGnmSubmitDone);
-    if (g_diag_hooks) { UNHOOK(sceGnmSubmitCommandBuffersForWorkload); UNHOOK(sceGnmSubmitAndFlipCommandBuffersForWorkload); }
     if (g_log) { fclose(g_log); g_log = NULL; }
     return 0;
 }

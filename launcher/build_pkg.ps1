@@ -33,8 +33,8 @@ $classic = Join-Path $repo 'build\classic\vcfg_classic.prx'
 if (-not (Test-Path $classic)) { throw "Build the classic engine first (classic/build.sh): $classic not found" }
 # Each release that changes a plugin uses a new file name: a running game keeps the old file mapped.
 Copy-Item $prx "$stage\plugins\vcfg16.prx"
-Copy-Item $classic "$stage\plugins\vcfg_classic50.prx"
-Copy-Item $classic "$stage\plugins\vcfg_alt_15.prx"
+Copy-Item $classic "$stage\plugins\vcfg_classic51.prx"
+Copy-Item $classic "$stage\plugins\vcfg_alt_16.prx"
 Copy-Item "$PSScriptRoot\assets\fonts\*" "$stage\assets\fonts\"
 
 # 3. System files from the OpenOrbis samples; our own icon.
@@ -57,7 +57,7 @@ foreach ($e in $entries) { Run $pkgTool @('sfo_setentry', $sfo, $e[0], '--type',
 
 # 5. gp4 project and package.
 $files = @('eboot.bin', 'sce_sys/param.sfo', 'sce_sys/icon0.png', 'sce_sys/about/right.sprx', 'sce_module/libc.prx', 'sce_module/libSceFios2.prx',
-    'plugins/vcfg16.prx', 'plugins/vcfg_classic50.prx', 'plugins/vcfg_alt_15.prx')
+    'plugins/vcfg16.prx', 'plugins/vcfg_classic51.prx', 'plugins/vcfg_alt_16.prx')
 $files += Get-ChildItem "$stage\assets\fonts" | ForEach-Object { "assets/fonts/$($_.Name)" }
 $fileXml = ($files | ForEach-Object { "  <file targ_path=""$_"" orig_path=""$_"" />" }) -join "`n"
 $gp4 = @"

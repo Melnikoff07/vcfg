@@ -51,3 +51,75 @@ void Notify(const char* IconUri, const char *FMT, ...);
 // Takes hardcoded input string 2 to strlen against during compile time.
 // startsWith(input_1, "input 2");
 #define startsWith(str1, str2) (strncmp(str1, str2, __builtin_strlen(str2)) == 0)
+
+size_t Detour_GetInstructionSize(Detour *This, uint64_t Address, size_t MinSize);
+void Detour_WriteJump64(Detour *This, void *Address, uint64_t Destination);
+void Detour_WriteJump32(Detour *This, void *Address, uint64_t Destination);
+
+// Static trampoline pool inside the PRX image (0x00000008xxxxxxxx, within +-2 GB of all system SPRXs).
+// Avoids both:
+//   1) DetourMode_x64's 14-byte overwrite (which corrupts short functions like sceVideoOutSetFlipRate that have
+//      PC-relative instructions at bytes 5..13), and
+//   2) Detour_DetourFunction32's malloc(14) low-heap allocation (0x00000000ffba5xxx in CUSA10249, >2 GB away).
+static uint8_t g_vcfg_tramp_pool[32][16] __attribute__((aligned(16)));
+static int g_vcfg_tramp_used = 0;
+
+static inline void *vcfg_hook_install(Detour *d, uint64_t fn_ptr, void *hk, const char *name)
+{
+    if (!fn_ptr || !hk) return NULL;
+    Detour_Construct(d, DetourMode_x32);
+    size_t ins_sz = Detour_GetInstructionSize(d, fn_ptr, sizeof(d->JumpInstructions32));
+    if (ins_sz < sizeof(d->JumpInstructions32)) return NULL;
+
+    void *tramp = NULL;
+    if (g_vcfg_tramp_used < 32) {
+        tramp = (void *)g_vcfg_tramp_pool[g_vcfg_tramp_used++];
+        sceKernelMprotect(tramp, 16, VM_PROT_ALL);
+    } else {
+        if (sceKernelMmap(0, sizeof(d->JumpInstructions64), VM_PROT_ALL, 0x1000 | 0x2, -1, 0, &tramp) < 0 || !tramp)
+            return NULL;
+    }
+
+    int64_t rel_tramp = (int64_t)(uintptr_t)tramp - (int64_t)(fn_ptr + sizeof(d->JumpInstructions32));
+    int64_t rel_hk    = (int64_t)(uintptr_t)hk    - (int64_t)(fn_ptr + sizeof(d->JumpInstructions32));
+    uint64_t jmp32_dst = 0;
+    if (rel_tramp >= -0x7FFFFFFFLL && rel_tramp <= 0x7FFFFFFFLL) {
+        Detour_WriteJump64(d, tramp, (uint64_t)(uintptr_t)hk);
+        jmp32_dst = (uint64_t)(uintptr_t)tramp;
+    } else if (rel_hk >= -0x7FFFFFFFLL && rel_hk <= 0x7FFFFFFFLL) {
+        jmp32_dst = (uint64_t)(uintptr_t)hk;
+    } else {
+        Detour_Construct(d, DetourMode_x64);
+        return Detour_DetourFunction(d, fn_ptr, hk);
+    }
+
+    d->TrampolinePtr = tramp;
+    d->FunctionPtr = (void *)(uintptr_t)fn_ptr;
+    d->HookPtr = hk;
+    sceKernelMprotect((void *)(uintptr_t)fn_ptr, ins_sz, VM_PROT_ALL);
+    d->StubSize = ins_sz + sizeof(d->JumpInstructions64);
+    if (sceKernelMmap(0, d->StubSize, VM_PROT_ALL, 0x1000 | 0x2, -1, 0, &d->StubPtr) < 0 || !d->StubPtr)
+        return NULL;
+
+    const uint8_t *p = (const uint8_t *)(uintptr_t)fn_ptr;
+    if (p[0] == 0xE9u && ins_sz == 5) {
+        int32_t orig_rel = *(const int32_t *)(p + 1);
+        uint64_t orig_dst = (uint64_t)((intptr_t)fn_ptr + 5 + (intptr_t)orig_rel);
+        memset(d->StubPtr, 0x90, ins_sz);
+        Detour_WriteJump64(d, d->StubPtr, orig_dst);
+    } else {
+        memcpy(d->StubPtr, (void *)(uintptr_t)fn_ptr, ins_sz);
+        Detour_WriteJump64(d, (void *)((uintptr_t)d->StubPtr + ins_sz), fn_ptr + ins_sz);
+    }
+
+    memset((void *)(uintptr_t)fn_ptr, 0x90, ins_sz);
+    Detour_WriteJump32(d, (void *)(uintptr_t)fn_ptr, jmp32_dst);
+    klog("[vcfg_hook] %s: x32 fn=%p ins=%zu stub=%p tramp=%p\n",
+         name, (void *)(uintptr_t)fn_ptr, ins_sz, d->StubPtr, (void *)(uintptr_t)jmp32_dst);
+    return d->StubPtr;
+}
+
+#undef HOOK32
+#define HOOK32(name) do { \
+    vcfg_hook_install(&(Detour_##name), (uint64_t)(uintptr_t)(name), (void *)&(name##_hook), #name); \
+} while (0)

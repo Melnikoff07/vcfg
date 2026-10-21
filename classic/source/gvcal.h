@@ -29,6 +29,10 @@ typedef struct {
     double n[2], sr[2], sf[2], srr[2], sff[2], srf[2];      // inlier sums per axis over all informative frames
     float  fmr[2][GVCAL_MAXF], fmf[2][GVCAL_MAXF], fa[2][GVCAL_MAXF];   // per frame: mean raw, mean flow, slope
     uint32_t nf[2];                                          // informative frames per axis (stored up to MAXF)
+    // DRS pixel-space hypothesis: raw pre-scaled by (ref_w / cur_w, ref_h / cur_h) when target resolution varies
+    double drs_n[2], drs_sr[2], drs_sf[2], drs_srr[2], drs_sff[2], drs_srf[2];
+    float  drs_fmr[2][GVCAL_MAXF], drs_fa[2][GVCAL_MAXF];
+    uint32_t ref_w, ref_h, cur_w, cur_h, drs_varied;
     uint32_t classes;                                        // motion classes seen (bit mask)
     uint32_t frames, informative, flat, stale_votes, const_frames;
     uint32_t mode_x, mode_y, mode_frames;                    // repeated exact raw value (sentinel candidate)
@@ -45,6 +49,8 @@ typedef struct {
     int   sentinel; uint32_t sent_x, sent_y;   // raw bit pattern meaning "not written" (objects-only buffer)
     uint32_t frames, blocks, classes;
     char  units[48];
+    uint32_t cal_w, cal_h;  // active target resolution at calibration (for pixel-space DRS scaling)
+    int   drs_scale;        // 1 if velocity is in render-target pixels and scales with (cal_w / cur_w)
 } gvcal_result_t;
 
 // last frame's numbers, for the log
@@ -55,6 +61,8 @@ typedef struct {
 } gvcal_frame_t;
 
 void gvcal_reset(gvcal_t *c);
+// optional: inform gvcal of the candidate's active resolution (w, h) in this frame before gvcal_add
+void gvcal_set_res(gvcal_t *c, uint32_t w, uint32_t h);
 // one snapshot; returns 1 if the frame was informative
 int  gvcal_add(gvcal_t *c, const gv_rec_t *rec, gvcal_frame_t *fo);
 // 0 pending, 1 accept, -1 reject (fills res either way)

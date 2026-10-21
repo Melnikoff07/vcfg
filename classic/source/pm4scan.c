@@ -105,6 +105,23 @@ typedef struct { uint64_t base, size; pm4_desc_t d; uint32_t slot, w, h, bpp, fl
 static uint32_t br_x(uint32_t v) { return v & 0x7FFFu; }
 static uint32_t br_y(uint32_t v) { return (v >> 16) & 0x7FFFu; }
 
+static float bits_f32(uint32_t u)
+{
+    union { uint32_t u; float f; } x = { u };
+    return x.f < 0.0f ? -x.f : x.f;
+}
+
+// Strip macro-tile vertical alignment padding when a 16:9 surface's allocation height was rounded up
+// (e.g., 1920x1088 -> 1920x1080, 3840x2176 -> 3840x2160, 2560x1472 -> 2560x1440, 1600x928 -> 1600x900, 1280x736 -> 1280x720)
+static uint32_t unpad_alloc_h(uint32_t w, uint32_t h)
+{
+    if (w >= 640u && (w * 9u) % 16u == 0u) {
+        uint32_t h16 = (w * 9u) / 16u;
+        if (h > h16 && h - h16 <= 64u && (h & 7u) == 0u) return h16;
+    }
+    return h;
+}
+
 static void active_area(const pm4_frame_t *f, uint32_t pitch, uint32_t ah, uint32_t *w, uint32_t *h)
 {
     const uint16_t r[4] = { CTX_PA_SC_SCREEN_SCISSOR_BR, CTX_PA_SC_WINDOW_SCISSOR_BR, CTX_PA_SC_GENERIC_SCISSOR_BR,
@@ -115,6 +132,22 @@ static void active_area(const pm4_frame_t *f, uint32_t pitch, uint32_t ah, uint3
         if (x >= 8 && x < mw) mw = x;   // scissors that are "wide open" (0x4000) are clamped to the surface
         if (y >= 8 && y < mh) mh = y;
     }
+    // Check PA_CL_VPORT_XSCALE / YSCALE for engines that apply dynamic resolution scaling via viewport transform
+    // while leaving hardware scissors at full allocation size.
+    if (f->ctx[CTX_PA_CL_VPORT_XSCALE] && f->ctx[CTX_PA_CL_VPORT_YSCALE]) {
+        float xs = bits_f32(f->ctx[CTX_PA_CL_VPORT_XSCALE]);
+        float xo = bits_f32(f->ctx[CTX_PA_CL_VPORT_XOFFSET]);
+        float ys = bits_f32(f->ctx[CTX_PA_CL_VPORT_YSCALE]);
+        float yo = bits_f32(f->ctx[CTX_PA_CL_VPORT_YOFFSET]);
+        if (xs >= 160.0f && xs <= 4096.0f && ys >= 90.0f && ys <= 4096.0f) {
+            float fw = (xo >= xs * 0.5f && xo <= xs * 1.5f) ? (xo + xs) : (xs * 2.0f);
+            float fh = (yo >= ys * 0.5f && yo <= ys * 1.5f) ? (yo + ys) : (ys * 2.0f);
+            uint32_t vw = (uint32_t)(fw + 0.5f), vh = (uint32_t)(fh + 0.5f);
+            if (vw >= 320u && vw < mw) mw = vw;
+            if (vh >= 180u && vh < mh) mh = vh;
+        }
+    }
+    if (mh == ah) mh = unpad_alloc_h(mw, mh);
     *w = mw; *h = mh;
 }
 
@@ -219,6 +252,43 @@ static void track_alias(pm4_frame_t *f, uint64_t b, uint64_t s)
     save_cs(f, &k->al_cs);
 }
 
+// Check if a T# descriptor is a single-mip 2D velocity or depth surface that can be discovered directly from
+// shader user data (e.g., compute-written velocity buffers or surfaces bound without a prior CB/DB draw).
+static int tsharp_is_surface_candidate(const uint32_t *t, uint64_t base, tgt_t *out)
+{
+    uint32_t type = t[3] >> 28, dfmt = (t[1] >> 20) & 0x3Fu, nfmt = (t[1] >> 26) & 0xFu;
+    if (type != 9u || base < 0x100000ull || base >= (1ull << 47) || (base & 0xFFull)) return 0;
+    uint32_t base_lvl = (t[3] >> 12) & 0xFu, last_lvl = (t[3] >> 16) & 0xFu, tile = (t[3] >> 20) & 0x1Fu;
+    if (base_lvl != 0u || last_lvl != 0u || tile == 8u) return 0;   // single-mip tiled 2D surface only
+    if ((t[4] & 0x1FFFu) != 0u || (t[4] >> 27) != 0u || (t[5] & 0x1FFFFFu) != 0u) return 0;
+    uint32_t w = (t[2] & 0x3FFFu) + 1u, h = ((t[2] >> 14) & 0x3FFFu) + 1u;
+    uint32_t pitch = ((t[4] >> 13) & 0x3FFFu) + 1u;
+    if (w < 640u || w > 4096u || h < 360u || h > 2304u || pitch < w || pitch > 4096u || (pitch & 7u) != 0u) return 0;
+    // Aspect ratio: ~16:9 (within 10%) or half-width 8:9 checkerboard
+    uint64_t lhs = (uint64_t)w * 9u, rhs = (uint64_t)h * 16u;
+    int ar_ok = (lhs * 100u >= rhs * 90u && lhs * 100u <= rhs * 110u) ||
+                (lhs * 200u >= rhs * 95u && lhs * 200u <= rhs * 105u);
+    if (!ar_ok) return 0;
+    int is_vel = (dfmt == 5u || dfmt == 12u) && (nfmt == 7u || nfmt == 1u || nfmt == 0u);
+    int is_z32 = (dfmt == 4u && nfmt == 7u);
+    int is_z24 = ((dfmt == 20u || dfmt == 21u) && nfmt == 0u);
+    if (!is_vel && !is_z32 && !is_z24) return 0;
+    memset(out, 0, sizeof(*out));
+    out->base = base;
+    out->d.depth = (is_z32 || is_z24) ? 1u : 0u;
+    out->d.fmt = is_z32 ? 3u : is_z24 ? 2u : dfmt;
+    out->d.num = is_z32 ? 7u : is_z24 ? 0u : nfmt;
+    out->d.pitch = pitch;
+    out->d.alloc_h = (h + 7u) & ~7u;
+    out->d.tile = tile;
+    out->w = w;
+    out->h = h;
+    out->bpp = out->d.depth ? 4u : pm4_cb_bpp(dfmt);
+    out->size = (uint64_t)out->d.pitch * out->d.alloc_h * out->bpp;
+    out->slot = out->d.depth ? 8u : 0u;
+    return 1;
+}
+
 // ---- T# (image resource) recognition for "was this target sampled later" ----
 static void tsharp_match(pm4_frame_t *f, const uint32_t *t, int cs)
 {
@@ -228,13 +298,50 @@ static void tsharp_match(pm4_frame_t *f, const uint32_t *t, int cs)
     // (shadPS4 AmdGpu::Image), so they must not take part in the address compare
     uint64_t base = ((uint64_t)t[0] << 8) | ((uint64_t)(t[1] & 0x3Fu) << 40);
     if (!base) return;
+    int matched = 0;
     for (uint32_t i = 0; i < f->nrt; i++) {
         pm4_rt_t *r = &f->rt[i];
         if (r->base != base || !r->draws) continue;
-        if (!r->samp_draw) { r->samp_draw = f->draws + f->dispatches; memcpy(r->samp_t, t, sizeof(r->samp_t)); }
+        matched = 1;
+        if (!r->samp_draw) { r->samp_draw = f->draws + f->dispatches + 1u; memcpy(r->samp_t, t, sizeof(r->samp_t)); }
         if (cs) r->samp_cs++; else r->samp_ps++;
         r->flags |= PM4RT_SAMPLED;
+        // Refine active dimensions from the sampling T# when the draw scissors were left at full allocation size
+        if (type == 9u) {
+            uint32_t tw = (t[2] & 0x3FFFu) + 1u, th = ((t[2] >> 14) & 0x3FFFu) + 1u;
+            if (tw >= 320u && tw <= r->d.pitch && th >= 180u && th <= r->d.alloc_h &&
+                r->w == r->d.pitch && (tw < r->w || th < r->h)) {
+                r->w = tw; r->h = th;
+            }
+        }
         f->tsharp_hits++;
+    }
+    if (!matched && (f->mode & PM4_FULL)) {
+        tgt_t st;
+        if (tsharp_is_surface_candidate(t, base, &st)) {
+            for (uint32_t i = 0; i < f->ndisplay; i++)
+                if (ranges_overlap(f->display[i], 1, st.base, st.size)) return;
+            pm4_rt_t *r = find_rt(f, &st, 1);
+            if (r) {
+                if (!r->draws) {
+                    r->draws = 20u;
+                    r->zdraws = 20u;
+                    r->w = st.w;
+                    r->h = st.h;
+                    r->slot_mask |= 1u << st.slot;
+                    if (st.d.depth) r->zfunc[6] = 20u;
+                }
+                r->last_draw = f->draws;
+                r->last_pass = f->passes;
+                if (!r->samp_draw) {
+                    r->samp_draw = f->draws + f->dispatches + 1u;
+                    memcpy(r->samp_t, t, sizeof(r->samp_t));
+                }
+                if (cs) r->samp_cs++; else r->samp_ps++;
+                r->flags |= PM4RT_SAMPLED;
+                f->tsharp_hits++;
+            }
+        }
     }
 }
 
@@ -249,22 +356,44 @@ static int tbl_seen(pm4_frame_t *f, uint64_t p)
     return 1;   // table full: treat as seen (bounds the work)
 }
 
+static uint32_t readable_table_dwords(pm4_frame_t *f, const uint32_t *tb)
+{
+    if (!f->readable) return 0;
+    static const uint32_t probes[5] = { 128u, 64u, 32u, 16u, 8u };
+    for (int k = 0; k < 5; k++) {
+        if (f->readable(tb, (size_t)probes[k] * 4u, f->user)) return probes[k];
+    }
+    return 0;
+}
+
 // 16 user-data dwords of a shader stage: inline T# (8 dwords) or a pointer (2 dwords) to a table of descriptors.
 // GNM puts small resource sets inline in user SGPRs and larger ones behind a pointer (Gnm::InputUsageSlot
-// kShaderInputUsageImmResource / kShaderInputUsagePtrResourceTable). We do not know the shader's input usage
-// table, so both readings are tried; a false T# match needs an exact 40-bit base address equal to a render
-// target written this frame, which random data does not produce.
+// kShaderInputUsageImmResource / kShaderInputUsagePtrResourceTable / ExtendedUserData). We do not know the shader's
+// input usage table, so both readings are tried; inside EUD tables, descriptors are 2-dword (8-byte) aligned because
+// 64-bit pointers occupy 2 dwords before 8-dword T# descriptors.
 static void scan_user_data(pm4_frame_t *f, const uint32_t *ud, int cs)
 {
     for (int i = 0; i + 8 <= 16; i++) tsharp_match(f, ud + i, cs);
     for (int i = 0; i + 2 <= 16; i++) {
         uint64_t p = (uint64_t)ud[i] | ((uint64_t)ud[i + 1] << 32);
-        if ((p & 3u) || p < 0x100000u || p >= (1ull << 40)) continue;   // GPU VAs are 40 bit on Liverpool
+        if ((p & 3u) || p < 0x100000u || p >= (1ull << 47)) continue;
         if (f->tables_read >= 4096 || tbl_seen(f, p)) continue;
         const uint32_t *tb = (const uint32_t *)(uintptr_t)p;
-        if (!f->readable || !f->readable(tb, 64 * 4, f->user)) continue;
+        uint32_t max_dw = readable_table_dwords(f, tb);
+        if (!max_dw) continue;
         f->tables_read++;
-        for (int j = 0; j + 8 <= 64; j += 4) tsharp_match(f, tb + j, cs);
+        for (uint32_t j = 0; j + 8u <= max_dw; j += 2u) tsharp_match(f, tb + j, cs);
+        // Support 1 level of nested EUD -> ResourceTable pointer indirection in the first 16 EUD slots
+        for (uint32_t j = 0; j + 2u <= max_dw && j < 32u; j += 2u) {
+            uint64_t p2 = (uint64_t)tb[j] | ((uint64_t)tb[j + 1] << 32);
+            if ((p2 & 7u) || p2 < 0x100000u || p2 >= (1ull << 47)) continue;
+            if (f->tables_read >= 4096 || tbl_seen(f, p2)) continue;
+            const uint32_t *tb2 = (const uint32_t *)(uintptr_t)p2;
+            uint32_t max_dw2 = readable_table_dwords(f, tb2);
+            if (!max_dw2) continue;
+            f->tables_read++;
+            for (uint32_t k = 0; k + 8u <= max_dw2; k += 2u) tsharp_match(f, tb2 + k, cs);
+        }
     }
 }
 
@@ -288,7 +417,9 @@ static void on_draw(pm4_frame_t *f)
                 r->draws++;
                 if (zon) r->zdraws++;
                 r->last_draw = f->draws; r->last_pass = f->passes;
-                r->w = t[i].w; r->h = t[i].h;
+                if (!r->w || (t[i].w >= 320u && t[i].h >= 180u)) {
+                    r->w = t[i].w; r->h = t[i].h;
+                }
                 r->slot_mask |= 1u << t[i].slot;
                 r->flags |= t[i].flags;
                 if (ncb > 1 && t[i].slot < 8) r->flags |= PM4RT_WITHMRT;
@@ -306,7 +437,8 @@ static void on_draw(pm4_frame_t *f)
                 k->ord_seen = f->ord_n;
                 if (o == f->trk_ordinal) {
                     if (k->aliased) { k->rewritten++; k->aliased = 0; k->al_entry = -1; }
-                    k->written = 1; k->addr = t[i].base; k->size = t[i].size; k->w = t[i].w; k->h = t[i].h;
+                    k->written = 1; k->addr = t[i].base; k->size = t[i].size;
+                    if (!k->w || (t[i].w >= 320u && t[i].h >= 180u)) { k->w = t[i].w; k->h = t[i].h; }
                     k->lw_entry = f->cur_entry;
                     k->lw_end = f->top_chained ? 0xFFFFFFFFu : f->cur_top_end;   // after a chain: no cut inside
                     continue;
@@ -315,7 +447,10 @@ static void on_draw(pm4_frame_t *f)
             track_alias(f, t[i].base, t[i].size);
         }
     }
-    if (f->mode & PM4_FULL) scan_user_data(f, f->sh + SH_USER_DATA_PS_0, 0);
+    if (f->mode & PM4_FULL) {
+        scan_user_data(f, f->sh + SH_USER_DATA_PS_0, 0);
+        scan_user_data(f, f->sh + SH_USER_DATA_VS_0, 0);
+    }
 }
 
 static void on_dispatch(pm4_frame_t *f)
@@ -346,6 +481,29 @@ static void on_dma(pm4_frame_t *f, const uint32_t *b, uint32_t nb)
 static void set_regs(uint32_t *regs, uint32_t off, const uint32_t *v, uint32_t n)
 {
     for (uint32_t i = 0; i < n && off + i < 0x400u; i++) regs[off + i] = v[i];
+}
+
+static void on_load_regs(pm4_frame_t *f, uint32_t *regs, const uint32_t *b, uint32_t nb, int is_sh)
+{
+    f->loads++;
+    if (nb < 4 || !f->readable) return;
+    uint64_t base = (uint64_t)(b[0] & ~3u) | ((uint64_t)(b[1] & 0xFFFFu) << 32);
+    if ((base & 3u) || base < 0x100000ull || base >= (1ull << 47)) return;
+    for (uint32_t k = 2; k + 1 < nb; k += 2) {
+        uint32_t off = b[k] & 0xFFFFu, cnt = b[k + 1] & 0x3FFFu;
+        if (!cnt || cnt > 0x400u || off + cnt > 0x400u) continue;
+        // GNM LOAD_CONTEXT_REG / LOAD_SH_REG: values sit at base + off*4 (or at base if single range at offset 0)
+        const uint32_t *src = (const uint32_t *)(uintptr_t)(base + (uint64_t)off * 4u);
+        if (!f->readable(src, (size_t)cnt * 4u, f->user)) {
+            src = (const uint32_t *)(uintptr_t)base;
+            if (k != 2 || !f->readable(src, (size_t)cnt * 4u, f->user)) continue;
+        }
+        set_regs(regs, off, src, cnt);
+        if (is_sh) {
+            for (int i = 0; i < PM4_NCS; i++)
+                if (pm4_cs_reg_idx[i] >= off && pm4_cs_reg_idx[i] < off + cnt) f->cs_seen |= 1u << i;
+        }
+    }
 }
 
 static void on_marker(pm4_frame_t *f, const uint32_t *b, uint32_t nb, int color)
@@ -383,9 +541,10 @@ int pm4_walk_entry(pm4_frame_t *f, const uint32_t *dcb, uint32_t ndw, int32_t en
     if (((uintptr_t)dcb & 3u) || !f->readable || !f->readable(dcb, (size_t)ndw * 4u, f->user)) {
         f->abort = PM4_ABORT_UNREADABLE; f->abort_at_dw = f->dwords; return f->abort;
     }
-    struct { const uint32_t *p, *end; } st[PM4_MAX_DEPTH + 1];
+    struct { const uint32_t *base, *p, *end; } st[PM4_MAX_DEPTH + 1];
     int d = 0;
-    st[0].p = dcb; st[0].end = dcb + ndw;
+    uint32_t entry_ibs = 0;
+    st[0].base = dcb; st[0].p = dcb; st[0].end = dcb + ndw;
     while (d >= 0) {
         if (st[d].p >= st[d].end) { d--; continue; }
         const uint32_t *p = st[d].p;
@@ -428,7 +587,13 @@ int pm4_walk_entry(pm4_frame_t *f, const uint32_t *dcb, uint32_t ndw, int32_t en
             f->clear_state++;
             memset(f->ctx, 0, sizeof(f->ctx));
             break;
-        case OP_LOAD_SH_REG: case OP_LOAD_CONFIG_REG: case OP_LOAD_CONTEXT_REG: case OP_SET_CONTEXT_REG_INDIRECT:
+        case OP_LOAD_CONTEXT_REG:
+            on_load_regs(f, f->ctx, b, nb, 0);
+            break;
+        case OP_LOAD_SH_REG:
+            on_load_regs(f, f->sh, b, nb, 1);
+            break;
+        case OP_LOAD_CONFIG_REG: case OP_SET_CONTEXT_REG_INDIRECT:
             f->loads++;                    // state loaded from memory: our shadow may be wrong (logged)
             break;
         case OP_DRAW_INDIRECT: case OP_DRAW_INDEX_INDIRECT: case OP_DRAW_INDEX_2: case OP_DRAW_INDIRECT_MULTI:
@@ -458,17 +623,24 @@ int pm4_walk_entry(pm4_frame_t *f, const uint32_t *dcb, uint32_t ndw, int32_t en
             uint32_t sz = b[2] & 0xFFFFFu, chain = (b[2] >> 20) & 1u;                    // IB_SIZE 19:0, CHAIN bit 20
             f->ibs++;
             if (!sz) break;
+            if ((a & 3u) || a < 0x100000ull || a >= (1ull << 47) || ++entry_ibs > 4096u) {
+                f->ib_unreadable++;
+                if (f->trk_on) { f->abort = PM4_ABORT_UNREADABLE; f->abort_at_dw = f->dwords; }
+                break;
+            }
             const uint32_t *ib = (const uint32_t *)(uintptr_t)a;
-            if (!f->readable || !f->readable(ib, (size_t)sz * 4u, f->user)) {
+            int cyclic = 0;
+            for (int k = 0; k <= d; k++) if (st[k].base == ib) { cyclic = 1; break; }
+            if (cyclic || !f->readable || !f->readable(ib, (size_t)sz * 4u, f->user)) {
                 f->ib_unreadable++;
                 if (f->trk_on) { f->abort = PM4_ABORT_UNREADABLE; f->abort_at_dw = f->dwords; }   // could hide a write
                 break;
             }
             if (chain) {                   // the rest of this buffer is not executed: continue in the target
                 if (d == 0) { f->top_chained = 1; f->top_chain_off = f->cur_top_off; }
-                st[d].p = ib; st[d].end = ib + sz;
+                st[d].base = ib; st[d].p = ib; st[d].end = ib + sz;
             } else if (d < PM4_MAX_DEPTH) {
-                d++; st[d].p = ib; st[d].end = ib + sz;
+                d++; st[d].base = ib; st[d].p = ib; st[d].end = ib + sz;
                 if ((uint32_t)d > f->depth_max) f->depth_max = (uint32_t)d;
             } else {
                 f->ib_unreadable++;        // deeper than we follow: treat as unknown
@@ -491,8 +663,16 @@ int pm4_rt_game_tsharp(const pm4_rt_t *r, uint32_t *tile, uint32_t *pitch)
     if (!r->samp_draw) return 0;
     const uint32_t *t = r->samp_t;
     uint32_t type = t[3] >> 28, dfmt = (t[1] >> 20) & 0x3Fu;
-    uint32_t want = r->d.depth ? (r->d.fmt == 3 ? 4u : r->d.fmt == 1 ? 2u : 0u) : r->d.fmt;   // IMG_DATA_FORMAT
-    if (type != 9 || !want || dfmt != want) return 0;              // plain 2D view in the same data format only
+    if (type != 9) return 0;
+    int fmt_ok = 0;
+    if (r->d.depth) {
+        if (r->d.fmt == 3) fmt_ok = (dfmt == 4u || dfmt == 22u);        // Z32F: 32 or X24_8_32_FLOAT
+        else if (r->d.fmt == 2) fmt_ok = (dfmt == 20u || dfmt == 21u);  // Z24: 8_24 or 24_8
+        else if (r->d.fmt == 1) fmt_ok = (dfmt == 2u);                  // Z16: 16
+    } else {
+        fmt_ok = (r->d.fmt != 0u && dfmt == r->d.fmt);
+    }
+    if (!fmt_ok) return 0;
     uint32_t p = ((t[4] >> 13) & 0x3FFFu) + 1u, w = (t[2] & 0x3FFFu) + 1u;
     if (p < w || p > 16384u) return 0;
     *tile = (t[3] >> 20) & 0x1Fu;
@@ -516,29 +696,38 @@ void pm4_rank(pm4_frame_t *f, uint32_t sw, uint32_t sh)
         int s = 0;
         int full = near_ratio(r->w, sw, 1, 1) && near_ratio(r->h, sh, 1, 1);
         int half = near_ratio(r->w, sw, 1, 2) && near_ratio(r->h, sh, 1, 2);
-        int dyn = !full && !half && r->w * 4u >= sw * 2u && r->w <= sw && r->h * 4u >= sh * 2u && r->h <= sh &&
-                  near_ratio(r->w * sh, r->h * sw, 1, 1);           // same aspect, 50..100 % (dynamic resolution)
+        int ar16_9 = near_ratio(r->w * 9u, r->h * 16u, 1, 1) || near_ratio(r->w * sh, r->h * sw, 1, 1);
+        // Dynamic resolution: 50%..100% of display resolution, 1280x720..3840x2160 16:9 (including PS4 Pro neo=1
+        // supersampling or sub-4K DRS), or horizontal DRS / checkerboard (50%..100% width at full height).
+        int dyn_hi = !full && !half && ar16_9 &&
+                     ((r->w * 100u >= sw * 63u && r->w <= sw && r->h * 100u >= sh * 63u && r->h <= sh) ||
+                      (r->w >= 1248u && r->w <= 3840u && r->h >= 702u && r->h <= 2160u));
+        int dyn_lo = !full && !half && !dyn_hi &&
+                     ((ar16_9 && r->w * 2u >= sw && r->w <= sw && r->h * 2u >= sh && r->h <= sh) ||
+                      (near_ratio(r->h, sh, 1, 1) && r->w * 2u >= sw && r->w <= sw));
+        int dyn = dyn_hi || dyn_lo;
         if (r->d.depth) {
             if (full) s += 40; else if (dyn) s += 25; else if (half) s += 5; else s -= 40;
             if (r->d.fmt == 3) s += 10;
+            else if (r->d.fmt == 2) s += 8;                             // Z24 depth buffer
             if (r->draws >= 50) s += 20; else if (r->draws >= 10) s += 10;
             if (r->flags & PM4RT_SAMPLED) s += 10;
             if (r->flags & PM4RT_MSAA) s -= 50;
-            if (r->first_draw * 2u > tot) s -= 10;                   // depth of a late pass (shadow / UI)
+            if (r->first_draw * 2u > tot) s -= 10;                      // depth of a late pass (shadow / UI)
         } else {
             if (r->flags & PM4RT_DISPLAY) { r->score = -1000; continue; }
             if (r->nch == 2) s += 40;
-            else if (r->nch == 4 && r->bpp == 8) s += 15;            // RGBA16: velocity in .xy or .zw
+            else if (r->nch == 4 && r->bpp == 8) s += 15;               // RGBA16: velocity in .xy or .zw
             else if (r->nch == 1) s -= 20;
-            else if (r->nch == 4 && r->bpp == 4) s -= 5;              // RGBA8 G-buffer (packed velocity: rare)
+            else if (r->nch == 4 && r->bpp == 4) s -= 5;                // RGBA8 G-buffer (packed velocity: rare)
             if (r->d.num == 7 || r->d.num == 1) s += 10; else if (r->d.num == 0) s += 5;
             else if (r->d.num == 6) s -= 30; else s -= 5;
-            if (full) s += 25; else if (half || dyn) s += 15; else s -= 30;
+            if (full) s += 25; else if (dyn_hi) s += 20; else if (half || dyn_lo) s += 15; else s -= 30;
             if (r->draws >= 100) s += 15; else if (r->draws >= 20) s += 10; else if (r->draws <= 2) s -= 5;
-            if (r->zdraws * 2u >= r->draws && r->draws) s += 15;      // rasterised geometry with depth test
+            if (r->zdraws * 2u >= r->draws && r->draws) s += 15;         // rasterised geometry with depth test
             if (r->flags & PM4RT_WITHMRT) s += 5;
-            if (r->flags & PM4RT_SAMPLED) s += 10;                    // read later (TAA / motion blur)
-            if (r->first_draw * 2u < tot) s += 5;                     // written in the first half of the frame
+            if (r->flags & PM4RT_SAMPLED) s += 10;                       // read later (TAA / motion blur)
+            if (r->first_draw * 2u < tot) s += 5;                        // written in the first half of the frame
             if (r->flags & PM4RT_MSAA) s -= 50;
             if (r->bpp >= 16) s -= 10;
         }

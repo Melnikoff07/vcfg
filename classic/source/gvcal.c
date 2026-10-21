@@ -28,6 +28,19 @@ static uint32_t bits_(float x) { uint32_t u; memcpy(&u, &x, 4); return u; }
 
 void gvcal_reset(gvcal_t *c) { memset(c, 0, sizeof(*c)); }
 
+void gvcal_set_res(gvcal_t *c, uint32_t w, uint32_t h)
+{
+    if (w < 320u || h < 180u) return;
+    c->cur_w = w;
+    c->cur_h = h;
+    if (!c->ref_w) {
+        c->ref_w = w;
+        c->ref_h = h;
+    } else if (w != c->ref_w || h != c->ref_h) {
+        c->drs_varied = 1u;
+    }
+}
+
 // k-th smallest of a[0..n) (quickselect, in place)
 static float kth(float *a, int n, int k)
 {
@@ -86,9 +99,10 @@ int gvcal_add(gvcal_t *c, const gv_rec_t *rec, gvcal_frame_t *fo)
     memset(fo, 0, sizeof(*fo));
     c->frames++;
     // ---- heavy hitter of exact raw values over textured blocks (sentinel candidate) ----
-    uint32_t hv[8][2], hc[8], nh = 0, ntex = 0;
+    uint32_t hv[8][2], hc[8], nh = 0, ntex = 0, nimg_tex = 0;
     for (int i = 0; i < GV_NB; i++) {
         const gv_rec_t *r = &rec[i];
+        if (r->tex >= TEX_MIN) nimg_tex++;
         if (!(r->flags & GVREC_GVALID) || r->tex < TEX_MIN) continue;
         ntex++;
         uint32_t x = bits_(r->rx), y = bits_(r->ry);
@@ -146,7 +160,9 @@ int gvcal_add(gvcal_t *c, const gv_rec_t *rec, gvcal_frame_t *fo)
         if (c->mode_x == mx_ && c->mode_y == my_) { c->mode_frames++; c->mode_share += fo->mode_share; }
     }
     fo->n_rel = (uint32_t)n;
-    if (have_mode && fo->mode_share >= 0.9f && c->mode_n >= MIN_REL) {
+    if (nimg_tex >= MIN_REL && ntex < MIN_REL / 2) {
+        c->const_frames++;
+    } else if (have_mode && fo->mode_share >= 0.9f && c->mode_n >= MIN_REL) {
         // (nearly) the whole buffer holds one value: count the frame if the image moved on those blocks. Either not
         // a velocity buffer, or an objects-only buffer with no moving object in view: a SOFT rejection (retried)
         double mn = c->mode_n, ex = c->mode_sfx / mn, ey = c->mode_sfy / mn;
@@ -160,30 +176,41 @@ int gvcal_add(gvcal_t *c, const gv_rec_t *rec, gvcal_frame_t *fo)
     }
     int inf_any = 0;
     for (int ax = 0; ax < 2; ax++) {
+        // Robust location and scale of raw and flow before the initial least-squares fit, so isolated corrupt
+        // raw texels on a UV/NDC/UNORM buffer cannot blow up s.srr and drive the initial slope a -> 0.
+        for (int j = 0; j < n; j++) { const gv_rec_t *r = &rec[g_idx[j]]; g_res[j] = ax ? r->fy : r->fx; }
+        float medf = kth(g_res, n, n / 2);
+        for (int j = 0; j < n; j++) { const gv_rec_t *r = &rec[g_idx[j]]; g_res[j] = ax ? r->ry : r->rx; }
+        float medr = kth(g_res, n, n / 2);
+        for (int j = 0; j < n; j++) { const gv_rec_t *r = &rec[g_idx[j]]; g_res[j] = fabs_((ax ? r->ry : r->rx) - medr); }
+        float mad_r = kth(g_res, n, n / 2);
+        float p95_r = kth(g_res, n, (n * 19) / 20);
+        float rscale = 1.4826f * mad_r;
+        if (p95_r > rscale) rscale = p95_r;
+        float rmax = 10.0f * rscale + 1e-5f * fabs_(medr) + 1e-6f;
+        float rthr = 5.0f * 1.4826f * mad_r + 1e-6f * fabs_(medr) + 1e-9f;
+
         // A uniform pan has (almost) no flow variance INSIDE the frame: the frame then contributes one point
         // (mean raw, mean flow) and the slope comes from the differences BETWEEN frames. So the fit is done on
         // the sums over all frames; per frame we only trim outliers and keep the per-frame means.
         sums_t s = { 0 };
         for (int j = 0; j < n; j++) {
             const gv_rec_t *r = &rec[g_idx[j]];
-            sums_add(&s, ax ? r->ry : r->rx, ax ? r->fy : r->fx);
+            float rv = ax ? r->ry : r->rx, fv = ax ? r->fy : r->fx;
+            if (fabs_(rv - medr) > rmax) continue;
+            sums_add(&s, rv, fv);
         }
         float a, b, r2, vf;
         int ok = fit(&s, &a, &b, &r2, &vf);
-        float mf = (float)(s.sf / s.n);
+        float mf = s.n > 0 ? (float)(s.sf / s.n) : medf;
         int moving = vf >= STD_INF * STD_INF || fabs_(mf) >= 2.0f;
         if (!moving) continue;
         if (!ok && vf >= STD_INF * STD_INF) c->flat++;          // raw constant while the flow varies inside the frame
-        // trimming model: the global fit when there is one, else this frame's fit (if it has variance), else none
+        // trimming model: the global fit when there is one, else this frame's fit (if it has variance and correlation), else none
         sums_t g = { c->n[ax], c->sr[ax], c->sf[ax], c->srr[ax], c->sff[ax], c->srf[ax] };
         float ga, gb, gr2, gvf;
         int use_global = c->nf[ax] >= 2 && fit(&g, &ga, &gb, &gr2, &gvf) && gr2 > 0.5f;
-        int use_frame = !use_global && ok && vf >= STD_INF * STD_INF;
-        // robust location of raw and flow (median) for the fallback trimming
-        for (int j = 0; j < n; j++) { const gv_rec_t *r = &rec[g_idx[j]]; g_res[j] = ax ? r->fy : r->fx; }
-        float medf = kth(g_res, n, n / 2);
-        for (int j = 0; j < n; j++) { const gv_rec_t *r = &rec[g_idx[j]]; g_res[j] = ax ? r->ry : r->rx; }
-        float medr = kth(g_res, n, n / 2);
+        int use_frame = !use_global && ok && vf >= STD_INF * STD_INF && r2 >= 0.25f;
         for (int j = 0; j < n; j++) {
             const gv_rec_t *r = &rec[g_idx[j]];
             float rv = ax ? r->ry : r->rx, fv = ax ? r->fy : r->fx;
@@ -193,21 +220,20 @@ int gvcal_add(gvcal_t *c, const gv_rec_t *rec, gvcal_frame_t *fo)
         float mad = kth(g_res, n, n / 2);
         float thr = 3.0f * 1.4826f * mad;
         if (thr < 1.5f) thr = 1.5f;
-        // raw spread for the fallback (no model): keep blocks near the median raw (5 x MAD of raw)
-        float rthr = 0;
-        if (!use_global && !use_frame) {
-            for (int j = 0; j < n; j++) { const gv_rec_t *r = &rec[g_idx[j]]; g_res[j] = fabs_((ax ? r->ry : r->rx) - medr); }
-            rthr = 5.0f * 1.4826f * kth(g_res, n, n / 2) + 1e-6f * fabs_(medr) + 1e-9f;
-        }
-        sums_t si = { 0 }, sp = { 0 };
+        float drs_k = 1.0f;
+        if (c->ref_w && c->cur_w && c->ref_h && c->cur_h)
+            drs_k = ax ? ((float)c->ref_h / (float)c->cur_h) : ((float)c->ref_w / (float)c->cur_w);
+        sums_t si = { 0 }, sp = { 0 }, sdrs = { 0 };
         for (int j = 0; j < n; j++) {
             const gv_rec_t *r = &rec[g_idx[j]];
             float rv = ax ? r->ry : r->rx, fv = ax ? r->fy : r->fx, pv = ax ? r->fpy : r->fpx;
+            if (fabs_(rv - medr) > rmax) continue;
             float e = use_global ? fv - (ga * rv + gb) : use_frame ? fv - (a * rv + b) : fv - medf;
             if (fabs_(e) > thr) continue;
             if (!use_global && !use_frame && fabs_(rv - medr) > rthr) continue;
             sums_add(&si, rv, fv);
             sums_add(&sp, rv, pv);
+            sums_add(&sdrs, rv * drs_k, fv);
         }
         if (si.n < MIN_REL / 2) continue;
         float fa_ = 0, fb_ = 0, fr2 = 0, fvf = 0, ap, bp, r2p, vfp;
@@ -217,9 +243,15 @@ int gvcal_add(gvcal_t *c, const gv_rec_t *rec, gvcal_frame_t *fo)
         // stale test: only meaningful with variance inside the frame
         if (fok && fvf >= 4.0f && r2p > fr2 + 0.05f) fo->stale = 1;
         c->n[ax] += si.n; c->sr[ax] += si.sr; c->sf[ax] += si.sf; c->srr[ax] += si.srr; c->sff[ax] += si.sff; c->srf[ax] += si.srf;
+        c->drs_n[ax] += sdrs.n; c->drs_sr[ax] += sdrs.sr; c->drs_sf[ax] += sdrs.sf;
+        c->drs_srr[ax] += sdrs.srr; c->drs_sff[ax] += sdrs.sff; c->drs_srf[ax] += sdrs.srf;
         uint32_t k = c->nf[ax] % GVCAL_MAXF;
         c->fmr[ax][k] = (float)(si.sr / si.n); c->fmf[ax][k] = (float)(si.sf / si.n);
-        c->fa[ax][k] = (fok && fvf >= 4.0f && fr2 >= 0.85f) ? fa_ : 0.0f;   // per-frame slope only where the frame has variance AND a good fit (RDR2: a frame with R2 0.55 had slope 0.35, the good ones 1.0, and the spread rule rejected the true buffer)
+        // per-frame slope only where the frame has variance AND a good fit (CUSA03041: a frame with R2 0.55 had
+        // slope 0.35, the good ones 1.0, and the spread rule rejected the true buffer)
+        c->fa[ax][k] = (fok && fvf >= 4.0f && fr2 >= 0.85f) ? fa_ : 0.0f;
+        c->drs_fmr[ax][k] = (float)(sdrs.sr / sdrs.n);
+        c->drs_fa[ax][k] = (fok && fvf >= 4.0f && fr2 >= 0.85f && drs_k > 0.0f) ? (fa_ / drs_k) : 0.0f;
         c->nf[ax]++;
         inf_any = 1;
     }
@@ -233,26 +265,26 @@ int gvcal_add(gvcal_t *c, const gv_rec_t *rec, gvcal_frame_t *fo)
 
 static int popc(uint32_t x) { int n = 0; while (x) { n += (int)(x & 1u); x >>= 1; } return n; }
 
-int gvcal_decide(const gvcal_t *c, gvcal_result_t *res)
+static void eval_fit(const gvcal_t *c, int use_drs, float a[2], float b[2], float r2[2], float spread[2], float jit[2])
 {
-    memset(res, 0, sizeof(*res));
-    res->frames = c->informative;
-    res->blocks = (uint32_t)(c->n[0] + c->n[1]);
-    res->classes = c->classes;
-    float a[2] = { 0, 0 }, b[2] = { 0, 0 }, r2[2] = { 0, 0 }, spread[2] = { 0, 0 }, jit[2] = { 0, 0 };
     for (int ax = 0; ax < 2; ax++) {
-        sums_t s = { c->n[ax], c->sr[ax], c->sf[ax], c->srr[ax], c->sff[ax], c->srf[ax] };
-        float vf;
+        sums_t s = use_drs
+            ? (sums_t){ c->drs_n[ax], c->drs_sr[ax], c->drs_sf[ax], c->drs_srr[ax], c->drs_sff[ax], c->drs_srf[ax] }
+            : (sums_t){ c->n[ax], c->sr[ax], c->sf[ax], c->srr[ax], c->sff[ax], c->srf[ax] };
+        float vf = 0.0f;
+        a[ax] = 0.0f; b[ax] = 0.0f; r2[ax] = 0.0f; spread[ax] = 0.0f; jit[ax] = 0.0f;
         fit(&s, &a[ax], &b[ax], &r2[ax], &vf);
         uint32_t m = c->nf[ax] < GVCAL_MAXF ? c->nf[ax] : GVCAL_MAXF;
         if (m >= 3 && a[ax] != 0.0f) {
             // spread of the per-frame slopes (relative mean absolute deviation) and jitter = spread of the
-            // per-frame intercepts under the global slope
+            // per-frame intercepts under the global slope (centered around b[ax] to avoid float cancellation on UNORM)
             double sa = 0, sj = 0, sj2 = 0;
             uint32_t ms = 0;
             for (uint32_t k = 0; k < m; k++) {
-                if (c->fa[ax][k] != 0.0f) { sa += fabs_(c->fa[ax][k] / a[ax] - 1.0f); ms++; }
-                double bj = c->fmf[ax][k] - a[ax] * c->fmr[ax][k];
+                float fak = use_drs ? c->drs_fa[ax][k] : c->fa[ax][k];
+                float fmrk = use_drs ? c->drs_fmr[ax][k] : c->fmr[ax][k];
+                if (fak != 0.0f) { sa += fabs_(fak / a[ax] - 1.0f); ms++; }
+                double bj = ((double)c->fmf[ax][k] - (double)a[ax] * (double)fmrk) - (double)b[ax];
                 sj += bj; sj2 += bj * bj;
             }
             spread[ax] = ms >= 3 ? (float)(sa / ms) : 0.0f;
@@ -260,18 +292,53 @@ int gvcal_decide(const gvcal_t *c, gvcal_result_t *res)
             jit[ax] = sqrt_((float)(vj > 0 ? vj : 0));
         }
     }
+}
+
+int gvcal_decide(const gvcal_t *c, gvcal_result_t *res)
+{
+    memset(res, 0, sizeof(*res));
+    res->frames = c->informative;
+    res->blocks = (uint32_t)(c->n[0] + c->n[1]);
+    res->classes = c->classes;
+    res->cal_w = c->ref_w;
+    res->cal_h = c->ref_h;
+    float a[2] = { 0, 0 }, b[2] = { 0, 0 }, r2[2] = { 0, 0 }, spread[2] = { 0, 0 }, jit[2] = { 0, 0 };
+    eval_fit(c, 0, a, b, r2, spread, jit);
+    if (c->drs_varied && c->ref_w && c->ref_h) {
+        float da[2], db[2], dr2[2], dspread[2], djit[2];
+        eval_fit(c, 1, da, db, dr2, dspread, djit);
+        float sp0 = spread[0] > spread[1] ? spread[0] : spread[1];
+        float dsp = dspread[0] > dspread[1] ? dspread[0] : dspread[1];
+        if (fabs_(da[0]) >= 0.4f && fabs_(da[0]) <= 3.5f &&
+            ((dr2[0] + dr2[1] > r2[0] + r2[1] + 0.02f) || (dsp + 0.02f < sp0 && dr2[0] >= 0.8f))) {
+            for (int ax = 0; ax < 2; ax++) {
+                a[ax] = da[ax]; b[ax] = db[ax]; r2[ax] = dr2[ax]; spread[ax] = dspread[ax]; jit[ax] = djit[ax];
+            }
+            res->drs_scale = 1;
+        }
+    } else if (c->ref_w && c->ref_h && fabs_(a[0]) >= 0.4f && fabs_(a[0]) <= 3.5f) {
+        res->drs_scale = 1;
+    }
     res->ax = a[0]; res->bx = b[0]; res->ay = a[1]; res->by = b[1];
     res->r2x = r2[0]; res->r2y = r2[1]; res->jit_x = jit[0]; res->jit_y = jit[1];
     res->slope_spread = spread[0] > spread[1] ? spread[0] : spread[1];
     // units (log only; the fitted values are used)
     {
         float k = fabs_(a[0]);
+        float zrx = k > 1e-3f ? (-b[0] / a[0]) : 0.0f;
+        int unorm_bias = fabs_(zrx - 0.5f) < 0.02f;
         const char *u = "custom";
         if (k > 0.97f && k < 1.03f) u = "pixels";
         else if (k > 1.94f && k < 2.06f) u = "half-res pixels";
+        else if (k > 0.48f && k < 0.52f) u = "4K pixels";
+        else if (k > 0.73f && k < 0.77f) u = "1440p pixels";
+        else if (k > 1.16f && k < 1.24f) u = "900p pixels";
+        else if (k > 1.45f && k < 1.55f) u = "720p pixels";
+        else if (k >= 0.45f && k <= 3.1f) u = "DRS pixels";
         else if (k > 931.f && k < 989.f) u = "NDC (x W/2)";
-        else if (k > 1862.f && k < 1978.f) u = "UV (x W)";
+        else if (k > 1862.f && k < 1978.f) u = unorm_bias ? "UNORM UV (x W, bias 0.5)" : "UV (x W)";
         else if (k > 3733.f && k < 3963.f) u = "UE4 encoded (x W/2/0.2495)";
+        else if (unorm_bias) u = "UNORM biased";
         int flip = (a[0] < 0) != (a[1] < 0);
         snprintf(res->units, sizeof(res->units), "%s%s%s", u, a[0] < 0 ? ", cur-prev" : ", prev-cur", flip ? ", Y up" : "");
     }
@@ -297,7 +364,7 @@ int gvcal_decide(const gvcal_t *c, gvcal_result_t *res)
         if (fx >= 8 && vf > 4.0 && vr <= 1e-12 * (1.0 + mr * mr)) { res->state = -1; snprintf(res->reason, sizeof(res->reason), "raw value constant over %d moving frames", fx); return -1; }
     }
     if (c->informative >= 8 && c->flat * 2 >= c->informative) { res->state = -1; snprintf(res->reason, sizeof(res->reason), "constant buffer while the image moves (%u of %u frames)", c->flat, c->informative); return -1; }
-    if (fx >= 8 && r2[0] < 0.3f && (fy < 3 || r2[1] < 0.3f)) { res->state = -1; snprintf(res->reason, sizeof(res->reason), "no correlation with flow (R2 x %.2f y %.2f)", r2[0], r2[1]); return -1; }
+    if (fx >= 5 && r2[0] < 0.3f && (fy < 3 || r2[1] < 0.3f)) { res->state = -1; snprintf(res->reason, sizeof(res->reason), "no correlation with flow (R2 x %.2f y %.2f)", r2[0], r2[1]); return -1; }
     if (c->informative >= 8 && c->stale_votes * 2 > c->informative) { res->state = -1; snprintf(res->reason, sizeof(res->reason), "matches the PREVIOUS frame's flow better (stale copy, %u/%u)", c->stale_votes, c->informative); return -1; }
     if (fx >= 12 && spread[0] > 0.35f) { res->state = -1; snprintf(res->reason, sizeof(res->reason), "slope changes from frame to frame (spread %.2f): not a linear encoding", spread[0]); return -1; }
     // ---- acceptance ----

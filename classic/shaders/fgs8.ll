@@ -22,7 +22,7 @@
 ; must move faster than the camera: |V2|^2 > |gm|^2 + 4; (b) one of the 4 cardinal L2 neighbours must have a vector
 ; within 4 L2 px (manhattan): a real object is bigger than one 32x32 block, an isolated mismatch is not. On the
 ; console dump 03 (fast turn) this leaves 6 foreground blocks instead of 144.
-; 8.5 (head split, RDR2): ANCHORS. A block that really matches (same camera test), deviates from the camera like a
+; 8.5 (head split, CUSA03041): ANCHORS. A block that really matches (same camera test), deviates from the camera like a
 ; foreground block but moves at most half as fast as the camera on screen (|V2|^2 * 4 <= |gm|^2: a third-person
 ; character, a held object, HUD over a turning scene) is splatted too, with prio 0 (key < 1 << 20, so any real
 ; foreground key wins the atomic max). me1 / mf8 then penalise every candidate far from the anchor vector: the

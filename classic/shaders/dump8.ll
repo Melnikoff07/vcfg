@@ -57,7 +57,7 @@ entry:
   call void @llvm.amdgcn.raw.buffer.store.i32(i32 %pa, <4 x i32> %vo, i32 %off0, i32 0, i32 0)
   call void @llvm.amdgcn.raw.buffer.store.i32(i32 %pb, <4 x i32> %vo, i32 %off1, i32 0, i32 0)
   call void @llvm.amdgcn.raw.buffer.store.i32(i32 %pcc, <4 x i32> %vo, i32 %off2, i32 0, i32 0)
-  ; field copy (RDR2 round): one thread per block (120 x 68 = 8160): F final (+0x100), GK splat keys (+0x150), FT raw (+0x180)
+  ; field copy (CUSA03041 round): one thread per block (120 x 68 = 8160): F final (+0x100), GK splat keys (+0x150), FT raw (+0x180)
   ; written behind the three planes: F at 12441600, GK at +65280, FT at +97920
   %gxl = mul i32 %gy, 120
   %gxs = add i32 %gxl, %gx

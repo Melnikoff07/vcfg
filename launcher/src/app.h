@@ -10,10 +10,12 @@ enum { SEL_AUTO, SEL_CLASSIC, SEL_ALT, SEL_NEW, SEL_COUNT };
 // 2-BUFFER = force present copy + virtual flip queue (two_buffer=1, present_copy=1), STANDARD = force standard mid buffers (present_copy=2).
 enum { BUF_AUTO, BUF_2BUF, BUF_STD, BUF_COUNT };
 enum { TAB_GAMES, TAB_DEFAULTS, TAB_OVERLAY, TAB_INSTALL, TAB_DEV, TAB_COUNT };
+enum { DIAG_NONE, DIAG_OK, DIAG_OOM_BOOT, DIAG_REG_CONFLICT, DIAG_2BUF_NEEDED, DIAG_FLIP_STALL, DIAG_BOOT_EARLY, DIAG_INERT };
 
 typedef struct { int fg, preset, sharp, enhance, overlay; } Settings;   // preset 0 quality 1 fast; overlay 0..8
 
 typedef struct {
+    int manual_mode;  // 0 = AUTO (ALGORITHM DECIDES), 1 = CUSTOM (MANUAL DEV OVERRIDE)
     int shave_mode;   // 0 AUTO (VALVE+SHAVE), 1 VALVE ONLY, 2 LATE ALLOC (FRAME 120)
     int reg_mode;     // 0 AUTO (EXTEND+RELOC), 1 TOP GROUP (16-N), 2 DEFERRED (FRAME 120)
     int pace_order;   // 0 AUTO, 1 PRE-SUBMIT, 2 POST-SUBMIT, 3 TIMER (PAIR)
@@ -23,6 +25,15 @@ typedef struct {
     int safe_state;   // read from safe-<TITLE>.state: 0 EARLY, 1 DEFERRED, 2 PASSIVE
     int has_adapt;    // 1 if adapt-<TITLE>.ini exists
     int has_crash;    // 1 if crash-<TITLE>.txt exists
+    int diag_kind;    // DIAG_* analyzed from crash / boot / trace / safe files
+    int rec_row;      // 1..7 recommended Dev Mode row to adjust (0 = none)
+    char diag_cause[64];
+    char diag_stage[64];
+    char diag_advice[64];
+    char diag_detail[192];
+    char step1[64], step2[64], step3[64];
+    char log_tail[4][80];
+    int n_tail;
 } DevCfg;
 
 typedef struct {
@@ -35,9 +46,10 @@ typedef struct {
     DevCfg dev;
 } Game;
 
-// The engine a game runs with: the player's choice, AUTO = the table entry.
+// The engine a game runs with: when manual_mode is 0, AUTO = the table entry.
 static inline int game_engine(const Game *g)
 {
+    if (!g->dev.manual_mode) return g->engine;
     switch (g->eng_sel) {
     case SEL_CLASSIC: return g->engine == ENGINE_CLASSIC_BB ? ENGINE_CLASSIC_BB : ENGINE_CLASSIC;
     case SEL_ALT: return ENGINE_CLASSIC_ALT;
@@ -46,13 +58,38 @@ static inline int game_engine(const Game *g)
     }
 }
 
-// The buffer mode a game runs with: the player's choice, AUTO = def_buf (BUF_2BUF for known 2-buffer titles, BUF_STD otherwise).
+// The buffer mode a game runs with: when manual_mode is 0, AUTO = def_buf.
 static inline int game_buf(const Game *g)
 {
+    if (!g->dev.manual_mode) return g->def_buf == BUF_2BUF ? BUF_2BUF : BUF_STD;
     switch (g->buf_sel) {
     case BUF_2BUF: return BUF_2BUF;
     case BUF_STD: return BUF_STD;
     default: return g->def_buf == BUF_2BUF ? BUF_2BUF : BUF_STD;
+    }
+}
+
+// Combined Engine + Buffer preset index (0..5) for 05 DEV Row 1:
+// 0 = AUTO, 1 = DEFAULT + 3-BUF, 2 = DEFAULT + 2-BUF, 3 = ALT + 3-BUF, 4 = ALT + 2-BUF, 5 = NEW + 3-BUF
+static inline int game_pipe_preset(const Game *g)
+{
+    if (g->eng_sel == SEL_AUTO && g->buf_sel == BUF_AUTO) return 0;
+    if (g->eng_sel == SEL_NEW) return 5;
+    int is_alt = (g->eng_sel == SEL_ALT);
+    int is_2b  = (g->buf_sel == BUF_2BUF) || (g->buf_sel == BUF_AUTO && g->def_buf == BUF_2BUF);
+    if (is_alt) return is_2b ? 4 : 3;
+    return is_2b ? 2 : 1;
+}
+
+static inline void game_set_pipe_preset(Game *g, int p)
+{
+    switch (p) {
+    case 0: g->eng_sel = SEL_AUTO;    g->buf_sel = BUF_AUTO; break;
+    case 1: g->eng_sel = SEL_CLASSIC; g->buf_sel = BUF_STD;  break;
+    case 2: g->eng_sel = SEL_CLASSIC; g->buf_sel = BUF_2BUF; break;
+    case 3: g->eng_sel = SEL_ALT;     g->buf_sel = BUF_STD;  break;
+    case 4: g->eng_sel = SEL_ALT;     g->buf_sel = BUF_2BUF; break;
+    case 5: g->eng_sel = SEL_NEW;     g->buf_sel = BUF_STD;  break;
     }
 }
 
@@ -70,6 +107,11 @@ typedef struct {
     char rec_msg[64];                                    // result of the last recording, shown next to the hotkey
     int plugin_state;                                    // 0 missing, 1 installed, 2 outdated
     int debug_log;
+    int net_telemetry;                                   // 1 = auto-send crash reports to VPS + send report on Circle
+    char telemetry_host[64];                             // VPS IP or hostname from vcfg_launcher.ini / telemetry.ini
+    int telemetry_port;                                  // VPS TCP port (default 8765)
+    int dark_theme;                                      // 1 = dark theme (default), 0 = light theme
+    int dev_expand;                                      // 1 = expanded full-screen Crash/Log Advisor in 05 DEV
     char version[16];                                    // app and plugin version, shown in the header
     char status[128];
     char log[6][96]; int nlog;
@@ -78,9 +120,10 @@ typedef struct {
     Fonts *f;
 } App;
 
-enum { ACT_NONE, ACT_SAVE_EXIT, ACT_INSTALL, ACT_REMOVE, ACT_SAVE, ACT_DEBUG, ACT_REPORT, ACT_CLEAN, ACT_RESET_DEV };
+enum { ACT_NONE, ACT_SAVE_EXIT, ACT_INSTALL, ACT_REMOVE, ACT_SAVE, ACT_DEBUG, ACT_REPORT, ACT_CLEAN, ACT_RESET_DEV, ACT_LAUNCH, ACT_APPLY_ADVICE, ACT_TELEMETRY_TOGGLE };
 enum { PAD_UP = 0x10, PAD_RIGHT = 0x20, PAD_DOWN = 0x40, PAD_LEFT = 0x80, PAD_OPTIONS = 0x08,
-       PAD_TRIANGLE = 0x1000, PAD_CIRCLE = 0x2000, PAD_CROSS = 0x4000, PAD_SQUARE = 0x8000, PAD_L1 = 0x400, PAD_R1 = 0x800, PAD_R2 = 0x200 };
+       PAD_TRIANGLE = 0x1000, PAD_CIRCLE = 0x2000, PAD_CROSS = 0x4000, PAD_SQUARE = 0x8000,
+       PAD_L1 = 0x400, PAD_R1 = 0x800, PAD_L2 = 0x100, PAD_R2 = 0x200 };
 
 void app_draw(Canvas *c, App *a);
 int  app_input(App *a, uint32_t pressed);      // edge-triggered buttons -> ACT_*

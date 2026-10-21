@@ -23,7 +23,7 @@
 ; 8.3: the field goes to +0x180 V#FT (raw); mf8 filters it into +0x100 (F cur).
 ; 8.5: GK keys below 1 << 20 are ANCHORS (fgs8: a screen-fixed object while the camera turns). Slot 8 then carries
 ; the anchor vector with bias 64, and every other candidate farther than ARAD = 3 L1 px (manhattan) from it pays
-; ESC = 512: on the mid grid a vector whose two endpoints jump over a static, frame-to-frame noisy object (RDR2 hair)
+; ESC = 512: on the mid grid a vector whose two endpoints jump over a static, frame-to-frame noisy object (CUSA03041 hair)
 ; onto uniform sky has bilateral SAD ~50 against 300..1200 for the true vector, and once it is in the field the
 ; temporal predictors keep it (the head split). Real foreground keys (>= 1 << 20) are unchanged.
 ; 8.6 (round 2): (1) a temporal candidate (slots 4..6: last frame's vector at this / the right / the lower block, not
@@ -483,13 +483,16 @@ entry:
   %gvy = call i32 @uny(i32 %gv)
   %gdx = shl i32 %gvx, 1
   %gdy = shl i32 %gvy, 1
-  ; ---- camera vector (gm8, L2 px) -> L1 px; the camera stands still when gm = 0
+  ; ---- camera vector (gm8, L2 px) -> L1 px; the camera stands still when gm = 0 and fg_blocks <= 32
   %gmx = call i32 @llvm.amdgcn.raw.buffer.load.i32(<4 x i32> %vm, i32 16, i32 0, i32 0)
   %gmy = call i32 @llvm.amdgcn.raw.buffer.load.i32(<4 x i32> %vm, i32 20, i32 0, i32 0)
+  %fgcnt = call i32 @llvm.amdgcn.raw.buffer.load.i32(<4 x i32> %vm, i32 24, i32 0, i32 0)
+  %fg_still = icmp ule i32 %fgcnt, 32
   %gmx2 = shl i32 %gmx, 1
   %gmy2 = shl i32 %gmy, 1
   %gmor = or i32 %gmx, %gmy
-  %still = icmp eq i32 %gmor, 0
+  %still0 = icmp eq i32 %gmor, 0
+  %still = and i1 %still0, %fg_still
   ; ---- phase 1
   %islt4 = icmp ult i32 %sub, 4
   %s4 = sub i32 %sub, 4
@@ -733,7 +736,8 @@ fin:
   %gax = call i32 @llvm.abs.i32(i32 %gmx, i1 false)
   %gay = call i32 @llvm.abs.i32(i32 %gmy, i1 false)
   %gaxy = call i32 @llvm.smax.i32(i32 %gax, i32 %gay)
-  %slow1 = icmp sle i32 %gaxy, 1
+  %slow1a = icmp sle i32 %gaxy, 1
+  %slow1 = and i1 %slow1a, %fg_still
   %fade = and i1 %fade0, %slow1
   %zero = or i1 %zero0, %fade
   ; block (0, 0) reports the fade decision in misc dword 7 (frame statistics for the log)
@@ -753,13 +757,16 @@ fin2:
   %fidx = add i32 %frow, %bx
   %foff = shl i32 %fidx, 3
   call void @llvm.amdgcn.raw.buffer.store.v2f32(<2 x float> %o1, <4 x i32> %vf, i32 %foff, i32 0, i32 0)
-  ; unmatched block: best and zero SAD above 256 + the SAD a uniform brightness change alone would cause
-  ; (64 px * mean luma change per px), so fades do not count as scene changes
+  ; unmatched block: best and zero SAD above 384 + the SAD a uniform brightness change alone would cause
+  ; (64 px * mean luma change per px), and motion SAD r0 did not reduce static SAD r5 by >= 2x (r0 * 2 > r5)
   %mn = call i32 @llvm.umin.i32(i32 %r0, i32 %r5)
   %mnf = uitofp i32 %mn to float
   %fdl = fmul float %fad, 0x3F602E85C0000000; 0.0019753087
-  %cthr = fadd float %fdl, 256.0
-  %cut = fcmp ogt float %mnf, %cthr
+  %cthr = fadd float %fdl, 384.0
+  %cut0 = fcmp ogt float %mnf, %cthr
+  %r0_2 = shl i32 %r0, 1
+  %no_gain = icmp ugt i32 %r0_2, %r5
+  %cut = and i1 %cut0, %no_gain
   br i1 %cut, label %cnt, label %exit
 cnt:
   %old = call i32 @llvm.amdgcn.raw.buffer.atomic.add.i32(i32 1, <4 x i32> %vm, i32 0, i32 0, i32 0)

@@ -30,7 +30,7 @@ void hatch(Canvas *c, int x, int y, int w, int h, int r, uint32_t a, uint32_t b,
 // RGBA8 source (stb_image order), bilinear, clipped to a rounded rect of radius r.
 void blit_scaled(Canvas *c, const uint8_t *rgba, int sw, int sh, int x, int y, int w, int h, int r);
 
-enum { BTN_CROSS, BTN_CIRCLE, BTN_TRIANGLE, BTN_SQUARE, BTN_LR, BTN_UD, BTN_RIGHT };
+enum { BTN_CROSS, BTN_CIRCLE, BTN_TRIANGLE, BTN_SQUARE, BTN_LR, BTN_UD, BTN_RIGHT, BTN_R2, BTN_L2 };
 void draw_button(Canvas *c, int kind, int x, int cy, int size, uint32_t color);   // returns nothing; size = height
 
 void ui_memset(void *d, int v, size_t n);

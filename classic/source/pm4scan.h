@@ -15,7 +15,7 @@
 
 #define PM4_MAX_RT     64     // distinct targets per frame (more are counted in `rt_overflow`)
 #define PM4_MAX_ENTRY  64     // top-level DCB entries per submit call that we can track
-#define PM4_MAX_DEPTH  3      // IB nesting we follow (GNM uses 1 level for "call" command buffers)
+#define PM4_MAX_DEPTH  8      // IB nesting we follow (GNM uses 1..3 levels for nested / chained command buffers)
 #define PM4_MAX_PASSNAME 24
 #define PM4_MAX_MARK   48     // debug-marker pass names remembered per frame
 
@@ -37,7 +37,9 @@
 #define CTX_PA_SC_GENERIC_SCISSOR_BR 0x091
 #define CTX_PA_SC_VPORT_SCISSOR_0_BR 0x095
 #define CTX_PA_CL_VPORT_XSCALE  0x10F
+#define CTX_PA_CL_VPORT_XOFFSET 0x110
 #define CTX_PA_CL_VPORT_YSCALE  0x111
+#define CTX_PA_CL_VPORT_YOFFSET 0x112
 #define CTX_DB_DEPTH_CONTROL    0x200
 #define CTX_CB_COLOR_CONTROL    0x202
 #define CTX_CB_COLOR0_BASE      0x318   // + 15 * n for target n (0x3C bytes per target)
@@ -90,7 +92,7 @@ typedef struct {
 typedef struct {
     uint64_t base, size;        // bytes
     pm4_desc_t d;
-    uint32_t w, h;              // active area at the last write (scissors), pixels
+    uint32_t w, h;              // active area at the last write (scissors / viewport), pixels
     uint32_t bpp, nch;          // bytes per pixel, channels
     uint32_t slot_mask;         // CB slots (bits 0..7) it was bound to; bit 8 = DB
     uint32_t draws, zdraws;     // draws that wrote it, of those with depth test on
