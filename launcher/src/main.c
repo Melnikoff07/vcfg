@@ -40,8 +40,7 @@ static const Supported k_sup[] = {
     { "CUSA00207", "vcfg_classic42.prx", ENGINE_CLASSIC_BB, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg16.prx", "vcfg_classic42.prx" };
-static const char *k_exp_prx = "vcfg_classic42.prx";   // engine for experimental (not verified) titles
+static const char *k_files[] = { "vcfg16.prx", "vcfg_classic42.prx", "vcfg_alt_02.prx" };
 // Double-buffered titles that run best with the 2-BUFFER engine (virtual flip queue, tested on hardware 20.10): AUTO = 2-BUFFER.
 static const char *const k_auto_2buf[] = { "CUSA05571", "CUSA08809" };
 static int auto_2buf(const char *id)
@@ -49,9 +48,20 @@ static int auto_2buf(const char *id)
     for (unsigned i = 0; i < sizeof(k_auto_2buf) / sizeof(k_auto_2buf[0]); i++) if (!strcmp(id, k_auto_2buf[i])) return 1;
     return 0;
 }
+static const char *const k_auto_alt[] = { "CUSA17419", "CUSA00918", "CUSA11456" };
+static int auto_alt(const char *id)
+{
+    for (unsigned i = 0; i < sizeof(k_auto_alt) / sizeof(k_auto_alt[0]); i++) if (!strcmp(id, k_auto_alt[i])) return 1;
+    return 0;
+}
 #define MAPMAX 176   // plugins.ini sections we manage: the verified table + every game in the list (App.games)
 #define ENGFILE CFGDIR "/vcfg_engines.ini"   // the player's engine choice per game: CUSAxxxxx=<SEL_*>, AUTO not written
-static const char *prx_of(int engine) { return engine == ENGINE_NEW ? k_files[0] : k_files[1]; }
+static const char *prx_of(int engine)
+{
+    if (engine == ENGINE_NEW) return k_files[0];
+    if (engine == ENGINE_CLASSIC_ALT) return k_files[2];
+    return k_files[1];
+}
 static const Game *find_game(const App *a, const char *id)
 {
     for (int i = 0; i < a->ngames; i++) if (!strcmp(a->games[i].id, id)) return &a->games[i];
@@ -254,7 +264,7 @@ static void build_map(const App *a)
     for (int i = 0; i < a->ngames && g_nmap < MAPMAX; i++) {
         const Game *g = &a->games[i]; if (!g->experimental) continue;
         Map *m = &g_map[g_nmap++]; snprintf(m->id, sizeof(m->id), "%s", g->id);
-        m->prx = g->s.fg ? (game_engine(g) == ENGINE_NEW ? k_files[0] : k_exp_prx) : NULL; m->keep_empty = 0;
+        m->prx = g->s.fg ? prx_of(game_engine(g)) : NULL; m->keep_empty = 0;
     }
 }
 static int ours(const char *l) { return strstr(l, PLUG "vcfg") || strstr(l, PLUG "bb_probe"); }
@@ -658,7 +668,9 @@ int main(void)
             if (known) { sr->known++; continue; }
             if (a->ngames >= (int)(sizeof(a->games) / sizeof(a->games[0]))) { sr->full++; continue; }   // counted, shown in the report
             Game *g = &a->games[a->ngames++]; memset(g, 0, sizeof(*g));
-            snprintf(g->id, sizeof(g->id), "%s", e->d_name); g->engine = auto_2buf(e->d_name) ? ENGINE_CLASSIC_2BUF : ENGINE_CLASSIC; g->experimental = 1;
+            snprintf(g->id, sizeof(g->id), "%s", e->d_name);
+            g->engine = auto_2buf(e->d_name) ? ENGINE_CLASSIC_2BUF : auto_alt(e->d_name) ? ENGINE_CLASSIC_ALT : ENGINE_CLASSIC;
+            g->experimental = 1;
             load_meta(g);
             if (!g->installed) { a->ngames--; sr->not_installed++; } else sr->added++;
         }

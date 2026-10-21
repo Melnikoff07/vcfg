@@ -2,10 +2,11 @@
 #pragma once
 #include "ui.h"
 
-enum { ENGINE_NEW, ENGINE_CLASSIC, ENGINE_CLASSIC_BB, ENGINE_CLASSIC_2BUF };
-// Engine choice per game in the app (experimental): AUTO = the table / old behaviour, CLASSIC, NEW, or 2-BUFFER = the
-// classic engine with the virtual flip queue for double-buffered games (writes two_buffer=1 into config-<TITLE>.ini).
-enum { SEL_AUTO, SEL_CLASSIC, SEL_NEW, SEL_2BUF, SEL_COUNT };
+enum { ENGINE_NEW, ENGINE_CLASSIC, ENGINE_CLASSIC_BB, ENGINE_CLASSIC_2BUF, ENGINE_CLASSIC_ALT };
+// Engine choice per game in the app (experimental): AUTO = the table / old behaviour, CLASSIC, NEW, 2-BUFFER = the
+// classic engine with the virtual flip queue for double-buffered games (writes two_buffer=1 into config-<TITLE>.ini),
+// or ALT = the memory-valve / arena-shaving classic engine (vcfg_alt_02.prx).
+enum { SEL_AUTO, SEL_CLASSIC, SEL_NEW, SEL_2BUF, SEL_ALT, SEL_COUNT };
 enum { TAB_GAMES, TAB_DEFAULTS, TAB_OVERLAY, TAB_INSTALL, TAB_COUNT };
 
 typedef struct { int fg, preset, sharp, enhance, overlay; } Settings;   // preset 0 quality 1 fast; overlay 0..8
@@ -25,6 +26,7 @@ static inline int game_engine(const Game *g)
     case SEL_CLASSIC: return g->engine == ENGINE_CLASSIC_BB ? ENGINE_CLASSIC_BB : ENGINE_CLASSIC;
     case SEL_NEW: return ENGINE_NEW;
     case SEL_2BUF: return ENGINE_CLASSIC_2BUF;
+    case SEL_ALT: return ENGINE_CLASSIC_ALT;
     default: return g->engine;
     }
 }

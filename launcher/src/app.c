@@ -18,7 +18,7 @@ static void cat(char *d, const char *s) { while (*d) d++; while (*s) *d++ = *s++
 
 static const char *mode_name(int p) { return p ? "FAST" : "QUALITY"; }
 static const char *aa_name(int e) { return e == 2 ? "STRONG" : e == 1 ? "LIGHT" : "OFF"; }
-static const char *engine_name(int e) { return e == ENGINE_NEW ? "NEW" : e == ENGINE_CLASSIC_2BUF ? "2-BUFFER" : "CLASSIC"; }
+static const char *engine_name(int e) { return e == ENGINE_NEW ? "NEW" : e == ENGINE_CLASSIC_2BUF ? "2-BUFFER" : e == ENGINE_CLASSIC_ALT ? "ALT" : "CLASSIC"; }
 static const char *corner_name(int ov)
 {
     static const char *n[9] = { "OFF", "SMALL TL", "DETAIL TL", "SMALL TR", "DETAIL TR", "SMALL BR", "DETAIL BR", "SMALL BL", "DETAIL BL" };
