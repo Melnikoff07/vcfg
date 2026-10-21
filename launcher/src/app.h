@@ -9,9 +9,21 @@ enum { SEL_AUTO, SEL_CLASSIC, SEL_ALT, SEL_NEW, SEL_COUNT };
 // Buffer strategy per game (independent of Engine): AUTO = 2-buffer present copy when the game registers 2 buffers,
 // 2-BUFFER = force present copy + virtual flip queue (two_buffer=1, present_copy=1), STANDARD = force standard mid buffers (present_copy=2).
 enum { BUF_AUTO, BUF_2BUF, BUF_STD, BUF_COUNT };
-enum { TAB_GAMES, TAB_DEFAULTS, TAB_OVERLAY, TAB_INSTALL, TAB_COUNT };
+enum { TAB_GAMES, TAB_DEFAULTS, TAB_OVERLAY, TAB_INSTALL, TAB_DEV, TAB_COUNT };
 
 typedef struct { int fg, preset, sharp, enhance, overlay; } Settings;   // preset 0 quality 1 fast; overlay 0..8
+
+typedef struct {
+    int shave_mode;   // 0 AUTO (VALVE+SHAVE), 1 VALVE ONLY, 2 LATE ALLOC (FRAME 120)
+    int reg_mode;     // 0 AUTO (EXTEND+RELOC), 1 TOP GROUP (16-N), 2 DEFERRED (FRAME 120)
+    int pace_order;   // 0 AUTO, 1 PRE-SUBMIT, 2 POST-SUBMIT, 3 TIMER (PAIR)
+    int post_mid;     // 0 AUTO, 1 MID ONLY, 2 MID + REAL
+    int fps_lock;     // 0 = 30 FPS (default), 1 = 20 FPS, 2 = 60 FPS, 3 = UNLOCKED
+    int tile_mode;    // 0 = AUTO, 1..6 = IDX 10, 14, 13, 9, 12, 11
+    int safe_state;   // read from safe-<TITLE>.state: 0 EARLY, 1 DEFERRED, 2 PASSIVE
+    int has_adapt;    // 1 if adapt-<TITLE>.ini exists
+    int has_crash;    // 1 if crash-<TITLE>.txt exists
+} DevCfg;
 
 typedef struct {
     char id[12], title[64], version[16];   // version: APP_VER of the installed game (with its update)
@@ -20,6 +32,7 @@ typedef struct {
     int buf_sel;                               // BUF_*: the player's buffer mode choice (AUTO keeps def_buf)
     const uint8_t *icon; int iw, ih;           // RGBA8, may be 0
     Settings s;
+    DevCfg dev;
 } Game;
 
 // The engine a game runs with: the player's choice, AUTO = the table entry.
@@ -65,7 +78,7 @@ typedef struct {
     Fonts *f;
 } App;
 
-enum { ACT_NONE, ACT_SAVE_EXIT, ACT_INSTALL, ACT_REMOVE, ACT_SAVE, ACT_DEBUG, ACT_REPORT, ACT_CLEAN };
+enum { ACT_NONE, ACT_SAVE_EXIT, ACT_INSTALL, ACT_REMOVE, ACT_SAVE, ACT_DEBUG, ACT_REPORT, ACT_CLEAN, ACT_RESET_DEV };
 enum { PAD_UP = 0x10, PAD_RIGHT = 0x20, PAD_DOWN = 0x40, PAD_LEFT = 0x80, PAD_OPTIONS = 0x08,
        PAD_TRIANGLE = 0x1000, PAD_CIRCLE = 0x2000, PAD_CROSS = 0x4000, PAD_SQUARE = 0x8000, PAD_L1 = 0x400, PAD_R1 = 0x800, PAD_R2 = 0x200 };
 

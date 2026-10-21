@@ -19,6 +19,7 @@
 #include <orbis/SystemService.h>
 #include "app.h"
 #include "../../overlay/menu_combo.h"
+#include "../../overlay/title_families.h"
 #include <GoldHEN.h>
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -35,28 +36,31 @@ typedef struct { const char *id, *prx; int engine, testing; } Supported;
 // Titles verified on hardware (docs/COMPATIBILITY.md); the classic engine is the older v1.16 plugin line.
 static const Supported k_sup[] = {
     { "CUSA07439", "vcfg16.prx", ENGINE_NEW, 0 },
-    { "CUSA08519", "vcfg_classic45.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00411", "vcfg_classic45.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA00207", "vcfg_classic45.prx", ENGINE_CLASSIC_BB, 0 },
-    { "CUSA17419", "vcfg_alt_06.prx", ENGINE_CLASSIC_ALT, 0 },
-    { "CUSA00918", "vcfg_alt_06.prx", ENGINE_CLASSIC_ALT, 0 },
+    { "CUSA08519", "vcfg_classic50.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00411", "vcfg_classic50.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00207", "vcfg_classic50.prx", ENGINE_CLASSIC_BB, 0 },
+    { "CUSA17419", "vcfg_alt_15.prx", ENGINE_CLASSIC_ALT, 0 },
+    { "CUSA00918", "vcfg_alt_15.prx", ENGINE_CLASSIC_ALT, 0 },
+    { "CUSA04529", "vcfg_alt_15.prx", ENGINE_CLASSIC_ALT, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
-static const char *k_files[] = { "vcfg16.prx", "vcfg_classic45.prx", "vcfg_alt_06.prx" };
+static const char *k_files[] = { "vcfg16.prx", "vcfg_classic50.prx", "vcfg_alt_15.prx" };
 // Double-buffered titles that run best with 2-BUFFER present copy + virtual flip queue: AUTO = 2-BUFFER.
-static const char *const k_auto_2buf[] = { "CUSA05571", "CUSA08809", "CUSA17419" };
 static int auto_2buf(const char *id)
 {
-    for (unsigned i = 0; i < sizeof(k_auto_2buf) / sizeof(k_auto_2buf[0]); i++) if (!strcmp(id, k_auto_2buf[i])) return 1;
-    return 0;
+    return vcfg_in_family(id, "CUSA05571") || vcfg_in_family(id, "CUSA08809") || vcfg_in_family(id, "CUSA17419");
 }
-static const char *const k_auto_alt[] = { "CUSA17419", "CUSA00918", "CUSA11456" };
 static int auto_alt(const char *id)
 {
-    for (unsigned i = 0; i < sizeof(k_auto_alt) / sizeof(k_auto_alt[0]); i++) if (!strcmp(id, k_auto_alt[i])) return 1;
-    return 0;
+    return vcfg_in_family(id, "CUSA17419") || vcfg_in_family(id, "CUSA04529") || vcfg_in_family(id, "CUSA11456");
 }
-#define MAPMAX 176   // plugins.ini sections we manage: the verified table + every game in the list (App.games)
+static const Supported *sup_for_title(const char *id)
+{
+    const char *fam = vcfg_title_family(id);
+    for (int i = 0; i < NSUP; i++) if (!strcmp(fam, k_sup[i].id)) return &k_sup[i];
+    return NULL;
+}
+#define MAPMAX 256   // plugins.ini sections we manage: the verified table + regional aliases + every game in the list (App.games)
 #define ENGFILE CFGDIR "/vcfg_engines.ini"   // the player's engine choice per game: CUSAxxxxx=<SEL_*>, AUTO not written
 #define BUFFILE CFGDIR "/vcfg_buffers.ini"   // the player's buffer mode choice per game: CUSAxxxxx=<BUF_*>, AUTO not written
 static const char *prx_of(int engine)
@@ -249,6 +253,31 @@ static int ini_int(const char *text, const char *key, int def)
     }
     return def;
 }
+static int file_exists(const char *p) { FILE *f = fopen(p, "rb"); if (f) fclose(f); return f != NULL; }
+static const int k_dev_locks[4] = { 30, 20, 60, 0 };
+static const int k_dev_tiles[7] = { -1, 10, 14, 13, 9, 12, 11 };
+static int lock_to_dev(int lk)
+{
+    for (int i = 0; i < 4; i++) if (k_dev_locks[i] == lk) return i;
+    return 0;
+}
+static int tile_to_dev(int ti)
+{
+    for (int i = 1; i < 7; i++) if (k_dev_tiles[i] == ti) return i;
+    return 0;
+}
+static void refresh_dev_status(Game *g)
+{
+    char path[96]; size_t n = 0;
+    snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id);
+    unsigned char *sb = read_all(path, &n);
+    g->dev.safe_state = (sb && n >= 1 && sb[0] >= '0' && sb[0] <= '2') ? (sb[0] - '0') : 0;
+    free(sb);
+    snprintf(path, sizeof(path), CFGDIR "/adapt-%s.ini", g->id);
+    g->dev.has_adapt = file_exists(path);
+    snprintf(path, sizeof(path), CFGDIR "/crash-%s.txt", g->id);
+    g->dev.has_crash = file_exists(path);
+}
 static void load_settings(App *a)
 {
     size_t n; char path[96];
@@ -272,6 +301,17 @@ static void load_settings(App *a)
     free(bf);
     for (int i = 0; i < a->ngames; i++) {
         Game *g = &a->games[i]; g->s = a->defaults; if (g->testing || g->experimental) g->s.fg = 0;
+        memset(&g->dev, 0, sizeof(g->dev));
+        refresh_dev_status(g);
+        snprintf(path, sizeof(path), CFGDIR "/adapt-%s.ini", g->id);
+        unsigned char *ab = read_all(path, &n);
+        if (ab) {
+            const char *as = (const char *)ab;
+            g->dev.shave_mode = ini_int(as, "shave_mode", g->dev.shave_mode);
+            g->dev.reg_mode   = ini_int(as, "reg_mode", g->dev.reg_mode);
+            g->dev.pace_order = ini_int(as, "pace_order", g->dev.pace_order);
+            free(ab);
+        }
         if (uses_vcfg_ini(g)) {
             unsigned char *b = read_all(CFGDIR "/vcfg.ini", &n); if (!b) continue;
             const char *s = (const char *)b;
@@ -282,13 +322,19 @@ static void load_settings(App *a)
             unsigned char *b = read_all(path, &n); if (!b) continue;
             const char *s = (const char *)b;
             g->s = (Settings){ ini_int(s, "framegen", g->experimental ? 0 : 1), ini_int(s, "preset", 0), ini_int(s, "sharpness", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
+            int sm = ini_int(s, "shave_mode", 0); if (sm > 0) g->dev.shave_mode = sm;
+            int rm = ini_int(s, "reg_mode", 0);   if (rm > 0) g->dev.reg_mode   = rm;
+            int po = ini_int(s, "pace_order", 0); if (po > 0) g->dev.pace_order = po;
+            int pm = ini_int(s, "post_mid", 0);   if (pm > 0) g->dev.post_mid   = pm;
+            g->dev.fps_lock   = lock_to_dev(ini_int(s, "fps_lock", 30));
+            g->dev.tile_mode  = tile_to_dev(ini_int(s, "tile_idx", -1));
             free(b);
         }
     }
 }
 static void save_settings(App *a)
 {
-    char buf[512], path[96];
+    char buf[640], path[96];
     sceKernelMkdir(CFGDIR, 0777);
     const unsigned combo = menu_combo_sanitize(a->menu_combo);   // validated mask, written to every file the plugins read
     snprintf(buf, sizeof(buf), "fg=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\noverlay_pos=%d\noverlay_opacity=%d\nmenu_combo=%u\n",
@@ -309,7 +355,7 @@ static void save_settings(App *a)
         if (bn) write_all(BUFFILE, bb, bn); else remove(BUFFILE);
     }
     for (int i = 0; i < a->ngames; i++) {
-        Game *g = &a->games[i]; Settings *s = &g->s;
+        Game *g = &a->games[i]; Settings *s = &g->s; DevCfg *d = &g->dev;
         if (!g->installed) continue;
         if (uses_vcfg_ini(g)) {
             snprintf(buf, sizeof(buf), "enabled=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\nopacity=%d\nmenu_combo=%u\n",
@@ -318,17 +364,43 @@ static void save_settings(App *a)
         } else {
             int bmode = game_buf(g);
             int pcopy = (g->buf_sel == BUF_2BUF) ? 1 : (g->buf_sel == BUF_STD) ? 2 : 0;
+            int lk = k_dev_locks[d->fps_lock >= 0 && d->fps_lock < 4 ? d->fps_lock : 0];
+            int ti = k_dev_tiles[d->tile_mode >= 0 && d->tile_mode < 7 ? d->tile_mode : 0];
             snprintf(path, sizeof(path), CFGDIR "/config-%s.ini", g->id);
-            snprintf(buf, sizeof(buf), "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\nmenu_combo=%u\ntwo_buffer=%d\npresent_copy=%d\n",
-                     s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo, bmode == BUF_2BUF, pcopy);
+            snprintf(buf, sizeof(buf),
+                     "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\nmenu_combo=%u\n"
+                     "two_buffer=%d\npresent_copy=%d\nshave_mode=%d\nreg_mode=%d\npace_order=%d\npost_mid=%d\nfps_lock=%d\ntile_idx=%d\n",
+                     s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo,
+                     bmode == BUF_2BUF, pcopy, d->shave_mode, d->reg_mode, d->pace_order, d->post_mid, lk, ti);
             write_all(path, buf, strlen(buf));
+            snprintf(path, sizeof(path), CFGDIR "/tile_%s", g->id);
+            if (ti >= 0) { char tb[16]; snprintf(tb, sizeof(tb), "%d\n", ti); write_all(path, tb, strlen(tb)); }
+            else remove(path);
             if (s->fg) {
                 snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id); remove(path);
                 snprintf(path, sizeof(path), CFGDIR "/safe-%s.boot", g->id); remove(path);
+                refresh_dev_status(g);
             }
         }
     }
     vlog("settings saved\n");
+}
+static void addlog(App *a, const char *msg);
+static void do_reset_dev(App *a)
+{
+    if (!a->ngames) return;
+    Game *g = &a->games[a->sel];
+    char path[96];
+    memset(&g->dev, 0, sizeof(g->dev));
+    snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id); remove(path);
+    snprintf(path, sizeof(path), CFGDIR "/safe-%s.boot", g->id);  remove(path);
+    snprintf(path, sizeof(path), CFGDIR "/adapt-%s.ini", g->id);  remove(path);
+    snprintf(path, sizeof(path), CFGDIR "/crash-%s.txt", g->id);  remove(path);
+    snprintf(path, sizeof(path), CFGDIR "/tile_%s", g->id);       remove(path);
+    save_settings(a);
+    refresh_dev_status(g);
+    snprintf(a->status, sizeof(a->status), "RESET DEV & ADAPT STATE FOR %s", g->id);
+    addlog(a, a->status);
 }
 
 // ---- plugins.ini: point our titles at our files; keep foreign lines; [default] stays last ----
@@ -344,8 +416,23 @@ static void build_map(const App *a)
         const Game *g = find_game(a, k_sup[t].id);   // the player's engine choice, if the game is listed
         m->prx = k_sup[t].testing ? NULL : g ? prx_of(game_engine(g)) : k_sup[t].prx; m->keep_empty = 1;
     }
+    for (unsigned ai = 0; ai < sizeof(k_vcfg_title_aliases) / sizeof(k_vcfg_title_aliases[0]) && g_nmap < MAPMAX; ai++) {
+        const char *id = k_vcfg_title_aliases[ai].id;
+        const Supported *sup = sup_for_title(id);
+        if (!sup) continue;
+        int dup = 0;
+        for (int k = 0; k < g_nmap; k++) if (!strcmp(g_map[k].id, id)) { dup = 1; break; }
+        if (dup) continue;
+        Map *m = &g_map[g_nmap++]; snprintf(m->id, sizeof(m->id), "%s", id);
+        const Game *g = find_game(a, id);
+        if (!g) g = find_game(a, sup->id);
+        m->prx = sup->testing ? NULL : g ? prx_of(game_engine(g)) : sup->prx; m->keep_empty = 1;
+    }
     for (int i = 0; i < a->ngames && g_nmap < MAPMAX; i++) {
         const Game *g = &a->games[i]; if (!g->experimental) continue;
+        int dup = 0;
+        for (int k = 0; k < g_nmap; k++) if (!strcmp(g_map[k].id, g->id)) { dup = 1; break; }
+        if (dup) continue;
         Map *m = &g_map[g_nmap++]; snprintf(m->id, sizeof(m->id), "%s", g->id);
         m->prx = g->s.fg ? prx_of(game_engine(g)) : NULL; m->keep_empty = 0;
     }
@@ -487,7 +574,7 @@ static void do_clean(App *a)
     do_ini(a, 0);
     static const char *const plug[] = { "vcfg" };
     int np = clean_dir("/data/GoldHEN/plugins", plug, 1, ".prx");
-    static const char *const cfg[] = { "config-", "trace-", "boot-", "probe", "vcfg", "debug_log", "inject", "hud", "pace_timer", "scan_", "dump_", "summary", "safe-", "tile_" };
+    static const char *const cfg[] = { "config-", "trace-", "boot-", "crash-", "adapt-", "probe", "vcfg", "debug_log", "inject", "hud", "pace_timer", "scan_", "dump_", "summary", "safe-", "tile_" };
     int nc = clean_dir(CFGDIR, cfg, (int)(sizeof(cfg) / sizeof(cfg[0])), NULL);
     set_off(1);
     char m[96]; snprintf(m, sizeof(m), "DELETED %d PLUGIN FILES AND %d SETTINGS/LOG FILES. VCFG IS OFF.", np, nc); addlog(a, m);
@@ -520,7 +607,6 @@ static void remap_if_changed(App *a)
 #else
 #define VCFG_VERSION "dev"
 #endif
-static int file_exists(const char *p) { FILE *f = fopen(p, "rb"); if (f) fclose(f); return f != NULL; }
 static void do_debug_toggle(App *a)
 {
     a->debug_log = !a->debug_log;
@@ -561,10 +647,10 @@ static void summarize(Buf *r, const char *id, const char *which, const char *t)
 {
     char v[24] = "?", secs[40] = "?", line[208];
     find_line(t, "version: ", v, sizeof(v)); find_line(t, "seconds since start: ", secs, sizeof(secs));
-    int frame = strstr(t, "first SubmitAndFlip") || strstr(t, "A22_TITLE") || strstr(t, "gnm #1 ");
+    int frame = strstr(t, "first SubmitAndFlip") || strstr(t, "first VideoOutSubmitFlip") || strstr(t, "A22_TITLE") || strstr(t, "gnm #1 ");
     int gpu = strstr(t, "gpu_init: ok") || strstr(t, "A20_ALLOC");
-    int fg = strstr(t, "mode4 #") || strstr(t, "kind=1");
-    int post = strstr(t, "inject #") != NULL;   // our commands were injected (OSD / post pass): not proof of generated frames
+    int fg = strstr(t, "mode4 #") || strstr(t, "vout fg #") || strstr(t, "kind=1");
+    int post = strstr(t, "inject #") != NULL || strstr(t, "vout inject #") != NULL;   // our commands were injected (OSD / post pass): not proof of generated frames
     int menu = strstr(t, "menu opened") || strstr(t, "A20_MENU open=1");
     bprintf(r, "%s, %s: %s | %s | first frame %s, GPU memory %s, FG frames %s, OSD/post injects %s, menu used %s\n", id, which, v, secs,
             frame ? "yes" : "NO", gpu ? "yes" : "no", fg ? "yes" : "no", post ? "yes" : "no", menu ? "yes" : "no");
@@ -679,6 +765,10 @@ static void do_report(App *a)
     for (int i = 0; i < a->ngames; i++) {
         char p[96]; snprintf(p, sizeof(p), CFGDIR "/config-%s.ini", a->games[i].id);
         if (file_exists(p)) bfile(&r, "game settings", p, 8u << 10);
+        snprintf(p, sizeof(p), CFGDIR "/adapt-%s.ini", a->games[i].id);
+        if (file_exists(p)) bfile(&r, "auto-adapted settings", p, 8u << 10);
+        snprintf(p, sizeof(p), CFGDIR "/crash-%s.txt", a->games[i].id);
+        if (file_exists(p)) bfile(&r, "crash dump", p, 32u << 10);
     }
     for (int k = 0; k < nt; k++) {
         char p[96]; snprintf(p, sizeof(p), CFGDIR "/trace-%s%s.txt", tf[k].id, tf[k].prev ? ".prev" : "");
@@ -783,9 +873,11 @@ int main(void)
             if (a->ngames >= (int)(sizeof(a->games) / sizeof(a->games[0]))) { sr->full++; continue; }   // counted, shown in the report
             Game *g = &a->games[a->ngames++]; memset(g, 0, sizeof(*g));
             snprintf(g->id, sizeof(g->id), "%s", e->d_name);
-            g->engine = auto_alt(e->d_name) ? ENGINE_CLASSIC_ALT : ENGINE_CLASSIC;
+            const Supported *sup = sup_for_title(e->d_name);
+            g->engine = sup ? sup->engine : (auto_alt(e->d_name) ? ENGINE_CLASSIC_ALT : ENGINE_CLASSIC);
             g->def_buf = auto_2buf(e->d_name) ? BUF_2BUF : BUF_STD;
-            g->experimental = 1;
+            g->testing = sup ? sup->testing : 0;
+            g->experimental = sup ? 0 : 1;
             load_meta(g);
             if (!g->installed) { a->ngames--; sr->not_installed++; } else sr->added++;
         }
@@ -835,6 +927,7 @@ int main(void)
             else if (act == ACT_CLEAN) do_clean(a);
             else if (act == ACT_DEBUG) do_debug_toggle(a);
             else if (act == ACT_REPORT) do_report(a);
+            else if (act == ACT_RESET_DEV) do_reset_dev(a);
             else if (act == ACT_SAVE) { save_settings(a); remap_if_changed(a); }
             else if (act == ACT_SAVE_EXIT) {
                 save_settings(a); remap_if_changed(a);

@@ -7,8 +7,8 @@
 ;        me1 / me3 / fgs8 accumulate them),
 ;        +0x150 V#GK (120x68 foreground splat keys, zeroed here by the first 8160 threads; fgs8 fills, me1 reads).
 ; thread (tx = tid&7, ty = tid>>3) of group (gx, gy): L1 pixels x = gx*32 + tx*4 + k (k = 0..3), y = gy*8 + ty.
-; one bilinear tap at the shared corner of a 2x2 full-res quad = exact 2x2 box average. luma = sqrt((r+2g+b)/4)
-; (sqrt spreads the dark range, CUSA00207 is mostly dark). L2/L3 = 2x2 means of the unquantised values (LDS).
+; Supports arbitrary input resolution (720p/900p/1080p/1440p/2160p) by reading W-1 and H-1 from T#cur dword 2
+; and scaling the 960x540 L1 sample centers by (W / 1920.0, H / 1080.0) into native texel space.
 target triple = "amdgcn--"
 declare <4 x float> @llvm.amdgcn.image.sample.lz.2d.v4f32.f32(i32 immarg, float, float, <8 x i32>, <4 x i32>, i1 immarg, i32 immarg, i32 immarg)
 declare void @llvm.amdgcn.raw.buffer.store.i32(i32, <4 x i32>, i32, i32, i32 immarg)
@@ -57,6 +57,17 @@ entry:
   %v3 = load <4 x i32>, ptr addrspace(4) %p3, align 16, !invariant.load !0
   %pm = getelementptr i8, ptr addrspace(4) %tbl, i64 288
   %vm = load <4 x i32>, ptr addrspace(4) %pm, align 16, !invariant.load !0
+  %tc2 = extractelement <8 x i32> %tc, i32 2
+  %wm1 = and i32 %tc2, 16383
+  %hm1_0 = lshr i32 %tc2, 14
+  %hm1 = and i32 %hm1_0, 16383
+  %w_i = add i32 %wm1, 1
+  %h_i = add i32 %hm1, 1
+  %wf = uitofp i32 %w_i to float
+  %hf = uitofp i32 %h_i to float
+  %sx = fmul float %wf, 0x3F41111120000000 ; 1.0 / 1920.0
+  %sy = fmul float %hf, 0x3F4E573AC0000000 ; 1.0 / 1080.0
+  %sx2 = fmul float %sx, 2.0
   %tx = and i32 %tid, 7
   %ty = lshr i32 %tid, 3
   %gxb = shl i32 %gx, 5
@@ -64,16 +75,18 @@ entry:
   %x1 = add i32 %gxb, %txb
   %gyb = shl i32 %gy, 3
   %y1 = add i32 %gyb, %ty
-  ; full-res sample positions (unnormalised texel space: texel i spans [i, i+1))
+  ; full-res sample positions (unnormalised texel space: texel i spans [i, i+1), scaled from 960x540 L1 to WxH)
   %x2 = shl i32 %x1, 1
   %y2 = shl i32 %y1, 1
   %y2o = or i32 %y2, 1
-  %vf = uitofp i32 %y2o to float
+  %vf0 = uitofp i32 %y2o to float
+  %vf = fmul float %vf0, %sy
   %u0i = or i32 %x2, 1
-  %u0 = uitofp i32 %u0i to float
-  %u1 = fadd float %u0, 2.0
-  %u2 = fadd float %u0, 4.0
-  %u3 = fadd float %u0, 6.0
+  %u0_0 = uitofp i32 %u0i to float
+  %u0 = fmul float %u0_0, %sx
+  %u1 = fadd float %u0, %sx2
+  %u2 = fadd float %u1, %sx2
+  %u3 = fadd float %u2, %sx2
   %l0 = call float @luma(<8 x i32> %tc, <4 x i32> %sm, float %u0, float %vf)
   %l1 = call float @luma(<8 x i32> %tc, <4 x i32> %sm, float %u1, float %vf)
   %l2 = call float @luma(<8 x i32> %tc, <4 x i32> %sm, float %u2, float %vf)

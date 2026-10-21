@@ -6,15 +6,43 @@
 
 // Data format of the game's scanout buffers in every T#: 10 = 8_8_8_8 (0x8000xxxx), 9 = 2_10_10_10 (0x88xxxxxx).
 // The passes read and write floats, so only this field changes; both are 4 bytes per pixel.
+//
+// PS4 Pro (Neo, 16 pipes) vs Base (Liverpool, 8 pipes) T# macro-tile mode:
+// Disassembly of libSceGnm (sceGnmCreateTexture @ +0x17be5: cmpl $1, 0x28(%r14); sete %dl; shlq $0x38, %rdx -> qword +0x14;
+// sceGnmGetTextureSizeAlign @ +0x17d71: movzbl 0x1b(%r14), %ecx; andl $1, %ecx) and shadPS4.exe (@ 0x7000010515fb)
+// proves that m_minGpuMode == kGpuModeNeo (alt_tile_mode) is stored at bit 24 of t[6] (0x01000000, byte 0x1b bit 0):
+//   t[6] bits [11:0]  = min_lod_warn (12b)
+//   t[6] bits [19:12] = counter_bank_id (8b)
+//   t[6] bit  [20]    = lod_hdw_cnt_en (1b)
+//   t[6] bit  [21]    = compression_en (1b)
+//   t[6] bit  [22]    = alpha_is_on_msb (1b)
+//   t[6] bit  [23]    = color_transform (1b)
+//   t[6] bit  [24]    = alt_tile_mode (1b: 1 = Neo P16 macro-tile table, 0 = Base P8_32x32_8x16 table)
+// Without bit 24 of t[6] set on PS4 Pro, tidx = 10 (kTileModeDisplay_2dThin) uses the 8-pipe macro-tile table while
+// the game and DCE use the 16-pipe macro-tile table, causing 128-px vertical column striping.
+#define GNM_T6_ALT_TILE_MODE_NEO (1u << 24)
 static uint32_t g_t_dfmt = 10u;
-static inline void make_t(uint32_t *t, uint64_t a, uint32_t w, uint32_t h, uint32_t pitch, uint32_t tidx)
+static int g_t_is_neo = 0;
+static int g_t6_bit_override = -1; // optional INI override (0..31); -1 = default bit 24 (GNM_T6_ALT_TILE_MODE_NEO)
+
+static inline void make_t_ex(uint32_t *t, uint64_t a, uint32_t w, uint32_t h, uint32_t pitch, uint32_t tidx, int is_neo)
 {
+    uint32_t t6 = 0u;
+    if (is_neo && tidx != 8u) {
+        t6 = (g_t6_bit_override >= 0 && g_t6_bit_override <= 31) ? (1u << g_t6_bit_override) : GNM_T6_ALT_TILE_MODE_NEO;
+    }
     t[0] = (uint32_t)(a >> 8);
     t[1] = (uint32_t)((a >> 40) & 0xFFu) | (g_t_dfmt << 20);
     t[2] = (w - 1u) | ((h - 1u) << 14);
     t[3] = 4u | (5u << 3) | (6u << 6) | (7u << 9) | (tidx << 20) | (9u << 28);
     t[4] = (pitch - 1u) << 13;
-    t[5] = t[6] = t[7] = 0;
+    t[5] = 0;
+    t[6] = t6;
+    t[7] = 0;
+}
+static inline void make_t(uint32_t *t, uint64_t a, uint32_t w, uint32_t h, uint32_t pitch, uint32_t tidx)
+{
+    make_t_ex(t, a, w, h, pitch, tidx, g_t_is_neo);
 }
 static inline void make_v(uint32_t *v, uint64_t a, uint32_t nbytes)
 {

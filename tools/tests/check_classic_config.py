@@ -34,7 +34,7 @@ extern int sscanf(const char *, const char *, ...);
 extern int strcmp(const char *, const char *);
 extern size_t strlen(const char *);
 extern void *memcpy(void *, const void *, size_t);
-static int g_known_game, g_detected_60fps, g_tile_override = -1, g_tile_sweep;
+static int g_known_game, g_detected_60fps, g_tile_override = -1, g_tile_sweep, g_t6_bit_override = -1;
 static void tile_load(int idx) { (void)idx; }
 static const char *input;
 static int sceKernelOpen(const char *p, int f, int m) { return input ? 1 : -1; }

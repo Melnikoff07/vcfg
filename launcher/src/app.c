@@ -25,6 +25,36 @@ static const char *corner_name(int ov)
     static const char *n[9] = { "OFF", "SMALL TL", "DETAIL TL", "SMALL TR", "DETAIL TR", "SMALL BR", "DETAIL BR", "SMALL BL", "DETAIL BL" };
     return (ov >= 0 && ov <= 8) ? n[ov] : "OFF";
 }
+static const char *shave_name(int v)
+{
+    static const char *n[3] = { "AUTO: VALVE+SHAVE", "VALVE ONLY", "LATE (FRAME 120)" };
+    return (v >= 0 && v <= 2) ? n[v] : n[0];
+}
+static const char *reg_name(int v)
+{
+    static const char *n[3] = { "AUTO: EXTEND+RELOC", "TOP GROUP (16-N)", "DEFERRED (F120)" };
+    return (v >= 0 && v <= 2) ? n[v] : n[0];
+}
+static const char *pace_name(int v)
+{
+    static const char *n[4] = { "AUTO: PRE ON STD", "PRE-SUBMIT", "POST-SUBMIT", "TIMER (PAIR)" };
+    return (v >= 0 && v <= 3) ? n[v] : n[0];
+}
+static const char *post_name(int v)
+{
+    static const char *n[3] = { "AUTO", "MID ONLY", "MID + REAL" };
+    return (v >= 0 && v <= 2) ? n[v] : n[0];
+}
+static const char *fps_lock_name(int v)
+{
+    static const char *n[4] = { "30 FPS", "20 FPS", "60 FPS", "UNLOCKED" };
+    return (v >= 0 && v <= 3) ? n[v] : n[0];
+}
+static const char *tile_mode_name(int v)
+{
+    static const char *n[7] = { "AUTO", "IDX 10 (STD 2D)", "IDX 14 (NEO A)", "IDX 13 (NEO B)", "IDX 9", "IDX 12", "IDX 11" };
+    return (v >= 0 && v <= 6) ? n[v] : n[0];
+}
 
 // ---- header: logo plate, subtitle, tabs ----
 static int draw_header(Canvas *c, App *a)
@@ -39,14 +69,14 @@ static int draw_header(Canvas *c, App *a)
     if (a->version[0]) { char v[24] = "V"; cat(v, a->version); draw_text(c, &f->mono, M + lw + 56 + 34, bottom - 82, v, DIM, 1); }
     draw_text(c, &f->mono, M + lw + 56 + 34, bottom - 46, "VIBE CODED", INK, 1);
     draw_text(c, &f->mono, M + lw + 56 + 34, bottom - 10, "FRAME GENERATOR", INK, 1);
-    static const char *tabs[TAB_COUNT] = { "01 GAMES", "02 DEFAULTS", "03 OVERLAY", "04 PLUGIN" };
+    static const char *tabs[TAB_COUNT] = { "01 GAMES", "02 DEFAULTS", "03 OVERLAY", "04 PLUGIN", "05 DEV" };
     int x = c->w - M;
     for (int i = TAB_COUNT - 1; i >= 0; i--) {
         int w = text_width(&f->mono, tabs[i], 1);
         x -= w;
         if (i == a->tab) { fill_rect(c, x - 14, bottom - 40, w + 28, 50, INK); draw_text(c, &f->mono, x, bottom - 6, tabs[i], CREAM, 1); }
         else draw_text(c, &f->mono, x, bottom - 6, tabs[i], INK, 1);
-        x -= 52;
+        x -= 44;
     }
     return bottom;
 }
@@ -250,6 +280,68 @@ static void draw_install(Canvas *c, App *a, int top)
     if (a->status[0]) draw_text(c, &f->mono, M, c->h - FOOT - 40, a->status, INK, 1);
 }
 
+// ---- developer compatibility tab ----
+static void draw_dev(Canvas *c, App *a, int top)
+{
+    Fonts *f = a->f;
+    int y = top + 58, left = 520;
+    if (!a->ngames) {
+        draw_text(c, &f->title, M, y + 60, "No games found on this console.", INK, 0);
+        return;
+    }
+    Game *g = &a->games[a->sel];
+    DevCfg *d = &g->dev;
+    int isz = 250;
+    if (g->icon) blit_scaled(c, g->icon, g->iw, g->ih, M, y, isz, isz, 16);
+    else hatch(c, M, y, isz, isz, 16, INK, 0xFF232323u, 36);
+    char l1[64], l2[64];
+    wrap2(&f->title, g->title[0] ? g->title : g->id, left - 40, l1, l2);
+    int ty = y + isz + 46;
+    draw_text(c, &f->title, M, ty, l1, INK, 0);
+    if (l2[0]) { ty += 42; draw_text(c, &f->title, M, ty, l2, INK, 0); }
+    char info1[64] = ""; cat(info1, g->id); cat(info1, " / "); cat(info1, engine_name(game_engine(g)));
+    cat(info1, " / "); cat(info1, buf_name(game_buf(g)));
+    ty += 44; draw_text(c, &f->mono, M, ty, info1, INK, 1);
+
+    static const char *st_names[3] = { "0 (EARLY PIPELINE)", "1 (DEFERRED F120)", "2 (PASSIVE SAFE)" };
+    char st_line[64] = "BOOT STATE: ";
+    cat(st_line, st_names[d->safe_state >= 0 && d->safe_state <= 2 ? d->safe_state : 0]);
+    ty += 44; draw_text(c, &f->mono, M, ty, st_line, d->safe_state ? RED : INK, 1);
+
+    char ad_line[64] = "SELF-ADAPT: ";
+    cat(ad_line, d->has_adapt ? "ACTIVE (ADAPT INI)" : "NONE (DEFAULT)");
+    ty += 38; draw_text(c, &f->mono, M, ty, ad_line, d->has_adapt ? BLUE : DIM, 1);
+
+    char cr_line[64] = "CRASH DUMP: ";
+    cat(cr_line, d->has_crash ? "PRESENT (SEE REPORT)" : "NONE");
+    ty += 38; draw_text(c, &f->mono, M, ty, cr_line, d->has_crash ? RED : DIM, 1);
+
+    static const char *lk_s[4] = { "30", "20", "60", "A" };
+    static const char *ti_s[7] = { "A", "10", "14", "13", "9", "12", "11" };
+    char rc_line[64] = "RECIPE: M", nb[12];
+    itoa_(d->shave_mode, nb); cat(rc_line, nb); cat(rc_line, "-R"); itoa_(d->reg_mode, nb); cat(rc_line, nb);
+    cat(rc_line, "-P"); itoa_(d->pace_order, nb); cat(rc_line, nb); cat(rc_line, "-T"); itoa_(d->post_mid, nb); cat(rc_line, nb);
+    cat(rc_line, "-F"); cat(rc_line, lk_s[d->fps_lock >= 0 && d->fps_lock < 4 ? d->fps_lock : 0]);
+    cat(rc_line, "-TL"); cat(rc_line, ti_s[d->tile_mode >= 0 && d->tile_mode < 7 ? d->tile_mode : 0]);
+    ty += 38; draw_text(c, &f->mono, M, ty, rc_line, INK, 1);
+
+    ty += 40; draw_text(c, &f->mono, M, ty, "TRIANGLE: CLEAR ADAPT/SAFE", DIM, 1);
+    if (a->status[0]) { ty += 38; draw_text(c, &f->mono, M, ty, a->status, RED, 1); }
+
+    Row r[7];
+    r[0] = (Row){ "Target game", "", 0, 0 }; cat(r[0].value, g->id);
+    r[1] = (Row){ "Memory hook", "", 0, 0 }; cat(r[1].value, shave_name(d->shave_mode));
+    r[2] = (Row){ "Buffer reg", "", 0, 0 };  cat(r[2].value, reg_name(d->reg_mode));
+    r[3] = (Row){ "Flip pacing", "", 0, 0 }; cat(r[3].value, pace_name(d->pace_order));
+    r[4] = (Row){ "Post target", "", 0, 0 }; cat(r[4].value, post_name(d->post_mid));
+    r[5] = (Row){ "FPS lock", "", 0, 0 };    cat(r[5].value, fps_lock_name(d->fps_lock));
+    r[6] = (Row){ "Tile mode", "", 0, 0 };   cat(r[6].value, tile_mode_name(d->tile_mode));
+
+    char head[64] = "DEVELOPER PIPELINE / "; cat(head, g->id);
+    const char *sub = d->has_adapt ? "AUTO-ADAPTED PROFILE" : "COMPATIBILITY TUNING";
+    draw_rows(c, a, M + left, y, c->w - 2 * M - left, head, "DEV", sub, r, 7);
+}
+
 void app_draw(Canvas *c, App *a)
 {
     fill_rect(c, 0, 0, c->w, c->h, CREAM);
@@ -296,6 +388,10 @@ void app_draw(Canvas *c, App *a)
         }
         Hint h[] = { { BTN_UD, "SELECT" }, { BTN_LR, "CHANGE" }, { BTN_CROSS, a->rec ? "SAVE HOTKEY" : "RECORD HOTKEY" } };
         draw_footer(c, a, h, a->row == 3 ? 3 : 2);
+    } else if (a->tab == TAB_DEV) {
+        draw_dev(c, a, top);
+        Hint h[] = { { BTN_UD, "SELECT" }, { BTN_LR, "CHANGE" }, { BTN_TRIANGLE, "RESET ADAPT" }, { BTN_CROSS, "SAVE" } };
+        draw_footer(c, a, h, 4);
     } else {
         draw_install(c, a, top);
         Hint h[] = { { BTN_CROSS, "INSTALL / UPDATE" }, { BTN_SQUARE, "TURN OFF" }, { BTN_TRIANGLE, "DEBUG LOG" }, { BTN_CIRCLE, "SAVE REPORT" } };
@@ -355,7 +451,7 @@ int app_input(App *a, uint32_t b)
         return ACT_NONE;
     }
     Settings *s = a->tab == TAB_GAMES ? &a->games[a->sel].s : &a->defaults;
-    int rows = a->tab == TAB_OVERLAY ? 4 : a->tab == TAB_GAMES ? 7 : 5;
+    int rows = a->tab == TAB_OVERLAY ? 4 : (a->tab == TAB_GAMES || a->tab == TAB_DEV) ? 7 : 5;
     if (a->tab == TAB_INSTALL) {
         if (b & PAD_R2) {
             if (armed) { a->status[0] = 0; return ACT_CLEAN; }
@@ -370,6 +466,24 @@ int app_input(App *a, uint32_t b)
     if (b & PAD_UP) step(&a->row, -1, 0, rows - 1, 1);
     if (b & PAD_DOWN) step(&a->row, 1, 0, rows - 1, 1);
     int dir = (b & PAD_RIGHT) ? 1 : (b & PAD_LEFT) ? -1 : 0;
+    if (a->tab == TAB_DEV) {
+        if (!a->ngames) return ACT_NONE;
+        DevCfg *d = &a->games[a->sel].dev;
+        if (dir) {
+            if (a->row == 0) step(&a->sel, dir, 0, a->ngames - 1, 1);
+            else if (a->row == 1) step(&d->shave_mode, dir, 0, 2, 1);
+            else if (a->row == 2) step(&d->reg_mode, dir, 0, 2, 1);
+            else if (a->row == 3) step(&d->pace_order, dir, 0, 3, 1);
+            else if (a->row == 4) step(&d->post_mid, dir, 0, 2, 1);
+            else if (a->row == 5) step(&d->fps_lock, dir, 0, 3, 1);
+            else if (a->row == 6) step(&d->tile_mode, dir, 0, 6, 1);
+            if (a->row > 0) { a->dirty = 1; a->status[0] = 0; cat(a->status, "MODIFIED (PRESS CROSS TO SAVE)"); }
+        }
+        if (b & PAD_TRIANGLE) return ACT_RESET_DEV;
+        if (b & PAD_CROSS) { a->status[0] = 0; cat(a->status, "DEV PROFILE SAVED."); return ACT_SAVE; }
+        if (b & PAD_SQUARE) return ACT_SAVE_EXIT;
+        return ACT_NONE;
+    }
     if (dir) {
         if (a->tab == TAB_OVERLAY) {
             if (a->row == 0) step(&a->overlay_pos, dir, 1, 8, 1);

@@ -18,13 +18,13 @@
 
 static int tb_title(void)
 {
-    return VCFG_2BUF_TEST && (!strcmp(g_title_id, "CUSA05571") || !strcmp(g_title_id, "CUSA08809"));
+    return VCFG_2BUF_TEST && (vcfg_in_family(g_title_id, "CUSA05571") || vcfg_in_family(g_title_id, "CUSA08809"));
 }
 
 HOOK_INIT(sceVideoOutGetFlipStatus);
 static int g_status_hooked;   // sceVideoOutGetFlipStatus is hooked (virtual queue or a test build on a test title)
 static int g_vq_on;           // two_buffer=1 for this title (read once in plugin_load)
-static int vq_active(void) { return (g_vq_on || (VCFG_2BUF_TEST == 4 && tb_title())) && g_pcopy_on && !g_fg_off; }
+static int vq_active(void) { return (g_vq_on || g_ngame == 2 || (VCFG_2BUF_TEST == 4 && tb_title())) && g_pcopy_on && !g_fg_off; }
 
 // What the game saw in its last status poll before it submitted a frame (= the value that let it out of its wait):
 // raw queue numbers and the ones it was given. Index 7 = 7 or more.
