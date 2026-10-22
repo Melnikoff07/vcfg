@@ -63,6 +63,9 @@ HARNESS_C = r"""
 #include <stddef.h>
 
 typedef int64_t off_t;
+typedef struct { void *FunctionPtr; } Detour;
+static int scePthreadGetthreadid(void) { return 1001; }
+int32_t sceKernelMapDirectMemory2_hook(void **addr, size_t len, int type, int prot, int flags, long dmStart, size_t maxPageSize);
 
 extern void *memset(void *, int, size_t);
 extern void *calloc(size_t, size_t);
@@ -315,8 +318,9 @@ static int32_t sceKernelReleaseDirectMemory(long phys, size_t len)
     return -1;
 }
 
-static int32_t raw_sceKernelMapDirectMemory(void **addr, size_t len, int prot, int flags, long dmStart, size_t maxPageSize)
+static int32_t raw_sceKernelMapDirectMemory2(void **addr, size_t len, int type, int prot, int flags, long dmStart, size_t maxPageSize)
 {
+    (void)type;
     (void)maxPageSize;
     if (!sim_dm_is_allocated_range(dmStart, len))
         return (int32_t)0x80020016u;
@@ -325,6 +329,8 @@ static int32_t raw_sceKernelMapDirectMemory(void **addr, size_t len, int prot, i
     if (g_own_alloc && len <= sizeof(g_backing_buf)) {
         uintptr_t b = ((uintptr_t)g_backing_buf + 0x3FFFFu) & ~(uintptr_t)0x3FFFFu;
         out_va = (void *)b;
+    } else if ((flags & 0x10) && addr && *addr != NULL) {
+        out_va = *addr;
     } else {
         g_sim_fake_va_cursor = (g_sim_fake_va_cursor + 0x1FFFFFu) & ~(uintptr_t)0x1FFFFFu;
         out_va = (void *)g_sim_fake_va_cursor;
@@ -342,6 +348,12 @@ static int32_t raw_sceKernelMapDirectMemory(void **addr, size_t len, int prot, i
     }
     if (addr) *addr = out_va;
     return 0;
+}
+
+// In Orbis libkernel.sprx, sceKernelMapDirectMemory and sceKernelMapNamedDirectMemory call sceKernelMapDirectMemory2!
+static int32_t raw_sceKernelMapDirectMemory(void **addr, size_t len, int prot, int flags, long dmStart, size_t maxPageSize)
+{
+    return sceKernelMapDirectMemory2_hook(addr, len, -1, prot, flags, dmStart, maxPageSize);
 }
 
 static int32_t raw_sceKernelMapNamedDirectMemory(void **addr, size_t len, int prot, int flags, long dmStart, size_t maxPageSize, const char *name)
@@ -620,6 +632,7 @@ static void test_sequential_chunks_and_slice_maps(void)
 
 static void test_range_constrained_relocation(void)
 {
+    // 1. Full overlap of g_pre_mem relocates 8 MB below avoid_s:
     sim_reset(0x40000000u);
     reset_shave_state();
     setup_early_buffers_top_first();
@@ -631,6 +644,20 @@ static void test_range_constrained_relocation(void)
     ASSERT(g_pre_mem != NULL && g_pre_size == 0x800000u);
     ASSERT(g_pre_mem_phys + (long)g_pre_size <= 0x3C000000L);
     ASSERT(g_shave_n == 0);
+
+    // 2. Partial top-tail overlap (CUSA08809/CUSA08034 requesting top 0x220000 in 0x3FDE0000..0x40000000):
+    //    trims only the overlapping 8 MB tail in-place (32 MB -> 24 MB) without moving g_pre_mem or releasing g_pre_work/gpu!
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    void *orig_va = g_pre_mem;
+    long orig_phys = g_pre_mem_phys;
+    long tail_phys = 0;
+    r = sceKernelAllocateDirectMemory(0x3FDE0000L, 0x40000000L, 0x220000u, 0x20000u, 3, &tail_phys);
+    ASSERT(r == 0 && tail_phys == 0x3FDE0000L);
+    ASSERT(g_pre_mem == orig_va && g_pre_mem_phys == orig_phys);
+    ASSERT(g_pre_size == 0x1800000u);
+    ASSERT(g_pre_work != NULL && g_pre_gpu != NULL);
 }
 
 static void test_avail_hook_and_late_alloc_mode2(void)
@@ -673,6 +700,46 @@ static void test_avail_hook_and_late_alloc_mode2(void)
     ASSERT(sceKernelMapDirectMemory(&va_post, 0xCC80000u, 0x33, 0, post_reg, 0x80000u) == 0 && va_post != NULL);
 }
 
+static void test_runtime_streaming_and_batchmap_guards(void)
+{
+    // 1. alloc_gv_dm consumes 0 bytes of DirectMemory even when DirectMemory is 100% free:
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    void *gv = alloc_gv_dm(0x100000u, 0x10000u, 0);
+    ASSERT(gv != NULL);
+    ASSERT(sim_dm_used_bytes() == 0);
+
+    // 2. Runtime streaming (g_flips > 0) synthetic flex-backed chunk (CUSA32946 / CUSA10237 / CUSA10123):
+    sim_reset(0x20000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    release_early_gpu();
+    release_early_work();
+    g_mbuf_state = 1;
+    g_flips = 380;
+    long main_arena = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x20000000L, 0x1E000000u, 0x200000u, 3, &main_arena) == 0);
+    ASSERT(dm_avail(0x4000u) == 0);
+    long stream_phys = 0;
+    void *stream_va = NULL;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x20000000L, 0x1000000u, 0x10000u, 0, &stream_phys) == 0);
+    ASSERT(sceKernelMapDirectMemory(&stream_va, 0x1000000u, 0x32, 0x10, stream_phys, 0x10000u) == 0);
+    ASSERT(stream_va != NULL);
+
+    // 3. Non-2MB-aligned giant BatchMap bundle in shave_mode=2 (CUSA28561 pattern):
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    g_cfg.shave_mode = 2;
+    long b0 = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x10000000u, 0x200000u, 3, &b0) == 0);
+    long bundle = 0;
+    // Request 0x2F8F0000 (not 2MB-aligned, leaves < 8 MB): claims 8 MB g_pre_mem and refuses un-shavable bundle so
+    // the game's binary splitter can allocate 2MB-aligned chunks cleanly around g_pre_mem.
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x2F8F0000u, 0x10000u, 3, &bundle) != 0);
+    ASSERT(g_pre_mem != NULL && g_pre_size == 0x800000u);
+    ASSERT(g_shave_n == 0);
+}
+
 int main(void)
 {
     test_flex_gpu_fallback_and_alignment();
@@ -681,7 +748,8 @@ int main(void)
     test_sequential_chunks_and_slice_maps();
     test_range_constrained_relocation();
     test_avail_hook_and_late_alloc_mode2();
-    printf("lowmem valve & alloc_flex_gpu unit tests: all 6 suites passed\n");
+    test_runtime_streaming_and_batchmap_guards();
+    printf("lowmem valve & alloc_flex_gpu unit tests: all 7 suites passed\n");
     return 0;
 }
 """

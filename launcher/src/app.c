@@ -498,14 +498,21 @@ static void format_recipe(const DevCfg *d, char *rc_line)
     cat(rc_line, "-TL"); cat(rc_line, ti_s[d->tile_mode >= 0 && d->tile_mode < 7 ? d->tile_mode : 0]);
 }
 
+static int row_needs_fix(const DevCfg *d, int i)
+{
+    if (d->rec_applied) return 0;
+    if (d->rec_mask) return (d->rec_mask & (1 << i)) != 0;
+    return d->rec_row == i;
+}
+
 static void draw_dev_expanded(Canvas *c, App *a, int top, Game *g, DevCfg *d)
 {
     Theme th = theme_of(a);
     Fonts *f = a->f;
     int y = top + 58, w = c->w - 2 * M, h = 756;
     uint32_t sub_box = a->dark_theme ? 0xFF11141Bu : 0xFFE4E2DAu;
-    int has_issue = d->diag_kind >= DIAG_OOM_BOOT || d->has_crash || d->safe_state > 0;
-    uint32_t adv_col = has_issue ? RED : (d->diag_kind == DIAG_OK ? BLUE : th.div);
+    int has_issue = !d->rec_applied && (d->diag_kind >= DIAG_OOM_BOOT || d->has_crash || d->safe_state > 0 || d->rec_mask != 0);
+    uint32_t adv_col = has_issue ? RED : ((d->rec_applied || d->diag_kind == DIAG_OK) ? BLUE : th.div);
 
     fill_round(c, M, y, w, h, 22, th.panel);
     fill_round(c, M, y, w, 72, 22, th.head_bg);
@@ -549,17 +556,19 @@ static void draw_dev_expanded(Canvas *c, App *a, int top, Game *g, DevCfg *d)
     int y2 = y1 + h1 + 14, h2 = 204;
     fill_round(c, lx, y2, lw, h2, 16, sub_box);
     stroke_rect(c, lx, y2, lw, h2, 2, th.div);
-    draw_text_clip(c, &f->mono, lx + 16, y2 + 32, iw, "TROUBLESHOOTING STEPS (PRESS R2 TO APPLY STEP 1):", a->dark_theme ? YEL : INK, 0);
+    draw_text_clip(c, &f->mono, lx + 16, y2 + 32, iw,
+                   d->rec_applied ? "ADVISOR PROFILE ACTIVE (PRESS SQUARE TO LAUNCH):" : "ADVISOR ACTION PLAN (PRESS R2 TO APPLY ALL):",
+                   d->rec_applied ? BLUE : (a->dark_theme ? YEL : INK), 0);
 
     const char *st1 = d->step1[0] ? d->step1 : "1. Memory hook -> LATE (F120) if game crashes on boot.";
     const char *st2 = d->step2[0] ? d->step2 : "2. Buffer reg -> TOP GROUP (16-N) or DEFERRED if black screen.";
     const char *st3 = d->step3[0] ? d->step3 : "3. Flip pacing -> POST-SUBMIT or TIMER (PAIR) if stutter/hang.";
-    draw_text_clip(c, &f->mono, lx + 16, y2 + 70,  iw, st1, d->rec_row > 0 ? (a->dark_theme ? YEL : RED) : th.ink, 0);
+    draw_text_clip(c, &f->mono, lx + 16, y2 + 70,  iw, st1, !d->rec_applied && (d->rec_row > 0 || d->rec_mask) ? (a->dark_theme ? YEL : RED) : th.ink, 0);
     draw_text_clip(c, &f->mono, lx + 16, y2 + 106, iw, st2, th.ink, 0);
     draw_text_clip(c, &f->mono, lx + 16, y2 + 142, iw, st3, th.dim, 0);
     draw_text_clip(c, &f->mono, lx + 16, y2 + 182, iw,
-                   a->status[0] ? a->status : "D-PAD: TUNE | R2: AUTO-FIX | SQUARE: LAUNCH",
-                   a->status[0] ? RED : BLUE, 0);
+                   a->status[0] ? a->status : "D-PAD: TUNE | R2: APPLY ALL ADVISOR SETTINGS | SQUARE: LAUNCH",
+                   a->status[0] ? (d->rec_applied ? BLUE : RED) : BLUE, 0);
 
     // 3. Log Tail Box
     int y3 = y2 + h2 + 14, h3 = 216;
@@ -578,18 +587,18 @@ static void draw_dev_expanded(Canvas *c, App *a, int top, Game *g, DevCfg *d)
     // ---- Right Column: All 7 Dev Parameters with Live Controls & Full Descriptions ----
     int rx = lx + lw + 24, rw_box = w - (lx - M) - lw - 24 - 26;
     Row r[8];
-    r[1] = (Row){ "1. Engine / Buffers", "", d->rec_row == 1 ? 3 : 0, 0 }; pipe_preset_label(g, r[1].value);
-    r[2] = (Row){ "2. Memory hook",      "", d->rec_row == 2 ? 3 : 0, 0 }; cat(r[2].value, shave_name(d->manual_mode ? d->shave_mode : 0));
-    r[3] = (Row){ "3. Buffer reg",       "", d->rec_row == 3 ? 3 : 0, 0 }; cat(r[3].value, reg_name(d->manual_mode ? d->reg_mode : 0));
-    r[4] = (Row){ "4. Flip pacing",      "", d->rec_row == 4 ? 3 : 0, 0 }; cat(r[4].value, pace_name(d->manual_mode ? d->pace_order : 0));
-    r[5] = (Row){ "5. Post target",      "", d->rec_row == 5 ? 3 : 0, 0 }; cat(r[5].value, post_name(d->manual_mode ? d->post_mid : 0));
-    r[6] = (Row){ "6. FPS lock",         "", d->rec_row == 6 ? 3 : 0, 0 }; cat(r[6].value, fps_lock_name(d->manual_mode ? d->fps_lock : 0));
-    r[7] = (Row){ "7. Tile mode",        "", d->rec_row == 7 ? 3 : 0, 0 }; cat(r[7].value, tile_mode_name(d->manual_mode ? d->tile_mode : 0));
+    r[1] = (Row){ "1. Engine / Buffers", "", row_needs_fix(d, 1) ? 3 : 0, 0 }; pipe_preset_label(g, r[1].value);
+    r[2] = (Row){ "2. Memory hook",      "", row_needs_fix(d, 2) ? 3 : 0, 0 }; cat(r[2].value, shave_name(d->manual_mode ? d->shave_mode : 0));
+    r[3] = (Row){ "3. Buffer reg",       "", row_needs_fix(d, 3) ? 3 : 0, 0 }; cat(r[3].value, reg_name(d->manual_mode ? d->reg_mode : 0));
+    r[4] = (Row){ "4. Flip pacing",      "", row_needs_fix(d, 4) ? 3 : 0, 0 }; cat(r[4].value, pace_name(d->manual_mode ? d->pace_order : 0));
+    r[5] = (Row){ "5. Post target",      "", row_needs_fix(d, 5) ? 3 : 0, 0 }; cat(r[5].value, post_name(d->manual_mode ? d->post_mid : 0));
+    r[6] = (Row){ "6. FPS lock",         "", row_needs_fix(d, 6) ? 3 : 0, 0 }; cat(r[6].value, fps_lock_name(d->manual_mode ? d->fps_lock : 0));
+    r[7] = (Row){ "7. Tile mode",        "", row_needs_fix(d, 7) ? 3 : 0, 0 }; cat(r[7].value, tile_mode_name(d->manual_mode ? d->tile_mode : 0));
 
     for (int i = 1; i <= 7; i++) {
         int cy = y1 + (i - 1) * 94, ch = 86;
         int sel = (a->row == i) || (a->row == 0 && i == 1);
-        int rec = (d->rec_row == i);
+        int rec = row_needs_fix(d, i);
         uint32_t cbg = sel ? (a->dark_theme ? 0xFF202634u : 0xFFF7E48Au) : sub_box;
         uint32_t cbd = rec ? RED : (sel ? (a->dark_theme ? YEL : INK) : th.div);
         fill_round(c, rx, cy, rw_box, ch, 14, cbg);
@@ -642,15 +651,16 @@ static void draw_dev(Canvas *c, App *a, int top)
 
     // ---- Block 2: Crash & Log Advisor Box (y+142 .. y+482, height 340) ----
     int ay = y + 142, ah = 340;
-    int has_issue = d->diag_kind >= DIAG_OOM_BOOT || d->has_crash || d->safe_state > 0;
-    uint32_t adv_border = has_issue ? RED : (d->diag_kind == DIAG_OK ? BLUE : th.div);
+    int has_issue = !d->rec_applied && (d->diag_kind >= DIAG_OOM_BOOT || d->has_crash || d->safe_state > 0 || d->rec_mask != 0);
+    uint32_t adv_border = has_issue ? RED : ((d->rec_applied || d->diag_kind == DIAG_OK) ? BLUE : th.div);
     fill_round(c, M, ay, lw, ah, 18, th.panel);
     stroke_rect(c, M, ay, lw, ah, 3, adv_border);
     fill_rect(c, M, ay, lw, 42, adv_border);
     const char *adv_hdr = has_issue ? "CRASH ADVISOR [ISSUE]" :
-                          (d->diag_kind == DIAG_OK ? "CRASH ADVISOR [HEALTHY]" : "CRASH ADVISOR [READY]");
+                          (d->rec_applied && d->rec_manual ? "CRASH ADVISOR [FIX APPLIED]" :
+                          (d->diag_kind == DIAG_OK ? "CRASH ADVISOR [HEALTHY]" : "CRASH ADVISOR [READY]"));
     draw_text_clip(c, &f->mono, M + 18, ay + 29, iw, adv_hdr,
-                   has_issue || d->diag_kind == DIAG_OK ? CREAM : th.ink, 1);
+                   has_issue || d->rec_applied || d->diag_kind == DIAG_OK ? CREAM : th.ink, 1);
 
     static const char *st_names[3] = { "0 (EARLY)", "1 (DEFER)", "2 (SAFE)" };
     char st_line[64] = "BOOT: ";
@@ -665,10 +675,11 @@ static void draw_dev(Canvas *c, App *a, int top)
 
     fill_rect(c, M + 18, ay + 156, iw, 2, th.div);
     draw_text_clip(c, &f->mono, M + 18, ay + 186, iw,
-                   d->rec_row > 0 ? "RECOMMENDED FIX (R2: APPLY):" : "ADVISOR STATUS:", th.dim, 0);
+                   !d->rec_applied && (d->rec_row > 0 || d->rec_mask) ? "RECOMMENDED FIX (R2: APPLY ALL):" :
+                   (d->rec_applied && d->rec_manual ? "ADVISOR FIX ACTIVE (SQ: LAUNCH):" : "ADVISOR STATUS:"), th.dim, 0);
     draw_wrapped(c, &f->mono, M + 18, ay + 220, 32, iw, 2,
                  d->diag_advice[0] ? d->diag_advice : "DEFAULT SETTINGS ARE OK",
-                 d->rec_row > 0 ? (a->dark_theme ? YEL : RED) : BLUE, 0);
+                 !d->rec_applied && (d->rec_row > 0 || d->rec_mask) ? (a->dark_theme ? YEL : RED) : BLUE, 0);
 
     fill_round(c, M + 14, ay + 280, lw - 28, 46, 12, a->dark_theme ? 0xFF222836u : INK);
     draw_button(c, BTN_CIRCLE, M + 28, ay + 303, 24, YEL);
@@ -683,40 +694,40 @@ static void draw_dev(Canvas *c, App *a, int top)
     draw_wrapped(c, &f->mono, M + 18, gy + 72, 34, iw, 4, full_g, th.ink, 0);
 
     fill_rect(c, M + 18, gy + 198, iw, 2, th.div);
-    const char *st_msg = a->status[0] ? a->status : "L2: GAME | R2: FIX | SQ: RUN";
-    draw_text_clip(c, &f->mono, M + 18, gy + 234, iw, st_msg, a->status[0] ? (a->dark_theme ? YEL : RED) : th.dim, 0);
+    const char *st_msg = a->status[0] ? a->status : "L2: GAME | R2: APPLY ADVISOR | SQ: RUN";
+    draw_text_clip(c, &f->mono, M + 18, gy + 234, iw, st_msg, a->status[0] ? (d->rec_applied ? BLUE : (a->dark_theme ? YEL : RED)) : th.dim, 0);
 
     int auto_k = d->manual_mode ? 0 : 4;
     Row r[8];
     r[0] = (Row){ "Control mode", "", 1, d->manual_mode };
     cat(r[0].value, d->manual_mode ? "CUSTOM (MANUAL)" : "AUTO (ALGORITHM)");
 
-    r[1] = (Row){ "Engine / Buffers", "", d->rec_row == 1 ? 3 : auto_k, 0 };
-    if (d->rec_row == 1) cat(r[1].value, "[!] ");
-    pipe_preset_label(g, r[1].value + (d->rec_row == 1 ? 4 : 0));
+    r[1] = (Row){ "Engine / Buffers", "", row_needs_fix(d, 1) ? 3 : auto_k, 0 };
+    if (row_needs_fix(d, 1)) cat(r[1].value, "[!] ");
+    pipe_preset_label(g, r[1].value + (row_needs_fix(d, 1) ? 4 : 0));
 
-    r[2] = (Row){ "Memory hook", "", d->rec_row == 2 ? 3 : auto_k, 0 };
-    if (d->rec_row == 2) cat(r[2].value, "[!] ");
+    r[2] = (Row){ "Memory hook", "", row_needs_fix(d, 2) ? 3 : auto_k, 0 };
+    if (row_needs_fix(d, 2)) cat(r[2].value, "[!] ");
     cat(r[2].value, shave_name(d->manual_mode ? d->shave_mode : 0));
 
-    r[3] = (Row){ "Buffer reg", "", d->rec_row == 3 ? 3 : auto_k, 0 };
-    if (d->rec_row == 3) cat(r[3].value, "[!] ");
+    r[3] = (Row){ "Buffer reg", "", row_needs_fix(d, 3) ? 3 : auto_k, 0 };
+    if (row_needs_fix(d, 3)) cat(r[3].value, "[!] ");
     cat(r[3].value, reg_name(d->manual_mode ? d->reg_mode : 0));
 
-    r[4] = (Row){ "Flip pacing", "", d->rec_row == 4 ? 3 : auto_k, 0 };
-    if (d->rec_row == 4) cat(r[4].value, "[!] ");
+    r[4] = (Row){ "Flip pacing", "", row_needs_fix(d, 4) ? 3 : auto_k, 0 };
+    if (row_needs_fix(d, 4)) cat(r[4].value, "[!] ");
     cat(r[4].value, pace_name(d->manual_mode ? d->pace_order : 0));
 
-    r[5] = (Row){ "Post target", "", d->rec_row == 5 ? 3 : auto_k, 0 };
-    if (d->rec_row == 5) cat(r[5].value, "[!] ");
+    r[5] = (Row){ "Post target", "", row_needs_fix(d, 5) ? 3 : auto_k, 0 };
+    if (row_needs_fix(d, 5)) cat(r[5].value, "[!] ");
     cat(r[5].value, post_name(d->manual_mode ? d->post_mid : 0));
 
-    r[6] = (Row){ "FPS lock", "", d->rec_row == 6 ? 3 : auto_k, 0 };
-    if (d->rec_row == 6) cat(r[6].value, "[!] ");
+    r[6] = (Row){ "FPS lock", "", row_needs_fix(d, 6) ? 3 : auto_k, 0 };
+    if (row_needs_fix(d, 6)) cat(r[6].value, "[!] ");
     cat(r[6].value, fps_lock_name(d->manual_mode ? d->fps_lock : 0));
 
-    r[7] = (Row){ "Tile mode", "", d->rec_row == 7 ? 3 : auto_k, 0 };
-    if (d->rec_row == 7) cat(r[7].value, "[!] ");
+    r[7] = (Row){ "Tile mode", "", row_needs_fix(d, 7) ? 3 : auto_k, 0 };
+    if (row_needs_fix(d, 7)) cat(r[7].value, "[!] ");
     cat(r[7].value, tile_mode_name(d->manual_mode ? d->tile_mode : 0));
 
     char head[64] = "TECHNICAL PIPELINE / "; cat(head, g->id);
@@ -778,8 +789,8 @@ void app_draw(Canvas *c, App *a)
         draw_footer(c, a, h, 6);
     } else {
         draw_install(c, a, top);
-        Hint h[] = { { BTN_CROSS, "INSTALL / UPDATE" }, { BTN_SQUARE, "TURN OFF" }, { BTN_TRIANGLE, "DEBUG LOG" }, { BTN_L2, "NET SEND" }, { BTN_CIRCLE, "SAVE / SEND REPORT" } };
-        draw_footer(c, a, h, 5);
+        Hint h[] = { { BTN_CROSS, "INSTALL" }, { BTN_SQUARE, "TURN OFF" }, { BTN_R2, "WIPE ALL" }, { BTN_TRIANGLE, "DEBUG LOG" }, { BTN_L2, "NET SEND" }, { BTN_CIRCLE, "REPORT" } };
+        draw_footer(c, a, h, 6);
     }
 }
 

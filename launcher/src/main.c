@@ -54,6 +54,38 @@ static const Supported k_sup[] = {
     { "CUSA00557", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
     { "CUSA09171", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
     { "CUSA13801", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA14209", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA12054", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA16734", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA36842", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA01015", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA33388", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA34384", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA15778", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00083", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA02320", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA03388", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA02299", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA09311", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA18534", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA10123", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA08364", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA08344", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA10454", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA11100", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA15090", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA18723", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA36375", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA06548", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA10237", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA11260", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA32946", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA28561", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA01154", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA04841", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA17722", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA32836", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA01113", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
 static const char *k_files[] = { "vcfg16.prx", "vcfg_classic51.prx", "vcfg_alt_16.prx" };
@@ -62,7 +94,12 @@ static int auto_2buf(const char *id)
 {
     return vcfg_in_family(id, "CUSA05571") || vcfg_in_family(id, "CUSA08809") ||
            vcfg_in_family(id, "CUSA17419") || vcfg_in_family(id, "CUSA14209") ||
-           vcfg_in_family(id, "CUSA36375");
+           vcfg_in_family(id, "CUSA36375") || vcfg_in_family(id, "CUSA08519") ||
+           vcfg_in_family(id, "CUSA11456") || vcfg_in_family(id, "CUSA01015") ||
+           vcfg_in_family(id, "CUSA15778") || vcfg_in_family(id, "CUSA00083") ||
+           vcfg_in_family(id, "CUSA02299") || vcfg_in_family(id, "CUSA08344") ||
+           vcfg_in_family(id, "CUSA10454") || vcfg_in_family(id, "CUSA11100") ||
+           vcfg_in_family(id, "CUSA15090") || vcfg_in_family(id, "CUSA18723");
 }
 static int auto_alt(const char *id)
 {
@@ -109,7 +146,9 @@ static unsigned char *read_all(const char *path, size_t *n)
 }
 static int write_all(const char *path, const void *d, size_t n)
 {
-    FILE *f = fopen(path, "wb"); if (!f) return -1;
+    FILE *f = fopen(path, "wb");
+    if (!f) { remove(path); f = fopen(path, "wb"); }
+    if (!f) return -1;
     size_t w = fwrite(d, 1, n, f); int c = fclose(f); return (w == n && !c) ? 0 : -1;
 }
 static int write_verified(const char *path, const void *d, size_t n)
@@ -117,7 +156,8 @@ static int write_verified(const char *path, const void *d, size_t n)
     char tmp[256]; snprintf(tmp, sizeof(tmp), "%s.vcfg_tmp", path);
     if (write_all(tmp, d, n)) return -1;
     size_t m = 0; unsigned char *b = read_all(tmp, &m); int ok = b && m == n && !memcmp(b, d, n); free(b);
-    if (!ok || rename(tmp, path)) { remove(tmp); return -1; }
+    if (!ok) { remove(tmp); return -1; }
+    if (rename(tmp, path)) { remove(path); if (rename(tmp, path)) { remove(tmp); return -1; } }
     return 0;
 }
 
@@ -272,13 +312,14 @@ static void load_meta(Game *g)
 // ---- settings files ----
 static int ini_int(const char *text, const char *key, int def)
 {
+    int res = def;
     size_t kl = strlen(key);
     for (const char *p = text; p && *p; ) {
         while (*p == ' ' || *p == '\t') p++;
-        if (!strncmp(p, key, kl)) { const char *q = p + kl; while (*q == ' ') q++; if (*q == '=') return atoi(q + 1); }
+        if (!strncmp(p, key, kl)) { const char *q = p + kl; while (*q == ' ') q++; if (*q == '=') res = atoi(q + 1); }
         p = strchr(p, '\n'); if (p) p++;
     }
-    return def;
+    return res;
 }
 static void ini_str(const char *text, const char *key, char *out, size_t cap, const char *def)
 {
@@ -348,14 +389,26 @@ static void add_tail_lines(DevCfg *d, const char *src)
         d->n_tail++;
     }
 }
+static int count_substr(const char *s, const char *needle)
+{
+    if (!s || !needle || !needle[0]) return 0;
+    int c = 0;
+    size_t l = strlen(needle);
+    const char *p = s;
+    while ((p = strstr(p, needle)) != NULL) { c++; p += l; }
+    return c;
+}
 static void refresh_dev_status(Game *g)
 {
     char path[96]; size_t n = 0, bn = 0, tn = 0;
     DevCfg *d = &g->dev;
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id);
     unsigned char *sb = read_all(path, &n);
-    d->safe_state = (sb && n >= 1 && sb[0] >= '0' && sb[0] <= '2') ? (sb[0] - '0') : 0;
+    int raw_safe = (sb && n >= 1 && sb[0] >= '0' && sb[0] <= '2') ? (sb[0] - '0') : 0;
     free(sb);
+    if (raw_safe > 0) d->had_watchdog = raw_safe;
+    d->safe_state = raw_safe > 0 ? raw_safe : d->had_watchdog;
+
     snprintf(path, sizeof(path), CFGDIR "/adapt-%s.ini", g->id);
     d->has_adapt = file_exists(path);
     snprintf(path, sizeof(path), CFGDIR "/crash-%s.txt", g->id);
@@ -377,18 +430,30 @@ static void refresh_dev_status(Game *g)
         tb = read_all(path, &tn);
     }
 
-    d->diag_kind = DIAG_NONE;
-    d->rec_row = 0;
-    d->n_tail = 0;
+    d->diag_kind      = DIAG_NONE;
+    d->rec_row        = 0;
+    d->rec_mask       = 0;
+    d->rec_applied    = 0;
+    d->rec_manual     = 0;
+    d->rec_eng_sel    = SEL_AUTO;
+    d->rec_buf_sel    = BUF_AUTO;
+    d->rec_shave_mode = 0;
+    d->rec_reg_mode   = 0;
+    d->rec_pace_order = 0;
+    d->rec_post_mid   = 0;
+    d->rec_fps_lock   = 0;
+    d->rec_tile_mode  = 0;
+    d->n_tail         = 0;
+
     snprintf(d->diag_cause, sizeof(d->diag_cause), "NO CRASH RECORDED");
     snprintf(d->diag_stage, sizeof(d->diag_stage), "READY FOR TEST");
-    snprintf(d->diag_advice, sizeof(d->diag_advice), "DEFAULT SETTINGS ARE OK");
+    snprintf(d->diag_advice, sizeof(d->diag_advice), "AUTO (ALGORITHM) PROFILE");
     snprintf(d->diag_detail, sizeof(d->diag_detail),
-             "No crash or error log found for %s. Launch the game with SQUARE; if it exits or stutters, return here for automatic log analysis.",
+             "No crash or error log found for %s. Press R2 to ensure the recommended AUTO profile is active, then launch with SQUARE.",
              g->id);
-    snprintf(d->step1, sizeof(d->step1), "1. Press SQUARE to launch %s with current settings.", g->id);
-    snprintf(d->step2, sizeof(d->step2), "2. If a crash occurs, open 05 DEV and press CIRCLE.");
-    snprintf(d->step3, sizeof(d->step3), "3. Press R2 to auto-apply the Advisor fix.");
+    snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply the recommended Advisor profile.");
+    snprintf(d->step2, sizeof(d->step2), "2. Press SQUARE to launch %s and test.", g->id);
+    snprintf(d->step3, sizeof(d->step3), "3. If an issue occurs, return here and press R2.");
 
     const char *cs = cb ? (const char *)cb : "";
     const char *bs = bb ? (const char *)bb : "";
@@ -398,6 +463,23 @@ static void refresh_dev_status(Game *g)
     if (d->n_tail < 4 && tb) add_tail_lines(d, ts);
     if (d->n_tail < 4 && bb) add_tail_lines(d, bs);
 
+    // Deterministic log-based telemetry (never depends on live UI sliders so R2 is 100% idempotent):
+    int logged_shave   = kv_uint_after(bs, "shave_mode=", 0);
+    int logged_reg     = kv_uint_after(bs, "reg_mode=", 0);
+    int logged_pace    = kv_uint_after(bs, "pace_order=", 0);
+    int is_2b_log      = (strstr(bs, "num=2") != NULL || strstr(ts, "count=2") != NULL ||
+                          strstr(ts, "double-buffered game") != NULL || strstr(ts, "1x1_gv_fallback") != NULL ||
+                          strstr(bs, " 1x1 ") != NULL || auto_2buf(g->id));
+    int multi_reg      = count_substr(bs, "RegisterBuffers enter:") + count_substr(ts, "RegisterBuffers handle=");
+    int has_shave_log  = (strstr(bs, "arena shave OK") != NULL || strstr(bs, "shave=1") != NULL);
+    int has_vout_only  = (strstr(ts, "flips via sceVideoOutSubmitFlip") != NULL || strstr(ts, "vout_flip") != NULL);
+    int has_60fps_inert= (strstr(ts, "60FPS NATIVE") != NULL || strstr(ts, "detected_60fps=1") != NULL);
+    int has_hdr_inert  = (strstr(ts, "HDR/FMT") != NULL);
+    unsigned pace_to   = (unsigned)kv_uint_after(ts, "pace timeouts ", 0);
+    unsigned missed_vb = (unsigned)kv_uint_after(ts, "missed ", 0);
+    int fg_ran         = (strstr(ts, "mode4 #") != NULL || strstr(ts, "vout fg #") != NULL ||
+                          strstr(bs, "gnm #100") != NULL || strstr(bs, "flip #100") != NULL);
+
     if (cb) {
         const char *sig = strstr(cs, "SIGBUS") ? "SIGBUS" :
                           strstr(cs, "SIGILL") ? "SIGILL" :
@@ -406,122 +488,298 @@ static void refresh_dev_status(Game *g)
         int in_sub     = kv_uint_after(cs, "in_submit=", 0);
         int afail      = kv_uint_after(cs, "alloc_fail=", 0);
         int oom = afail > 0 || strstr(cs, "AllocateDirectMemory") || strstr(cs, "MapDirectMemory") ||
-                  strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory");
+                  strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory") || strstr(bs, "[LOWMEM] valve=0");
         if (oom) {
-            d->diag_kind = DIAG_OOM_BOOT;
-            d->rec_row = d->shave_mode < 2 ? 2 : 1;
+            d->diag_kind      = DIAG_OOM_BOOT;
+            d->rec_manual     = 1;
+            d->rec_eng_sel    = (g->engine == ENGINE_NEW) ? SEL_NEW : SEL_ALT;
+            d->rec_buf_sel    = is_2b_log ? BUF_2BUF : BUF_AUTO;
+            d->rec_shave_mode = (flips == 0 && logged_shave >= 1) ? 2 : (has_shave_log ? 1 : 2);
+            d->rec_reg_mode   = (flips == 0) ? 2 : 1;
+            d->rec_pace_order = is_2b_log ? 3 : 2;
+            d->rec_post_mid   = 1;
+            d->rec_row        = 2;
             snprintf(d->diag_cause, sizeof(d->diag_cause), "%s: GPU / DIRECT MEM OOM", sig);
             snprintf(d->diag_stage, sizeof(d->diag_stage), "VRAM EXHAUSTED AT FLIP %u", flips);
-            snprintf(d->diag_advice, sizeof(d->diag_advice),
-                     d->shave_mode < 2 ? "MEMORY HOOK -> LATE (F120) / ALT" : "ENGINE -> ALT (LOW VRAM)");
+            snprintf(d->diag_advice, sizeof(d->diag_advice), "ALT + %s + %s (R2: APPLY ALL)",
+                     d->rec_shave_mode == 1 ? "VALVE ONLY" : "LATE (F120)",
+                     d->rec_reg_mode == 1 ? "TOP GROUP" : "DEFER REG");
             snprintf(d->diag_detail, sizeof(d->diag_detail),
-                     "Game ran out of DirectMemory (%s at flip %u, alloc_fail=%d). Early 64MB shave conflicted with engine boot pools.",
-                     sig, flips, afail);
-            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to set Memory Hook -> LATE (F120).");
-            snprintf(d->step2, sizeof(d->step2), "2. Or set Engine / Buffers -> ALT (LOW VRAM).");
+                     "DirectMemory conflict (%s at flip %u, alloc_fail=%d). Press R2 to apply ALT low-VRAM engine + %s + %s + MID ONLY.",
+                     sig, flips, afail,
+                     d->rec_shave_mode == 1 ? "VALVE ONLY" : "LATE (F120)",
+                     d->rec_reg_mode == 1 ? "TOP GROUP" : "DEFERRED (F120)");
+            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply the full Low-VRAM Advisor profile.");
+            snprintf(d->step2, sizeof(d->step2), "2. Sets ALT Engine + %s + %s.",
+                     d->rec_shave_mode == 1 ? "VALVE ONLY" : "LATE (F120)",
+                     d->rec_reg_mode == 1 ? "TOP GROUP" : "DEFERRED");
             snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to re-test the game.");
-        } else if (flips == 0 || strstr(cs, "RegisterBuffers")) {
-            d->diag_kind = DIAG_BOOT_EARLY;
-            d->rec_row = d->shave_mode < 2 ? 2 : 3;
+        } else if (flips == 0 || strstr(cs, "RegisterBuffers") || strstr(cs, "BatchMap")) {
+            d->diag_kind      = DIAG_BOOT_EARLY;
+            d->rec_manual     = 1;
+            d->rec_eng_sel    = (g->engine == ENGINE_NEW) ? SEL_NEW : SEL_ALT;
+            d->rec_buf_sel    = is_2b_log ? BUF_2BUF : BUF_AUTO;
+            d->rec_shave_mode = (strstr(cs, "RegisterBuffers") || strstr(bs, "BatchMap")) ? 1 : 2;
+            d->rec_reg_mode   = (logged_reg == 1) ? 2 : 1;
+            d->rec_pace_order = is_2b_log ? 3 : 2;
+            d->rec_post_mid   = 1;
+            d->rec_row        = (d->rec_shave_mode == 2) ? 2 : 3;
             snprintf(d->diag_cause, sizeof(d->diag_cause), "%s BEFORE FIRST FRAME", sig);
             snprintf(d->diag_stage, sizeof(d->diag_stage), "EARLY BOOT / BUFFER REG HOOK");
-            snprintf(d->diag_advice, sizeof(d->diag_advice),
-                     d->shave_mode < 2 ? "MEMORY HOOK -> LATE (FRAME 120)" : "BUFFER REG -> DEFERRED (F120)");
+            snprintf(d->diag_advice, sizeof(d->diag_advice), "ALT + %s + %s (R2: APPLY ALL)",
+                     d->rec_shave_mode == 2 ? "LATE (F120)" : "VALVE ONLY",
+                     d->rec_reg_mode == 2 ? "DEFER (F120)" : "TOP GROUP");
             snprintf(d->diag_detail, sizeof(d->diag_detail),
-                     "Crash (%s) occurred during engine initialization before frame 1. Hooking DirectMemory or RegisterBuffers too early broke startup.",
-                     sig);
-            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to defer Memory Hook / Buffer Reg to F120.");
-            snprintf(d->step2, sizeof(d->step2), "2. If crash persists, set Buffer Reg -> TOP GROUP.");
+                     "Crash (%s) during engine init before frame 1. Press R2 to isolate display buffers in %s and use %s memory hook.",
+                     sig,
+                     d->rec_reg_mode == 2 ? "DEFERRED (F120)" : "TOP GROUP (16-N)",
+                     d->rec_shave_mode == 2 ? "LATE (F120)" : "VALVE ONLY");
+            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply the full Boot-Safe Advisor profile.");
+            snprintf(d->step2, sizeof(d->step2), "2. Sets ALT + %s + %s.",
+                     d->rec_shave_mode == 2 ? "LATE (F120)" : "VALVE ONLY",
+                     d->rec_reg_mode == 2 ? "DEFERRED (F120)" : "TOP GROUP");
             snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to test boot stability.");
-        } else if (in_sub || strstr(cs, "SubmitAndFlip") || strstr(cs, "SubmitDone") || strstr(cs, "VideoOutSubmitFlip")) {
-            d->diag_kind = DIAG_FLIP_STALL;
-            d->rec_row = 4;
+        } else if (in_sub || strstr(cs, "SubmitAndFlip") || strstr(cs, "SubmitDone") ||
+                   strstr(cs, "VideoOutSubmitFlip") || strstr(cs, "WaitOnAddress")) {
+            d->diag_kind      = DIAG_FLIP_STALL;
+            d->rec_manual     = 1;
+            d->rec_eng_sel    = SEL_AUTO;
+            d->rec_buf_sel    = is_2b_log ? BUF_2BUF : BUF_AUTO;
+            d->rec_shave_mode = 1;
+            d->rec_reg_mode   = 1;
+            d->rec_pace_order = (logged_pace == 2 || is_2b_log) ? 3 : 2;
+            d->rec_post_mid   = 1;
+            d->rec_row        = 4;
             snprintf(d->diag_cause, sizeof(d->diag_cause), "%s IN FLIP SUBMIT (F%u)", sig, flips);
             snprintf(d->diag_stage, sizeof(d->diag_stage), "SUBMIT / VBLANK PACER CONFLICT");
-            snprintf(d->diag_advice, sizeof(d->diag_advice),
-                     d->pace_order != 2 ? "FLIP PACING -> POST-SUBMIT" : "FLIP PACING -> TIMER (PAIR)");
+            snprintf(d->diag_advice, sizeof(d->diag_advice), "%s + TOP GROUP + MID ONLY (R2)",
+                     d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
             snprintf(d->diag_detail, sizeof(d->diag_detail),
-                     "Crash (%s at flip %u, in_submit=%d) inside GNM / VideoOut flip submission. Game's command buffer pacer collided with pre-submit FG dispatch.",
-                     sig, flips, in_sub);
-            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to switch Flip Pacing -> POST-SUBMIT.");
-            snprintf(d->step2, sizeof(d->step2), "2. If stutter occurs, try Flip Pacing -> TIMER (PAIR).");
-            snprintf(d->step3, sizeof(d->step3), "3. Try Post Target -> MID ONLY if HUD flickers.");
+                     "Crash (%s at flip %u, in_submit=%d) inside flip submission. Press R2 to configure %s pacing + TOP GROUP + MID ONLY.",
+                     sig, flips, in_sub, d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
+            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply the full Flip-Safe Advisor profile.");
+            snprintf(d->step2, sizeof(d->step2), "2. Sets %s + TOP GROUP + VALVE ONLY.",
+                     d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
+            snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch.");
         } else {
-            d->diag_kind = DIAG_REG_CONFLICT;
-            d->rec_row = d->shave_mode == 0 ? 2 : 3;
+            d->diag_kind      = DIAG_REG_CONFLICT;
+            d->rec_manual     = 1;
+            d->rec_eng_sel    = (g->engine == ENGINE_NEW) ? SEL_NEW : SEL_ALT;
+            d->rec_buf_sel    = is_2b_log ? BUF_2BUF : BUF_AUTO;
+            d->rec_shave_mode = 1;
+            d->rec_reg_mode   = 1;
+            d->rec_pace_order = is_2b_log ? 3 : 2;
+            d->rec_post_mid   = 1;
+            d->rec_row        = 3;
             snprintf(d->diag_cause, sizeof(d->diag_cause), "%s AT FLIP %u", sig, flips);
             snprintf(d->diag_stage, sizeof(d->diag_stage), "MID-GAME ARENA / REG CONFLICT");
-            snprintf(d->diag_advice, sizeof(d->diag_advice),
-                     d->shave_mode == 0 ? "MEMORY HOOK -> VALVE ONLY / LATE" : "BUFFER REG -> TOP GROUP (16-N)");
+            snprintf(d->diag_advice, sizeof(d->diag_advice), "ALT + VALVE ONLY + TOP GROUP (R2)");
             snprintf(d->diag_detail, sizeof(d->diag_detail),
-                     "Mid-session fault (%s at flip %u). Engine re-allocated display buffers or hit reduced memory arena limits.",
+                     "Mid-session fault (%s at flip %u). Engine re-allocated display buffers or hit arena limits. Press R2 to apply full isolation profile.",
                      sig, flips);
-            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to set Memory Hook -> VALVE ONLY.");
-            snprintf(d->step2, sizeof(d->step2), "2. Set Buffer Reg -> TOP GROUP (16-N) for UE4/RE.");
+            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply VALVE ONLY + TOP GROUP (16-N).");
+            snprintf(d->step2, sizeof(d->step2), "2. Sets %s pacing + MID ONLY post target.",
+                     d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
             snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to verify stability.");
         }
     } else if (d->safe_state > 0) {
-        d->diag_kind = DIAG_BOOT_EARLY;
-        d->rec_row = d->safe_state >= 2 ? 2 : 3;
+        d->diag_kind      = DIAG_BOOT_EARLY;
+        d->rec_manual     = 1;
+        d->rec_eng_sel    = (g->engine == ENGINE_NEW) ? SEL_NEW : SEL_ALT;
+        d->rec_buf_sel    = is_2b_log ? BUF_2BUF : BUF_AUTO;
+        d->rec_shave_mode = (multi_reg >= 2) ? 1 : 2;
+        d->rec_reg_mode   = 1;
+        d->rec_pace_order = is_2b_log ? 3 : 2;
+        d->rec_post_mid   = 1;
+        d->rec_row        = 2;
         snprintf(d->diag_cause, sizeof(d->diag_cause),
                  d->safe_state >= 2 ? "REPEATED BOOT ABORT -> PASSIVE" : "PREVIOUS BOOT STOPPED EARLY");
         snprintf(d->diag_stage, sizeof(d->diag_stage),
                  d->safe_state >= 2 ? "FG PAUSED BY SAFE WATCHDOG" : "AUTO-DEFERRED TO FRAME 120");
-        snprintf(d->diag_advice, sizeof(d->diag_advice),
-                 d->shave_mode < 2 ? "MEMORY HOOK -> LATE (FRAME 120)" : "BUFFER REG -> DEFERRED (F120)");
+        snprintf(d->diag_advice, sizeof(d->diag_advice), "ALT + %s + TOP GROUP (R2: APPLY)",
+                 d->rec_shave_mode == 2 ? "LATE (F120)" : "VALVE ONLY");
         snprintf(d->diag_detail, sizeof(d->diag_detail),
-                 "Watchdog detected %s before frame 120 (safe_state=%d). VCFG automatically stepped down to prevent boot loops.",
-                 d->safe_state >= 2 ? "2+ incomplete boots and paused FG" : "an incomplete boot and deferred hooks", d->safe_state);
-        snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply LATE (F120) hook & clear watchdog.");
+                 "Watchdog detected %s before frame 120 (safe_state=%d). Press R2 to apply the full Boot-Safe Advisor profile and clear watchdog.",
+                 d->safe_state >= 2 ? "2+ incomplete boots" : "an incomplete boot", d->safe_state);
+        snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply ALT + %s + TOP GROUP.",
+                 d->rec_shave_mode == 2 ? "LATE (F120)" : "VALVE ONLY");
         snprintf(d->step2, sizeof(d->step2), "2. Or press TRIANGLE to restore AUTO (ALGORITHM).");
         snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch and test.");
-    } else if (strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory") || strstr(ts, "alloc_fail")) {
-        d->diag_kind = DIAG_OOM_BOOT;
-        d->rec_row = 2;
+    } else if (strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory") || strstr(ts, "work memory: none") || strstr(bs, "alloc_dm FAIL")) {
+        d->diag_kind      = DIAG_OOM_BOOT;
+        d->rec_manual     = 1;
+        d->rec_eng_sel    = SEL_ALT;
+        d->rec_buf_sel    = is_2b_log ? BUF_2BUF : BUF_AUTO;
+        d->rec_shave_mode = 0;
+        d->rec_reg_mode   = 1;
+        d->rec_pace_order = is_2b_log ? 3 : 2;
+        d->rec_post_mid   = 1;
+        d->rec_row        = 1;
         snprintf(d->diag_cause, sizeof(d->diag_cause), "GPU WORK MEMORY ALLOC FAILED");
         snprintf(d->diag_stage, sizeof(d->diag_stage), "NOT ENOUGH FREE DIRECT MEMORY");
-        snprintf(d->diag_advice, sizeof(d->diag_advice), "MEMORY HOOK -> VALVE+SHAVE / ALT");
+        snprintf(d->diag_advice, sizeof(d->diag_advice), "ALT ENGINE + VALVE+SHAVE + TOP GROUP (R2)");
         snprintf(d->diag_detail, sizeof(d->diag_detail),
                  "Game booted without crashing, but VCFG could not allocate DirectMemory for optical flow textures (dmem_FAIL in log).");
-        snprintf(d->step1, sizeof(d->step1), "1. Set Memory Hook -> VALVE+SHAVE (64M) and Save.");
-        snprintf(d->step2, sizeof(d->step2), "2. Or set Engine / Buffers -> ALT (LOW VRAM).");
+        snprintf(d->step1, sizeof(d->step1), "1. Press R2 to set ALT Engine + VALVE+SHAVE + TOP GROUP.");
+        snprintf(d->step2, sizeof(d->step2), "2. Enables MID ONLY post target to save memory.");
         snprintf(d->step3, sizeof(d->step3), "3. Re-launch with SQUARE.");
-    } else if ((strstr(bs, "count=2 ") || strstr(ts, "count=2 ")) && game_buf(g) != BUF_2BUF &&
-               (strstr(ts, "inert") || strstr(ts, "no mid") || strstr(bs, "pcopy=0"))) {
-        d->diag_kind = DIAG_2BUF_NEEDED;
-        d->rec_row = 1;
-        snprintf(d->diag_cause, sizeof(d->diag_cause), "2-BUFFER GAME WITHOUT PCOPY");
+    } else if (is_2b_log && !fg_ran &&
+               (strstr(ts, "inert") || strstr(ts, "no mid") || strstr(bs, "pcopy=0") || strstr(bs, "want_pcopy=0") || strstr(bs, "two_buffer=0"))) {
+        d->diag_kind      = DIAG_2BUF_NEEDED;
+        d->rec_manual     = 1;
+        d->rec_eng_sel    = auto_alt(g->id) ? SEL_ALT : SEL_CLASSIC;
+        d->rec_buf_sel    = BUF_2BUF;
+        d->rec_shave_mode = 1;
+        d->rec_reg_mode   = 1;
+        d->rec_pace_order = 3;
+        d->rec_post_mid   = 1;
+        d->rec_row        = 1;
+        snprintf(d->diag_cause, sizeof(d->diag_cause), "2-BUFFER / 1X1 FLIP WITHOUT PCOPY");
         snprintf(d->diag_stage, sizeof(d->diag_stage), "ONLY 2 DISPLAY BUFFERS REGISTERED");
-        snprintf(d->diag_advice, sizeof(d->diag_advice), "PRESS R2: ENABLE 2-BUFFER + TOP REG");
+        snprintf(d->diag_advice, sizeof(d->diag_advice), "2-BUFFER PCOPY + TOP GROUP + TIMER (R2)");
         snprintf(d->diag_detail, sizeof(d->diag_detail),
-                 "Log shows count=2 display buffers without extra mid-buffer slots. Standard 3-buffer ring cannot insert generated frames.");
-        snprintf(d->step1, sizeof(d->step1), "1. Press R2 to enable 2-BUFFER pcopy + TOP GROUP.");
-        snprintf(d->step2, sizeof(d->step2), "2. Keep Flip Pacing -> TIMER (PAIR) or POST-SUBMIT.");
+                 "Log shows a 2-buffer swapchain without extra mid-buffer slots. Press R2 to configure 2-BUFFER present copy + TOP GROUP + TIMER pacing.");
+        snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply 2-BUFFER + TOP GROUP + TIMER.");
+        snprintf(d->step2, sizeof(d->step2), "2. Sets VALVE ONLY + MID ONLY automatically.");
         snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch.");
-    } else if (strstr(ts, "mode4 #") || strstr(ts, "vout fg #") || strstr(bs, "gnm #100") || strstr(bs, "flip #100")) {
-        d->diag_kind = DIAG_OK;
-        d->rec_row = 0;
-        snprintf(d->diag_cause, sizeof(d->diag_cause), "LAST SESSION RAN NORMALLY");
-        snprintf(d->diag_stage, sizeof(d->diag_stage), "FG PIPELINE ACTIVE & VERIFIED");
-        snprintf(d->diag_advice, sizeof(d->diag_advice), "TUNE PACING / TILE IF VISUAL BUGS");
-        snprintf(d->diag_detail, sizeof(d->diag_detail),
-                 "Last session of %s reached steady-state 60Hz frame generation with no crashes. Only change parameters if you notice judder or tile garbling.",
-                 g->id);
-        snprintf(d->step1, sizeof(d->step1), "1. Micro-stutter? Try Flip Pacing -> TIMER or POST-SUBMIT.");
-        snprintf(d->step2, sizeof(d->step2), "2. Garbled blocks? Cycle Tile Mode (0x0D / 0x0E / LINEAR).");
-        snprintf(d->step3, sizeof(d->step3), "3. Uncapped 35-45 FPS? Set FPS Lock -> 30 FPS.");
+    } else if (fg_ran) {
+        if (strstr(ts, "STALL SNAPSHOT") || pace_to > 10 || missed_vb > 40) {
+            d->diag_kind      = DIAG_FLIP_STALL;
+            d->rec_manual     = 1;
+            d->rec_eng_sel    = SEL_AUTO;
+            d->rec_buf_sel    = is_2b_log ? BUF_2BUF : BUF_AUTO;
+            d->rec_shave_mode = (multi_reg >= 2) ? 1 : 0;
+            d->rec_reg_mode   = 1;
+            d->rec_pace_order = (logged_pace == 2 || is_2b_log) ? 3 : 2;
+            d->rec_post_mid   = 1;
+            d->rec_row        = 4;
+            snprintf(d->diag_cause, sizeof(d->diag_cause), "FLIP PACING CONTENTION (%u TO, %u MISS)", pace_to, missed_vb);
+            snprintf(d->diag_stage, sizeof(d->diag_stage), "FG ACTIVE WITH CADENCE STALLS");
+            snprintf(d->diag_advice, sizeof(d->diag_advice), "%s + TOP GROUP + MID ONLY (R2)",
+                     d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
+            snprintf(d->diag_detail, sizeof(d->diag_detail),
+                     "FG ran, but trace recorded %u pace timeouts and %u missed vblanks. Press R2 to apply %s pacing + TOP GROUP + MID ONLY.",
+                     pace_to, missed_vb, d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
+            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply %s + TOP GROUP + MID ONLY.",
+                     d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
+            snprintf(d->step2, sizeof(d->step2), "2. Eliminates flip queue contention on loading/cutscenes.");
+            snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch.");
+        } else {
+            d->diag_kind = DIAG_OK;
+            if (g->experimental && is_2b_log) {
+                d->rec_manual     = 1;
+                d->rec_eng_sel    = auto_alt(g->id) ? SEL_ALT : SEL_CLASSIC;
+                d->rec_buf_sel    = BUF_2BUF;
+                d->rec_shave_mode = 1;
+                d->rec_reg_mode   = 1;
+                d->rec_pace_order = 3;
+                d->rec_post_mid   = 1;
+            }
+            snprintf(d->diag_cause, sizeof(d->diag_cause), "LAST SESSION RAN NORMALLY");
+            snprintf(d->diag_stage, sizeof(d->diag_stage), "FG PIPELINE ACTIVE & VERIFIED");
+            snprintf(d->diag_advice, sizeof(d->diag_advice), "OPTIMAL PROFILE VERIFIED (R2: SYNC)");
+            snprintf(d->diag_detail, sizeof(d->diag_detail),
+                     "Last session of %s reached steady-state 60Hz frame generation with no crashes. Press R2 to ensure the verified profile is synced.",
+                     g->id);
+            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to sync the verified Advisor profile.");
+            snprintf(d->step2, sizeof(d->step2), "2. Garbled blocks? Cycle Tile Mode (0x0D / 0x0E / LINEAR).");
+            snprintf(d->step3, sizeof(d->step3), "3. Uncapped 35-45 FPS? Set FPS Lock -> 30 FPS.");
+        }
     } else if (bb || tb) {
         d->diag_kind = DIAG_INERT;
-        d->rec_row = 4;
-        snprintf(d->diag_cause, sizeof(d->diag_cause), "NO FG FRAMES GENERATED YET");
-        snprintf(d->diag_stage, sizeof(d->diag_stage), "GAME EXITED EARLY OR INERT PATH");
-        snprintf(d->diag_advice, sizeof(d->diag_advice), "TRY FLIP PACING OR 2-BUFFER MODE");
-        snprintf(d->diag_detail, sizeof(d->diag_detail),
-                 "Boot log exists for %s, but no generated frames were recorded before exit. Game may use custom flip queue or exited on intro.",
-                 g->id);
-        snprintf(d->step1, sizeof(d->step1), "1. Press R2 to switch Flip Pacing -> POST-SUBMIT.");
-        snprintf(d->step2, sizeof(d->step2), "2. Or try Engine / Buffers -> CLASSIC / 2-BUF.");
-        snprintf(d->step3, sizeof(d->step3), "3. Play past the main menu and re-check logs.");
+        if (has_hdr_inert) {
+            d->rec_manual = 0;
+            snprintf(d->diag_cause, sizeof(d->diag_cause), "PS4 HDR10 OUTPUT IS ENABLED");
+            snprintf(d->diag_stage, sizeof(d->diag_stage), "10-BIT PQ SWAPCHAIN (0x88740000)");
+            snprintf(d->diag_advice, sizeof(d->diag_advice), "DISABLE HDR IN PS4 VIDEO SETTINGS");
+            snprintf(d->diag_detail, sizeof(d->diag_detail),
+                     "Game registered a 10-bit HDR10 display buffer. Turn off HDR in PS4 Settings -> Sound and Screen -> Video Output Settings to run 60Hz FG.");
+            snprintf(d->step1, sizeof(d->step1), "1. Open PS4 Settings -> Sound and Screen -> Video Output.");
+            snprintf(d->step2, sizeof(d->step2), "2. Set HDR -> Off (switches game to 8-bit SDR).");
+            snprintf(d->step3, sizeof(d->step3), "3. Launch %s again with SQUARE.", g->id);
+        } else if (has_60fps_inert) {
+            d->rec_manual     = 1;
+            d->rec_eng_sel    = SEL_AUTO;
+            d->rec_buf_sel    = is_2b_log ? BUF_2BUF : BUF_AUTO;
+            d->rec_shave_mode = 1;
+            d->rec_reg_mode   = 1;
+            d->rec_pace_order = 2;
+            d->rec_post_mid   = 1;
+            d->rec_fps_lock   = 0;
+            d->rec_row        = 6;
+            snprintf(d->diag_cause, sizeof(d->diag_cause), "UNLOCKED / 60 FPS NATIVE DETECTED");
+            snprintf(d->diag_stage, sizeof(d->diag_stage), "FG AUTO-PAUSED ABOVE 48 FPS");
+            snprintf(d->diag_advice, sizeof(d->diag_advice), "30 FPS LOCK + POST-SUBMIT (R2)");
+            snprintf(d->diag_detail, sizeof(d->diag_detail),
+                     "Game ran unlocked above 48 FPS so native 60Hz bypass engaged. Press R2 to lock game cadence to 30 FPS and generate 60Hz FG.");
+            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to lock game to 30 FPS + POST-SUBMIT.");
+            snprintf(d->step2, sizeof(d->step2), "2. Sets TOP GROUP + MID ONLY automatically.");
+            snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch.");
+        } else {
+            d->rec_manual     = 1;
+            d->rec_eng_sel    = auto_alt(g->id) ? SEL_ALT : SEL_CLASSIC;
+            d->rec_buf_sel    = is_2b_log ? BUF_2BUF : BUF_AUTO;
+            d->rec_shave_mode = 1;
+            d->rec_reg_mode   = 1;
+            d->rec_pace_order = is_2b_log ? 3 : 2;
+            d->rec_post_mid   = 1;
+            d->rec_row        = (multi_reg >= 2) ? 3 : 4;
+            snprintf(d->diag_cause, sizeof(d->diag_cause),
+                     multi_reg >= 2 ? "LOADING SCREEN BUFFER RE-REG" :
+                     (has_vout_only ? "DIRECT VIDEOOUT FLIP PATH" : "NO FG FRAMES GENERATED YET"));
+            snprintf(d->diag_stage, sizeof(d->diag_stage),
+                     multi_reg >= 2 ? "STREAMING SWAPCHAIN RESET" : "GAME EXITED EARLY OR INERT PATH");
+            snprintf(d->diag_advice, sizeof(d->diag_advice), "TOP GROUP + %s + MID ONLY (R2)",
+                     d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
+            snprintf(d->diag_detail, sizeof(d->diag_detail),
+                     "Boot log exists for %s, but no FG frames were recorded. Press R2 to apply TOP GROUP (16-N) + %s pacing + VALVE ONLY.",
+                     g->id, d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
+            snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply TOP GROUP + %s + VALVE ONLY.",
+                     d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
+            snprintf(d->step2, sizeof(d->step2), "2. Isolates loading-screen buffer resets and flip pacing.");
+            snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch and play past the menu.");
+        }
+    }
+
+    // Compare current settings against the full Advisor target recipe (rec_*):
+    int mask = 0;
+    if (d->rec_manual == 0) {
+        if (d->manual_mode != 0) {
+            if (g->eng_sel != SEL_AUTO || g->buf_sel != BUF_AUTO) mask |= (1 << 1);
+            if (d->shave_mode != 0) mask |= (1 << 2);
+            if (d->reg_mode   != 0) mask |= (1 << 3);
+            if (d->pace_order != 0) mask |= (1 << 4);
+            if (d->post_mid   != 0) mask |= (1 << 5);
+            if (d->fps_lock   != 0) mask |= (1 << 6);
+            if (d->tile_mode  != 0) mask |= (1 << 7);
+            if (!mask) mask = (1 << 1);
+        }
+    } else {
+        int cur_eng = d->manual_mode ? g->eng_sel : SEL_AUTO;
+        int cur_buf = d->manual_mode ? g->buf_sel : BUF_AUTO;
+        int cur_shv = d->manual_mode ? d->shave_mode : 0;
+        int cur_reg = d->manual_mode ? d->reg_mode   : 0;
+        int cur_pac = d->manual_mode ? d->pace_order : 0;
+        int cur_pst = d->manual_mode ? d->post_mid   : 0;
+        int cur_lck = d->manual_mode ? d->fps_lock   : 0;
+        int cur_til = d->manual_mode ? d->tile_mode  : 0;
+        if (cur_eng != d->rec_eng_sel || cur_buf != d->rec_buf_sel) mask |= (1 << 1);
+        if (cur_shv != d->rec_shave_mode) mask |= (1 << 2);
+        if (cur_reg != d->rec_reg_mode)   mask |= (1 << 3);
+        if (cur_pac != d->rec_pace_order) mask |= (1 << 4);
+        if (cur_pst != d->rec_post_mid)   mask |= (1 << 5);
+        if (cur_lck != d->rec_fps_lock)   mask |= (1 << 6);
+        if (cur_til != d->rec_tile_mode)  mask |= (1 << 7);
+        if (!d->manual_mode && !mask) mask = (1 << 1);
+    }
+    d->rec_mask    = mask;
+    d->rec_applied = (mask == 0) ? 1 : 0;
+    if (d->rec_applied) {
+        d->rec_row = 0;
+    } else if (d->rec_row == 0 || !(mask & (1 << d->rec_row))) {
+        for (int i = 1; i <= 7; i++) {
+            if (mask & (1 << i)) { d->rec_row = i; break; }
+        }
     }
 
     free(cb); free(bb); free(tb);
@@ -702,42 +960,36 @@ static void do_apply_advice(App *a)
     Game *g = &a->games[a->sel];
     DevCfg *d = &g->dev;
     char path[96];
-    d->manual_mode = 1;
-    int target_row = d->rec_row > 0 ? d->rec_row : (a->row >= 1 && a->row <= 7 ? a->row : 2);
-    if (d->diag_kind == DIAG_OOM_BOOT) {
-        if (d->shave_mode < 2) { d->shave_mode = 2; target_row = 2; }
-        if (game_engine(g) != ENGINE_CLASSIC_ALT && g->engine != ENGINE_NEW) g->eng_sel = SEL_ALT;
-    } else if (d->diag_kind == DIAG_BOOT_EARLY) {
-        if (d->shave_mode < 2) { d->shave_mode = 2; target_row = 2; }
-        else { d->reg_mode = 2; target_row = 3; }
-    } else if (d->diag_kind == DIAG_2BUF_NEEDED) {
-        g->buf_sel = BUF_2BUF;
-        if (d->reg_mode == 0) d->reg_mode = 1;
-        target_row = 1;
-    } else if (d->diag_kind == DIAG_FLIP_STALL || d->diag_kind == DIAG_INERT) {
-        d->pace_order = (d->pace_order == 2) ? 3 : 2;
-        target_row = 4;
-    } else if (d->diag_kind == DIAG_REG_CONFLICT) {
-        if (d->shave_mode == 0) { d->shave_mode = 1; target_row = 2; }
-        else { d->reg_mode = (d->reg_mode == 1) ? 2 : 1; target_row = 3; }
-    } else {
-        if (target_row == 1) { int p = (game_pipe_preset(g) + 1) % 6; game_set_pipe_preset(g, p); }
-        else if (target_row == 2) d->shave_mode = (d->shave_mode + 1) % 3;
-        else if (target_row == 3) d->reg_mode = (d->reg_mode + 1) % 3;
-        else if (target_row == 4) d->pace_order = (d->pace_order + 1) % 4;
-        else if (target_row == 5) d->post_mid = (d->post_mid + 1) % 3;
-        else if (target_row == 6) d->fps_lock = (d->fps_lock + 1) % 4;
-        else if (target_row == 7) d->tile_mode = (d->tile_mode + 1) % 7;
+    refresh_dev_status(g);
+    if (d->rec_applied && g->s.fg) {
+        snprintf(a->status, sizeof(a->status), "ADVISOR PROFILE ALREADY ACTIVE FOR %s (NO CHANGES)", g->id);
+        addlog(a, a->status);
+        return;
     }
+    int focus_row = d->rec_row > 0 ? d->rec_row : 0;
+    d->manual_mode = d->rec_manual;
+    g->eng_sel     = d->rec_eng_sel;
+    g->buf_sel     = d->rec_buf_sel;
+    d->shave_mode  = d->rec_shave_mode;
+    d->reg_mode    = d->rec_reg_mode;
+    d->pace_order  = d->rec_pace_order;
+    d->post_mid    = d->rec_post_mid;
+    d->fps_lock    = d->rec_fps_lock;
+    d->tile_mode   = d->rec_tile_mode;
     g->s.fg = 1;
-    a->row = target_row;
+    if (focus_row >= 1 && focus_row <= 7) a->row = focus_row;
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id); remove(path);
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.boot", g->id);  remove(path);
-    snprintf(path, sizeof(path), CFGDIR "/crash-%s.txt", g->id);  remove(path);
+    if (!d->manual_mode) {
+        snprintf(path, sizeof(path), CFGDIR "/adapt-%s.ini", g->id); remove(path);
+        snprintf(path, sizeof(path), CFGDIR "/tile_%s", g->id);      remove(path);
+    }
     save_settings(a);
     remap_if_changed(a);
     refresh_dev_status(g);
-    snprintf(a->status, sizeof(a->status), "CUSTOM FIX APPLIED & SAVED FOR %s!", g->id);
+    snprintf(a->status, sizeof(a->status),
+             d->manual_mode ? "ADVISOR PROFILE APPLIED & SAVED FOR %s!" : "ADVISOR AUTO PROFILE APPLIED FOR %s!",
+             g->id);
     addlog(a, a->status);
 }
 
@@ -877,6 +1129,8 @@ static int do_ini(App *a, int install)
     return rc;
 }
 static int clean_dir(const char *dir, const char *const *prefixes, int np, const char *suffix);
+static uint64_t exp_sig(const App *a);
+static uint64_t g_exp_written;
 static void do_install(App *a)
 {
     set_off(0);
@@ -890,10 +1144,16 @@ static void do_install(App *a)
         snprintf(m, sizeof(m), rc ? "CANNOT WRITE %s" : "COPIED %s (%zu KB)", k_files[i], n / 1024); addlog(a, m);
         if (rc) return;
     }
-    // Clear stale self-adapt / safe-watchdog state files from previous plugin versions on install/update:
-    static const char *const stale_pfx[] = { "adapt-", "safe-", "vcfg_ver_" };
-    clean_dir(CFGDIR, stale_pfx, 3, NULL);
+    // Clear stale self-adapt / safe-watchdog / legacy experiment files from previous plugin versions on install/update:
+    static const char *const stale_pfx[] = {
+        "adapt-", "safe-", "state-", "vcfg_ver_", "tile_",
+        "cut_blocks_", "postfix_", "gridmix_", "bench_capture", "a20_"
+    };
+    clean_dir(CFGDIR, stale_pfx, (int)(sizeof(stale_pfx) / sizeof(stale_pfx[0])), NULL);
+    remove(ENGFILE);
+    remove(BUFFILE);
     do_ini(a, 1);
+    g_exp_written = exp_sig(a);
     a->plugin_state = plugin_state();
 }
 
@@ -903,9 +1163,11 @@ static int clean_dir(const char *dir, const char *const *prefixes, int np, const
     DIR *d = opendir(dir); if (!d) return 0; int n = 0; struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
-        int hit = 0; for (int i = 0; i < np; i++) if (!strncmp(e->d_name, prefixes[i], strlen(prefixes[i]))) hit = 1;
+        int hit = (np <= 0);
+        for (int i = 0; i < np; i++) if (!strncmp(e->d_name, prefixes[i], strlen(prefixes[i]))) hit = 1;
         if (hit && suffix) { size_t l = strlen(e->d_name), q = strlen(suffix); if (l < q || strcmp(e->d_name + l - q, suffix)) hit = 0; }
         if (!hit) continue;
+        if (!strcmp(e->d_name, "telemetry.ini")) continue;
         char p[192]; snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
         if (remove(p) == 0) n++;
     }
@@ -914,12 +1176,29 @@ static int clean_dir(const char *dir, const char *const *prefixes, int np, const
 static void do_clean(App *a)
 {
     do_ini(a, 0);
-    static const char *const plug[] = { "vcfg" };
-    int np = clean_dir("/data/GoldHEN/plugins", plug, 1, ".prx");
-    static const char *const cfg[] = { "config-", "trace-", "boot-", "crash-", "adapt-", "probe", "vcfg", "debug_log", "inject", "hud", "pace_timer", "scan_", "dump_", "summary", "safe-", "tile_" };
-    int nc = clean_dir(CFGDIR, cfg, (int)(sizeof(cfg) / sizeof(cfg[0])), NULL);
+    static const char *const plug[] = { "vcfg", "bb_probe" };
+    int np = clean_dir("/data/GoldHEN/plugins", plug, 2, ".prx");
+    static const char *const bak[] = { "plugins.ini.vcfg_backup_" };
+    clean_dir("/data/GoldHEN", bak, 1, NULL);
+    int nc = clean_dir(CFGDIR, NULL, 0, NULL);
+    remove("/data/vcfg_report.txt");
     set_off(1);
-    char m[96]; snprintf(m, sizeof(m), "DELETED %d PLUGIN FILES AND %d SETTINGS/LOG FILES. VCFG IS OFF.", np, nc); addlog(a, m);
+    a->debug_log = 0;
+    a->defaults = (Settings){ 1, 0, 40, 1, 0 };
+    a->overlay_pos = 4;
+    a->overlay_opacity = 80;
+    a->menu_combo = MENU_COMBO_DEFAULT;
+    a->dark_theme = 1;
+    for (int i = 0; i < a->ngames; i++) {
+        Game *g = &a->games[i];
+        g->eng_sel = SEL_AUTO;
+        g->buf_sel = BUF_AUTO;
+        memset(&g->dev, 0, sizeof(g->dev));
+        g->s = a->defaults;
+        if (g->testing || g->experimental) g->s.fg = 0;
+        refresh_dev_status(g);
+    }
+    char m[96]; snprintf(m, sizeof(m), "WIPED %d PLUGINS + %d FILES & RESET RAM TO FACTORY ZERO.", np, nc); addlog(a, m);
     a->plugin_state = plugin_state();
 }
 
@@ -937,7 +1216,14 @@ static uint64_t g_exp_written;
 static void remap_if_changed(App *a)
 {
     if (is_off()) return;   // turned off: plugins.ini stays without VCFG
-    if (exp_sig(a) == g_exp_written) return;
+    size_t n = 0, un = 0;
+    unsigned char *ini = read_all(INI, &n);
+    build_map(a);
+    char *u = ini_update(ini ? (char *)ini : "", 1, &un);
+    int differs = (!ini || !u || un != n || memcmp(u, ini, n) != 0);
+    free(ini);
+    free(u);
+    if (!differs && exp_sig(a) == g_exp_written) return;
     if (!do_ini(a, 1)) g_exp_written = exp_sig(a);
 }
 
@@ -991,12 +1277,13 @@ static void summarize(Buf *r, const char *id, const char *which, const char *t)
     find_line(t, "version: ", v, sizeof(v)); find_line(t, "seconds since start: ", secs, sizeof(secs));
     int frame = strstr(t, "first SubmitAndFlip") || strstr(t, "first VideoOutSubmitFlip") || strstr(t, "A22_TITLE") || strstr(t, "gnm #1 ");
     int gpu = strstr(t, "gpu_init: ok") || strstr(t, "A20_ALLOC");
-    int fg = strstr(t, "mode4 #") || strstr(t, "vout fg #") || strstr(t, "kind=1");
-    int post = strstr(t, "inject #") != NULL || strstr(t, "vout inject #") != NULL;   // our commands were injected (OSD / post pass): not proof of generated frames
+    int post = strstr(t, "inject #") != NULL || strstr(t, "vout inject #") != NULL;
+    int fg = strstr(t, "mode4 #") || strstr(t, "vout fg #") || strstr(t, "kind=1") ||
+             (post && !strstr(t, "inert:") && !strstr(t, "framegen=0") && strstr(t, "extra buffer(s)"));
     int menu = strstr(t, "menu opened") || strstr(t, "A20_MENU open=1");
     bprintf(r, "%s, %s: %s | %s | first frame %s, GPU memory %s, FG frames %s, OSD/post injects %s, menu used %s\n", id, which, v, secs,
             frame ? "yes" : "NO", gpu ? "yes" : "no", fg ? "yes" : "no", post ? "yes" : "no", menu ? "yes" : "no");
-    static const char *keys[] = { "inert", "FAIL", "fail", "stop", "NATIVE_ONLY", "refus", "no memory", "dcb_unreadable" };
+    static const char *keys[] = { "STALL SNAPSHOT", "inert", "FAIL", "fail", "stop", "NATIVE_ONLY", "refus", "no memory", "dcb_unreadable" };
     int shown = 0;
     for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]) && shown < 4; k++)
         if (find_line(t, keys[k], line, sizeof(line))) { bprintf(r, "    reason? %s\n", line); shown++; }
@@ -1180,6 +1467,17 @@ static void check_auto_send_crashes(App *a)
         vlog("auto-send crash %s -> rc=%d id=%s\n", g->id, rc, rep_id);
         if (rc == 0) {
             size_t cur = strlen(sent_buf);
+            if (cur + 32 >= sizeof(sent_buf)) {
+                const char *nl = strchr(sent_buf + 512, '\n');
+                if (nl) {
+                    size_t rem = strlen(nl + 1);
+                    memmove(sent_buf, nl + 1, rem + 1);
+                    cur = rem;
+                } else {
+                    sent_buf[0] = 0;
+                    cur = 0;
+                }
+            }
             if (cur + 32 < sizeof(sent_buf))
                 snprintf(sent_buf + cur, sizeof(sent_buf) - cur, "%s=%d\n", g->id, h_val);
             snprintf(last_id, sizeof(last_id), "%s", rep_id);
@@ -1532,6 +1830,8 @@ int main(void)
         addlog(a, a->plugin_state ? "UPDATING PLUGINS" : "INSTALLING PLUGINS");
         do_install(a);
         load_settings(a);
+    } else {
+        remap_if_changed(a);
     }
     check_auto_send_crashes(a);
 

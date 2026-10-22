@@ -71,26 +71,67 @@ def cr(img, u, v, csh):
 W_DIM, H_DIM = 1920.0, 1080.0
 
 
+def sum3(a):
+    return a[..., 0] + a[..., 1] + a[..., 2]
+
+
+def side_lerp(a2, b2, sp, sc, e0, eac, ebp, t):
+    ga = diff3(a2, sp)
+    gb = diff3(b2, sc)
+    da = np.minimum(eac, ga)
+    db = np.minimum(ebp, gb)
+    d_lu = sum3(b2 - a2)
+    d_min = da - db
+    adadb = np.abs(d_min)
+    d_cr = eac - ebp
+    d_sf = ga - gb
+    g_em = sat((e0 - F32(0.08)) * F32(6.0))
+    g_occ = sat((e0 - F32(0.50)) * F32(4.0))
+    b_hi = F32(0.07) + F32(0.35) * g_occ
+    raw = (d_min * F32(0.33) + d_cr * F32(0.07)) + (d_sf * F32(0.14) + d_lu * F32(0.05))
+    dlt = np.clip(g_em * raw, -b_hi, b_hi)
+    tab = sat(F32(t) + dlt)
+    return a2 + (b2 - a2) * tab[..., None], adadb
+
+
+def mlp_cw(x0, x1, x2, x3, x4, x5, x6):
+    h0 = sat(F32(0.08378879) + x0 * F32(0.3122884) + x1 * F32(-0.06405229) + x2 * F32(0.39919406) +
+             x3 * F32(-0.40893617) + x4 * F32(0.39562488) + x5 * F32(0.03776005) + x6 * F32(0.05472043))
+    h1 = sat(F32(0.10258989) + x0 * F32(0.09324288) + x1 * F32(-0.45190883) + x2 * F32(0.07457424) +
+             x3 * F32(1.2041868) + x4 * F32(0.01678786) + x5 * F32(-0.06750677) + x6 * F32(0.04755138))
+    h2 = sat(F32(0.08788525) + x0 * F32(0.04194829) + x1 * F32(-0.23096271) + x2 * F32(0.11147978) +
+             x3 * F32(1.2359258) + x4 * F32(-0.08524036) + x5 * F32(-0.01249109) + x6 * F32(-0.02008916))
+    h3 = sat(F32(0.10726561) + x0 * F32(-0.06678485) + x1 * F32(-0.35585028) + x2 * F32(-0.00519136) +
+             x3 * F32(1.3616265) + x4 * F32(-0.22773714) + x5 * F32(-0.01309819) + x6 * F32(-0.02095419))
+    h4 = sat(F32(0.05736038) + x0 * F32(0.09630327) + x1 * F32(-0.6363102) + x2 * F32(-0.14480157) +
+             x3 * F32(1.126871) + x4 * F32(0.10785085) + x5 * F32(-0.01815644) + x6 * F32(0.00447425))
+    h5 = sat(F32(0.12341757) + x0 * F32(0.2863919) + x1 * F32(-0.28996587) + x2 * F32(0.3041999) +
+             x3 * F32(0.05265474) + x4 * F32(0.09418704) + x5 * F32(0.01205526) + x6 * F32(0.01750351))
+    return (F32(0.04139773) + h0 * F32(0.3545042) + h1 * F32(-0.24156542) + h2 * F32(-0.29795778) +
+            h3 * F32(-0.40481237) + h4 * F32(-0.08111887) + h5 * F32(0.29362506))
+
+
 def _taps(tp, tc, u, v, vx, vy, t, sp, sc, es, str_en, quad, csh=0.5, use_cr=False):
     """one candidate vector (vx, vy): returns (a2, b2, e) as @taps / @tapsq (no overlay rectangle)"""
     tc1 = F32(1.0) - F32(t)
     up, vp = u + vx * F32(t), v + vy * F32(t)
     uc, vc = u - vx * tc1, v - vy * tc1
+    Wd, Hd = F32(tp.shape[1]), F32(tp.shape[0])
+    oobp = (up < F32(0.5)) | (up > Wd - F32(0.5)) | (vp < F32(0.5)) | (vp > Hd - F32(0.5))
+    oobc = (uc < F32(0.5)) | (uc > Wd - F32(0.5)) | (vc < F32(0.5)) | (vc > Hd - F32(0.5))
     if quad or use_cr:
-        a, b = cr(tp, up, vp, csh), cr(tc, uc, vc, csh)
+        csh_b = np.where(oobp | oobc, F32(0.0), F32(csh))
+        a, b = cr(tp, up, vp, csh_b), cr(tc, uc, vc, csh_b)
     else:
         a, b = bil(tp, up, vp), bil(tc, uc, vc)
-    Wd, Hd = F32(tp.shape[1]), F32(tp.shape[0])
-    oobp = (up < 0) | (up > Wd) | (vp < 0) | (vp > Hd)
-    oobc = (uc < 0) | (uc > Wd) | (vc < 0) | (vc > Hd)
     onlyp, onlyc = oobp & ~oobc, oobc & ~oobp
     one = onlyp | onlyc
     a2 = np.where(onlyp[..., None], b, a)
     b2 = np.where(onlyc[..., None], a, b)
     e0 = diff3(a2, b2)
     if quad:
-        return a2, b2, np.where(one, F32(0.1), e0)
-    eb = np.where(one, F32(0.1), e0)
+        return a2, b2, e0
+    eb = np.where(one, F32(0.02), e0)
     both = ~oobp & ~oobc
     fastc = (np.abs(vx) + np.abs(vy)) > 16
     st_on = str_en & both & fastc
@@ -151,16 +192,19 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         vby = (f00[..., 1] * w00 + f10[..., 1] * w10) + (f01[..., 1] * w01 + f11[..., 1] * w11)
         zv = (vbx == 0) & (vby == 0)
         zm = lerp4(sp, sc, t)
-        a2, b2, fe = _taps(tp, tc, u, v, vbx, vby, t, sp, sc, es, None, True, csh=wp.get("csh", 0.5))
+        vmb = np.abs(vbx) + np.abs(vby)
+        vms = sat((vmb - F32(9.0)) * F32(0.14))
+        csh_e = F32(wp.get("csh", 0.5)) * (F32(1.0) - vms)
+        a2, b2, fe = _taps(tp, tc, u, v, vbx, vby, t, sp, sc, es, None, True, csh=csh_e)
         if wp.get("fast_bil") is not None:   # cloud-report idea: bilinear instead of Catmull-Rom above this vector length
             ab, bb, feb = _taps(tp, tc, u, v, vbx, vby, t, sp, sc, es, np.zeros(es.shape, bool), False)
             usebil = ((np.abs(vbx) + np.abs(vby)) > F32(wp["fast_bil"]))[..., None]
             a2, b2 = np.where(usebil, ab, a2), np.where(usebil, bb, b2)
             fe = np.where(usebil[..., 0], feb, fe)
-        fm = lerp4(a2, b2, t)
+        eac_f, ebp_f = diff3(a2, sc), diff3(b2, sp)
+        fm, _ = side_lerp(a2, b2, sp, sc, fe, eac_f, ebp_f, t)
         fast_mov = np.where(zv[..., None], zm, fm)
         fast_e = np.where(zv, es, fe)
-        vmb = np.abs(vbx) + np.abs(vby)
         mov = np.where(coh[..., None], fast_mov, mov)
         emov = np.where(coh, fast_e, emov)
         vmg = np.where(coh, vmb, vmg)
@@ -176,7 +220,11 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
             em = None
             ranked = []
             for fv, w in ((f00, w00), (f10, w10), (f01, w01), (f11, w11)):
-                a2, b2, e = _taps(tp, tc, u, v, fv[..., 0], fv[..., 1], t, sp, sc, es, str_en, False, csh=wp.get("csh", 0.5), use_cr=bool(wp.get("slow_cr", False)))
+                a2, b2, e_raw = _taps(tp, tc, u, v, fv[..., 0], fv[..., 1], t, sp, sc, es, str_en, False, csh=wp.get("csh", 0.5), use_cr=bool(wp.get("slow_cr", False)))
+                eac_s, ebp_s = diff3(a2, sc), diff3(b2, sp)
+                m_s, adadb = side_lerp(a2, b2, sp, sc, e_raw, eac_s, ebp_s, t)
+                g_occ = sat((e_raw - F32(0.55)) * F32(4.0))
+                e = np.maximum(e_raw - adadb * F32(0.10) * g_occ, F32(0.0))
                 if wp.get('slow_cr_max') is not None:
                     ab, bb, eb = _taps(tp, tc, u, v, fv[..., 0], fv[..., 1], t, sp, sc, es, str_en, False)
                     sharp = (np.abs(fv[..., 0]) + np.abs(fv[..., 1])) <= F32(wp['slow_cr_max'])
@@ -184,14 +232,14 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
                 if win > 1:
                     e = boxf(e, win)
                 if wp.get("slow_select"):
-                    ranked.append((e, lerp4(a2, b2, t), w))
+                    ranked.append((e, m_s, w))
                 if em is None:
                     em = e.copy()
                 em1 = np.minimum(em, e)
-                scl = np.exp2((em1 - em) * F32(wp.get("k", 9.617967)))
-                x1 = np.exp2((em1 - e) * F32(wp.get("k", 9.617967)))
-                om = (w + F32(wp.get("w_eps", 0.05))) * x1
-                acc = acc * scl[..., None] + lerp4(a2, b2, t) * om[..., None]
+                scl = np.exp2((em1 - em) * F32(wp.get("k", 8.0)))
+                x1 = np.exp2((em1 - e) * F32(wp.get("k", 8.0)))
+                om = (w + F32(wp.get("w_eps", 0.08))) * x1
+                acc = acc * scl[..., None] + m_s * om[..., None]
                 sw = sw * scl + om
                 em = em1
             sm_ = acc / sw[..., None]
@@ -221,13 +269,26 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         if flags & 4096:
             ws = ws * F32(0.0)
         stat = lerp4(sp, sc, t)
-        cw2 = sat((emov - F32(wp.get("cw_bias", 0.5))) * F32(wp.get("cw_slope", 2.5)))
+        dmp = diff3(mov, sp)
+        dmc = diff3(mov, sc)
         dmv = diff3(mov, stat)
-        bg3 = (vmg > 8.0) & (es < 0.25) & ~hasfg
+        ddm = dmp - dmc
+        dtsc = np.clip(ddm * F32(0.45), F32(-0.30), F32(0.30))
+        tsc = sat(F32(t) + dtsc)
+        fillc = sp + (sc - sp) * tsc[..., None]
+        cw2 = sat((emov - F32(wp.get("cw_bias", 0.5))) * F32(wp.get("cw_slope", 2.5))) * sat((F32(0.80) - es) * F32(4.0))
+        bg3 = (vmg > 8.0) & (es < 0.25) & ~hasfg & (emov > 0.25)
         bgs = sat((dmv - es - F32(0.1225)) * F32(4.0))
-        cw = np.maximum(cw2, np.where(bg3, bgs, F32(0.0)))
-        cw = np.where(np.bool_((flags & 8) != 0), F32(0.0), cw)
-        fillc = stat
+        bgw = np.where(bg3, bgs, F32(0.0))
+        dl_s = sum3(stat) - sum3(mov)
+        dsw = sat((dl_s - F32(0.40)) * F32(1.60)) * sat((emov - F32(0.12)) * F32(5.0)) * sat((F32(0.30) - es) * F32(4.0))
+        cw_base = np.maximum(np.maximum(cw2, bgw), dsw)
+        res_cw = mlp_cw(ddm, emov, es, dmv, dl_s, spr, vmg)
+        dcw = sat((emov - F32(0.15)) * F32(10.0)) * res_cw
+        cw3_0 = sat(cw_base + dcw)
+        gcw = sat((emov - es) * F32(4.0))
+        cw3 = np.where(fgkill, F32(0.0), cw3_0 * gcw)
+        cw = np.where(np.bool_((flags & 8) != 0), F32(0.0), cw3)
         if wp.get("vis_fill"):   # cloud-report idea: fill from the visible side (the real frame that matches the warp) instead of a blend
             dmsc, dmsp = diff3(mov, sc), diff3(mov, sp)
             fillc = np.where((dmsc < dmsp)[..., None], sc, sp)

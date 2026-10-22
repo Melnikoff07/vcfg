@@ -56,8 +56,93 @@ size_t Detour_GetInstructionSize(Detour *This, uint64_t Address, size_t MinSize)
 void Detour_WriteJump64(Detour *This, void *Address, uint64_t Destination);
 void Detour_WriteJump32(Detour *This, void *Address, uint64_t Destination);
 
-static uint8_t g_vcfg_tramp_pool[32][16] __attribute__((aligned(16)));
+// Static trampoline pool placed in .text (PH[0], max_prot=RWX, lowest VA offset in PRX) plus a near-page
+// allocator for when the PRX is loaded >2 GB above libSceVideoOut.sprx (e.g. 0x8803cf000 vs 0x800061410).
+// Guarantees DetourMode_x32 (5-byte prologue patch) is always used and relocates any PC-relative jmp in StubPtr.
+__attribute__((aligned(16), noinline, used)) static void vcfg_tramp_pool_stub(void) { __asm__ volatile(".rept 512\n\t.byte 0x90\n\t.endr\n\t"); }
 static int g_vcfg_tramp_used = 0;
+static uint8_t *g_vcfg_near_page = NULL;
+static int g_vcfg_near_used = 0;
+
+static inline int vcfg_in_rel32(uint64_t src_end, uint64_t dst)
+{
+    int64_t rel = (int64_t)dst - (int64_t)src_end;
+    return (rel >= -0x7FFF0000LL && rel <= 0x7FFF0000LL);
+}
+
+static inline void *vcfg_alloc_near_tramp(uint64_t fn_ptr)
+{
+    uint64_t src_end = fn_ptr + 5;
+    if (g_vcfg_near_page && g_vcfg_near_used < 256) {
+        uint8_t *slot = g_vcfg_near_page + (g_vcfg_near_used * 16);
+        if (vcfg_in_rel32(src_end, (uint64_t)(uintptr_t)slot)) {
+            g_vcfg_near_used++;
+            return slot;
+        }
+    }
+    const uint64_t hints[8] = {
+        (fn_ptr > 0x08000000ULL) ? ((fn_ptr - 0x08000000ULL) & ~0x3FFFULL) : 0x00000007F0000000ULL,
+        0x00000007F0000000ULL,
+        0x00000007E0000000ULL,
+        0x00000007C0000000ULL,
+        0x0000000808000000ULL,
+        0x0000000820000000ULL,
+        0x0000000840000000ULL,
+        0x0000000860000000ULL
+    };
+    for (int i = 0; i < 8; i++) {
+        void *page = NULL;
+        if (sceKernelMmap((void *)(uintptr_t)hints[i], 0x4000, VM_PROT_ALL, 0x1000 | 0x2, -1, 0, &page) == 0 && page) {
+            if (vcfg_in_rel32(src_end, (uint64_t)(uintptr_t)page)) {
+                g_vcfg_near_page = (uint8_t *)page;
+                g_vcfg_near_used = 1;
+                return page;
+            }
+            sceKernelMunmap(page, 0x4000);
+        }
+    }
+    uint64_t probe = (fn_ptr > 0x40000000ULL) ? ((fn_ptr - 0x40000000ULL) & ~0x3FFFULL) : 0x0000000790000000ULL;
+    for (int step = 0; step < 64 && vcfg_in_rel32(src_end, probe); step++) {
+        OrbisKernelVirtualQueryInfo vq;
+        memset(&vq, 0, sizeof(vq));
+        if (sceKernelVirtualQuery((const void *)(uintptr_t)probe, 0, &vq, sizeof(vq)) != 0) {
+            void *page = NULL;
+            if (sceKernelMmap((void *)(uintptr_t)probe, 0x4000, VM_PROT_ALL, 0x1000 | 0x2 | 0x10, -1, 0, &page) == 0 &&
+                page && vcfg_in_rel32(src_end, (uint64_t)(uintptr_t)page)) {
+                g_vcfg_near_page = (uint8_t *)page;
+                g_vcfg_near_used = 1;
+                return page;
+            }
+            probe += 0x02000000ULL;
+        } else {
+            uint64_t end_va = ((uint64_t)(uintptr_t)vq.unk02 + 0x3FFFULL) & ~0x3FFFULL;
+            probe = (end_va > probe) ? end_va : (probe + 0x01000000ULL);
+        }
+    }
+    return NULL;
+}
+
+static inline void vcfg_build_stub(Detour *d, uint64_t fn_ptr, size_t ins_sz)
+{
+    const uint8_t *p = (const uint8_t *)(uintptr_t)fn_ptr;
+    uint8_t *dst = (uint8_t *)d->StubPtr;
+    size_t off = 0;
+    size_t out = 0;
+    while (off < ins_sz) {
+        size_t len = Detour_GetInstructionSize(d, fn_ptr + off, 1);
+        if (len == 0 || off + len > ins_sz) len = ins_sz - off;
+        if (len == 5 && p[off] == 0xE9u) {
+            int32_t orig_rel = *(const int32_t *)(p + off + 1);
+            uint64_t orig_dst = (uint64_t)((intptr_t)(fn_ptr + off + 5) + (intptr_t)orig_rel);
+            Detour_WriteJump64(d, dst + out, orig_dst);
+            return;
+        }
+        memcpy(dst + out, p + off, len);
+        out += len;
+        off += len;
+    }
+    Detour_WriteJump64(d, dst + out, fn_ptr + ins_sz);
+}
 
 static inline void *vcfg_hook_install(Detour *d, uint64_t fn_ptr, void *hk, const char *name)
 {
@@ -66,46 +151,57 @@ static inline void *vcfg_hook_install(Detour *d, uint64_t fn_ptr, void *hk, cons
     size_t ins_sz = Detour_GetInstructionSize(d, fn_ptr, sizeof(d->JumpInstructions32));
     if (ins_sz < sizeof(d->JumpInstructions32)) return NULL;
 
+    uint64_t src_end = fn_ptr + sizeof(d->JumpInstructions32);
     void *tramp = NULL;
-    if (g_vcfg_tramp_used < 32) {
-        tramp = (void *)g_vcfg_tramp_pool[g_vcfg_tramp_used++];
-        sceKernelMprotect(tramp, 16, VM_PROT_ALL);
-    } else {
-        if (sceKernelMmap(0, sizeof(d->JumpInstructions64), VM_PROT_ALL, 0x1000 | 0x2, -1, 0, &tramp) < 0 || !tramp)
-            return NULL;
-    }
-
-    int64_t rel_tramp = (int64_t)(uintptr_t)tramp - (int64_t)(fn_ptr + sizeof(d->JumpInstructions32));
-    int64_t rel_hk    = (int64_t)(uintptr_t)hk    - (int64_t)(fn_ptr + sizeof(d->JumpInstructions32));
     uint64_t jmp32_dst = 0;
-    if (rel_tramp >= -0x7FFFFFFFLL && rel_tramp <= 0x7FFFFFFFLL) {
-        Detour_WriteJump64(d, tramp, (uint64_t)(uintptr_t)hk);
-        jmp32_dst = (uint64_t)(uintptr_t)tramp;
-    } else if (rel_hk >= -0x7FFFFFFFLL && rel_hk <= 0x7FFFFFFFLL) {
+
+    if (vcfg_in_rel32(src_end, (uint64_t)(uintptr_t)hk)) {
         jmp32_dst = (uint64_t)(uintptr_t)hk;
     } else {
+        if (g_vcfg_tramp_used < 32) {
+            void *cand = (void *)((uint8_t *)(uintptr_t)&vcfg_tramp_pool_stub + (g_vcfg_tramp_used * 16));
+            if (vcfg_in_rel32(src_end, (uint64_t)(uintptr_t)cand) &&
+                sceKernelMprotect(cand, 16, VM_PROT_ALL) == 0) {
+                g_vcfg_tramp_used++;
+                tramp = cand;
+            }
+        }
+        if (!tramp) {
+            tramp = vcfg_alloc_near_tramp(fn_ptr);
+        }
+        if (tramp && vcfg_in_rel32(src_end, (uint64_t)(uintptr_t)tramp)) {
+            Detour_WriteJump64(d, tramp, (uint64_t)(uintptr_t)hk);
+            jmp32_dst = (uint64_t)(uintptr_t)tramp;
+        }
+    }
+
+    if (!jmp32_dst) {
         Detour_Construct(d, DetourMode_x64);
-        return Detour_DetourFunction(d, fn_ptr, hk);
+        ins_sz = Detour_GetInstructionSize(d, fn_ptr, sizeof(d->JumpInstructions64));
+        if (ins_sz < sizeof(d->JumpInstructions64)) return NULL;
+        d->FunctionPtr = (void *)(uintptr_t)fn_ptr;
+        d->HookPtr = hk;
+        sceKernelMprotect((void *)(uintptr_t)fn_ptr, ins_sz, VM_PROT_ALL);
+        d->StubSize = ins_sz + sizeof(d->JumpInstructions64) + 16;
+        if (sceKernelMmap(0, d->StubSize, VM_PROT_ALL, 0x1000 | 0x2, -1, 0, &d->StubPtr) < 0 || !d->StubPtr)
+            return NULL;
+        vcfg_build_stub(d, fn_ptr, ins_sz);
+        memset((void *)(uintptr_t)fn_ptr, 0x90, ins_sz);
+        Detour_WriteJump64(d, (void *)(uintptr_t)fn_ptr, (uint64_t)(uintptr_t)hk);
+        klog("[vcfg_hook] %s: x64-reloc fn=%p ins=%zu stub=%p hk=%p\n",
+             name, (void *)(uintptr_t)fn_ptr, ins_sz, d->StubPtr, hk);
+        return d->StubPtr;
     }
 
     d->TrampolinePtr = tramp;
     d->FunctionPtr = (void *)(uintptr_t)fn_ptr;
     d->HookPtr = hk;
     sceKernelMprotect((void *)(uintptr_t)fn_ptr, ins_sz, VM_PROT_ALL);
-    d->StubSize = ins_sz + sizeof(d->JumpInstructions64);
+    d->StubSize = ins_sz + sizeof(d->JumpInstructions64) + 16;
     if (sceKernelMmap(0, d->StubSize, VM_PROT_ALL, 0x1000 | 0x2, -1, 0, &d->StubPtr) < 0 || !d->StubPtr)
         return NULL;
 
-    const uint8_t *p = (const uint8_t *)(uintptr_t)fn_ptr;
-    if (p[0] == 0xE9u && ins_sz == 5) {
-        int32_t orig_rel = *(const int32_t *)(p + 1);
-        uint64_t orig_dst = (uint64_t)((intptr_t)fn_ptr + 5 + (intptr_t)orig_rel);
-        memset(d->StubPtr, 0x90, ins_sz);
-        Detour_WriteJump64(d, d->StubPtr, orig_dst);
-    } else {
-        memcpy(d->StubPtr, (void *)(uintptr_t)fn_ptr, ins_sz);
-        Detour_WriteJump64(d, (void *)((uintptr_t)d->StubPtr + ins_sz), fn_ptr + ins_sz);
-    }
+    vcfg_build_stub(d, fn_ptr, ins_sz);
 
     memset((void *)(uintptr_t)fn_ptr, 0x90, ins_sz);
     Detour_WriteJump32(d, (void *)(uintptr_t)fn_ptr, jmp32_dst);

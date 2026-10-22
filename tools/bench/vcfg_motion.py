@@ -1,7 +1,8 @@
-"""Motion stages of the NumPy port of VCFG classic mode 8: me3, me2, gm8, fgs8, me1, mf8 (see vcfg_ref.py).
+"""NumPy reference implementation of the VCFG classic mode 8 motion shaders (pyr8 -> me3 -> me2 -> gm8 -> fgs8 -> me1 -> mf8).
 
-Everything here is integer logic ported 1:1 from classic/shaders/*.ll: candidate order, bias terms, penalties and
-tie-breaks (key = cost << shift | candidate index, minimum wins) are the same as the shaders'.
+Integer arithmetic matches the shaders line by line: same clamping, same tie-breaking keys (cost << 8 | lane), same
+fixed-point shifts. All functions take / return NumPy arrays; pyr8 takes float32 RGB in [0, 1] (H, W, 3) and returns
+uint8 luma levels L1 (540, 960), L2 (270, 480), L3 (135, 240).
 """
 import numpy as np
 
@@ -9,62 +10,120 @@ BIG = np.iinfo(np.int64).max
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# block SAD helpers
+# @bsad / @bsadu: 8x8 luma SAD with displacement-preserving border clamp and structure-weighted DC compensation
 # ---------------------------------------------------------------------------------------------------------------
 def _blocks(img, xs, ys):
-    """img (h, w); xs (N,) block start x (clamped); ys (N, 8) clamped row indices -> (N, 8, 8)"""
+    """gather (N, 8, 8) int64 blocks; xs is (N,) already clamped to [0, w-8], ys is (N, 8) already clamped to [0, h-1]"""
     cols = xs[:, None] + np.arange(8)[None, :]
     return img[ys[:, :, None], cols[:, None, :]]
 
 
-def sad_cur_grid(prev, cur, X, Y, dx, dy):
-    """bsadu: cur block at (X, Y), prev block at (X + dx, Y + dy). x start clamped to [0, w-8], rows clamped one by one
-    (bsad(X + floor(d/2)) puts the prev block at X + floor + ceil = X + d and the cur block at X)."""
+def _dc_adjust(raw_sad, sum_p, sum_c):
+    """DC illumination/specular compensation + cross-frame occlusion DC mismatch penalty:
+    - When 256 < dc = |sum_P - sum_C| <= 2048 and ac = raw_sad - dc is small (coherent illumination shift on a matching
+      texture), discounts up to 3/4 of (dc - 256): disc = max(((dc - 256) * 3 >> 2) - (ac << 1), 0).
+    - When dc > 2048 (jumping onto a different surface across an occlusion boundary), adds (dc - 2048) >> 2 penalty.
+    """
+    dc = np.abs(sum_p - sum_c)
+    ac = raw_sad - dc
+    dc_eff = np.maximum(dc - 256, 0)
+    disc = np.maximum(((dc_eff * 3) >> 2) - (ac << 1), 0)
+    pen = np.maximum(dc - 2048, 0) >> 2
+    return raw_sad - np.where(dc <= 2048, disc, -pen)
+
+
+def sad_cur_grid(prev, cur, X, Y, dx, dy, dc_comp=False):
+    """bsadu: cur block at (X, Y), prev block at (X + dx, Y + dy) with displacement-preserving border clamp."""
     h, w = cur.shape
     r = np.arange(8)[None, :]
     X, Y, dx, dy = (np.asarray(a, np.int64) for a in (X, Y, dx, dy))
-    xc = np.clip(X, 0, w - 8)
-    xp = np.clip(X + dx, 0, w - 8)
-    yc = np.clip(Y[:, None] + r, 0, h - 1)
-    yp = np.clip((Y + dy)[:, None] + r, 0, h - 1)
-    return np.abs(_blocks(prev, xp, yp) - _blocks(cur, xc, yc)).sum(axis=(1, 2))
-
-
-def sad_bilateral(prev, cur, X, Y, dx, dy):
-    """me1 bsad: prev block at X + ceil(d/2), cur block at X - floor(d/2). Returns (sad, (sum_prev + sum_cur) >> 1)."""
-    h, w = cur.shape
-    r = np.arange(8)[None, :]
-    X, Y, dx, dy = (np.asarray(a, np.int64) for a in (X, Y, dx, dy))
-    xp = np.clip(X - ((-dx) >> 1), 0, w - 8)
-    xc = np.clip(X - (dx >> 1), 0, w - 8)
-    yp = np.clip((Y - ((-dy) >> 1))[:, None] + r, 0, h - 1)
-    yc = np.clip((Y - (dy >> 1))[:, None] + r, 0, h - 1)
+    wm8, hm8 = w - 8, h - 8
+    dxc = np.clip(dx, -wm8, wm8)
+    dyc = np.clip(dy, -hm8, hm8)
+    xc = np.clip(X, np.maximum(0, -dxc), np.minimum(wm8, wm8 - dxc))
+    xp = xc + dxc
+    ybc = np.clip(Y, np.maximum(0, -dyc), np.minimum(hm8, hm8 - dyc))
+    ybp = ybc + dyc
+    yc = ybc[:, None] + r
+    yp = ybp[:, None] + r
     p = _blocks(prev, xp, yp)
     c = _blocks(cur, xc, yc)
-    return np.abs(p - c).sum(axis=(1, 2)), (p.sum(axis=(1, 2)) + c.sum(axis=(1, 2))) >> 1
+    raw_sad = np.abs(p - c).sum(axis=(1, 2))
+    if dc_comp:
+        return _dc_adjust(raw_sad, p.sum(axis=(1, 2)), c.sum(axis=(1, 2)))
+    return raw_sad
+
+
+def sad_bilateral(prev, cur, X, Y, dx, dy, dc_comp=True):
+    """me1 bsad: prev block at X + ceil(d/2), cur block at X - floor(d/2) with displacement-preserving border clamp.
+    Returns (dc_compensated_sad, (sum_prev + sum_cur) >> 1)."""
+    h, w = cur.shape
+    r = np.arange(8)[None, :]
+    X, Y, dx, dy = (np.asarray(a, np.int64) for a in (X, Y, dx, dy))
+    wm8, hm8 = w - 8, h - 8
+    dxc = np.clip(dx, -wm8, wm8)
+    dyc = np.clip(dy, -hm8, hm8)
+    xc0 = X - (dxc >> 1)
+    xc = np.clip(xc0, np.maximum(0, -dxc), np.minimum(wm8, wm8 - dxc))
+    xp = xc + dxc
+    ybc0 = Y - (dyc >> 1)
+    ybc = np.clip(ybc0, np.maximum(0, -dyc), np.minimum(hm8, hm8 - dyc))
+    ybp = ybc + dyc
+    yc = ybc[:, None] + r
+    yp = ybp[:, None] + r
+    p = _blocks(prev, xp, yp)
+    c = _blocks(cur, xc, yc)
+    raw_sad = np.abs(p - c).sum(axis=(1, 2))
+    sum_p = p.sum(axis=(1, 2))
+    sum_c = c.sum(axis=(1, 2))
+    if dc_comp:
+        sad = _dc_adjust(raw_sad, sum_p, sum_c)
+    else:
+        sad = raw_sad
+    return np.minimum(sad, 65535), (sum_p + sum_c) >> 1
 
 
 def rnd(f):
-    """rnd(): floor(f + 0.5) clamped to +-4096"""
-    return np.clip(np.floor(np.asarray(f, np.float32) + np.float32(0.5)), -4096, 4096).astype(np.int64)
+    """LLVM @rnd: fptosi(f + (f < 0 ? -0.5 : 0.5)) — round half away from zero, float32."""
+    f = np.asarray(f, np.float32)
+    return np.trunc(f + np.where(f < 0, np.float32(-0.5), np.float32(0.5))).astype(np.int64)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# pyr8: 1920x1080 float RGB [0,1] -> L1 (540, 960), L2 (270, 480), L3 (135, 240) int64 in 0..255
+# ---------------------------------------------------------------------------------------------------------------
+def pyr8(rgb):
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    l0 = r * np.float32(0.2126) + g * np.float32(0.7152) + b * np.float32(0.0722)
+    l1f = np.float32(0.25) * (l0[0::2, 0::2] + l0[0::2, 1::2] + l0[1::2, 0::2] + l0[1::2, 1::2])
+    L1 = np.clip(l1f * np.float32(255.0) + np.float32(0.5), 0, 255).astype(np.int64)
+    L2 = (L1[0::2, 0::2] + L1[0::2, 1::2] + L1[1::2, 0::2] + L1[1::2, 1::2] + 2) >> 2
+    h2, w2 = L2.shape
+    y0 = np.arange((h2 + 1) // 2) * 2
+    y1 = np.minimum(y0 + 1, h2 - 1)
+    x0 = np.arange((w2 + 1) // 2) * 2
+    x1 = np.minimum(x0 + 1, w2 - 1)
+    L3 = (L2[y0[:, None], x0[None, :]] + L2[y0[:, None], x1[None, :]] +
+          L2[y1[:, None], x0[None, :]] + L2[y1[:, None], x1[None, :]] + 2) >> 2
+    return L1, L2, L3
 
 
 def _grid(nbx, nby):
-    bx, by = np.meshgrid(np.arange(nbx), np.arange(nby))
-    return bx.ravel().astype(np.int64), by.ravel().astype(np.int64)
+    by, bx = np.meshgrid(np.arange(nby, dtype=np.int64), np.arange(nbx, dtype=np.int64), indexing='ij')
+    return bx.ravel(), by.ravel()
 
 
-def _isqrt(m):
-    m = np.asarray(m, np.int64)
-    s = np.floor(np.sqrt(m.astype(np.float64))).astype(np.int64)
-    s = np.where(s * s > m, s - 1, s)
-    return np.where((s + 1) * (s + 1) <= m, s + 1, s)
+def _med4(a, b, c, d):
+    x0, x1 = np.minimum(a, b), np.maximum(a, b)
+    x2, x3 = np.minimum(c, d), np.maximum(c, d)
+    lo, hi = np.maximum(x0, x2), np.minimum(x1, x3)
+    return (lo + hi) >> 1
 
 
 # ---------------------------------------------------------------------------------------------------------------
 # me3 / me2: coarse motion on the CUR grid
 # ---------------------------------------------------------------------------------------------------------------
-def me3(L3p, L3c, prevF=None):
+def me3(L3p, L3c, prevF=None, dc_comp=True):
     """30 x 17 blocks of 8x8 L3 px -> V3 (17, 30, 2) in L3 px; also the sum of the cur L3 frame (misc luma sum)"""
     h, w = L3c.shape
     nbx, nby = (w + 7) // 8, (h + 7) // 8
@@ -78,57 +137,71 @@ def me3(L3p, L3c, prevF=None):
         tdx = rnd(prevF[ty, tx, 0] * np.float32(0.125))
         tdy = rnd(prevF[ty, tx, 1] * np.float32(0.125))
     zero = np.zeros(N, np.int64)
-    s0 = sad_cur_grid(L3p, L3c, X, Y, zero, zero)
-    s1 = sad_cur_grid(L3p, L3c, X, Y, tdx, tdy)
+    s0 = sad_cur_grid(L3p, L3c, X, Y, zero, zero, dc_comp=dc_comp)
+    s1 = sad_cur_grid(L3p, L3c, X, Y, tdx, tdy, dc_comp=dc_comp)
     usetemp = (s1 + 256 - 4) < (s0 + 256)   # lane 1 (temporal, bias 4) wins only with a strictly lower key
     cx, cy = np.where(usetemp, tdx, 0), np.where(usetemp, tdy, 0)
     best = np.full(N, BIG, np.int64)
     bk = np.zeros(N, np.int64)
     for k in range(435):
         ox, oy = k % 29 - 14, k // 29 - 7
-        s = sad_cur_grid(L3p, L3c, X, Y, cx + ox, cy + oy)
+        s = sad_cur_grid(L3p, L3c, X, Y, cx + ox, cy + oy, dc_comp=dc_comp)
         key = ((s + 256 + 4 * (abs(ox) + abs(oy))) << 9) | k
         better = key < best
         best = np.where(better, key, best)
         bk = np.where(better, k, bk)
-    V3 = np.stack([cx + bk % 29 - 14, cy + bk // 29 - 7], -1).reshape(nby, nbx, 2)
-    return V3, int(L3c.sum())
-
-
-def _med4(a, b, c, d):
-    lo1, hi1 = np.minimum(a, b), np.maximum(a, b)
-    lo2, hi2 = np.minimum(c, d), np.maximum(c, d)
-    return np.minimum(np.maximum(lo1, lo2), np.minimum(hi1, hi2))
+    vx, vy = cx + (bk % 29 - 14), cy + (bk // 29 - 7)
+    # luma sum accumulated by lane 0 of each block (same clamping as sad_cur_grid at d=0)
+    r = np.arange(8)[None, :]
+    lumasum = int(_blocks(L3c, np.clip(X, 0, w - 8), np.clip(Y[:, None] + r, 0, h - 1)).sum())
+    return np.stack([vx, vy], axis=-1).reshape(nby, nbx, 2), lumasum
 
 
 def me2(L2p, L2c, V3, prevF=None):
-    """60 x 34 blocks of 8x8 L2 px -> V2 (34, 60, 2) in L2 px and S2 (34, 60, 2) = (SAD of the best, SAD of zero)"""
+    """60 x 34 blocks of 8x8 L2 px -> V2 (34, 60, 2) in L2 px, S2 (34, 60, 2) = (best_sad, zero_sad)"""
     h, w = L2c.shape
     nbx, nby = (w + 7) // 8, (h + 7) // 8
     bx, by = _grid(nbx, nby)
     X, Y = bx * 8, by * 8
     N = bx.size
     n3y, n3x = V3.shape[:2]
-    ix0 = np.clip((bx * 4 - 2) >> 3, 0, n3x - 1)
+    ix0 = np.clip((bx * 4 - 2) >> 3, 0, max(n3x - 2, 0))
     ix1 = np.minimum(ix0 + 1, n3x - 1)
-    iy0 = np.clip((by * 4 - 2) >> 3, 0, n3y - 1)
+    iy0 = np.clip((by * 4 - 2) >> 3, 0, max(n3y - 2, 0))
     iy1 = np.minimum(iy0 + 1, n3y - 1)
     nb = [V3[iy0, ix0], V3[iy0, ix1], V3[iy1, ix0], V3[iy1, ix1]]    # lanes 0..3 (sub & 1 -> x1, sub & 2 -> y1)
     medx = _med4(*[v[:, 0] for v in nb]) * 2
     medy = _med4(*[v[:, 1] for v in nb]) * 2
-    tdx = np.zeros(N, np.int64)
-    tdy = np.zeros(N, np.int64)
-    if prevF is not None:
-        tx, ty = np.minimum(bx * 2 + 1, 119), np.minimum(by * 2 + 1, 67)
-        tdx = rnd(prevF[ty, tx, 0] * np.float32(0.25))
-        tdy = rnd(prevF[ty, tx, 1] * np.float32(0.25))
     zero = np.zeros(N, np.int64)
-    cands = [(v[:, 0] * 2, v[:, 1] * 2) for v in nb] + [(tdx, tdy), (zero, zero)]
+    tx0, ty0 = np.minimum(bx * 2 + 1, 119), np.minimum(by * 2 + 1, 67)
+
+    def tdv2(ox, oy):
+        if prevF is None:
+            return zero, zero
+        tx = np.clip(tx0 + ox, 0, 119)
+        ty = np.clip(ty0 + oy, 0, 67)
+        return rnd(prevF[ty, tx, 0] * np.float32(0.25)), rnd(prevF[ty, tx, 1] * np.float32(0.25))
+
+    ixm1 = np.maximum(ix0 - 1, 0)
+    ixp1 = np.minimum(ix1 + 1, n3x - 1)
+    iym1 = np.maximum(iy0 - 1, 0)
+    iyp1 = np.minimum(iy1 + 1, n3y - 1)
+    outer = [V3[iy0, ixm1], V3[iy0, ixp1], V3[iym1, ix0], V3[iyp1, ix0]]   # lanes 10..13
+    cands = (
+        [(v[:, 0] * 2, v[:, 1] * 2) for v in nb] +                         # lanes 0..3
+        [tdv2(0, 0), (zero, zero)] +                                       # lanes 4, 5
+        [tdv2(2, 0), tdv2(-2, 0), tdv2(0, 2), tdv2(0, -2)] +               # lanes 6..9 (symmetric temporal)
+        [(v[:, 0] * 2, v[:, 1] * 2) for v in outer]                        # lanes 10..13 (outer L3 ring)
+    )
     best = np.full(N, BIG, np.int64)
     cdx_b, cdy_b, zcost = zero.copy(), zero.copy(), None
     for sub, (cdx, cdy) in enumerate(cands):
-        s = sad_cur_grid(L2p, L2c, X, Y, cdx, cdy)
-        cost = s + 256 + 4 * (np.abs(cdx - medx) + np.abs(cdy - medy)) - (8 if sub == 4 else 0)
+        s = sad_cur_grid(L2p, L2c, X, Y, cdx, cdy, dc_comp=True)
+        oob_m = (X + cdx < 0) | (X + cdx > w - 8) | (Y + cdy < 0) | (Y + cdy > h - 8)
+        msh = np.where(oob_m, 3, 2)
+        ist = (sub == 4) or (6 <= sub <= 9)
+        isout = 10 <= sub <= 13
+        cost = s + 256 + ((np.abs(cdx - medx) + np.abs(cdy - medy)) << msh) + (8 if isout else 0) - (8 if ist else 0)
         if sub == 5:
             zcost = cost
         key = (cost << 8) | sub
@@ -140,7 +213,7 @@ def me2(L2p, L2c, V3, prevF=None):
     bk = np.zeros(N, np.int64)
     for k in range(25):
         ox, oy = k % 5 - 2, k // 5 - 2
-        s = sad_cur_grid(L2p, L2c, X, Y, cdx_b + ox, cdy_b + oy)
+        s = sad_cur_grid(L2p, L2c, X, Y, cdx_b + ox, cdy_b + oy, dc_comp=True)
         key = ((s + 256 + 4 * (abs(ox) + abs(oy))) << 8) | k
         better = key < best2
         best2 = np.where(better, key, best2)
@@ -164,6 +237,10 @@ def gm8(V2, S2):
 # ---------------------------------------------------------------------------------------------------------------
 # fgs8: foreground splat
 # ---------------------------------------------------------------------------------------------------------------
+def _isqrt(q):
+    return np.floor(np.sqrt(np.maximum(q, 0).astype(np.float32))).astype(np.int64)
+
+
 def fgs8(L2p, L2c, V2, S2, gm, anchor_hist=None):
     """returns GK (68, 120) uint32 splat keys (prio << 20 | closeness << 12 | L2 block) and the new anchor history"""
     nby2, nbx2 = V2.shape[:2]
@@ -174,15 +251,20 @@ def fgs8(L2p, L2c, V2, S2, gm, anchor_hist=None):
     vx, vy = V2[..., 0].ravel(), V2[..., 1].ravel()
     sb = S2[..., 0].ravel()
     gmx, gmy = gm
-    gs = [sad_cur_grid(L2p, L2c, BX, BY, np.full(N, gmx + ox), np.full(N, gmy + oy))
+    gs = [sad_cur_grid(L2p, L2c, BX, BY, np.full(N, gmx + ox), np.full(N, gmy + oy), dc_comp=True)
           for ox, oy in ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1))]
     gsad = np.minimum.reduce(gs)
-    good = (sb * 5 <= gsad * 4) & (gsad - sb >= 96)
+    gdif = gsad - sb
+    good = (sb * 5 <= gsad * 4) & (gdif >= 96)
     q = (vx - gmx) ** 2 + (vy - gmy) ** 2
     vv = vx ** 2 + vy ** 2
     gmv = gmx * gmx + gmy * gmy
-    dev = q > (gmv >> 2) + 4
-    mov = vv > gmv + 4
+    stl = np.bool_(gmv <= 4)
+    # Close the 0.5 * |gm| .. 1.0 * |gm| dead zone: any well-matched, textured, spatially coherent block
+    # deviating from gm (|V2 - gm|^2 > |gm|^2 / 16 + 3) and moving in screen space (vv > 2 when camera pans,
+    # vv > 4 when camera is still) is splatted as a moving foreground layer; quasi-static blocks (vv <= 2) are anchors.
+    dev = q > (gmv >> 4) + 3
+    mov = np.where(stl, vv > 4, vv > 2)
     one, zero = np.ones(N, np.int64), np.zeros(N, np.int64)
     tex = sad_cur_grid(L2c, L2c, BX, BY, one, zero) + sad_cur_grid(L2c, L2c, BX, BY, zero, one)
     texp = sad_cur_grid(L2p, L2p, BX + vx, BY + vy, one, zero) + sad_cur_grid(L2p, L2p, BX + vx, BY + vy, zero, one)
@@ -191,9 +273,8 @@ def fgs8(L2p, L2c, V2, S2, gm, anchor_hist=None):
     rm = 2 * sb <= texm
     f1 = good & dev & istex
     fg0 = f1 & mov & rm
-    slw = 4 * vv <= gmv
+    slw = (vv <= 2) & (4 * vv <= gmv)
     inb = (bxq >= 1) & (bxq <= 58) & (byq >= 1) & (byq <= 32)
-    stl = gmv <= 4
     an0 = np.where(stl, istex & (4 * vv <= 4) & rm, f1 & slw & rm) & inb
     need = fg0 | an0
 
@@ -204,12 +285,17 @@ def fgs8(L2p, L2c, V2, S2, gm, anchor_hist=None):
         return ok & (np.abs(V2[nyc, nxc, 0] - vx) + np.abs(V2[nyc, nxc, 1] - vy) <= 4)
 
     nbk = np.zeros(N, bool)
+    nb_cnt = np.zeros(N, np.int64)
     if need.any():
-        nbk = nbok(-1, 0) | nbok(1, 0) | nbok(0, -1) | nbok(0, 1)
+        nb0, nb1, nb2, nb3 = nbok(-1, 0), nbok(1, 0), nbok(0, -1), nbok(0, 1)
+        nbk = nb0 | nb1 | nb2 | nb3
+        nb_cnt = nb0.astype(np.int64) + nb1.astype(np.int64) + nb2.astype(np.int64) + nb3.astype(np.int64)
     isfg, isa0 = fg0 & nbk, an0 & nbk
     h = np.zeros(N, np.int64) if anchor_hist is None else anchor_hist.astype(np.int64)
     hn = np.where(isa0, np.minimum(h + 1, 255), 0)
-    doit = isfg | (isa0 & (hn >= 2))
+    strong_an = (~stl) & (nb_cnt >= 2) & (gdif >= 160)
+    isan = isa0 & ((hn >= 2) | strong_an)
+    doit = isfg | isan
     prio = np.where(isfg, _isqrt(np.minimum(q >> 2, 16760836)) + 1, 0)
     GK = np.zeros((68, 120), np.int64)
     for n in np.nonzero(doit)[0]:
@@ -232,8 +318,9 @@ def _equi(m, c, p):
     m, c, p = (np.asarray(a, np.float32) for a in (m, c, p))
     mx, mn = np.maximum(m, p), np.minimum(m, p)
     den = (mx - c) * np.float32(2.0)
+    cg = np.minimum(c * np.float32(2.0) / np.maximum(mn, np.float32(1.0)), np.float32(1.0))
     with np.errstate(divide='ignore', invalid='ignore'):
-        q = (m - p) / den
+        q = ((m - p) * cg) / den
     o = np.where(c < mn, q, np.float32(0.0))
     return np.clip(o, -0.5, 0.5).astype(np.float32)
 
@@ -249,19 +336,25 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
     n2y, n2x = V2.shape[:2]
     gmx, gmy = gm
     gmx2, gmy2 = gmx * 2, gmy * 2
-    still = (gmx | gmy) == 0
-    ix0 = np.clip((bx * 4 - 2) >> 3, 0, n2x - 1)
+    still = np.bool_((gmx | gmy) == 0)
+    ix0 = np.clip((bx * 4 - 2) >> 3, 0, max(n2x - 2, 0))
     ix1 = np.minimum(ix0 + 1, n2x - 1)
-    iy0 = np.clip((by * 4 - 2) >> 3, 0, n2y - 1)
+    iy0 = np.clip((by * 4 - 2) >> 3, 0, max(n2y - 2, 0))
     iy1 = np.minimum(iy0 + 1, n2y - 1)
     nbi = [(iy0, ix0), (iy0, ix1), (iy1, ix0), (iy1, ix1)]
     nbv = [V2[a, b].astype(np.int64) * 2 for a, b in nbi]                      # (N, 2) in L1 px
+    ixm1 = np.maximum(ix0 - 1, 0)
+    ixp1 = np.minimum(ix1 + 1, n2x - 1)
+    iym1 = np.maximum(iy0 - 1, 0)
+    iyp1 = np.minimum(iy1 + 1, n2y - 1)
+    out_nbi = [(iy0, ixm1), (iy0, ixp1), (iym1, ix0), (iyp1, ix0)]
+    out_nbv = [V2[a, b].astype(np.int64) * 2 for a, b in out_nbi]              # outer L2 ring for lanes 12..15
     zero = np.zeros(N, np.int64)
 
     def tdv(ex, ey):
         if prevF is None:
             return zero, zero
-        tx, ty = np.minimum(bx + ex, 119), np.minimum(by + ey, 67)
+        tx, ty = np.clip(bx + ex, 0, 119), np.clip(by + ey, 0, 67)
         return (rnd(prevF[ty, tx, 0] * np.float32(0.5)), rnd(prevF[ty, tx, 1] * np.float32(0.5)))
 
     gk = GK[by, bx]
@@ -270,9 +363,11 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
     isanc = hasfg & ~isfgk
     gv = V2.reshape(-1, 2)[gk & 4095].astype(np.int64) * 2
     gdx, gdy = gv[:, 0], gv[:, 1]
-    cand = [(nbv[k][:, 0], nbv[k][:, 1]) for k in range(4)]
-    cand += [tdv(0, 0), tdv(1, 0), tdv(0, 1)]                                   # slots 4, 5, 6 (temporal)
-    cand += [(zero, zero), (gdx, gdy), (np.full(N, gmx2), np.full(N, gmy2))]    # slots 7, 8, 9
+    cand = [(nbv[k][:, 0], nbv[k][:, 1]) for k in range(4)]                    # slots 0..3: inner 2x2 L2
+    cand += [tdv(0, 0), tdv(1, 0), tdv(0, 1)]                                  # slots 4..6: temporal (0, +x, +y)
+    cand += [(zero, zero), (gdx, gdy), (np.full(N, gmx2), np.full(N, gmy2))]   # slots 7, 8, 9: zero, GK, camera
+    cand += [tdv(-1, 0), tdv(0, -1)]                                           # slots 10..11: symmetric temporal (-x, -y)
+    cand += [(out_nbv[k][:, 0], out_nbv[k][:, 1]) for k in range(4)]           # slots 12..15: outer cardinal L2 ring
 
     def nbdist(a, b, cdx, cdy):
         v = V2[a, b].astype(np.int64) * 2
@@ -283,7 +378,8 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
     cx1, cy1 = zero.copy(), zero.copy()
     for sub, (cdx, cdy) in enumerate(cand):
         sad1, sum1 = sad_bilateral(L1p, L1c, X, Y, cdx, cdy)
-        ist = 4 <= sub <= 6
+        ist = (4 <= sub <= 6) or (10 <= sub <= 11)
+        isout = 12 <= sub <= 15
         bias = np.zeros(N, np.int64)
         if ist:
             bias += mp.get("tbias", 16)
@@ -293,20 +389,33 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
             bias += 32
         if sub == 8:
             bias = np.where(isfgk, 96, 64).astype(np.int64)
-        adx, ady = cdx - gdx, cdy - gdy
-        afar = (np.abs(adx) + np.abs(ady)) > 3
-        apen = np.where(isanc & afar & (sub != 8), 512, 0)
+        if isout:
+            bias -= 8
+        aad = np.abs(cdx - gdx) + np.abs(cdy - gdy)
+        sc = np.abs(cdx - gmx2) + np.abs(cdy - gmy2)
+        # Camera-escape guard: penalize jumping onto the camera pan gm2 (sc * 2 <= aad) or distant sky (aad > 16),
+        # while allowing articulated limb motion (3 < aad <= 16 away from gm2) around an anchor torso.
+        afar = (aad > 3) & ((aad > 16) | ((~still) & (sc * 2 <= aad)))
+        ap1 = isanc & afar & (sub != 8)
+        apen = np.where(ap1, 512, 0)
         p1f = (np.abs(cdx) + np.abs(cdy)) > 8
-        p1p = np.where(p1f, np.maximum((np.abs(sum1 - zsum) >> 1) - zs, 0), 0)
-        cost = sad1 + 256 + apen + p1p - bias
-        if sub < 8:
-            valid = np.ones(N, bool)
-            if ist:                                                              # 8.6 temporal support gate
-                sz = np.abs(cdx) + np.abs(cdy)
-                smin = np.minimum.reduce([nbdist(a, b, cdx, cdy) for a, b in nbi] + [
-                    sz, np.abs(cdx - gmx2) + np.abs(cdy - gmy2), np.where(hasfg, np.abs(cdx - gdx) + np.abs(cdy - gdy), sz)])
-                tok = (smin <= 3) | (sz <= 64) | isfgk
-                valid = tok
+        p1gate = (~isfgk) & (ap1 | ((~still) & (sc <= 6)))
+        p1p = np.where(p1f & p1gate, np.maximum((np.abs(sum1 - zsum) >> 1) - zs, 0), 0)
+        sm03 = np.minimum.reduce([nbdist(a, b, cdx, cdy) for a, b in nbi])
+        sm03c = np.minimum(sm03, sc)
+        xc1_0 = X - (cdx >> 1)
+        xp1_0 = xc1_0 + cdx
+        yc1_0 = Y - (cdy >> 1)
+        yp1_0 = yc1_0 + cdy
+        oob1 = ((xc1_0 < 0) | (xc1_0 > w - 8) | (xp1_0 < 0) | (xp1_0 > w - 8) |
+                (yc1_0 < 0) | (yc1_0 > h - 8) | (yp1_0 < 0) | (yp1_0 > h - 8))
+        oob_p = np.where(oob1 & (sm03c > 3) & ~isfgk, 128, 0)
+        cost = sad1 + 256 + apen + p1p - bias + oob_p
+        if ist:                                                                 # 8.6 temporal support gate
+            sz = np.abs(cdx) + np.abs(cdy)
+            smin = np.minimum.reduce([sm03c, sz, np.where(hasfg, aad, sz)])
+            tok = (smin <= 3) | (sz <= 64) | isfgk
+            valid = tok
         elif sub == 8:
             valid = hasfg
         else:
@@ -323,7 +432,11 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
         d2x, d2y = cx1 + ox, cy1 + oy
         sad2, sum2 = sad_bilateral(L1p, L1c, X, Y, d2x, d2y)
         p2f = (np.abs(d2x) + np.abs(d2y)) > 8
-        p2p = np.where(p2f, np.maximum((np.abs(sum2 - zsum) >> 1) - zs, 0), 0)
+        aad2 = np.abs(d2x - gdx) + np.abs(d2y - gdy)
+        sc2 = np.abs(d2x - gmx2) + np.abs(d2y - gmy2)
+        ap2 = isanc & (aad2 > 3) & ((aad2 > 16) | ((~still) & (sc2 * 2 <= aad2)))
+        p2gate = (~isfgk) & (ap2 | ((~still) & (sc2 <= 6)))
+        p2p = np.where(p2f & p2gate, np.maximum((np.abs(sum2 - zsum) >> 1) - zs, 0), 0)
         key = ((sad2 + 256 + p2p + mp.get("lam1", 4) * (abs(ox) + abs(oy))) << 8) | k
         better = key < best2
         best2 = np.where(better, key, best2)
@@ -364,13 +477,23 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None):
     hasfg = gk != 0
     isfgk = gk >= (1 << 20)
     nfgk = ~isfgk
-    gmx4, gmy4 = np.float32(gm[0] * 4), np.float32(gm[1] * 4)
+    isanc = hasfg & nfgk
+    notanc = ~isanc
+    gmx, gmy = gm
+    gmx2, gmy2 = gmx * 2, gmy * 2
+    still = np.bool_((gmx | gmy) == 0)
+    gmx4, gmy4 = np.float32(gmx * 4), np.float32(gmy * 4)
     av = V2.reshape(-1, 2)[gk & 4095].astype(np.int64) * 2
     cap = np.where(nfgk, mp.get("cap", 32), 8)
     lsh = np.where(nfgk, mp.get("lsh", 2), 1)
+    h1, w1 = L1c.shape
 
     def ldT(ox, oy):
-        return FT[np.clip(by + oy, 0, nby - 1), np.clip(bx + ox, 0, nbx - 1)]
+        x0 = bx + ox
+        y0 = by + oy
+        x = np.where(x0 < 0, min(1, nbx - 1), np.where(x0 >= nbx, max(nbx - 2, 0), x0))
+        y = np.where(y0 < 0, min(1, nby - 1), np.where(y0 >= nby, max(nby - 2, 0), y0))
+        return FT[y, x]
 
     nbrs = [ldT(ox, oy) for oy in (-1, 0, 1) for ox in (-1, 0, 1)]                # t0..t8 raster, t4 = own
     nbq = [(rnd(v[:, 0] * np.float32(0.5)), rnd(v[:, 1] * np.float32(0.5))) for v in nbrs]
@@ -385,18 +508,32 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None):
             k = 4
         cv = nbrs[k].copy()
         if sub == 9:
-            cv = np.where(isfgk[:, None], np.array([gmx4, gmy4], np.float32)[None, :], cv)
+            cv = np.where(notanc[:, None], np.array([gmx4, gmy4], np.float32)[None, :], cv)
         cx, cy = rnd(cv[:, 0] * np.float32(0.5)), rnd(cv[:, 1] * np.float32(0.5))
-        scx = np.where(nfgk, cx >> 1, 0)
-        scy = np.where(nfgk, cy >> 1, 0)
-        sad, _ = sad_bilateral(L1p, L1c, X + scx, Y + scy, cx, cy)
+        aoff = np.abs(cx - av[:, 0]) + np.abs(cy - av[:, 1])
+        sc = np.abs(cx - gmx2) + np.abs(cy - gmy2)
+        afar = (aoff > 3) & ((aoff > 16) | ((~still) & (sc * 2 <= aoff)))
+        ap = isanc & afar
+        # Only shift to the CUR grid when evaluating an anchor escape candidate (so static heads reject sky escape);
+        # keep all valid moving objects, articulated limbs, and normal blocks on the MID grid matching me1.
+        scx = np.where(ap, cx >> 1, 0)
+        scy = np.where(ap, cy >> 1, 0)
+        Xu, Yu = X + scx, Y + scy
+        sad, _ = sad_bilateral(L1p, L1c, Xu, Yu, cx, cy)
         terms = [np.minimum(np.abs(cx - nx) + np.abs(cy - ny), cap) for nx, ny in nbq]
-        sm = sum(terms[j] for j in (0, 1, 2, 3, 5, 6, 7, 8)) + np.where(nfgk, terms[4] * 3, 0)
+        sm0 = sum(terms[j] for j in (0, 1, 2, 3, 5, 6, 7, 8))
+        sm = sm0 + np.where(nfgk, terms[4] * 3, 0)
         pen = sm << lsh
         bias = np.where(hasfg, 96, 0) if sub == 0 else 0
-        aoff = np.abs(cx - av[:, 0]) + np.abs(cy - av[:, 1])
-        apen = np.where(hasfg & nfgk & (aoff > 3), 512, 0)
-        cost = sad + 256 + pen + apen - bias
+        apen = np.where(ap, 512, 0)
+        xc_0 = Xu - (cx >> 1)
+        xp_0 = xc_0 + cx
+        yc_0 = Yu - (cy >> 1)
+        yp_0 = yc_0 + cy
+        oob = ((xc_0 < 0) | (xc_0 > w1 - 8) | (xp_0 < 0) | (xp_0 > w1 - 8) |
+               (yc_0 < 0) | (yc_0 > h1 - 8) | (yp_0 < 0) | (yp_0 > h1 - 8))
+        oob_p = np.where(oob & (sc > 3) & (sm0 > 24) & nfgk, 96, 0)
+        cost = sad + 256 + pen + apen + oob_p - bias
         key = (cost << 8) | sub
         if fade:
             valid = np.full(N, sub == 0)

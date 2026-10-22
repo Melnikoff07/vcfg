@@ -26,7 +26,19 @@ typedef struct {
     int has_adapt;    // 1 if adapt-<TITLE>.ini exists
     int has_crash;    // 1 if crash-<TITLE>.txt exists
     int diag_kind;    // DIAG_* analyzed from crash / boot / trace / safe files
-    int rec_row;      // 1..7 recommended Dev Mode row to adjust (0 = none)
+    int rec_row;      // 1..7 primary Dev Mode row recommended (0 = none)
+    int rec_mask;     // bitmask (1<<1 .. 1<<7) of rows differing from Advisor target recipe
+    int rec_applied;  // 1 if current settings already match the full Advisor target recipe
+    int had_watchdog; // sticky safe_state > 0 seen in this launcher session
+    int rec_manual;   // target manual_mode (0 = AUTO, 1 = CUSTOM)
+    int rec_eng_sel;  // target SEL_*
+    int rec_buf_sel;  // target BUF_*
+    int rec_shave_mode;
+    int rec_reg_mode;
+    int rec_pace_order;
+    int rec_post_mid;
+    int rec_fps_lock;
+    int rec_tile_mode;
     char diag_cause[64];
     char diag_stage[64];
     char diag_advice[64];

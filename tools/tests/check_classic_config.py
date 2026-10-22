@@ -27,14 +27,19 @@ struct = re.search(r'typedef struct \{.*?\} fg_config_t;', text, re.S)[0]
 out = ROOT / 'build/tests'
 out.mkdir(parents=True, exist_ok=True)
 source = out / 'classic_config.c'
+families_h = (ROOT / 'overlay/title_families.h').read_text().replace('#include <string.h>', '').replace('#pragma once', '')
 source.write_text('''#include <stdint.h>
 #include "menu_combo.h"
 #include <stddef.h>
 extern int sscanf(const char *, const char *, ...);
 extern int strcmp(const char *, const char *);
+extern char *strstr(const char *, const char *);
 extern size_t strlen(const char *);
 extern void *memcpy(void *, const void *, size_t);
+''' + families_h + '''
 static int g_known_game, g_detected_60fps, g_tile_override = -1, g_tile_sweep, g_t6_bit_override = -1;
+static char g_title_id[16] = "CUSA00000";
+static char g_family_id[16] = "CUSA00000";
 static void tile_load(int idx) { (void)idx; }
 static const char *input;
 static int sceKernelOpen(const char *p, int f, int m) { return input ? 1 : -1; }
@@ -42,7 +47,14 @@ static long sceKernelRead(int fd, void *p, size_t n) {
     size_t k = strlen(input); if(k>n)k=n; memcpy(p,input,k); return (long)k;
 }
 static int sceKernelClose(int fd) { return 0; }
-''' + struct + '\n' + '\n'.join(function(n) for n in ['fnv1a_bytes', 'cfg_defaults', 'parse_ini_file']) + '''
+''' + struct + '\n' + '\n'.join(function(n) for n in ['fnv1a_bytes', 'cfg_apply_title_defaults', 'cfg_defaults', 'parse_ini_file_ex', 'parse_ini_file']) + '''
+static void set_title(const char *id) {
+    size_t n = strlen(id);
+    memcpy(g_title_id, id, n + 1);
+    const char *fam = vcfg_title_family(id);
+    size_t fn = strlen(fam);
+    memcpy(g_family_id, fam, fn + 1);
+}
 int main(void) {
     fg_config_t c;
     cfg_defaults(&c);
@@ -63,6 +75,22 @@ int main(void) {
     if (c.present_copy != 2) return 6;
     input="two_buffer=1\\n"; parse_ini_file("title", &c, 0);
     if (c.two_buffer != 1) return 7;
+    // Verify per-family defaults from telemetry logs:
+    set_title("CUSA11456"); cfg_defaults(&c);
+    if (c.reg_mode != 1 || c.shave_mode != 1) return 8;
+    set_title("CUSA16596"); cfg_defaults(&c);
+    if (c.reg_mode != 1 || c.pace_order != 2) return 9;
+    set_title("CUSA09311"); cfg_defaults(&c);
+    if (c.reg_mode != 1 || c.game_vectors != 0) return 10;
+    set_title("CUSA18534"); cfg_defaults(&c);
+    if (c.reg_mode != 1 || c.game_vectors != 0) return 11;
+    set_title("CUSA28561"); cfg_defaults(&c);
+    if (c.shave_mode != 2) return 12;
+    set_title("CUSA11260"); cfg_defaults(&c);
+    if (c.pace_order != 2) return 13;
+    // Verify INI override still takes precedence over per-family default:
+    input="game_vectors=1\\n"; parse_ini_file("title", &c, 0);
+    if (c.game_vectors != 1) return 14;
     return 0;
 }
 ''', encoding='utf-8')

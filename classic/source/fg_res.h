@@ -45,6 +45,7 @@ static inline FgDim fg_dim(uint32_t w, uint32_t h)
 typedef struct { uint32_t w, h; int ready; } FgResEntry;
 static const FgResEntry k_fg_res[] = {
     { 3840u, 2160u, 1 },   // 2160p (4K PS4 Pro)
+    { 3200u, 1800u, 1 },   // 1800p (PS4 Pro, e.g. CUSA18723)
     { 2560u, 1440u, 1 },   // 1440p (PS4 Pro)
     { 1920u, 1080u, 1 },   // 1080p
     { 1600u,  900u, 1 },   // 900p

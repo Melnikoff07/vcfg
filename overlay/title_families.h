@@ -70,10 +70,15 @@ static const VcfgTitleAlias k_vcfg_title_aliases[] = {
 
     // CUSA08809 family
     { "CUSA08809", "CUSA08809" },
-    { "CUSA08344", "CUSA08809" },
+    { "CUSA08034", "CUSA08809" },
+    { "CUSA07090", "CUSA08809" },
     { "CUSA08810", "CUSA08809" },
     { "CUSA08811", "CUSA08809" },
     { "CUSA12085", "CUSA08809" },
+
+    // CUSA08344 family
+    { "CUSA08344", "CUSA08344" },
+    { "CUSA08308", "CUSA08344" },
 
     // CUSA00557 family
     { "CUSA00557", "CUSA00557" },
@@ -86,24 +91,30 @@ static const VcfgTitleAlias k_vcfg_title_aliases[] = {
     // CUSA09171 family
     { "CUSA09171", "CUSA09171" },
     { "CUSA07408", "CUSA09171" },
+    { "CUSA08966", "CUSA09171" },
     { "CUSA09175", "CUSA09171" },
     { "CUSA09176", "CUSA09171" },
+    { "CUSA09193", "CUSA09171" },
     { "CUSA09515", "CUSA09171" },
 
     // CUSA13801 family
     { "CUSA13801", "CUSA13801" },
     { "CUSA11993", "CUSA13801" },
+    { "CUSA12047", "CUSA13801" },
     { "CUSA12605", "CUSA13801" },
     { "CUSA13795", "CUSA13801" },
     { "CUSA13800", "CUSA13801" },
+    { "CUSA14876", "CUSA13801" },
 
     // CUSA11456 family
     { "CUSA11456", "CUSA11456" },
     { "CUSA11455", "CUSA11456" },
+    { "CUSA13323", "CUSA11456" },
     { "CUSA13917", "CUSA11456" },
 
     // CUSA14209 family
     { "CUSA14209", "CUSA14209" },
+    { "CUSA14123", "CUSA14209" },
     { "CUSA14168", "CUSA14209" },
     { "CUSA14205", "CUSA14209" },
     { "CUSA14208", "CUSA14209" },
@@ -113,6 +124,7 @@ static const VcfgTitleAlias k_vcfg_title_aliases[] = {
     { "CUSA16734", "CUSA16734" },
     { "CUSA16596", "CUSA16734" },
     { "CUSA16725", "CUSA16734" },
+    { "CUSA18278", "CUSA16734" },
 
     // CUSA10454 family
     { "CUSA10454", "CUSA10454" },
@@ -134,10 +146,65 @@ static const VcfgTitleAlias k_vcfg_title_aliases[] = {
     // CUSA18723 family
     { "CUSA18723", "CUSA18723" },
     { "CUSA18742", "CUSA18723" },
+    { "CUSA28863", "CUSA18723" },
+
+    // CUSA09311 family
+    { "CUSA09311", "CUSA09311" },
+    { "CUSA09303", "CUSA09311" },
+    { "CUSA09505", "CUSA09311" },
+
+    // CUSA18534 family
+    { "CUSA18534", "CUSA18534" },
+    { "CUSA18522", "CUSA18534" },
+    { "CUSA18526", "CUSA18534" },
+
+    // CUSA36842 family
+    { "CUSA36842", "CUSA36842" },
+    { "CUSA36843", "CUSA36842" },
+
+    // CUSA01015 family
+    { "CUSA01015", "CUSA01015" },
+
+    // CUSA33388 family
+    { "CUSA33388", "CUSA33388" },
+
+    // CUSA34384 family
+    { "CUSA34384", "CUSA34384" },
+
+    // CUSA15778 family
+    { "CUSA15778", "CUSA15778" },
+
+    // CUSA00083 family
+    { "CUSA00083", "CUSA00083" },
+
+    // CUSA02320 family
+    { "CUSA02320", "CUSA02320" },
+
+    // CUSA03388 family
+    { "CUSA03388", "CUSA03388" },
+
+    // CUSA02299 family
+    { "CUSA02299", "CUSA02299" },
+
+    // CUSA10123 family
+    { "CUSA10123", "CUSA10123" },
 
     // CUSA36375 family
     { "CUSA36375", "CUSA36375" },
     { "CUSA36374", "CUSA36375" },
+
+    // Additional verified families
+    { "CUSA08364", "CUSA08364" },
+    { "CUSA06548", "CUSA06548" },
+    { "CUSA10237", "CUSA10237" },
+    { "CUSA11260", "CUSA11260" },
+    { "CUSA32946", "CUSA32946" },
+    { "CUSA28561", "CUSA28561" },
+    { "CUSA01154", "CUSA01154" },
+    { "CUSA04841", "CUSA04841" },
+    { "CUSA17722", "CUSA17722" },
+    { "CUSA32836", "CUSA32836" },
+    { "CUSA01113", "CUSA01113" },
 };
 
 static inline const char *vcfg_title_family(const char *id)
@@ -160,7 +227,13 @@ static inline int vcfg_is_verified_family(const char *id)
     const char *f = vcfg_title_family(id);
     static const char *const k_ver[] = {
         "CUSA07439", "CUSA08519", "CUSA00411", "CUSA00207", "CUSA04529", "CUSA17419",
-        "CUSA05571", "CUSA08809", "CUSA00557", "CUSA09171", "CUSA13801", "CUSA11456"
+        "CUSA05571", "CUSA08809", "CUSA00557", "CUSA09171", "CUSA13801", "CUSA11456",
+        "CUSA14209", "CUSA12054", "CUSA16734", "CUSA36842", "CUSA01015", "CUSA33388",
+        "CUSA34384", "CUSA15778", "CUSA00083", "CUSA02320", "CUSA03388", "CUSA02299",
+        "CUSA09311", "CUSA18534", "CUSA10123", "CUSA08364", "CUSA08344", "CUSA10454",
+        "CUSA11100", "CUSA15090", "CUSA18723", "CUSA36375", "CUSA06548", "CUSA10237",
+        "CUSA11260", "CUSA32946", "CUSA28561", "CUSA01154", "CUSA04841", "CUSA17722",
+        "CUSA32836", "CUSA01113"
     };
     for (unsigned i = 0; i < sizeof(k_ver) / sizeof(k_ver[0]); i++) {
         if (!strcmp(f, k_ver[i])) return 1;

@@ -2,36 +2,12 @@
 ; tgid_y=1
 ; mode 8.4, pass 6: raw motion field (filtered by mf8 afterwards) on L1 (960x540), 120 x 68 blocks of 8x8 (= 16x16 full-res px), on the MID grid.
 ; dispatch 30 x 68 groups; lane = block (tid>>4) * 16 + slot (tid&15): 4 blocks per wave, 16 candidate slots each.
-;  phase 1: 4 nearest L2 vectors (x2) + 3 temporal predictors (previous field: same block, right, below) + zero;
-;           temporal slots get -TBIAS, zero gets -ZBIAS (inertia / static preference, 3DRS style);
-;           slot 8: the foreground vector fgs8 splatted onto this block (if any), x2, with -FGBIAS (96)
-;           slot 9 (8.3): the camera vector gm (gm8, L2 px) x2 with -CBIAS (32)
-;  8.3: the zero vector is only special while the camera stands still (gm = 0): zero bias and zero test apply
-;       then only. In a fast turn (78 px/frame on the dump) a dark 16x16 block often matches dark-on-dark at the
-;       zero vector better than at the true (blurred, changing) one; the zero vector won with its bias, and warp8
-;       picked it per pixel = dark specks in the bright flowers.
+;  phase 1: 4 nearest L2 vectors (x2) + 5 symmetric temporal predictors (same, +x, +y, -x, -y) + zero
+;           + slot 8 fg/anchor + slot 9 camera + slots 12..15 outer L2 ring;
 ;  phase 2: +-1 around the winner, penalty LAM1 per px
 ;  phase 3: SADs of b, b-+x, b-+y, 0 -> equiangular sub-pixel fit, zero test, store float2 full-res px vector.
-; Blocks whose best and zero SAD are both above 256 (+ the share of a global brightness change) count towards the
-; scene-change counter (misc dword 0).
-; If the frame's luma sum (misc dword 2 + parity, from me3) differs from the previous frame's by > 2 %, the whole
-; field is zero (fade / flash: plain blend). 8.3: only while the camera is (nearly) still, see the code.
-; The zero test (zero SAD within ZBIAS of the best -> exactly 0) is skipped where a foreground vector was splatted:
-; there the background behind the passing object matches the zero vector just as well, which is how mode 8 lost it.
 ; table: +0x80 V#L1cur, +0x90 V#L1prev, +0xF0 V#V2 (60x34 packed), +0x100 V#Fcur, +0x110 V#Fprev, +0x120 V#misc,
-;        +0x150 V#GK (120x68 splat keys from fgs8: prio | closeness | L2 block, 0 = none)
-; 8.3: the field goes to +0x180 V#FT (raw); mf8 filters it into +0x100 (F cur).
-; 8.5: GK keys below 1 << 20 are ANCHORS (fgs8: a screen-fixed object while the camera turns). Slot 8 then carries
-; the anchor vector with bias 64, and every other candidate farther than ARAD = 3 L1 px (manhattan) from it pays
-; ESC = 512: on the mid grid a vector whose two endpoints jump over a static, frame-to-frame noisy object (CUSA03041 hair)
-; onto uniform sky has bilateral SAD ~50 against 300..1200 for the true vector, and once it is in the field the
-; temporal predictors keep it (the head split). Real foreground keys (>= 1 << 20) are unchanged.
-; 8.6 (round 2): (1) a temporal candidate (slots 4..6: last frame's vector at this / the right / the lower block, not
-; motion compensated) larger than TPBIG = 64 L1 px (manhattan) must be supported by the cur grid now: within 3 L1 px of
-; one of the 4 L2 vectors, zero, the camera or the splat vector. Otherwise it is invalid: on dump 03 (camera still)
-; 40 head blocks kept (192, -50) frame after frame only through these slots (bilateral SAD ~20 vs ~250 at zero).
-; Cells with a real foreground key keep their temporal candidates (blade). (2) the zero test is skipped only under
-; REAL foreground keys, not under anchors (anchors now exist with a still camera too).
+;        +0x150 V#GK (120x68 splat keys from fgs8: prio | closeness | L2 block, 0 = none), +0x180 V#FT (raw)
 target triple = "amdgcn--"
 declare <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32>, i32, i32, i32 immarg)
 declare i32 @llvm.amdgcn.raw.buffer.load.i32(<4 x i32>, i32, i32, i32 immarg)
@@ -54,44 +30,51 @@ declare float @llvm.minnum.f32(float, float)
 @keys = internal addrspace(3) global [64 x i32] undef, align 16
 @vecs = internal addrspace(3) global [64 x i32] undef, align 16
 
-; Bilateral SAD of an 8x8 block of two packed-u8 luma images (wl bytes per row, wl % 4 == 0, hl rows).
-; Candidate d = (dx, dy): prev block at X + ceil(d/2), cur block at X - floor(d/2) (difference exactly d, so
-; cur(x) ~ prev(x + d) as in the old code). The x start is clamped to [0, wl-8] (8 contiguous bytes per row),
-; rows are clamped one by one. Each row: 3 dwords per image, 2 v_alignbyte, 2 v_sad_u8 (unmasked SAD of 4 bytes).
-; The 8 rows are written out (llc does not unroll loops): all 16 loads are in flight at once.
+; Bilateral SAD of an 8x8 block using a 2-iteration 4-row loop (to stay well within 64 VGPRs),
+; displacement-preserving clamp (r6), and structure-weighted DC-compensated SAD (r7).
 define internal i32 @bsad(<4 x i32> %vp, <4 x i32> %vc, i32 %wl, i32 %hl, i32 %X, i32 %Y, i32 %dx, i32 %dy) alwaysinline {
 entry:
-  %ndx = sub i32 0, %dx
-  %ndy = sub i32 0, %dy
-  %fpx = ashr i32 %ndx, 1
-  %fpy = ashr i32 %ndy, 1
-  %opx = sub i32 0, %fpx
-  %opy = sub i32 0, %fpy
-  %fcx = ashr i32 %dx, 1
-  %fcy = ashr i32 %dy, 1
   %wm8 = sub i32 %wl, 8
-  %hm1 = sub i32 %hl, 1
-  %xp0 = add i32 %X, %opx
-  %xp1 = call i32 @llvm.smax.i32(i32 %xp0, i32 0)
-  %xp = call i32 @llvm.smin.i32(i32 %xp1, i32 %wm8)
+  %hm8 = sub i32 %hl, 8
+  %nwm8 = sub i32 0, %wm8
+  %nhm8 = sub i32 0, %hm8
+  %dxc0 = call i32 @llvm.smax.i32(i32 %dx, i32 %nwm8)
+  %dxc = call i32 @llvm.smin.i32(i32 %dxc0, i32 %wm8)
+  %dyc0 = call i32 @llvm.smax.i32(i32 %dy, i32 %nhm8)
+  %dyc = call i32 @llvm.smin.i32(i32 %dyc0, i32 %hm8)
+  %ndx = sub i32 0, %dxc
+  %ndy = sub i32 0, %dyc
+  %fcx = ashr i32 %dxc, 1
+  %fcy = ashr i32 %dyc, 1
   %xc0 = sub i32 %X, %fcx
-  %xc1 = call i32 @llvm.smax.i32(i32 %xc0, i32 0)
-  %xc = call i32 @llvm.smin.i32(i32 %xc1, i32 %wm8)
+  %xmin_c = call i32 @llvm.smax.i32(i32 0, i32 %ndx)
+  %xmax_c0 = sub i32 %wm8, %dxc
+  %xmax_c = call i32 @llvm.smin.i32(i32 %wm8, i32 %xmax_c0)
+  %xc1 = call i32 @llvm.smax.i32(i32 %xc0, i32 %xmin_c)
+  %xc = call i32 @llvm.smin.i32(i32 %xc1, i32 %xmax_c)
+  %xp = add i32 %xc, %dxc
   %shp = and i32 %xp, 3
   %shc = and i32 %xc, 3
   %axp = and i32 %xp, -4
   %axc = and i32 %xc, -4
-  %ybp = add i32 %Y, %opy
-  %ybc = sub i32 %Y, %fcy
-  %ypr0 = add i32 %ybp, 0
-  %ypa0 = call i32 @llvm.smax.i32(i32 %ypr0, i32 0)
-  %yp0 = call i32 @llvm.smin.i32(i32 %ypa0, i32 %hm1)
-  %ycr0 = add i32 %ybc, 0
-  %yca0 = call i32 @llvm.smax.i32(i32 %ycr0, i32 0)
-  %yc0 = call i32 @llvm.smin.i32(i32 %yca0, i32 %hm1)
-  %rp0 = mul i32 %yp0, %wl
+  %ybc0 = sub i32 %Y, %fcy
+  %ymin_c = call i32 @llvm.smax.i32(i32 0, i32 %ndy)
+  %ymax_c0 = sub i32 %hm8, %dyc
+  %ymax_c = call i32 @llvm.smin.i32(i32 %hm8, i32 %ymax_c0)
+  %ybc1 = call i32 @llvm.smax.i32(i32 %ybc0, i32 %ymin_c)
+  %ybc = call i32 @llvm.smin.i32(i32 %ybc1, i32 %ymax_c)
+  %ybp = add i32 %ybc, %dyc
+  br label %rowloop
+rowloop:
+  %rbase = phi i32 [ 0, %entry ], [ 4, %rowloop ]
+  %sbin = phi i32 [ 0, %entry ], [ %sb3, %rowloop ]
+  %mbin = phi i32 [ 0, %entry ], [ %mb3, %rowloop ]
+  %mdin = phi i32 [ 0, %entry ], [ %md3, %rowloop ]
+  %ybp_r = add i32 %ybp, %rbase
+  %ybc_r = add i32 %ybc, %rbase
+  %rp0 = mul i32 %ybp_r, %wl
   %ap0 = add i32 %rp0, %axp
-  %rc0 = mul i32 %yc0, %wl
+  %rc0 = mul i32 %ybc_r, %wl
   %ac0 = add i32 %rc0, %axc
   %dp0 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vp, i32 %ap0, i32 0, i32 0)
   %dc0 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vc, i32 %ac0, i32 0, i32 0)
@@ -105,22 +88,14 @@ entry:
   %qp1_0 = call i32 @llvm.amdgcn.alignbyte(i32 %p2_0, i32 %p1_0, i32 %shp)
   %qc0_0 = call i32 @llvm.amdgcn.alignbyte(i32 %c1_0, i32 %c0_0, i32 %shc)
   %qc1_0 = call i32 @llvm.amdgcn.alignbyte(i32 %c2_0, i32 %c1_0, i32 %shc)
-  %sa0 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_0, i32 %qc0_0, i32 0)
+  %sa0 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_0, i32 %qc0_0, i32 %sbin)
   %sb0 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_0, i32 %qc1_0, i32 %sa0)
-  %ma0 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_0, i32 0, i32 0)
+  %ma0 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_0, i32 0, i32 %mbin)
   %mb0 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_0, i32 0, i32 %ma0)
-  %mc0 = call i32 @llvm.amdgcn.sad.u8(i32 %qc0_0, i32 0, i32 %mb0)
+  %mc0 = call i32 @llvm.amdgcn.sad.u8(i32 %qc0_0, i32 0, i32 %mdin)
   %md0 = call i32 @llvm.amdgcn.sad.u8(i32 %qc1_0, i32 0, i32 %mc0)
-  %ypr1 = add i32 %ybp, 1
-  %ypa1 = call i32 @llvm.smax.i32(i32 %ypr1, i32 0)
-  %yp1 = call i32 @llvm.smin.i32(i32 %ypa1, i32 %hm1)
-  %ycr1 = add i32 %ybc, 1
-  %yca1 = call i32 @llvm.smax.i32(i32 %ycr1, i32 0)
-  %yc1 = call i32 @llvm.smin.i32(i32 %yca1, i32 %hm1)
-  %rp1 = mul i32 %yp1, %wl
-  %ap1 = add i32 %rp1, %axp
-  %rc1 = mul i32 %yc1, %wl
-  %ac1 = add i32 %rc1, %axc
+  %ap1 = add i32 %ap0, %wl
+  %ac1 = add i32 %ac0, %wl
   %dp1 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vp, i32 %ap1, i32 0, i32 0)
   %dc1 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vc, i32 %ac1, i32 0, i32 0)
   %p0_1 = extractelement <3 x i32> %dp1, i32 0
@@ -135,20 +110,12 @@ entry:
   %qc1_1 = call i32 @llvm.amdgcn.alignbyte(i32 %c2_1, i32 %c1_1, i32 %shc)
   %sa1 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_1, i32 %qc0_1, i32 %sb0)
   %sb1 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_1, i32 %qc1_1, i32 %sa1)
-  %ma1 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_1, i32 0, i32 %md0)
+  %ma1 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_1, i32 0, i32 %mb0)
   %mb1 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_1, i32 0, i32 %ma1)
-  %mc1 = call i32 @llvm.amdgcn.sad.u8(i32 %qc0_1, i32 0, i32 %mb1)
+  %mc1 = call i32 @llvm.amdgcn.sad.u8(i32 %qc0_1, i32 0, i32 %md0)
   %md1 = call i32 @llvm.amdgcn.sad.u8(i32 %qc1_1, i32 0, i32 %mc1)
-  %ypr2 = add i32 %ybp, 2
-  %ypa2 = call i32 @llvm.smax.i32(i32 %ypr2, i32 0)
-  %yp2 = call i32 @llvm.smin.i32(i32 %ypa2, i32 %hm1)
-  %ycr2 = add i32 %ybc, 2
-  %yca2 = call i32 @llvm.smax.i32(i32 %ycr2, i32 0)
-  %yc2 = call i32 @llvm.smin.i32(i32 %yca2, i32 %hm1)
-  %rp2 = mul i32 %yp2, %wl
-  %ap2 = add i32 %rp2, %axp
-  %rc2 = mul i32 %yc2, %wl
-  %ac2 = add i32 %rc2, %axc
+  %ap2 = add i32 %ap1, %wl
+  %ac2 = add i32 %ac1, %wl
   %dp2 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vp, i32 %ap2, i32 0, i32 0)
   %dc2 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vc, i32 %ac2, i32 0, i32 0)
   %p0_2 = extractelement <3 x i32> %dp2, i32 0
@@ -163,20 +130,12 @@ entry:
   %qc1_2 = call i32 @llvm.amdgcn.alignbyte(i32 %c2_2, i32 %c1_2, i32 %shc)
   %sa2 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_2, i32 %qc0_2, i32 %sb1)
   %sb2 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_2, i32 %qc1_2, i32 %sa2)
-  %ma2 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_2, i32 0, i32 %md1)
+  %ma2 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_2, i32 0, i32 %mb1)
   %mb2 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_2, i32 0, i32 %ma2)
-  %mc2 = call i32 @llvm.amdgcn.sad.u8(i32 %qc0_2, i32 0, i32 %mb2)
+  %mc2 = call i32 @llvm.amdgcn.sad.u8(i32 %qc0_2, i32 0, i32 %md1)
   %md2 = call i32 @llvm.amdgcn.sad.u8(i32 %qc1_2, i32 0, i32 %mc2)
-  %ypr3 = add i32 %ybp, 3
-  %ypa3 = call i32 @llvm.smax.i32(i32 %ypr3, i32 0)
-  %yp3 = call i32 @llvm.smin.i32(i32 %ypa3, i32 %hm1)
-  %ycr3 = add i32 %ybc, 3
-  %yca3 = call i32 @llvm.smax.i32(i32 %ycr3, i32 0)
-  %yc3 = call i32 @llvm.smin.i32(i32 %yca3, i32 %hm1)
-  %rp3 = mul i32 %yp3, %wl
-  %ap3 = add i32 %rp3, %axp
-  %rc3 = mul i32 %yc3, %wl
-  %ac3 = add i32 %rc3, %axc
+  %ap3 = add i32 %ap2, %wl
+  %ac3 = add i32 %ac2, %wl
   %dp3 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vp, i32 %ap3, i32 0, i32 0)
   %dc3 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vc, i32 %ac3, i32 0, i32 0)
   %p0_3 = extractelement <3 x i32> %dp3, i32 0
@@ -191,125 +150,37 @@ entry:
   %qc1_3 = call i32 @llvm.amdgcn.alignbyte(i32 %c2_3, i32 %c1_3, i32 %shc)
   %sa3 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_3, i32 %qc0_3, i32 %sb2)
   %sb3 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_3, i32 %qc1_3, i32 %sa3)
-  %ma3 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_3, i32 0, i32 %md2)
+  %ma3 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_3, i32 0, i32 %mb2)
   %mb3 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_3, i32 0, i32 %ma3)
-  %mc3 = call i32 @llvm.amdgcn.sad.u8(i32 %qc0_3, i32 0, i32 %mb3)
+  %mc3 = call i32 @llvm.amdgcn.sad.u8(i32 %qc0_3, i32 0, i32 %md2)
   %md3 = call i32 @llvm.amdgcn.sad.u8(i32 %qc1_3, i32 0, i32 %mc3)
-  %ypr4 = add i32 %ybp, 4
-  %ypa4 = call i32 @llvm.smax.i32(i32 %ypr4, i32 0)
-  %yp4 = call i32 @llvm.smin.i32(i32 %ypa4, i32 %hm1)
-  %ycr4 = add i32 %ybc, 4
-  %yca4 = call i32 @llvm.smax.i32(i32 %ycr4, i32 0)
-  %yc4 = call i32 @llvm.smin.i32(i32 %yca4, i32 %hm1)
-  %rp4 = mul i32 %yp4, %wl
-  %ap4 = add i32 %rp4, %axp
-  %rc4 = mul i32 %yc4, %wl
-  %ac4 = add i32 %rc4, %axc
-  %dp4 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vp, i32 %ap4, i32 0, i32 0)
-  %dc4 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vc, i32 %ac4, i32 0, i32 0)
-  %p0_4 = extractelement <3 x i32> %dp4, i32 0
-  %p1_4 = extractelement <3 x i32> %dp4, i32 1
-  %p2_4 = extractelement <3 x i32> %dp4, i32 2
-  %c0_4 = extractelement <3 x i32> %dc4, i32 0
-  %c1_4 = extractelement <3 x i32> %dc4, i32 1
-  %c2_4 = extractelement <3 x i32> %dc4, i32 2
-  %qp0_4 = call i32 @llvm.amdgcn.alignbyte(i32 %p1_4, i32 %p0_4, i32 %shp)
-  %qp1_4 = call i32 @llvm.amdgcn.alignbyte(i32 %p2_4, i32 %p1_4, i32 %shp)
-  %qc0_4 = call i32 @llvm.amdgcn.alignbyte(i32 %c1_4, i32 %c0_4, i32 %shc)
-  %qc1_4 = call i32 @llvm.amdgcn.alignbyte(i32 %c2_4, i32 %c1_4, i32 %shc)
-  %sa4 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_4, i32 %qc0_4, i32 %sb3)
-  %sb4 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_4, i32 %qc1_4, i32 %sa4)
-  %ma4 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_4, i32 0, i32 %md3)
-  %mb4 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_4, i32 0, i32 %ma4)
-  %mc4 = call i32 @llvm.amdgcn.sad.u8(i32 %qc0_4, i32 0, i32 %mb4)
-  %md4 = call i32 @llvm.amdgcn.sad.u8(i32 %qc1_4, i32 0, i32 %mc4)
-  %ypr5 = add i32 %ybp, 5
-  %ypa5 = call i32 @llvm.smax.i32(i32 %ypr5, i32 0)
-  %yp5 = call i32 @llvm.smin.i32(i32 %ypa5, i32 %hm1)
-  %ycr5 = add i32 %ybc, 5
-  %yca5 = call i32 @llvm.smax.i32(i32 %ycr5, i32 0)
-  %yc5 = call i32 @llvm.smin.i32(i32 %yca5, i32 %hm1)
-  %rp5 = mul i32 %yp5, %wl
-  %ap5 = add i32 %rp5, %axp
-  %rc5 = mul i32 %yc5, %wl
-  %ac5 = add i32 %rc5, %axc
-  %dp5 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vp, i32 %ap5, i32 0, i32 0)
-  %dc5 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vc, i32 %ac5, i32 0, i32 0)
-  %p0_5 = extractelement <3 x i32> %dp5, i32 0
-  %p1_5 = extractelement <3 x i32> %dp5, i32 1
-  %p2_5 = extractelement <3 x i32> %dp5, i32 2
-  %c0_5 = extractelement <3 x i32> %dc5, i32 0
-  %c1_5 = extractelement <3 x i32> %dc5, i32 1
-  %c2_5 = extractelement <3 x i32> %dc5, i32 2
-  %qp0_5 = call i32 @llvm.amdgcn.alignbyte(i32 %p1_5, i32 %p0_5, i32 %shp)
-  %qp1_5 = call i32 @llvm.amdgcn.alignbyte(i32 %p2_5, i32 %p1_5, i32 %shp)
-  %qc0_5 = call i32 @llvm.amdgcn.alignbyte(i32 %c1_5, i32 %c0_5, i32 %shc)
-  %qc1_5 = call i32 @llvm.amdgcn.alignbyte(i32 %c2_5, i32 %c1_5, i32 %shc)
-  %sa5 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_5, i32 %qc0_5, i32 %sb4)
-  %sb5 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_5, i32 %qc1_5, i32 %sa5)
-  %ma5 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_5, i32 0, i32 %md4)
-  %mb5 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_5, i32 0, i32 %ma5)
-  %mc5 = call i32 @llvm.amdgcn.sad.u8(i32 %qc0_5, i32 0, i32 %mb5)
-  %md5 = call i32 @llvm.amdgcn.sad.u8(i32 %qc1_5, i32 0, i32 %mc5)
-  %ypr6 = add i32 %ybp, 6
-  %ypa6 = call i32 @llvm.smax.i32(i32 %ypr6, i32 0)
-  %yp6 = call i32 @llvm.smin.i32(i32 %ypa6, i32 %hm1)
-  %ycr6 = add i32 %ybc, 6
-  %yca6 = call i32 @llvm.smax.i32(i32 %ycr6, i32 0)
-  %yc6 = call i32 @llvm.smin.i32(i32 %yca6, i32 %hm1)
-  %rp6 = mul i32 %yp6, %wl
-  %ap6 = add i32 %rp6, %axp
-  %rc6 = mul i32 %yc6, %wl
-  %ac6 = add i32 %rc6, %axc
-  %dp6 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vp, i32 %ap6, i32 0, i32 0)
-  %dc6 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vc, i32 %ac6, i32 0, i32 0)
-  %p0_6 = extractelement <3 x i32> %dp6, i32 0
-  %p1_6 = extractelement <3 x i32> %dp6, i32 1
-  %p2_6 = extractelement <3 x i32> %dp6, i32 2
-  %c0_6 = extractelement <3 x i32> %dc6, i32 0
-  %c1_6 = extractelement <3 x i32> %dc6, i32 1
-  %c2_6 = extractelement <3 x i32> %dc6, i32 2
-  %qp0_6 = call i32 @llvm.amdgcn.alignbyte(i32 %p1_6, i32 %p0_6, i32 %shp)
-  %qp1_6 = call i32 @llvm.amdgcn.alignbyte(i32 %p2_6, i32 %p1_6, i32 %shp)
-  %qc0_6 = call i32 @llvm.amdgcn.alignbyte(i32 %c1_6, i32 %c0_6, i32 %shc)
-  %qc1_6 = call i32 @llvm.amdgcn.alignbyte(i32 %c2_6, i32 %c1_6, i32 %shc)
-  %sa6 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_6, i32 %qc0_6, i32 %sb5)
-  %sb6 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_6, i32 %qc1_6, i32 %sa6)
-  %ma6 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_6, i32 0, i32 %md5)
-  %mb6 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_6, i32 0, i32 %ma6)
-  %mc6 = call i32 @llvm.amdgcn.sad.u8(i32 %qc0_6, i32 0, i32 %mb6)
-  %md6 = call i32 @llvm.amdgcn.sad.u8(i32 %qc1_6, i32 0, i32 %mc6)
-  %ypr7 = add i32 %ybp, 7
-  %ypa7 = call i32 @llvm.smax.i32(i32 %ypr7, i32 0)
-  %yp7 = call i32 @llvm.smin.i32(i32 %ypa7, i32 %hm1)
-  %ycr7 = add i32 %ybc, 7
-  %yca7 = call i32 @llvm.smax.i32(i32 %ycr7, i32 0)
-  %yc7 = call i32 @llvm.smin.i32(i32 %yca7, i32 %hm1)
-  %rp7 = mul i32 %yp7, %wl
-  %ap7 = add i32 %rp7, %axp
-  %rc7 = mul i32 %yc7, %wl
-  %ac7 = add i32 %rc7, %axc
-  %dp7 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vp, i32 %ap7, i32 0, i32 0)
-  %dc7 = call <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32> %vc, i32 %ac7, i32 0, i32 0)
-  %p0_7 = extractelement <3 x i32> %dp7, i32 0
-  %p1_7 = extractelement <3 x i32> %dp7, i32 1
-  %p2_7 = extractelement <3 x i32> %dp7, i32 2
-  %c0_7 = extractelement <3 x i32> %dc7, i32 0
-  %c1_7 = extractelement <3 x i32> %dc7, i32 1
-  %c2_7 = extractelement <3 x i32> %dc7, i32 2
-  %qp0_7 = call i32 @llvm.amdgcn.alignbyte(i32 %p1_7, i32 %p0_7, i32 %shp)
-  %qp1_7 = call i32 @llvm.amdgcn.alignbyte(i32 %p2_7, i32 %p1_7, i32 %shp)
-  %qc0_7 = call i32 @llvm.amdgcn.alignbyte(i32 %c1_7, i32 %c0_7, i32 %shc)
-  %qc1_7 = call i32 @llvm.amdgcn.alignbyte(i32 %c2_7, i32 %c1_7, i32 %shc)
-  %sa7 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_7, i32 %qc0_7, i32 %sb6)
-  %sb7 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_7, i32 %qc1_7, i32 %sa7)
-  %ma7 = call i32 @llvm.amdgcn.sad.u8(i32 %qp0_7, i32 0, i32 %md6)
-  %mb7 = call i32 @llvm.amdgcn.sad.u8(i32 %qp1_7, i32 0, i32 %ma7)
-  %mc7 = call i32 @llvm.amdgcn.sad.u8(i32 %qc0_7, i32 0, i32 %mb7)
-  %md7 = call i32 @llvm.amdgcn.sad.u8(i32 %qc1_7, i32 0, i32 %mc7)
-  %msum = lshr i32 %md7, 1
+  %rmore = icmp eq i32 %rbase, 0
+  br i1 %rmore, label %rowloop, label %rowdone
+rowdone:
+  %sb7 = add i32 %sb3, 0
+  %mb7 = add i32 %mb3, 0
+  %md7 = add i32 %md3, 0
+  %msum0 = add i32 %mb7, %md7
+  %msum = lshr i32 %msum0, 1
+  %dc_diff = sub i32 %mb7, %md7
+  %dc_abs = call i32 @llvm.abs.i32(i32 %dc_diff, i1 false)
+  %dc_ac = sub i32 %sb7, %dc_abs
+  %dc_ac2 = shl i32 %dc_ac, 1
+  %dc_e0 = sub i32 %dc_abs, 256
+  %dc_eff = call i32 @llvm.smax.i32(i32 %dc_e0, i32 0)
+  %dc_t3 = mul i32 %dc_eff, 3
+  %dc_t3q = ashr i32 %dc_t3, 2
+  %dc_d0 = sub i32 %dc_t3q, %dc_ac2
+  %dc_d1 = call i32 @llvm.smax.i32(i32 %dc_d0, i32 0)
+  %dc_le = icmp sle i32 %dc_abs, 2048
+  %dc_disc = select i1 %dc_le, i32 %dc_d1, i32 0
+  %dc_ex0 = sub i32 %dc_abs, 2048
+  %dc_ex1 = call i32 @llvm.smax.i32(i32 %dc_ex0, i32 0)
+  %pen = ashr i32 %dc_ex1, 2
+  %sad0 = sub i32 %sb7, %dc_disc
+  %sad = add i32 %sad0, %pen
   %msh = shl i32 %msum, 16
-  %res = or i32 %sb7, %msh
+  %res = or i32 %sad, %msh
   ret i32 %res
 }
 
@@ -338,8 +209,7 @@ define internal i32 @rnd(float %f) alwaysinline {
   ret i32 %i
 }
 
-; min of the keys of lanes [base, base+n) (n = 16 or 64), every lane gets the result. Single-wave workgroup:
-; the barrier compiles away, the fences become s_waitcnt.
+; min of the keys of lanes [base, base+n) (n = 16 or 64), every lane gets the result.
 define internal i32 @reduce(i32 %tid, i32 %key, i32 %base, i32 %n) alwaysinline {
 entry:
   %p = getelementptr [64 x i32], ptr addrspace(3) @keys, i32 0, i32 %tid
@@ -422,27 +292,46 @@ entry:
   %bx = add i32 %gx4, %j
   %X = shl i32 %bx, 3
   %Y = shl i32 %gy, 3
-  ; ---- the 4 L2 blocks around this block centre
+  ; ---- the 4 L2 blocks around this block centre (symmetric border clamp [0,58]x[0,32]) + outer L2 ring
   %bx4 = shl i32 %bx, 2
   %fxm = sub i32 %bx4, 2
   %ix0r = ashr i32 %fxm, 3
   %ix0a = call i32 @llvm.smax.i32(i32 %ix0r, i32 0)
-  %ix0 = call i32 @llvm.smin.i32(i32 %ix0a, i32 59)
-  %ix1a = add i32 %ix0, 1
-  %ix1 = call i32 @llvm.smin.i32(i32 %ix1a, i32 59)
+  %ix0 = call i32 @llvm.smin.i32(i32 %ix0a, i32 58)
+  %ix1 = add i32 %ix0, 1
   %by4 = shl i32 %gy, 2
   %fym = sub i32 %by4, 2
   %iy0r = ashr i32 %fym, 3
   %iy0a = call i32 @llvm.smax.i32(i32 %iy0r, i32 0)
-  %iy0 = call i32 @llvm.smin.i32(i32 %iy0a, i32 33)
-  %iy1a = add i32 %iy0, 1
-  %iy1 = call i32 @llvm.smin.i32(i32 %iy1a, i32 33)
+  %iy0 = call i32 @llvm.smin.i32(i32 %iy0a, i32 32)
+  %iy1 = add i32 %iy0, 1
   %s1 = and i32 %sub, 1
   %s1b = icmp ne i32 %s1, 0
-  %nx = select i1 %s1b, i32 %ix1, i32 %ix0
+  %nx0 = select i1 %s1b, i32 %ix1, i32 %ix0
   %s2 = and i32 %sub, 2
   %s2b = icmp ne i32 %s2, 0
-  %ny = select i1 %s2b, i32 %iy1, i32 %iy0
+  %ny0 = select i1 %s2b, i32 %iy1, i32 %iy0
+  %ixm1a = call i32 @llvm.smax.i32(i32 %ix0r, i32 1)
+  %ixm1 = sub i32 %ixm1a, 1
+  %ixp1a = add i32 %ix1, 1
+  %ixp1 = call i32 @llvm.smin.i32(i32 %ixp1a, i32 59)
+  %iym1a = call i32 @llvm.smax.i32(i32 %iy0r, i32 1)
+  %iym1 = sub i32 %iym1a, 1
+  %iyp1a = add i32 %iy1, 1
+  %iyp1 = call i32 @llvm.smin.i32(i32 %iyp1a, i32 33)
+  %is12 = icmp eq i32 %sub, 12
+  %is13 = icmp eq i32 %sub, 13
+  %is14 = icmp eq i32 %sub, 14
+  %is15 = icmp eq i32 %sub, 15
+  %is1213 = or i1 %is12, %is13
+  %is1415 = or i1 %is14, %is15
+  %isout = or i1 %is1213, %is1415
+  %nx1 = select i1 %is12, i32 %ixm1, i32 %nx0
+  %nx2 = select i1 %is13, i32 %ixp1, i32 %nx1
+  %nx = select i1 %is1415, i32 %ix0, i32 %nx2
+  %ny1 = select i1 %is1213, i32 %iy0, i32 %ny0
+  %ny2 = select i1 %is14, i32 %iym1, i32 %ny1
+  %ny = select i1 %is15, i32 %iyp1, i32 %ny2
   %nrow = mul i32 %ny, 60
   %nidx = add i32 %nrow, %nx
   %noff = shl i32 %nidx, 2
@@ -451,15 +340,22 @@ entry:
   %nvy = call i32 @uny(i32 %nv)
   %ndx = shl i32 %nvx, 1
   %ndy = shl i32 %nvy, 1
-  ; ---- temporal predictors (previous frame's final field, full-res px -> L1 px)
+  ; ---- symmetric temporal predictors (previous frame's final field: same, +x, +y, -x, -y)
   %is5 = icmp eq i32 %sub, 5
   %is6 = icmp eq i32 %sub, 6
-  %e5 = zext i1 %is5 to i32
-  %e6 = zext i1 %is6 to i32
-  %tbxr = add i32 %bx, %e5
-  %tbx = call i32 @llvm.smin.i32(i32 %tbxr, i32 119)
-  %tbyr = add i32 %gy, %e6
-  %tby = call i32 @llvm.smin.i32(i32 %tbyr, i32 67)
+  %is10 = icmp eq i32 %sub, 10
+  %is11 = icmp eq i32 %sub, 11
+  %is1011 = or i1 %is10, %is11
+  %tox5 = select i1 %is5, i32 1, i32 0
+  %tox = select i1 %is10, i32 -1, i32 %tox5
+  %toy6 = select i1 %is6, i32 1, i32 0
+  %toy = select i1 %is11, i32 -1, i32 %toy6
+  %tbxa = add i32 %bx, %tox
+  %tbxb = call i32 @llvm.smax.i32(i32 %tbxa, i32 0)
+  %tbx = call i32 @llvm.smin.i32(i32 %tbxb, i32 119)
+  %tbya = add i32 %gy, %toy
+  %tbyb = call i32 @llvm.smax.i32(i32 %tbya, i32 0)
+  %tby = call i32 @llvm.smin.i32(i32 %tbyb, i32 67)
   %trow = mul i32 %tby, 120
   %tidx = add i32 %trow, %tbx
   %toff = shl i32 %tidx, 3
@@ -493,10 +389,13 @@ entry:
   %gmor = or i32 %gmx, %gmy
   %still0 = icmp eq i32 %gmor, 0
   %still = and i1 %still0, %fg_still
-  ; ---- phase 1
+  %nstl = xor i1 %still0, true
+  ; ---- phase 1: slots 0..3 inner L2, 4..6 & 10..11 temporal, 7 zero, 8 fg/anchor, 9 camera, 12..15 outer L2
   %islt4 = icmp ult i32 %sub, 4
+  %isl2 = or i1 %islt4, %isout
   %s4 = sub i32 %sub, 4
-  %ist = icmp ult i32 %s4, 3
+  %ist0 = icmp ult i32 %s4, 3
+  %ist = or i1 %ist0, %is1011
   %is8 = icmp eq i32 %sub, 8
   %cx0 = select i1 %ist, i32 %tdx, i32 0
   %cy0 = select i1 %ist, i32 %tdy, i32 0
@@ -505,15 +404,13 @@ entry:
   %cy9 = select i1 %is9, i32 %gmy2, i32 %cy0
   %cx8 = select i1 %is8, i32 %gdx, i32 %cx9
   %cy8 = select i1 %is8, i32 %gdy, i32 %cy9
-  %cdx = select i1 %islt4, i32 %ndx, i32 %cx8
-  %cdy = select i1 %islt4, i32 %ndy, i32 %cy8
+  %cdx = select i1 %isl2, i32 %ndx, i32 %cx8
+  %cdy = select i1 %isl2, i32 %ndy, i32 %cy8
   %zsrc = add i32 %base, 7
   %bs1 = call i32 @bsad(<4 x i32> %vp, <4 x i32> %vc, i32 960, i32 540, i32 %X, i32 %Y, i32 %cdx, i32 %cdy)
   %sad1 = and i32 %bs1, 65535
   %sum1 = lshr i32 %bs1, 16
-  ; 8.7 (round 6 idea): triangle-inequality penalty. Lane 7 (zero vector) publishes this block's centre info
-  ; (mean luma sum << 16 | zero SAD). A fast candidate (|d|_1 > 8) whose two taps have a mean brightness far from the
-  ; block centre by more than the centre's own frame-to-frame change (zero SAD) jumped over a static object onto sky.
+  ; 8.7: triangle-inequality penalty. Lane 7 (zero vector) publishes this block's centre info (mean luma sum << 16 | zero SAD).
   %zinfo = call i32 @bcast(i32 %tid, i32 %bs1, i32 %zsrc)
   %zsad0 = and i32 %zinfo, 65535
   %sum0 = lshr i32 %zinfo, 16
@@ -522,18 +419,31 @@ entry:
   %zb = select i1 %still, i32 48, i32 0
   %bz = select i1 %isz, i32 %zb, i32 %bt
   %b9 = select i1 %is9, i32 32, i32 %bz
-  ; 8.5 anchor cells (key < 1 << 20): slot 8 bias 64, escape penalty for candidates far from the anchor vector
+  ; 8.5 anchor cells (key < 1 << 20): slot 8 bias 64, camera-escape penalty for candidates jumping onto camera/sky
   %isfgk = icmp uge i32 %gk, 1048576
   %nfgk = xor i1 %isfgk, true
   %isanc = and i1 %hasfg, %nfgk
   %b8 = select i1 %isfgk, i32 96, i32 64
-  %bias = select i1 %is8, i32 %b8, i32 %b9
+  %bias0 = select i1 %is8, i32 %b8, i32 %b9
+  %open = select i1 %isout, i32 8, i32 0
+  %bias = sub i32 %bias0, %open
+  %scx0 = sub i32 %cdx, %gmx2
+  %scy0 = sub i32 %cdy, %gmy2
+  %scx = call i32 @llvm.abs.i32(i32 %scx0, i1 false)
+  %scy = call i32 @llvm.abs.i32(i32 %scy0, i1 false)
+  %sc = add i32 %scx, %scy
   %adx = sub i32 %cdx, %gdx
   %ady = sub i32 %cdy, %gdy
   %aadx = call i32 @llvm.abs.i32(i32 %adx, i1 false)
   %aady = call i32 @llvm.abs.i32(i32 %ady, i1 false)
   %aad = add i32 %aadx, %aady
-  %afar = icmp sgt i32 %aad, 3
+  %aadgt3 = icmp sgt i32 %aad, 3
+  %aadgt16 = icmp sgt i32 %aad, 16
+  %sc2 = shl i32 %sc, 1
+  %scle = icmp sle i32 %sc2, %aad
+  %cam_esc = and i1 %nstl, %scle
+  %esc = or i1 %aadgt16, %cam_esc
+  %afar = and i1 %aadgt3, %esc
   %not8 = xor i1 %is8, true
   %ap0 = and i1 %isanc, %afar
   %ap1 = and i1 %ap0, %not8
@@ -549,20 +459,26 @@ entry:
   %p1h = lshr i32 %p1d, 1
   %p1e0 = sub i32 %p1h, %zsad0
   %p1e = call i32 @llvm.smax.i32(i32 %p1e0, i32 0)
-  %p1a = and i1 %p1f, true
+  %is89 = or i1 %is8, %is9
+  %ist811 = or i1 %is89, %is1011
+  %nist811 = xor i1 %ist811, true
+  %nisl2 = xor i1 %isl2, true
+  %scgt16 = icmp sgt i32 %sc, 16
+  %p1g_nb = or i1 %nisl2, %scgt16
+  %p1g0 = and i1 %nfgk, %nist811
+  %p1_gate = and i1 %p1g0, %p1g_nb
+  %p1a = and i1 %p1f, %p1_gate
   %p1p = select i1 %p1a, i32 %p1e, i32 0
   %c1b = add i32 %c1ab, %p1p
-  %cost1 = sub i32 %c1b, %bias
-  %k1a = shl i32 %cost1, 8
-  %k1b = or i32 %k1a, %sub
-  ; 8.5 diagnostic (consts flags bit 6, inject letter 'T'): temporal slots 4..6 off
+  %cost1_0 = sub i32 %c1b, %bias
+  ; 8.5 diagnostic (consts flags bit 6, inject letter 'T'): temporal slots off
   %pcnt = getelementptr i8, ptr addrspace(4) %tbl, i64 112
   %cnt4 = load <4 x i32>, ptr addrspace(4) %pcnt, align 16, !invariant.load !0
   %flt = extractelement <4 x i32> %cnt4, i32 2
   %flt64 = and i32 %flt, 64
   %notp = icmp ne i32 %flt64, 0
   %tpoff = and i1 %ist, %notp
-  ; 8.6 temporal support (see header): distance of this lane's candidate to the support set
+  ; 8.6 temporal support & r6 OOB tie-break penalty: distance of this lane's candidate to the support set
   %sa0 = call i32 @nbdist(<4 x i32> %v2, i32 %ix0, i32 %iy0, i32 %cdx, i32 %cdy)
   %sa1 = call i32 @nbdist(<4 x i32> %v2, i32 %ix1, i32 %iy0, i32 %cdx, i32 %cdy)
   %sa2 = call i32 @nbdist(<4 x i32> %v2, i32 %ix0, i32 %iy1, i32 %cdx, i32 %cdy)
@@ -570,11 +486,6 @@ entry:
   %szx = call i32 @llvm.abs.i32(i32 %cdx, i1 false)
   %szy = call i32 @llvm.abs.i32(i32 %cdy, i1 false)
   %sz = add i32 %szx, %szy
-  %scx0 = sub i32 %cdx, %gmx2
-  %scy0 = sub i32 %cdy, %gmy2
-  %scx = call i32 @llvm.abs.i32(i32 %scx0, i1 false)
-  %scy = call i32 @llvm.abs.i32(i32 %scy0, i1 false)
-  %sc = add i32 %scx, %scy
   %sgx0 = sub i32 %cdx, %gdx
   %sgy0 = sub i32 %cdy, %gdy
   %sgx = call i32 @llvm.abs.i32(i32 %sgx0, i1 false)
@@ -584,6 +495,27 @@ entry:
   %sm01 = call i32 @llvm.umin.i32(i32 %sa0, i32 %sa1)
   %sm23 = call i32 @llvm.umin.i32(i32 %sa2, i32 %sa3)
   %sm03 = call i32 @llvm.umin.i32(i32 %sm01, i32 %sm23)
+  %sm03c = call i32 @llvm.umin.i32(i32 %sm03, i32 %sc)
+  %sp_un = icmp ugt i32 %sm03c, 3
+  %fcx1 = ashr i32 %cdx, 1
+  %fcy1 = ashr i32 %cdy, 1
+  %xc1_0 = sub i32 %X, %fcx1
+  %xp1_0 = add i32 %xc1_0, %cdx
+  %yc1_0 = sub i32 %Y, %fcy1
+  %yp1_0 = add i32 %yc1_0, %cdy
+  %ox1_0 = icmp ugt i32 %xc1_0, 952
+  %ox1_1 = icmp ugt i32 %xp1_0, 952
+  %oy1_0 = icmp ugt i32 %yc1_0, 532
+  %oy1_1 = icmp ugt i32 %yp1_0, 532
+  %oobx1 = or i1 %ox1_0, %ox1_1
+  %ooby1 = or i1 %oy1_0, %oy1_1
+  %oob1 = or i1 %oobx1, %ooby1
+  %oob_u0 = and i1 %oob1, %sp_un
+  %oob_u = and i1 %oob_u0, %nfgk
+  %oob_p = select i1 %oob_u, i32 128, i32 0
+  %cost1 = add i32 %cost1_0, %oob_p
+  %k1a = shl i32 %cost1, 8
+  %k1b = or i32 %k1a, %sub
   %smz = call i32 @llvm.umin.i32(i32 %sz, i32 %sc)
   %smg = call i32 @llvm.umin.i32(i32 %smz, i32 %sg)
   %smin = call i32 @llvm.umin.i32(i32 %sm03, i32 %smg)
@@ -597,7 +529,7 @@ entry:
   %tbad0 = xor i1 %tok, true
   %tbad = and i1 %ist, %tbad0
   %ntbad = xor i1 %tbad, true
-  %val1a1 = icmp ult i32 %sub, 8
+  %val1a1 = xor i1 %is89, true
   %val1a0 = and i1 %val1a1, %ntbad
   %ntpoff = xor i1 %tpoff, true
   %val1a = and i1 %val1a0, %ntpoff
@@ -632,7 +564,16 @@ entry:
   %p2h = lshr i32 %p2d, 1
   %p2e0 = sub i32 %p2h, %zsad0
   %p2e = call i32 @llvm.smax.i32(i32 %p2e0, i32 0)
-  %p2a = and i1 %p2f, true
+  %sc2x0 = sub i32 %d2x, %gmx2
+  %sc2y0 = sub i32 %d2y, %gmy2
+  %sc2x = call i32 @llvm.abs.i32(i32 %sc2x0, i1 false)
+  %sc2y = call i32 @llvm.abs.i32(i32 %sc2y0, i1 false)
+  %sc2d = add i32 %sc2x, %sc2y
+  %sc2le6 = icmp sle i32 %sc2d, 6
+  %cam2_near = and i1 %nstl, %sc2le6
+  %p2g0 = or i1 %isanc, %cam2_near
+  %p2_gate = and i1 %nfgk, %p2g0
+  %p2a = and i1 %p2f, %p2_gate
   %p2p = select i1 %p2a, i32 %p2e, i32 0
   %aox = call i32 @llvm.abs.i32(i32 %ox, i1 false)
   %aoy = call i32 @llvm.abs.i32(i32 %oy, i1 false)
@@ -729,10 +670,7 @@ fin:
   %fad = call float @llvm.fabs.f32(float %fdif)
   %flim = fmul float %fsp, 0x3F947AE140000000 ; 0.02
   %fade0 = fcmp ogt float %fad, %flim
-  ; 8.3: only while the camera (gm8) moves at most 1 L2 px (4 full-res px) per frame. Turning towards the bright sky
-  ; changes the frame's luma sum by several % too (9.5 % on the crop of dump 03), and a zero field then turned the
-  ; whole mid frame into a 50/50 blend = double image during turns (log: 'fade frames' 13..23 of 90). A real fade
-  ; with a moving camera is handled by the motion compensated blend anyway (prev and cur colours are mixed).
+  ; 8.3: only while the camera (gm8) moves at most 1 L2 px (4 full-res px) per frame and fg_blocks <= 32.
   %gax = call i32 @llvm.abs.i32(i32 %gmx, i1 false)
   %gay = call i32 @llvm.abs.i32(i32 %gmy, i1 false)
   %gaxy = call i32 @llvm.smax.i32(i32 %gax, i32 %gay)
@@ -776,15 +714,17 @@ exit:
 }
 
 ; equiangular (V shaped) sub-pixel fit of an L1 cost: o = (m - p) / (2 (max(m, p) - c)), clamped to +-0.5
-; 8.4: only at a strict local minimum c < min(m, p) (found by the other model in round 5): phase 2 picks the best
-; COST (SAD + 4 per px), so c can sit on a slope (m < c < p) and the fit then pushed the vector 0.5 L1 px (1 px)
-; towards the worse side.
 define internal float @equi(float %m, float %c, float %p) alwaysinline {
   %mx = call float @llvm.maxnum.f32(float %m, float %p)
   %mn = call float @llvm.minnum.f32(float %m, float %p)
+  %mn1 = call float @llvm.maxnum.f32(float %mn, float 1.0)
+  %c2 = fmul float %c, 2.0
+  %cg0 = fdiv float %c2, %mn1
+  %cg = call float @llvm.minnum.f32(float %cg0, float 1.0)
   %d0 = fsub float %mx, %c
   %den = fmul float %d0, 2.0
-  %num = fsub float %m, %p
+  %num0 = fsub float %m, %p
+  %num = fmul float %num0, %cg
   %q = fdiv float %num, %den
   %pos = fcmp olt float %c, %mn
   %o = select i1 %pos, float %q, float 0.0
