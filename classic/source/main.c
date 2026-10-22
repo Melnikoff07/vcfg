@@ -1301,7 +1301,7 @@ static int parse_ini_file_ex(const char *path, fg_config_t *c, uint32_t *hash_io
     if (n <= 0) return 0;
     buf[n] = 0;
     if (hash_io) *hash_io = fnv1a_bytes(*hash_io, buf, (size_t)n);
-    int file_manual = is_adapt ? 1 : 0;
+    int file_manual = is_adapt ? 1 : (strstr(buf, "; per-game profile") ? 0 : 1);
     int raw_pace = -1, raw_shave = -1, raw_reg = -1, raw_post = -1;
     char *p = buf;
     while (*p) {
@@ -1614,7 +1614,8 @@ static size_t safe_surface_stride(void)
     if (g_pitch >= 640 && g_bh >= 360) {
         size_t raw_sz = (size_t)g_pitch * (size_t)((g_bh + 63u) & ~63u) * 4u;
         size_t surf_sz = (raw_sz + 0x7FFFFu) & ~(size_t)0x7FFFFu;
-        if (surf_sz >= 0x100000 && (!one || one > surf_sz)) one = surf_sz;
+        int clamp_interleaved = (!one || one > surf_sz + 0x100000u || (g_pre_mem && g_pre_size >= surf_sz && g_pre_size < one));
+        if (surf_sz >= 0x100000 && clamp_interleaved) one = surf_sz;
     }
     return (one < 0x100000 || one > 0x4000000 || (one & 0x7FFF)) ? 0 : one;
 }
@@ -3253,15 +3254,18 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                     if (!one || diff < one) one = diff;
                 }
             }
-            // B01: the VA gap between the game's buffers is not proof of the surface size (a gap may hold other
-            // objects: 0x1000000 = 16 MB in CUSA14209/CUSA36375, 0x1fb0000 = 31.7 MB in CUSA32836).
-            // Clamp `one` to the true single-surface size `pitch * aligned_height * 4` rounded up to 512 KB.
+            // B01: the VA gap between the game's buffers is not proof of the surface size when the game interleaves
+            // depth/GBuffer surfaces between scanout buffers (0x1000000 = 16 MB in CUSA14209/CUSA36375,
+            // 0x10f8000 = 17 MB in CUSA10454/CUSA11100, 0x1fb0000 = 31.7 MB in CUSA32836), while small tails
+            // <= 1 MB (e.g. 0x870000 in CUSA08519 for DCC/CMASK metadata) are part of the scanout surface.
             if (g_pitch >= 640 && g_bh >= 360) {
                 size_t calc = (size_t)g_pitch * (size_t)((g_bh + 63u) & ~63u) * 4u;
                 size_t surf_sz = (calc + 0x7FFFFu) & ~(size_t)0x7FFFFu;
+                int clamp_interleaved = (!one || one > surf_sz + 0x100000u ||
+                                         (g_pre_mem && g_pre_size >= surf_sz && g_pre_size < one));
                 STAGE("mbufs size: VA-gap stride 0x%zx, pitch*h*4 0x%zx (surf_sz 0x%zx)%s", one, calc, surf_sz,
-                      one > surf_sz ? " -> clamped to surf_sz" : "");
-                if (surf_sz >= 0x100000 && (!one || one > surf_sz)) {
+                      (one && clamp_interleaved) ? " -> clamped to surf_sz" : "");
+                if (surf_sz >= 0x100000 && clamp_interleaved) {
                     one = surf_sz;
                     lg("mbufs: using computed surface size 0x%zx from %ux%u (pitch %u)\n", one, g_bw, g_bh, g_pitch);
                 }

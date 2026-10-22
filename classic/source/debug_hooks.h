@@ -669,8 +669,8 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
                 if (reserve && max_total_shave < (len - shave_av) + already_shaved)
                     max_total_shave = (len - shave_av) + already_shaved;
             }
-            if (g_mbuf_state == 1 && max_total_shave < already_shaved + 0x800000u)
-                max_total_shave = already_shaved + 0x800000u;
+            if (g_mbuf_state == 1 && max_total_shave < already_shaved + 0x2400000u)
+                max_total_shave = already_shaved + 0x2400000u;
             if (shave_av < len && (len - shave_av) <= 0x2400000u &&
                 already_shaved + (len - shave_av) <= max_total_shave) {
                 if (shave_av >= 0x4000u) {

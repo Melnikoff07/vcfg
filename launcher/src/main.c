@@ -54,14 +54,6 @@ static const Supported k_sup[] = {
     { "CUSA00557", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
     { "CUSA09171", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
     { "CUSA13801", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA14209", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA16734", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA10454", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA11100", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA12054", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA15090", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA18723", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
-    { "CUSA36375", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
 static const char *k_files[] = { "vcfg16.prx", "vcfg_classic51.prx", "vcfg_alt_16.prx" };

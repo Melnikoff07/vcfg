@@ -659,6 +659,18 @@ static void test_avail_hook_and_late_alloc_mode2(void)
     ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x20000000u, 0x200000u, 3, &c1) == 0);
     ASSERT(g_pre_mem != NULL && g_pre_size == 0x800000u);
     ASSERT(g_shave_n == 1 && g_shaves[0].real_len == 0x1F800000u);
+
+    // Post-RegisterBuffers large allocation (e.g. CUSA17226 len=0xcc80000 when g_mbuf_state==1 and 32MB g_pre_mem is registered)
+    sim_reset(0x20000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    g_mbuf_state = 1;
+    long pre_arena = 0, post_reg = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x20000000L, 0x12B80000u, 0x80000u, 3, &pre_arena) == 0);
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x20000000L, 0xCC80000u, 0x80000u, 3, &post_reg) == 0);
+    ASSERT(g_shave_n == 1 && g_shaves[0].orig_len == 0xCC80000u && g_shaves[0].real_len == 0xB480000u);
+    void *va_post = NULL;
+    ASSERT(sceKernelMapDirectMemory(&va_post, 0xCC80000u, 0x33, 0, post_reg, 0x80000u) == 0 && va_post != NULL);
 }
 
 int main(void)

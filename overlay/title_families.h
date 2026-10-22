@@ -160,9 +160,7 @@ static inline int vcfg_is_verified_family(const char *id)
     const char *f = vcfg_title_family(id);
     static const char *const k_ver[] = {
         "CUSA07439", "CUSA08519", "CUSA00411", "CUSA00207", "CUSA04529", "CUSA17419",
-        "CUSA05571", "CUSA08809", "CUSA00557", "CUSA09171", "CUSA13801", "CUSA11456",
-        "CUSA14209", "CUSA16734", "CUSA10454", "CUSA11100", "CUSA12054", "CUSA15090",
-        "CUSA18723", "CUSA36375"
+        "CUSA05571", "CUSA08809", "CUSA00557", "CUSA09171", "CUSA13801", "CUSA11456"
     };
     for (unsigned i = 0; i < sizeof(k_ver) / sizeof(k_ver[0]); i++) {
         if (!strcmp(f, k_ver[i])) return 1;
