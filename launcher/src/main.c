@@ -1152,6 +1152,12 @@ static void do_install(App *a)
     clean_dir(CFGDIR, stale_pfx, (int)(sizeof(stale_pfx) / sizeof(stale_pfx[0])), NULL);
     remove(ENGFILE);
     remove(BUFFILE);
+    for (int i = 0; i < a->ngames; i++) {
+        a->games[i].eng_sel = SEL_AUTO;
+        a->games[i].buf_sel = BUF_AUTO;
+        memset(&a->games[i].dev, 0, sizeof(a->games[i].dev));
+    }
+    save_settings(a);
     do_ini(a, 1);
     g_exp_written = exp_sig(a);
     a->plugin_state = plugin_state();

@@ -1553,6 +1553,30 @@ static void check_title_version_upgrade(void)
     sceKernelUnlink(p);
     snprintf(p, sizeof(p), LOG_DIR "/gridmix_%s", g_title_id);
     sceKernelUnlink(p);
+    // If config-<TITLE>.ini has manual_mode=1 saved from an older version's 05 DEV Advisor after a crash on that old
+    // version, reset manual_mode to 0 so the new plugin version uses its clean verified defaults while preserving all
+    // user visual preferences (framegen, preset, sharpness, enhance, overlay, menu_combo).
+    snprintf(p, sizeof(p), LOG_DIR "/config-%s.ini", g_title_id);
+    int cfd = sceKernelOpen(p, 0 /*O_RDONLY*/, 0);
+    if (cfd >= 0) {
+        char cbuf[1024];
+        long cn = (long)sceKernelRead(cfd, cbuf, sizeof(cbuf) - 1);
+        sceKernelClose(cfd);
+        if (cn > 0) {
+            cbuf[cn] = 0;
+            char *m1 = strstr(cbuf, "manual_mode=1");
+            if (!m1) m1 = strstr(cbuf, "manual_mode = 1");
+            if (m1) {
+                char *eq = strchr(m1, '1');
+                if (eq) *eq = '0';
+                int wcf = sceKernelOpen(p, 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0666);
+                if (wcf >= 0) {
+                    sceKernelWrite(wcf, cbuf, (size_t)cn);
+                    sceKernelClose(wcf);
+                }
+            }
+        }
+    }
     sceKernelMkdir(LOG_DIR, 0777);
     int wfd = sceKernelOpen(vpath, 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0666);
     if (wfd >= 0) {
@@ -1596,8 +1620,11 @@ static void *alloc_mbufs(size_t total)
 {
     long phys = 0; void *addr = NULL;
     size_t range = sceKernelGetDirectMemorySize();
+    long top_s = (range > total) ? (long)(range - total) : 0L;
     g_own_alloc++;
-    int r = sceKernelAllocateDirectMemory(0, (long)range, total, 0x200000, 3 /*WC_GARLIC*/, &phys);
+    int r = (top_s > 0) ? sceKernelAllocateDirectMemory(top_s, (long)range, total, 0x200000, 3 /*WC_GARLIC*/, &phys) : -1;
+    if (r != 0)
+        r = sceKernelAllocateDirectMemory(0, (long)range, total, 0x200000, 3 /*WC_GARLIC*/, &phys);
     if (r != 0) {
         g_own_alloc--;
         size_t av = dm_avail(0x200000);
@@ -1618,6 +1645,11 @@ static void *alloc_mbufs(size_t total)
     g_own_alloc--;
     STAGE("mbufs ok: len=0x%zx phys=0x%lx va=%p", total, phys, addr);
     memset(addr, 0, total);
+    if (!g_pre_mem) {
+        g_pre_mem = addr;
+        g_pre_size = total;
+        g_pre_mem_phys = phys;
+    }
     return addr;
 }
 
@@ -1738,16 +1770,25 @@ static void safe_try_activate(uint32_t handle)
     int hi = g_game_idx_hi > g_ngame ? g_game_idx_hi : g_ngame;
     int want_pcopy = (g_cfg.present_copy == 1) || (g_cfg.present_copy == 0 && g_ngame == 2);
     int hi_res = (g_bw > 1920 || g_bh > 1080);
-    int want = want_pcopy ? (hi_res ? 4 : 6) : (hi_res ? 2 : 3);
+    int stream_3buf = (!want_pcopy &&
+                       ((!g_known_game && g_dbg_allocs >= 64u) ||
+                        vcfg_in_family(g_title_id, "CUSA09311") ||
+                        vcfg_in_family(g_title_id, "CUSA18534") ||
+                        vcfg_in_family(g_title_id, "CUSA10123")));
+    int want = want_pcopy ? (hi_res ? 4 : 6) : (stream_3buf ? 1 : (hi_res ? 2 : 3));
     if (want > 16 - hi) want = 16 - hi;
     if (want < 1) { safe_refuse("NO INDICES"); return; }
     // Allocate display buffers (m) FIRST before g_pre_gpu / g_pre_work so our 2MB-aligned scanout allocation never
     // competes with GPU/work buffers (which can fall back to FlexibleMemory via alloc_flex_gpu).
     uint8_t *m = NULL; int nm = 0;
     if (g_pre_mem && g_pre_size >= one) {
-        m = (uint8_t *)g_pre_mem;
         nm = (int)(g_pre_size / one);
         if (nm > want) nm = want;
+        size_t used_pre = (one * (size_t)nm + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
+        if (used_pre > 0 && used_pre < g_pre_size) {
+            shrink_early_mem_to(used_pre);
+        }
+        m = (uint8_t *)g_pre_mem;
     }
     for (int n = want; !m && n >= 1; n = (n == 6 ? 4 : n - 1)) {   // 6, 4, 3, 2, 1
         size_t need = (one * (size_t)n + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
@@ -1756,10 +1797,21 @@ static void safe_try_activate(uint32_t handle)
         if (m) nm = n;
     }
     if (!m) { safe_refuse("NO DISPLAY MEM"); return; }
-    // Use early pre-reserved buffers if they survived boot; otherwise try late allocation (with FlexibleMemory fallback).
+    // Use early pre-reserved buffers if they survived boot; otherwise use FlexibleMemory first for stream_3buf titles
+    // so late activation consumes 0 extra bytes of DirectMemory.
     g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
+    if (!g_pre_gpu && stream_3buf) {
+        g_pre_gpu = alloc_flex_gpu(g_gpu_sz, g_gpu_sz);
+        g_pre_gpu_phys = -1;
+    }
     if (!g_pre_gpu) g_pre_gpu = alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
     if (!g_pre_gpu) { safe_refuse("NO GPU MEM"); return; }
+    if (!g_pre_work && stream_3buf) {
+        g_pre_work = alloc_flex_gpu(WORK_SZ_8, 0x10000);
+        g_pre_work_phys = -1;
+        g_pre_work_sz = g_pre_work ? WORK_SZ_8 : 0;
+        g_work_garlic = 0;
+    }
     if (!g_pre_work) {
         g_pre_work = alloc_work_early(WORK_SZ_8, 3);
         g_work_garlic = (g_pre_work != NULL && g_pre_work_phys >= 0);
@@ -2216,10 +2268,10 @@ static void pace_vblank_ex(int prev2_real, int prev_real, int cur_real, int32_t 
 {
     if (!g_mon_on) { pace_30(); return; }
     g_dbl_frames++;
-    volatile uint64_t *cnt = g_opt_early ? &g_mids_shown : &g_reals_shown;
+    volatile uint64_t *cnt = (g_opt_early || pace_pre) ? &g_mids_shown : &g_reals_shown;
     // Present copy (2-buffer games): release the game when the frame before the previous one is on screen, so its CPU
     // work overlaps the GPU of the previous frame (waiting for the previous one serialised them: 26 + 26 ms, 24 fps).
-    int64_t step = g_pcopy_on ? 2 : 1;
+    int64_t step = (g_pcopy_on && !pace_pre) ? 2 : 1;
     int64_t target = (int64_t)g_dbl_frames - step + g_pace_off;
     int64_t have = (int64_t)*cnt;
     if (have > target) {
@@ -2309,7 +2361,12 @@ static void pace_pair(void) { pace_pair_ex(g_handle, 0ull, 0); }
 static int pace_timer_on(void)
 {
     if (g_cfg.pace_order == 3) return 1;
-    if (g_cfg.pace_order == 0 && (g_pcopy_on || vcfg_in_family(g_title_id, "CUSA05571"))) {
+    if (g_cfg.pace_order == 0 &&
+        (g_pcopy_on ||
+         vcfg_in_family(g_title_id, "CUSA05571") ||
+         vcfg_in_family(g_title_id, "CUSA09311") ||
+         vcfg_in_family(g_title_id, "CUSA18534") ||
+         vcfg_in_family(g_title_id, "CUSA10123"))) {
         if (g_pace_timer < 0) {
             g_pace_timer = 1;
             lg("pacing: timer (auto for pcopy/%s)\n", g_title_id);
@@ -2404,11 +2461,16 @@ static void tick(uint32_t n, uint32_t handle, uint32_t index, uint32_t mode)
 static int dcb_mem_ok(uintptr_t a, size_t n)
 {
     if (!a || !n || a + n < a) return 0;
-    void *s = NULL, *en = NULL;
-    int32_t prot = 0;
-    if (sceKernelQueryMemoryProtection((void *)a, &s, &en, &prot) != 0) return 0;
-    if ((uintptr_t)s > a || (uintptr_t)en < a + n) return 0;
-    return (prot & 0x01 /*PROT_CPU_READ*/) != 0;
+    uintptr_t end = a + n, cur = a;
+    while (cur < end) {
+        void *s = NULL, *en = NULL;
+        int32_t prot = 0;
+        if (sceKernelQueryMemoryProtection((void *)cur, &s, &en, &prot) != 0) return 0;
+        if ((uintptr_t)s > cur || (uintptr_t)en <= cur) return 0;
+        if ((prot & 0x01 /*PROT_CPU_READ*/) == 0) return 0;
+        cur = (uintptr_t)en;
+    }
+    return 1;
 }
 
 #if VCFG_BENCH
@@ -2513,7 +2575,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
         vout_fg_ctx_init(handle, 0);
     }
 
-    if (g_inject_on && g_flips >= INJECT_AFTER_FLIPS && count >= 1 && count <= (gv_armed() ? GV_MAXE - 1u : 6u) && dcb && dcbSz && index < (uint32_t)g_nbuf) {
+    if (g_inject_on && g_flips >= INJECT_AFTER_FLIPS && count >= 1 && count <= (GV_MAXE - 1u) && dcb && dcbSz && index < (uint32_t)g_nbuf) {
         int dcb_valid = 1;
         for (uint32_t i = 0; i < count; i++) {
             if (!dcb[i] || !dcbSz[i] || (dcbSz[i] & 3u) || dcbSz[i] > (16u << 20) || !dcb_mem_ok((uintptr_t)dcb[i], dcbSz[i])) {
@@ -2683,10 +2745,6 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                     two_mids = 1;
                                     mid2_flip_idx = mi2;
                                     third_flip = 1;
-                                } else if (g_ngame != 2 && !g_mem_tight && g_cpu_ema_us > 30000u) {
-                                    // Single mid-buffer fallback (only when CPU itself > 30 ms): hold mid1 for 2 vblanks and cur for 1 vblank
-                                    t1_q16 = 29491u; // t = 0.45
-                                    hold_mid_us = 15500u;
                                 } else {
                                     t1_q16 = 32768u;
                                 }
@@ -2697,7 +2755,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             }
                         }
                     } else if (!g_fg_off) {
-                        // 1.1 FG Quality (strict 2x): 1 mid frame per real frame, real-timestamp midpoint phase & even hold
+                        // 1.1 FG Quality (strict 2x): 1 mid frame per real frame, real-timestamp midpoint phase
                         uint32_t prev_hold = __atomic_load_n(&g_last_real_hold_us, __ATOMIC_ACQUIRE);
                         uint32_t tot_us = g_ema_frame_us > 20000u ? g_ema_frame_us : 33366u;
                         uint32_t t_real = (prev_hold << 16) / tot_us;
@@ -2705,22 +2763,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         t1_q16 = (t_real + 32768u) >> 1;
                         if (t1_q16 < 22937u) t1_q16 = 22937u; // 0.35
                         if (t1_q16 > 42598u) t1_q16 = 42598u; // 0.65
-                        // Only when the game itself is slow: the 15 ms hold sleeps in the game's thread, so applying it to a
-                        // game that needs ~26 ms per frame kept it below 26 fps for good (CUSA05571: 24-25 fps).
-                        // Never sleep 15 ms on 2-buffer games (g_ngame == 2), where CPU time includes flip-queue waits.
-                        if (g_ngame != 2 && !g_mem_tight && tot_us > 38000u && g_cpu_ema_us > 30000u) {
-                            // Distribute extra vblanks evenly between mid and cur when game drops below 30 fps (e.g. 25 fps -> 50)
-                            uint32_t half_us = tot_us >> 1;
-                            int32_t extra_q16 = (int32_t)(((uint64_t)(half_us > 16683u ? half_us - 16683u : 0u) << 16) / 16683ull);
-                            g_q2x_hold_acc += extra_q16;
-                            if (g_q2x_hold_acc >= 32768 && __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) <= 2u) {
-                                g_q2x_hold_acc -= 65536;
-                                hold_mid_us = 15000u;
-                                t1_q16 = 32768u;
-                            }
-                        } else {
-                            g_q2x_hold_acc = 0;
-                        }
+                        g_q2x_hold_acc = 0;
                     }
 
                     uint32_t ci = 0;
@@ -3954,14 +3997,18 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
 #if VCFG_BENCH
         // capture memory (~50 MB) is taken later, from bench_flip once the game runs: taking it here crashed the game (run d, 2026-10-20)
 #endif
+        int stream_3buf_early = (vcfg_in_family(g_title_id, "CUSA09311") ||
+                                 vcfg_in_family(g_title_id, "CUSA18534") ||
+                                 vcfg_in_family(g_title_id, "CUSA10123"));
         if ((m == 4 || m >= 6) && !g_bench_enabled && !late_alloc) {
             // Allocate g_pre_mem FIRST at the top of the DirectMemory pool before g_pre_gpu and g_pre_work so
             // physical address 0x0 remains 100% unfragmented and g_pre_gpu + g_pre_work can pack together into the
             // single 2 MB page immediately below g_pre_mem_phys.
             size_t dm_sz = sceKernelGetDirectMemorySize();
             const size_t try_sz[3] = { 0x2000000u, 0x1000000u, 0x800000u };
+            int start_ti = stream_3buf_early ? 2 : 0;
             int r = -1;
-            for (int ti = 0; ti < 3 && !g_pre_mem; ti++) {
+            for (int ti = start_ti; ti < 3 && !g_pre_mem; ti++) {
                 size_t total = try_sz[ti];
                 long hi_s = dm_sz > total ? (long)(dm_sz - total) : 0;
                 for (int hi = (hi_s > 0 ? 1 : 0); hi >= 0 && !g_pre_mem; hi--) {
@@ -3990,17 +4037,14 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         if (m >= 1 && m <= 8 && !late_alloc) {
             g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
             STAGE("alloc gpu sz=0x%zx (mode %d)", (size_t)g_gpu_sz, m);
-            // If the lowest 2 MB page below the first 2MB-aligned free address is ALREADY partially occupied by the
-            // system before plugin_load (e.g. [0, 0x200000) in CUSA04529/CUSA10249/CUSA07820/CUSA00918, or
-            // [0x18000000, 0x18200000) in CUSA11456/CUSA13323), pack g_pre_gpu + g_pre_work at the top of that
-            // sub-2MB page ([first_2mb_start - 0x1C0000, first_2mb_start)) so they consume ZERO 2MB-aligned pages,
-            // leave the bottom 128..192 KB of that sub-2MB page free for small game allocations, and survive intact!
-            // Otherwise (if 0x0 is a full 2 MB page, as in CUSA17419 / CUSA32946), place them in the 2 MB page
-            // immediately below g_pre_mem_phys so [0, 0x200000) stays unfragmented.
             off_t first_2mb_start = 0;
             size_t tot_2mb = dm_avail_range(0, (long)sceKernelGetDirectMemorySize(), 0x200000u, &first_2mb_start);
             g_low_sub2mb_end = (tot_2mb > 0 && first_2mb_start >= 0x200000L) ? (long)first_2mb_start : 0x200000L;
-            if (tot_2mb > 0 && first_2mb_start >= 0x200000L) {
+            if (stream_3buf_early) {
+                g_pre_gpu = alloc_flex_gpu(g_gpu_sz, g_gpu_sz);
+                g_pre_gpu_phys = -1;
+            }
+            if (!g_pre_gpu && tot_2mb > 0 && first_2mb_start >= 0x200000L) {
                 long sub_page_s = (long)first_2mb_start - 0x200000L;
                 long sub_top_s  = (long)first_2mb_start - 0x1C0000L;
                 size_t need_pack = (size_t)g_gpu_sz + WORK_SZ_8;
@@ -4027,7 +4071,13 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         }
         if (m >= 6 && !late_alloc) {
             size_t wsz = (m == 8) ? WORK_SZ_8 : WORK_SZ;
-            if (m == 8) {
+            if (stream_3buf_early) {
+                g_pre_work = alloc_flex_gpu(wsz, 0x10000);
+                g_pre_work_phys = -1;
+                g_pre_work_sz = g_pre_work ? wsz : 0;
+                g_work_garlic = 0;
+            }
+            if (!g_pre_work && m == 8) {
                 STAGE("alloc work sz=0x%zx garlic", wsz);
                 g_pre_work = alloc_work_early(wsz, 3);
                 g_work_garlic = (g_pre_work != NULL && g_pre_work_phys >= 0);

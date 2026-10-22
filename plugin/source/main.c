@@ -2239,16 +2239,24 @@ static int dcb_mem_ok(uintptr_t a, size_t n)
         if (a >= g_dcb_mc[i].s && end_a <= g_dcb_mc[i].e)
             return (g_dcb_mc[i].prot & 0x01 /*PROT_CPU_READ*/) != 0;
     }
-    void *s = NULL, *en = NULL;
-    int32_t prot = 0;
-    if (sceKernelQueryMemoryProtection((void *)a, &s, &en, &prot) != 0) return 0;
-    if ((uintptr_t)s > a || (uintptr_t)en < end_a) return 0;
+    uintptr_t cur = a;
+    int32_t all_prot = 0x01;
+    for (int step = 0; step < 32 && cur < end_a; step++) {
+        void *s = NULL, *en = NULL;
+        int32_t prot = 0;
+        if (sceKernelQueryMemoryProtection((void *)cur, &s, &en, &prot) != 0) return 0;
+        if ((uintptr_t)s > cur || (uintptr_t)en <= cur) return 0;
+        if (!(prot & 0x01 /*PROT_CPU_READ*/)) return 0;
+        all_prot &= prot;
+        cur = (uintptr_t)en;
+    }
+    if (cur < end_a) return 0;
     uint32_t mc_n = __atomic_load_n(&g_dcb_mcn, __ATOMIC_RELAXED);
     if (mc_n < 64u) {
-        g_dcb_mc[mc_n] = (dcb_mrange_t){ (uintptr_t)s, (uintptr_t)en, prot };
+        g_dcb_mc[mc_n] = (dcb_mrange_t){ a, cur, all_prot };
         __atomic_store_n(&g_dcb_mcn, mc_n + 1u, __ATOMIC_RELEASE);
     }
-    return (prot & 0x01 /*PROT_CPU_READ*/) != 0;
+    return 1;
 }
 
 typedef struct { uintptr_t a; size_t n; } dcb_mem_req_t;
@@ -2403,7 +2411,7 @@ static int32_t flip_inner(uint32_t count, void *dcb[], uint32_t *dcbSz, void *cc
     }
 
 #if INJECT
-    if (g_inject_on && render_needed && g_flips >= INJECT_AFTER_FLIPS && count >= 1 && count <= (gv_armed() ? GV_MAXE - 1u : 6u) && dcb && dcbSz && index < (uint32_t)g_nbuf) {
+    if (g_inject_on && render_needed && g_flips >= INJECT_AFTER_FLIPS && count >= 1 && count <= GV_MAXE - 1u && dcb && dcbSz && index < (uint32_t)g_nbuf) {
         int dcb_valid = 1;
         for (uint32_t i = 0; i < count; i++) {
             if (!dcb[i] || !dcbSz[i] || (dcbSz[i] & 3u) || dcbSz[i] > (16u << 20) || !dcb_mem_cached((uintptr_t)dcb[i], dcbSz[i])) {
