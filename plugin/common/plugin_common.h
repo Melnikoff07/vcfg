@@ -198,7 +198,10 @@ static inline void vcfg_build_stub(Detour *d, uint64_t fn_ptr, size_t ins_sz)
 
 static inline int vcfg_can_patch_pi14(uint64_t fn_ptr, const char *name, size_t *out_ins_sz)
 {
-    if (name && strcmp(name, "sceVideoOutSetFlipRate") == 0) return 0;
+    if (!name || (strcmp(name, "sceGnmSubmitAndFlipCommandBuffers") != 0 &&
+                  strcmp(name, "sceGnmSubmitAndFlipCommandBuffersForWorkload") != 0)) {
+        return 0;
+    }
     const uint8_t *p = (const uint8_t *)(uintptr_t)fn_ptr;
     if (p[0] == 0xE9u || p[0] == 0xEBu) return 0;
     size_t off = 0;
@@ -208,6 +211,9 @@ static inline int vcfg_can_patch_pi14(uint64_t fn_ptr, const char *name, size_t 
         size_t len = hde64_disasm((const void *)(uintptr_t)(fn_ptr + off), &hs);
         if (len == 0 || (hs.flags & F_ERROR)) return 0;
         if (hs.opcode == 0xC3 || hs.opcode == 0xC2 ||
+            (hs.opcode >= 0x70 && hs.opcode <= 0x7F) ||
+            (hs.opcode >= 0xE0 && hs.opcode <= 0xE3) ||
+            (hs.opcode == 0x0F && (hs.opcode2 == 0x05 || (hs.opcode2 >= 0x80 && hs.opcode2 <= 0x8F))) ||
             (off > 0 && (hs.opcode == 0xE9 || hs.opcode == 0xEB ||
                          (hs.opcode == 0xFF && (hs.modrm & 0x38) == 0x20)))) {
             return 0;

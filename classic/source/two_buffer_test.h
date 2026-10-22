@@ -24,12 +24,12 @@ static int tb_title(void)
 HOOK_INIT(sceVideoOutGetFlipStatus);
 static int g_status_hooked;   // sceVideoOutGetFlipStatus is hooked (virtual queue or a test build on a test title)
 static int g_vq_on;           // two_buffer=1 for this title (read once in plugin_load)
-static int vq_active(void) { return (g_vq_on || g_ngame == 2 || (VCFG_2BUF_TEST == 4 && tb_title())) && g_pcopy_on && !g_fg_off; }
+static int vq_active(void) { return (g_vq_on || g_ngame == 2 || (VCFG_2BUF_TEST == 4 && tb_title())) && (g_pcopy_on || g_mbuf_state == 1) && !g_fg_off; }
 
 // What the game saw in its last status poll before it submitted a frame (= the value that let it out of its wait):
 // raw queue numbers and the ones it was given. Index 7 = 7 or more.
 static int32_t g_tb_last_p = -1, g_tb_last_g = -1, g_tb_last_vp = -1, g_tb_last_vg = -1;
-static uint32_t g_tb_exit_p[8], g_tb_exit_g[8], g_tb_exit_vp[8], g_tb_exit_vg[8], g_tb_virt_calls, g_tb_status_calls;
+static uint32_t g_tb_exit_p[8], g_tb_exit_g[8], g_tb_exit_vp[8], g_tb_exit_vg[8], g_tb_virt_calls, g_tb_status_calls, g_tb_status_logged;
 static void tb_hist(uint32_t *h, int32_t v) { if (v >= 0) __atomic_add_fetch(&h[v > 7 ? 7 : v], 1u, __ATOMIC_RELAXED); }
 // Called by the game's thread when it submits a frame: the last poll before it is the one that released the wait.
 static void tb_on_game_submit(void)
@@ -81,14 +81,22 @@ int32_t sceVideoOutGetFlipStatus_hook(int32_t h, VoFlipStatus *s)
             __atomic_store_n(&g_tb_last_p, s->flipPendingNum, __ATOMIC_RELAXED);
             __atomic_store_n(&g_tb_last_g, s->gcQueueNum, __ATOMIC_RELAXED);
             if (vq_active()) {   // one queue entry per real frame: our generated frame is not the game's
-                if (s->flipPendingNum > 0) s->flipPendingNum = (s->flipPendingNum + 1) / 2;
+                int on_our_buf = (g_mbase > 0 && s->currentBuffer >= g_mbase);
+                if (on_our_buf && s->flipPendingNum == 1 && s->gcQueueNum == 0) {
+                    s->flipPendingNum = 0;
+                } else if (s->flipPendingNum > 0) {
+                    s->flipPendingNum = (s->flipPendingNum + 1) / 2;
+                }
                 if (s->gcQueueNum > 0) s->gcQueueNum = (s->gcQueueNum + 1) / 2;
+                if (on_our_buf && g_ngame == 2) {
+                    s->currentBuffer = (g_prev_idx < (uint32_t)g_ngame) ? (int32_t)g_prev_idx : 0;
+                }
                 __atomic_add_fetch(&g_tb_virt_calls, 1u, __ATOMIC_RELAXED);
             }
             __atomic_store_n(&g_tb_last_vp, s->flipPendingNum, __ATOMIC_RELAXED);
             __atomic_store_n(&g_tb_last_vg, s->gcQueueNum, __ATOMIC_RELAXED);
         }
-        if (n <= 3 && !r && s)
+        if (n <= 3 && !r && s && __atomic_add_fetch(&g_tb_status_logged, 1u, __ATOMIC_RELAXED) <= 3u)
             lg("WAIT_API status caller=%p arg=%lld buf=%d pending=%d count=%llu\n", __builtin_return_address(0),
                (long long)s->flipArg, s->currentBuffer, s->flipPendingNum, (unsigned long long)s->count);
     }

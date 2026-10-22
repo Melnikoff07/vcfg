@@ -91,6 +91,10 @@ static const VcfgTitleAlias k_vcfg_title_aliases[] = {
     // CUSA09171 family
     { "CUSA09171", "CUSA09171" },
     { "CUSA07408", "CUSA09171" },
+    { "CUSA07410", "CUSA09171" },
+    { "CUSA07411", "CUSA09171" },
+    { "CUSA07412", "CUSA09171" },
+    { "CUSA07435", "CUSA09171" },
     { "CUSA08966", "CUSA09171" },
     { "CUSA09175", "CUSA09171" },
     { "CUSA09176", "CUSA09171" },
@@ -157,6 +161,7 @@ static const VcfgTitleAlias k_vcfg_title_aliases[] = {
     { "CUSA18534", "CUSA18534" },
     { "CUSA18522", "CUSA18534" },
     { "CUSA18526", "CUSA18534" },
+    { "CUSA33151", "CUSA18534" },
 
     // CUSA36842 family
     { "CUSA36842", "CUSA36842" },

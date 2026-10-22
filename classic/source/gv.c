@@ -395,7 +395,7 @@ static volatile int g_started = 0;
 void gv_set_shaders(uint8_t *gpu, uint32_t o_gv8, uint32_t o_gvc8, uint32_t o_warp8g, uint32_t o_gvz8)
 {
     g_gpu_ = gpu; gv_off_gv8 = o_gv8; g_off_gvc8 = o_gvc8; gv_off_warp8g = o_warp8g; g_off_gvz8 = o_gvz8;
-    if (g_started && g_gpu_ && g_off_gvc8 && gv_off_gv8 && gv_off_warp8g && gv_ensure_mem()) g_live = 1;
+    if (g_started && (g_letters & GVL_ON) && g_gpu_ && g_off_gvc8 && gv_off_gv8 && gv_off_warp8g && gv_ensure_mem()) g_live = 1;
 }
 void gv_set_display(const uint64_t *bufs, int n, uint32_t w, uint32_t h)
 {
@@ -437,7 +437,7 @@ void gv_start(int mode8)
     S.cfg.biasg = 48; S.cfg.biasz = 96;
     S.st = ST_OFF;
     g_started = 1;
-    if (g_gpu_ && g_off_gvc8 && gv_off_gv8 && gv_off_warp8g && gv_ensure_mem()) g_live = 1;   // else when gpu_init hands the shaders over
+    if ((g_letters & GVL_ON) && g_gpu_ && g_off_gvc8 && gv_off_gv8 && gv_off_warp8g && gv_ensure_mem()) g_live = 1;   // else when gpu_init hands the shaders over or GVL_ON is enabled
     lg("GV start: title %s version %s, profile %s/%s.ini\n", g_title, g_appver, GV_PROF_DIR, g_title);
 }
 
@@ -1159,8 +1159,13 @@ static void do_dump(void)
 
 void gv_io_tick(void)
 {
-    if (!g_live) return;
     uint32_t L = g_letters;
+    if (!g_live) {
+        if ((L & GVL_ON) && g_started && g_gpu_ && g_off_gvc8 && gv_off_gv8 && gv_off_warp8g && gv_ensure_mem())
+            g_live = 1;
+        else
+            return;
+    }
     uint64_t now = sceKernelGetProcessTime();
     if (!(L & GVL_ON)) {   // 'v' / game_vectors=0 at runtime: everything off (memory stays reserved)
         if (S.cfg.vel_on || S.cfg.depth_on || S.st != ST_OFF) {

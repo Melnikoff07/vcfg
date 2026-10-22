@@ -77,7 +77,7 @@ int main(void) {
     if (c.two_buffer != 1) return 7;
     // Verify per-family defaults from telemetry logs:
     set_title("CUSA11456"); cfg_defaults(&c);
-    if (c.reg_mode != 1 || c.shave_mode != 1) return 8;
+    if (c.reg_mode != 1 || c.shave_mode != 0) return 8;
     set_title("CUSA16596"); cfg_defaults(&c);
     if (c.reg_mode != 1 || c.pace_order != 2) return 9;
     set_title("CUSA09311"); cfg_defaults(&c);

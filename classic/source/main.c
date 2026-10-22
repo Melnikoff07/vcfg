@@ -578,6 +578,15 @@ void *alloc_dm(size_t len, size_t align, int type)
 
 static void *alloc_gv_dm(size_t len, size_t align, int type)
 {
+    size_t dm_sz = sceKernelGetDirectMemorySize();
+    if (dm_sz > 0x100000000ULL && dm_avail(0x200000) >= len + 0x10000000u) {
+        long top_e = (long)(dm_sz & ~(size_t)0x1FFFFFu);
+        long hi_s = top_e > (long)(len + 0x2000000u) ? (top_e - (long)(len + 0x2000000u)) : 0L;
+        void *top_dm = (hi_s > 0) ? alloc_dm_range(hi_s, top_e, len, align, type, NULL) : NULL;
+        if (top_dm) return top_dm;
+        void *dm = alloc_dm(len, align, type);
+        if (dm) return dm;
+    }
     void *flex = alloc_flex_gpu(len, align);
     if (flex) return flex;
     return alloc_dm(len, align, type);
@@ -635,7 +644,16 @@ static void gpu_init(void)
         g_hud_packed = (g_cfg.hud_protect >= 1) ? g_hud_file_packed : 0u;
     }
     if (!g_pre_gpu) g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
-    void *addr = g_pre_gpu ? g_pre_gpu : alloc_dm(g_gpu_sz, g_gpu_sz, 0 /*WB_ONION*/);
+    void *addr = g_pre_gpu;
+    if (!addr) {
+        size_t dm_sz = sceKernelGetDirectMemorySize();
+        long top_e = (long)(dm_sz & ~(size_t)0x1FFFFFu);
+        long hi_s = (g_pre_mem && g_pre_mem_phys >= 0x200000L) ? (g_pre_mem_phys - 0x200000L) : (top_e > 0x2000000L ? top_e - 0x2000000L : 0L);
+        long hi_e = (g_pre_mem && g_pre_mem_phys >= 0x200000L) ? g_pre_mem_phys : top_e;
+        if (hi_e > hi_s) addr = alloc_dm_range(hi_s, hi_e, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+        if (!addr) addr = alloc_flex_gpu(g_gpu_sz, g_gpu_sz);
+        if (!addr) addr = alloc_dm(g_gpu_sz, g_gpu_sz, 0 /*WB_ONION*/);
+    }
     if (!addr) { STAGE("gpu_init FAILED: no GPU memory (0x%zx) -> native", (size_t)g_gpu_sz); return; }
     memset(addr, 0, g_gpu_sz);
     memcpy(addr, cs_code, sizeof(cs_code));
@@ -694,7 +712,15 @@ static void gpu_init(void)
             }
         }
     }
-    g_work = (uint8_t *)(g_pre_work ? g_pre_work : alloc_dm(g_inject_on == 8 ? WORK_SZ_8 : WORK_SZ, 0x10000, 0));
+    if (g_pre_work) {
+        g_work = (uint8_t *)g_pre_work;
+    } else {
+        size_t wsz = (g_inject_on == 8) ? WORK_SZ_8 : WORK_SZ;
+        g_pre_work = alloc_work_early(wsz, 3);
+        g_work_garlic = (g_pre_work != NULL && g_pre_work_phys >= 0);
+        if (!g_pre_work) g_pre_work = alloc_work_early(wsz, 0);
+        g_work = (uint8_t *)g_pre_work;
+    }
     if (!g_work) lg("gpu_init: work memory unavailable, mode 6 disabled\n");
     g_mon = (volatile uint32_t *)((uint8_t *)addr + MON_OFF);
     g_gpu = (uint8_t *)addr;
@@ -1361,7 +1387,7 @@ static void cfg_defaults(fg_config_t *c)
     c->upscale        = 0;
     c->upscale_factor = 100;
     c->hud_protect    = 1;
-    c->game_vectors   = 1;
+    c->game_vectors   = 0;
     c->fps_lock       = 30;
     c->menu_hold_ms   = 3000;
     c->menu_opacity   = 80;
@@ -1620,9 +1646,10 @@ static void *alloc_mbufs(size_t total)
 {
     long phys = 0; void *addr = NULL;
     size_t range = sceKernelGetDirectMemorySize();
-    long top_s = (range > total) ? (long)(range - total) : 0L;
+    long top_e = (long)(range & ~(size_t)0x1FFFFFu);
+    long top_s = (top_e > (long)total) ? (top_e - (long)total) : 0L;
     g_own_alloc++;
-    int r = (top_s > 0) ? sceKernelAllocateDirectMemory(top_s, (long)range, total, 0x200000, 3 /*WC_GARLIC*/, &phys) : -1;
+    int r = (top_s > 0) ? sceKernelAllocateDirectMemory(top_s, top_e, total, 0x200000, 3 /*WC_GARLIC*/, &phys) : -1;
     if (r != 0)
         r = sceKernelAllocateDirectMemory(0, (long)range, total, 0x200000, 3 /*WC_GARLIC*/, &phys);
     if (r != 0) {
@@ -1749,6 +1776,11 @@ static size_t safe_surface_stride(void)
     return (one < 0x100000 || one > 0x4000000 || (one & 0x7FFF)) ? 0 : one;
 }
 
+static void *g_ext_va[8];
+static int g_ext_nm = 0;
+static int g_ext_attr_slot = -1;
+static VoAttr g_ext_attr;
+
 // Called once on the game's flip thread at frame INJECT_AFTER_FLIPS, after the config was read.
 static void safe_try_activate(uint32_t handle)
 {
@@ -1826,6 +1858,10 @@ static void safe_try_activate(uint32_t handle)
                                (int32_t)handle, base, ext, nm, &g_attr);
     STAGE("safe mode RegisterBuffers (late group at %d, %d x 0x%zx) = 0x%08x", base, nm, one, (unsigned)r1);
     if (r1 < 0) { safe_refuse("REGISTER FAILED"); return; }
+    g_ext_attr_slot = r1;
+    g_ext_nm = nm <= 8 ? nm : 8;
+    for (int i = 0; i < g_ext_nm; i++) g_ext_va[i] = ext[i];
+    g_ext_attr = g_attr;
     for (int i = 0; i < nm; i++) g_buf[base + i] = (uint64_t)(uintptr_t)ext[i];
     g_mbase = base;
     g_nbuf = base + nm;
@@ -1892,8 +1928,8 @@ static int file_flags_ex(uint32_t *hash_io)
         if (b[i] == 'a') g |= GVL_ANCHOR; if (b[i] == 'z') g |= GVL_VIZ; if (b[i] == 'W') g |= GVL_WIDE;
     }
     g_ab_x_flag = (f & 1) ? 1 : 0;
-    g_gv_letters_base = g & ~GVL_ON;
-    if (g_cfg.game_vectors) g |= GVL_ON;
+    g_gv_letters_base = g;
+    if (g_cfg.game_vectors) g |= GVL_ON; else g &= ~GVL_ON;
     gv_set_letters(g);
     return f;
 }
@@ -1911,7 +1947,7 @@ static void cfg_reload_from_disk(int force)
         if (f & (1 << 15)) c.preset = 1;
         else if (f & (1 << 14)) c.preset = 2;
         if (f & (1 << 6)) c.hud_protect = 0;
-        if (gv_armed()) c.game_vectors = 1;
+        if (g_gv_letters_base & GVL_ON) c.game_vectors = 1;
     }
     int has_global = parse_ini_file(LOG_DIR "/config.ini", &c, &h);
     int has_game = 0;
@@ -2268,10 +2304,10 @@ static void pace_vblank_ex(int prev2_real, int prev_real, int cur_real, int32_t 
 {
     if (!g_mon_on) { pace_30(); return; }
     g_dbl_frames++;
-    volatile uint64_t *cnt = (g_opt_early || pace_pre) ? &g_mids_shown : &g_reals_shown;
+    volatile uint64_t *cnt = g_opt_early ? &g_mids_shown : &g_reals_shown;
     // Present copy (2-buffer games): release the game when the frame before the previous one is on screen, so its CPU
     // work overlaps the GPU of the previous frame (waiting for the previous one serialised them: 26 + 26 ms, 24 fps).
-    int64_t step = (g_pcopy_on && !pace_pre) ? 2 : 1;
+    int64_t step = g_pcopy_on ? 2 : 1;
     int64_t target = (int64_t)g_dbl_frames - step + g_pace_off;
     int64_t have = (int64_t)*cnt;
     if (have > target) {
@@ -3346,10 +3382,6 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
 
 int32_t sceVideoOutUnregisterBuffers(int32_t handle, int32_t attributeIndex);
 
-static void *g_ext_va[8];
-static int g_ext_nm = 0;
-static VoAttr g_ext_attr;
-
 int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void *const *addresses, int32_t bufferNum, const VoAttr *attr)
 {
     flush_map_run();
@@ -3360,15 +3392,20 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
               attr->aspectRatio, attr->width, attr->height, attr->pitchInPixel, attr->option);
     for (int i = 0; addresses && i < bufferNum && i < 8; i++) STAGE("  buf[%d]=%p", startIndex + i, addresses[i]);
     lg("RegisterBuffers handle=%d start=%d num=%d\n", handle, startIndex, bufferNum);
+    int is_aux_plane = (startIndex > 0 && g_bw > 0 && attr &&
+                        (attr->width != g_bw || attr->height != g_bh || attr->tilingMode != g_attr.tilingMode));
     if (attr && startIndex == 0) { g_handle = handle; g_attr = *attr; }
-    if (attr) {
+    if (attr && !is_aux_plane) {
         g_bw = attr->width; g_bh = attr->height; g_pitch = attr->pitchInPixel;
         // Scanout formats: 8-bit 0x8000xxxx and 10-bit 0x88xxxxxx (each needs its own T# data format; treating 10-bit as
         // 8888 turned the picture into noise). When startIndex == 0, the game is registering a primary scanout set
         // (e.g. switching from an 8-bit linear splash screen to a 10-bit tiled 3D engine in CUSA04529), so reset seen_dfmt.
         uint32_t fam = attr->format >> 24, dfmt = fam == 0x80u ? 10u : fam == 0x88u ? 9u : 0u;   // 0x88740000 = HDR10 PQ
         static uint32_t seen_dfmt;
-        if (startIndex == 0) { seen_dfmt = 0; g_fmt_supported = 1; g_game_idx_hi = 0; g_nbuf = 0; }
+        if (startIndex == 0) {
+            seen_dfmt = 0; g_fmt_supported = 1; g_game_idx_hi = 0; g_nbuf = 0;
+            g_prev_idx = 0xFFFFFFFFu; g_prev2_idx = 0xFFFFFFFFu;
+        }
         if (!dfmt || (seen_dfmt && seen_dfmt != dfmt)) g_fmt_supported = 0;
         else { seen_dfmt = dfmt; g_t_dfmt = dfmt; }
         vov_set_hdr(attr->format == 0x88740000u);   // HDR10 (BT.2020 PQ): overlay palette re-encoded, passes unchanged
@@ -3376,7 +3413,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
            attr->format, g_fmt_supported, attr->tilingMode, attr->aspectRatio, attr->width, attr->height, attr->pitchInPixel, attr->option);
     }
     int overlapped_our_mbase = 0;
-    if (addresses && bufferNum > 0) {
+    if (addresses && bufferNum > 0 && !is_aux_plane) {
         if (startIndex > 0 && g_mbuf_state == 1 && startIndex < g_nbuf && startIndex + bufferNum > g_mbase) {
             overlapped_our_mbase = 1;
             STAGE("RegisterBuffers: the game registers %d..%d over our buffers from %d -> will unregister slot 0 & relocate ours to top",
@@ -3385,9 +3422,17 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
         if (startIndex + bufferNum > g_game_idx_hi) g_game_idx_hi = startIndex + bufferNum;
     }
     for (int i = 0; addresses && i < bufferNum && startIndex + i < 16; i++) {
-        g_buf[startIndex + i] = (uint64_t)(uintptr_t)addresses[i];
-        if (startIndex + i + 1 > g_nbuf) g_nbuf = startIndex + i + 1;
+        if (!is_aux_plane) {
+            g_buf[startIndex + i] = (uint64_t)(uintptr_t)addresses[i];
+            if (startIndex + i + 1 > g_nbuf) g_nbuf = startIndex + i + 1;
+        }
         lg("  buf[%d]=%p\n", startIndex + i, addresses[i]);
+    }
+    if (g_safe_active && startIndex == 0 && g_mbuf_state == 1 && g_mbase >= bufferNum && g_ext_nm >= 1) {
+        for (int i = 0; i < g_ext_nm && g_mbase + i < 16; i++) {
+            g_buf[g_mbase + i] = (uint64_t)(uintptr_t)g_ext_va[i];
+        }
+        g_nbuf = g_mbase + g_ext_nm;
     }
     if (overlapped_our_mbase && g_ext_nm >= 1) {
         // Free attribute slot 0 (which held 0..g_ngame+g_ext_nm-1) and re-register the game's original 0..startIndex-1
@@ -3418,6 +3463,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
             lg("mbufs: auto-relocated %d buffer(s) to index %d after game registered %d..%d (r=0x%08x)\n",
                g_ext_nm, base, startIndex, startIndex + bufferNum - 1, (unsigned)r1);
             if (r1 >= 0) {
+                g_ext_attr_slot = r1;
                 g_mbase = base;
                 for (int i = 0; i < g_ext_nm; i++) g_buf[base + i] = (uint64_t)(uintptr_t)g_ext_va[i];
                 g_nbuf = base + g_ext_nm;
@@ -3437,7 +3483,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
     }
     // 1.4: Support 2..8 game display buffers (some engines register 4 buffers)
     if (g_safe && attr && startIndex == 0 && bufferNum >= 2 && bufferNum <= 8) g_ngame = bufferNum;   // observed only: see safe_try_activate()
-    if (attr && startIndex == 0 && bufferNum >= 2 && bufferNum <= 8 && addresses && g_mbuf_state >= 0 && !g_safe) {
+    if (attr && startIndex == 0 && bufferNum >= 2 && bufferNum <= 8 && addresses && (g_mbuf_state >= 0 || g_pre_mem != NULL) && !g_safe) {
         g_ngame = bufferNum;
         int m_raw = read_mode_raw();
         int want4 = (m_raw == 4 || m_raw == 6 || m_raw == 7 || m_raw == 8);
@@ -3505,7 +3551,33 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                     // CUSA17722, CUSA01154, CUSA32946).
                     size_t used_pre = (one * (size_t)nm + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
                     if (used_pre > 0 && used_pre < g_pre_size) {
+                        long old_pm = g_pre_mem_phys;
                         shrink_early_mem_to(used_pre);
+                        // If g_pre_gpu / g_pre_work were packed in the 2 MB page right below old_pm, move them right below
+                        // the new g_pre_mem_phys so the reclaimed range [old_pm, g_pre_mem_phys) is not pinned in the middle.
+                        if (g_pre_mem && g_pre_mem_phys > old_pm && g_pre_mem_phys >= 0x200000L && !g_gpu && !g_work) {
+                            long new_pack_s = g_pre_mem_phys - 0x200000L, new_pack_e = g_pre_mem_phys;
+                            if (g_pre_gpu && g_pre_gpu_phys >= old_pm - 0x200000L && g_pre_gpu_phys < old_pm) {
+                                long np = 0;
+                                void *nv = alloc_dm_range(new_pack_s, new_pack_e, g_gpu_sz, g_gpu_sz, 0, &np);
+                                if (nv) {
+                                    size_t osz = g_gpu_sz;
+                                    free_dm_block(&g_pre_gpu, &g_pre_gpu_phys, &osz, "gpu_repack");
+                                    g_pre_gpu = nv; g_pre_gpu_phys = np;
+                                }
+                            }
+                            if (g_pre_work && g_pre_work_phys >= old_pm - 0x200000L && g_pre_work_phys < old_pm) {
+                                long np = 0;
+                                size_t wsz = g_pre_work_sz;
+                                long ws = (g_pre_gpu && g_pre_gpu_phys >= new_pack_s && g_pre_gpu_phys < new_pack_e)
+                                          ? (g_pre_gpu_phys + (long)g_gpu_sz) : new_pack_s;
+                                void *nv = (ws < new_pack_e) ? alloc_dm_range(ws, new_pack_e, wsz, 0x10000, g_work_garlic ? 3 : 0, &np) : NULL;
+                                if (nv) {
+                                    free_dm_block(&g_pre_work, &g_pre_work_phys, &g_pre_work_sz, "work_repack");
+                                    g_pre_work = nv; g_pre_work_phys = np; g_pre_work_sz = wsz;
+                                }
+                            }
+                        }
                     }
                     m = (uint8_t *)g_pre_mem;
                 }
@@ -3518,13 +3590,20 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
             // Never allocate a second DirectMemory block m2 when g_pre_mem already provides nm >= 2 buffers
             // (nm = 4 for 1080p = 2 mids + 2 present-copy buffers), so we don't consume an extra 16 MB of un-valved
             // DirectMemory in games that allocate arenas after RegisterBuffers (CUSA13323, CUSA11456, CUSA32946).
+            static uint8_t *s_pcopy_m2 = NULL;
+            static size_t s_pcopy_m2_sz = 0;
             uint8_t *m2 = NULL; int nm2 = 0;
             STAGE("pcopy gate: ngame=%d pcopy_cfg=%d want_pcopy=%d tight=%d m=%p nm=%d one=0x%zx pre=%p pre_size=0x%zx max_extra=%d",
                   g_ngame, pcopy_cfg, want_pcopy, mem_tight, (void *)m, nm, one, g_pre_mem, g_pre_size, max_extra);
-            if (want_pcopy && !mem_tight && m && nm < 2) {
+            if (want_pcopy && m && nm < 2) {
                 size_t need2 = (one * (size_t)(2 - nm) + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
-                m2 = (uint8_t *)alloc_mbufs(need2);
-                if (m2) nm2 = 2 - nm;
+                if (s_pcopy_m2 && s_pcopy_m2_sz >= need2) {
+                    m2 = s_pcopy_m2;
+                    nm2 = 2 - nm;
+                } else if (!mem_tight || dm_avail(0x200000) >= need2 + 0x4000000u) {
+                    m2 = (uint8_t *)alloc_mbufs(need2);
+                    if (m2) { s_pcopy_m2 = m2; s_pcopy_m2_sz = need2; nm2 = 2 - nm; }
+                }
             }
             STAGE("pcopy gate done: nm=%d nm2=%d m2=%p", nm, nm2, (void *)m2);
             g_nmid = nm > 0 ? nm : 1;
@@ -3544,13 +3623,23 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                     int base = 16 - nm;
                     int32_t r0 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
                                                handle, startIndex, addresses, bufferNum, attr);
+                    if (r0 >= 0 && g_ext_attr_slot > 0) {
+                        sceVideoOutUnregisterBuffers(handle, g_ext_attr_slot);
+                        g_ext_attr_slot = -1;
+                    }
                     int32_t r1 = r0 < 0 ? r0 : HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
                                                              handle, base, ext + g_ngame, nm, attr);
+                    if (r0 >= 0 && r1 == (int32_t)0x80290010) {
+                        for (int sl = 1; sl < 4; sl++) sceVideoOutUnregisterBuffers(handle, sl);
+                        r1 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                                           handle, base, ext + g_ngame, nm, attr);
+                    }
                     lg("mbufs: %d extra buffer(s) of 0x%zx in separate top group at index %d (reg_mode=1): game=0x%08x, ours=0x%08x\n",
                        nm, one, base, (unsigned)r0, (unsigned)r1);
                     STAGE("RegisterBuffers done (reg_mode=1 separate group at %d, %d x 0x%zx): game=0x%08x, ours=0x%08x",
                           base, nm, one, (unsigned)r0, (unsigned)r1);
-                    if (r0 >= 0 && r1 >= 0) {
+                    if (r0 >= 0 && (r1 >= 0 || r1 == (int32_t)0x80290010)) {
+                        if (r1 >= 0) g_ext_attr_slot = r1;
                         g_mbase = base;
                         for (int i = 0; i < nm; i++) g_buf[base + i] = (uint64_t)(uintptr_t)ext[g_ngame + i];
                         g_nbuf = base + nm;
@@ -4005,17 +4094,19 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
             // physical address 0x0 remains 100% unfragmented and g_pre_gpu + g_pre_work can pack together into the
             // single 2 MB page immediately below g_pre_mem_phys.
             size_t dm_sz = sceKernelGetDirectMemorySize();
+            long top_e = (long)(dm_sz & ~(size_t)0x1FFFFFu);
             const size_t try_sz[3] = { 0x2000000u, 0x1000000u, 0x800000u };
             int start_ti = stream_3buf_early ? 2 : 0;
             int r = -1;
             for (int ti = start_ti; ti < 3 && !g_pre_mem; ti++) {
                 size_t total = try_sz[ti];
-                long hi_s = dm_sz > total ? (long)(dm_sz - total) : 0;
+                long hi_s = top_e > (long)total ? (top_e - (long)total) : 0;
                 for (int hi = (hi_s > 0 ? 1 : 0); hi >= 0 && !g_pre_mem; hi--) {
                     long phys = 0; void *addr = NULL;
                     long s = hi ? hi_s : 0;
+                    long e = hi ? top_e : (long)dm_sz;
                     g_own_alloc++;
-                    r = sceKernelAllocateDirectMemory(s, (long)dm_sz, total, 0x200000, 3 /*WC_GARLIC*/, &phys);
+                    r = sceKernelAllocateDirectMemory(s, e, total, 0x200000, 3 /*WC_GARLIC*/, &phys);
                     if (r == 0) {
                         r = sceKernelMapDirectMemory(&addr, total, 0x33, 0, phys, 0x200000);
                         if (r != 0 || !addr) sceKernelReleaseDirectMemory(phys, total);
@@ -4027,8 +4118,8 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
                         g_pre_size = total;
                         g_pre_mem_phys = phys;
                     }
-                    STAGE("early display memory try %d (%s): len=0x%zx align=0x200000 type=3 range=0x%lx..0x%zx r=0x%08x phys=0x%lx%s",
-                          ti + 1, hi ? "top" : "full", total, s, dm_sz, (unsigned)r, g_pre_mem ? phys : 0L,
+                    STAGE("early display memory try %d (%s): len=0x%zx align=0x200000 type=3 range=0x%lx..0x%lx r=0x%08x phys=0x%lx%s",
+                          ti + 1, hi ? "top" : "full", total, s, e, (unsigned)r, g_pre_mem ? phys : 0L,
                           g_pre_mem ? " ok" : "");
                 }
             }
@@ -4037,28 +4128,29 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         if (m >= 1 && m <= 8 && !late_alloc) {
             g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
             STAGE("alloc gpu sz=0x%zx (mode %d)", (size_t)g_gpu_sz, m);
+            size_t dm_sz = sceKernelGetDirectMemorySize();
             off_t first_2mb_start = 0;
-            size_t tot_2mb = dm_avail_range(0, (long)sceKernelGetDirectMemorySize(), 0x200000u, &first_2mb_start);
+            size_t tot_2mb = dm_avail_range(0, (long)dm_sz, 0x200000u, &first_2mb_start);
             g_low_sub2mb_end = (tot_2mb > 0 && first_2mb_start >= 0x200000L) ? (long)first_2mb_start : 0x200000L;
-            if (stream_3buf_early) {
-                g_pre_gpu = alloc_flex_gpu(g_gpu_sz, g_gpu_sz);
-                g_pre_gpu_phys = -1;
-            }
-            if (!g_pre_gpu && tot_2mb > 0 && first_2mb_start >= 0x200000L) {
-                long sub_page_s = (long)first_2mb_start - 0x200000L;
-                long sub_top_s  = (long)first_2mb_start - 0x1C0000L;
-                size_t need_pack = (size_t)g_gpu_sz + WORK_SZ_8;
-                if (dm_avail_range(sub_top_s, (long)first_2mb_start, 0x10000u, NULL) >= need_pack) {
+            if (!g_pre_gpu && vcfg_in_family(g_title_id, "CUSA04529") && tot_2mb > 0 && first_2mb_start >= 0x200000L) {
+                size_t need_sub = g_gpu_sz + ((m >= 6) ? ((m == 8) ? WORK_SZ_8 : WORK_SZ) : 0u);
+                long sub_top_s = (long)first_2mb_start - 0x200000L;
+                size_t sub_av = dm_avail_range(sub_top_s, (long)first_2mb_start, 0x10000u, NULL);
+                if (sub_av >= need_sub) {
                     g_pre_gpu = alloc_dm_range(sub_top_s, (long)first_2mb_start, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
-                } else if (dm_avail_range(sub_page_s, (long)first_2mb_start, 0x10000u, NULL) >= need_pack) {
-                    g_pre_gpu = alloc_dm_range(sub_page_s, (long)first_2mb_start, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
                 }
             }
             if (!g_pre_gpu && g_pre_mem && g_pre_mem_phys >= 0x200000L) {
                 g_pre_gpu = alloc_dm_range(g_pre_mem_phys - 0x200000L, g_pre_mem_phys, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
             }
             if (!g_pre_gpu) {
-                g_pre_gpu = alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+                long top_e = (long)(dm_sz & ~(size_t)0x1FFFFFu);
+                if (top_e >= 0x200000L) {
+                    g_pre_gpu = alloc_dm_range(top_e - 0x200000L, top_e, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+                }
+            }
+            if (!g_pre_gpu) {
+                g_pre_gpu = alloc_dm_range(0, (long)dm_sz, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
             }
             STAGE("alloc gpu -> %p (phys=0x%lx)", g_pre_gpu, g_pre_gpu_phys);
             {
@@ -4071,12 +4163,6 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         }
         if (m >= 6 && !late_alloc) {
             size_t wsz = (m == 8) ? WORK_SZ_8 : WORK_SZ;
-            if (stream_3buf_early) {
-                g_pre_work = alloc_flex_gpu(wsz, 0x10000);
-                g_pre_work_phys = -1;
-                g_pre_work_sz = g_pre_work ? wsz : 0;
-                g_work_garlic = 0;
-            }
             if (!g_pre_work && m == 8) {
                 STAGE("alloc work sz=0x%zx garlic", wsz);
                 g_pre_work = alloc_work_early(wsz, 3);

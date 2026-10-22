@@ -9,7 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define BOOT_STAGE_MAX 2500
+#define BOOT_STAGE_MAX 600
 
 static volatile int g_boot_lines = 0;
 static volatile uint32_t g_boot_lock = 0;

@@ -44,7 +44,7 @@ MAIN_ALLOC_PART2 = extract_between(
 )
 HOOKS_DECLS = extract_between(
     HOOKS_H,
-    "#define SHAVE_MAX 8",
+    "#define SHAVE_MAX ",
     "// ---- Lock-free API flight ring buffer",
 )
 HOOKS_VMAP = extract_between(
@@ -85,6 +85,7 @@ extern void exit(int);
 #define WORK_SZ     0x220000u
 #define WORK_SZ_8   0x190000u
 #define DUMP_SZ     0xC00000u
+#define INJECT_AFTER_FLIPS 120
 
 typedef struct {
     int shave_mode;
@@ -97,8 +98,11 @@ static uint32_t g_dbg_allocs = 0;
 static uint32_t g_dbg_maps = 0;
 static uint32_t g_dbg_alloc_fail = 0;
 static uint32_t g_flips = 0;
+static volatile uint32_t g_vo_submit_flips = 0;
 static int g_gpu_state = 0;
 static int g_mbuf_state = 0;
+static int g_safe_never = 0, g_fg_off = 0;
+static long g_low_sub2mb_end = 0;
 static size_t g_gpu_sz = GPU_SZ_BASE;
 static int g_work_garlic = 0;
 
@@ -138,7 +142,7 @@ typedef struct {
     int in_use;
 } SimFlexBlock;
 
-static uint8_t g_backing_buf[0x300000];
+static uint8_t g_backing_buf[0x400000];
 static void *sim_memset(void *dst, int c, size_t n)
 {
     uintptr_t d = (uintptr_t)dst;
@@ -148,21 +152,31 @@ static void *sim_memset(void *dst, int c, size_t n)
 }
 #define memset sim_memset
 static size_t g_sim_dm_total = 0x40000000u; // 1 GB default
+static size_t g_sim_flex_avail = 0x10000000u;
 static SimDmBlock g_sim_dm[MAX_DM_BLOCKS];
 static SimFlexBlock g_sim_flex[MAX_FLEX_BLOCKS];
 static int g_sim_force_misaligned_flex = 0;
 static int g_sim_map_dm_calls = 0;
 static int g_sim_map_flex_calls = 0;
+static int g_sim_last_flex_flags = 0;
 static uintptr_t g_sim_fake_va_cursor = 0x550000000000ULL;
+
+static int32_t sceKernelAvailableFlexibleMemorySize(size_t *out)
+{
+    if (out) *out = g_sim_flex_avail;
+    return 0;
+}
 
 static void sim_reset(size_t dm_total)
 {
     memset(g_sim_dm, 0, sizeof(g_sim_dm));
     memset(g_sim_flex, 0, sizeof(g_sim_flex));
     g_sim_dm_total = dm_total;
+    g_sim_flex_avail = 0x10000000u;
     g_sim_force_misaligned_flex = 0;
     g_sim_map_dm_calls = 0;
     g_sim_map_flex_calls = 0;
+    g_sim_last_flex_flags = 0;
     g_sim_fake_va_cursor = 0x550000000000ULL;
 
     g_cfg.shave_mode = 0;
@@ -366,14 +380,16 @@ static int32_t sceKernelMapFlexibleMemory(void **addr, size_t len, int prot, int
 {
     if (!addr || !len) return -1;
     g_sim_map_flex_calls++;
+    g_sim_last_flex_flags = flags;
+    if (len > g_sim_flex_avail) return (int32_t)0x8002000cu;
     uintptr_t base = 0;
-    if (g_own_alloc && len <= sizeof(g_backing_buf)) {
-        base = ((uintptr_t)g_backing_buf + 0x3FFFFu) & ~(uintptr_t)0x3FFFFu;
+    if ((flags & 0x10) && *addr != NULL) {
+        base = (uintptr_t)(*addr);
+    } else if (g_own_alloc && len <= sizeof(g_backing_buf) - 0x100000u) {
+        base = ((uintptr_t)g_backing_buf + 0xFFFFFu) & ~(uintptr_t)0xFFFFFu;
         if (g_sim_force_misaligned_flex) {
             base += 0x4000u; // 16KB aligned, NOT 64KB/256KB aligned
         }
-    } else if ((flags & 0x10) && *addr != NULL) {
-        base = (uintptr_t)(*addr);
     } else {
         g_sim_fake_va_cursor = (g_sim_fake_va_cursor + 0x3FFFu) & ~(uintptr_t)0x3FFFu;
         base = g_sim_fake_va_cursor;
@@ -573,16 +589,18 @@ static void test_multi_arena_shave_and_post_reserve(void)
     ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x4000000u, 0x200000u, 0, &a2) == 0);
     ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x4600000u, 0x200000u, 3, &a3) == 0);
     // Remaining before g_pre_mem (after shrinking 32 MB -> 8 MB) is 0x2F200000.
-    // Arena 4 requests 0x2F000000 (which would leave only 0x200000 = 2 MB unshaved, starving Alloc 5 = 0x600000).
+    // Arena 4 (0x2F000000, type=3 GPU Garlic) fits 100% in real DirectMemory unshaved, leaving 0x200000 (2 MB) for Alloc 5:
     ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x2F000000u, 0x200000u, 3, &a4) == 0);
     ASSERT(g_pre_mem != NULL && g_pre_size == 0x800000u);
-    ASSERT(g_shave_n == 1);
-    ASSERT(g_shaves[0].real_len == 0x2EC00000u);
-    ASSERT(g_shaves[0].orig_len == 0x2F000000u);
+    ASSERT(g_shave_n == 0);
 
-    // RegisterBuffers runs before Alloc 5 in CUSA10249 (setting g_mbuf_state = 1):
+    // RegisterBuffers runs before Alloc 5 in CUSA10249 (setting g_mbuf_state = 1), and Alloc 5 (0x600000, type=0 CPU)
+    // takes the remaining 2 MB of real DirectMemory + 4 MB FlexibleMemory tail:
     g_mbuf_state = 1;
     ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x600000u, 0x200000u, 0, &a5) == 0);
+    ASSERT(g_shave_n == 1);
+    ASSERT(g_shaves[0].real_len == 0x200000u);
+    ASSERT(g_shaves[0].orig_len == 0x600000u);
     void *va_a5 = NULL;
     ASSERT(sceKernelMapDirectMemory(&va_a5, 0x600000u, 0x2, 0, a5, 0x200000u) == 0);
     ASSERT(va_a5 != NULL);
@@ -738,6 +756,28 @@ static void test_runtime_streaming_and_batchmap_guards(void)
     ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x2F8F0000u, 0x10000u, 3, &bundle) != 0);
     ASSERT(g_pre_mem != NULL && g_pre_size == 0x800000u);
     ASSERT(g_shave_n == 0);
+
+    // 4. CUSA07820 pattern: when 0 bytes of DirectMemory remain and only 2 MB of FlexibleMemory remains,
+    //    a 4 MB synthetic tail-only probe fails immediately with 0x80020023 (so caller falls back to 2 MB
+    //    without looping 192 MapDirectMemory calls), and mapping a fixed-VA synthetic chunk uses 0x90
+    //    (MAP_FIXED | MAP_NO_OVERWRITE) so libc.prx is never unmapped:
+    sim_reset(0x20000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    release_early_gpu();
+    release_early_work();
+    g_mbuf_state = 1;
+    long fill_arena = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x20000000L, 0x1E000000u, 0x200000u, 3, &fill_arena) == 0);
+    ASSERT(dm_avail(0x4000u) == 0);
+    g_sim_flex_avail = 0x200000u;
+    long probe4m = 0, fallback2m = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0x1E000000L, 0x20000000L, 0x400000u, 0x200000u, 3, &probe4m) == (int32_t)0x80020023u);
+    ASSERT(sceKernelAllocateDirectMemory(0x1E000000L, 0x20000000L, 0x200000u, 0x200000u, 3, &fallback2m) == 0);
+    void *fixed_va = (void *)0x40000000ULL;
+    ASSERT(sceKernelMapDirectMemory(&fixed_va, 0x200000u, 0x33, 0x90, fallback2m, 0x200000u) == 0);
+    ASSERT(fixed_va == (void *)0x40000000ULL);
+    ASSERT((g_sim_last_flex_flags & 0x90) == 0x90);
 }
 
 int main(void)
