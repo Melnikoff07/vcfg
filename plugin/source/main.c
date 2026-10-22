@@ -245,7 +245,8 @@ static char g_lgq[LGQ_N][384];
 static volatile uint32_t g_lgq_w = 0, g_lgq_r = 0, g_lgq_lock = 0, g_lgq_drop = 0;
 static volatile int g_lg_async = 0;
 // Only bb_io may write the file; its own messages must not fill its drain queue.
-static __thread int g_lg_io_owner = 0;
+int scePthreadGetthreadid(void);
+static volatile int g_lg_io_owner_tid = 0;
 static int lgq_trylock(void)
 {
     for (int i = 0; i < 2000; i++)
@@ -262,7 +263,8 @@ void lg(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (g_lg_io_owner) { lg_write(buf); return; }
+    int io_tid = __atomic_load_n(&g_lg_io_owner_tid, __ATOMIC_ACQUIRE);
+    if (io_tid != 0 && scePthreadGetthreadid() == io_tid) { lg_write(buf); return; }
     if (g_lg_async) {
         if (lgq_trylock()) {
             if (g_lgq_w - g_lgq_r < LGQ_N) { memcpy(g_lgq[g_lgq_w % LGQ_N], buf, sizeof(buf)); g_lgq_w++; } else g_lgq_drop++;
@@ -1826,7 +1828,7 @@ static void pad_poll_start(void);
 static void *io_thread(void *arg)
 {
     (void)arg;
-    g_lg_io_owner = 1;
+    __atomic_store_n(&g_lg_io_owner_tid, scePthreadGetthreadid(), __ATOMIC_RELEASE);
     unsigned poll_n = 0;
     int no_flip_logged = 0;
     int crash_cleared = 0;
@@ -2760,10 +2762,11 @@ int32_t sceGnmSubmitAndFlipCommandBuffers_hook(uint32_t count, void *dcb[], uint
 int32_t sceGnmSubmitCommandBuffers_hook(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz)
 {
     // A21: pass-through counter of game submits between flips (our own fence submit is excluded).
-    if (!a21_own_submit) __atomic_add_fetch(&a21_nonflip_submits, 1u, __ATOMIC_RELEASE);
+    int own_sub = a21_is_own_submit();
+    if (!own_sub) __atomic_add_fetch(&a21_nonflip_submits, 1u, __ATOMIC_RELEASE);
 #if A21_SIDE_WALK
     // S3b: read-only walk of the game's buffers (compute-register writes) before they are submitted.
-    int a21_walked = !a21_own_submit && __atomic_load_n(&a20_state, __ATOMIC_ACQUIRE) == 2;
+    int a21_walked = !own_sub && __atomic_load_n(&a20_state, __ATOMIC_ACQUIRE) == 2;
     if (a21_walked) a21_side_submit(count, dcb, dcbSz, ccb, ccbSz);
 #endif
     void *gd[GV_MAXE]; uint32_t gs[GV_MAXE]; void *gc[GV_MAXE]; uint32_t gcs[GV_MAXE];
@@ -2794,9 +2797,10 @@ static void wl_count(int k, const char *name)
 int32_t sceGnmSubmitCommandBuffersForWorkload_hook(uint32_t workload, uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz)
 {
     wl_count(0, "sceGnmSubmitCommandBuffersForWorkload");
-    if (!a21_own_submit) __atomic_add_fetch(&a21_nonflip_submits, 1u, __ATOMIC_RELEASE);
+    int own_sub = a21_is_own_submit();
+    if (!own_sub) __atomic_add_fetch(&a21_nonflip_submits, 1u, __ATOMIC_RELEASE);
 #if A21_SIDE_WALK
-    if (!a21_own_submit) a21_side_mark_dirty(1);   // not walked: the carried shadow is no longer proven
+    if (!own_sub) a21_side_mark_dirty(1);   // not walked: the carried shadow is no longer proven
 #endif
     return HOOK_CONTINUE(sceGnmSubmitCommandBuffersForWorkload,
                          int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *),
@@ -2806,9 +2810,10 @@ int32_t sceGnmSubmitAndFlipCommandBuffersForWorkload_hook(uint32_t workload, uin
                                                           uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
 {
     wl_count(1, "sceGnmSubmitAndFlipCommandBuffersForWorkload");
-    if (!a21_own_submit) __atomic_add_fetch(&a21_nonflip_submits, 1u, __ATOMIC_RELEASE);
+    int own_sub = a21_is_own_submit();
+    if (!own_sub) __atomic_add_fetch(&a21_nonflip_submits, 1u, __ATOMIC_RELEASE);
 #if A21_SIDE_WALK
-    if (!a21_own_submit) a21_side_mark_dirty(1);
+    if (!own_sub) a21_side_mark_dirty(1);
 #endif
     return HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffersForWorkload,
                          int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
@@ -2957,7 +2962,7 @@ static uint64_t g_combo_t = 0, g_pad_last_ts = 0, g_pad_rep_t = 0, g_pad_swallow
 static uint32_t g_pad_prev_nav = 0, g_pad_last_raw = 0;
 static int g_combo_fired = 0;
 static int32_t g_combo_handle = -1;
-static __thread int t_in_pad = 0;
+static volatile int g_in_pad_tid = 0;
 static volatile uint32_t g_pad_calls[4];
 static volatile uint32_t g_pad_wrap_activity;
 static volatile uint32_t g_pad_poll_reads = 0;
@@ -3112,21 +3117,25 @@ static void pad_menu_step_h(int32_t handle, PadDataRaw *pkts, int count)
 
 int32_t scePadReadState_hook(int32_t handle, void *data)
 {
-    if (t_in_pad) return HOOK_CONTINUE(scePadReadState, int32_t (*)(int32_t, void *), handle, data);
-    t_in_pad = 1;
+    int tid = scePthreadGetthreadid();
+    int cur = __atomic_load_n(&g_in_pad_tid, __ATOMIC_ACQUIRE);
+    if (cur != 0 && cur == tid) return HOOK_CONTINUE(scePadReadState, int32_t (*)(int32_t, void *), handle, data);
+    __atomic_store_n(&g_in_pad_tid, tid, __ATOMIC_RELEASE);
     int32_t r = HOOK_CONTINUE(scePadReadState, int32_t (*)(int32_t, void *), handle, data);
     if (r == 0 && data) pad_menu_step_h(handle, (PadDataRaw *)data, 1);
-    t_in_pad = 0;
+    __atomic_store_n(&g_in_pad_tid, 0, __ATOMIC_RELEASE);
     return r;
 }
 
 int32_t scePadRead_hook(int32_t handle, void *data, int32_t num)
 {
-    if (t_in_pad) return HOOK_CONTINUE(scePadRead, int32_t (*)(int32_t, void *, int32_t), handle, data, num);
-    t_in_pad = 1;
+    int tid = scePthreadGetthreadid();
+    int cur = __atomic_load_n(&g_in_pad_tid, __ATOMIC_ACQUIRE);
+    if (cur != 0 && cur == tid) return HOOK_CONTINUE(scePadRead, int32_t (*)(int32_t, void *, int32_t), handle, data, num);
+    __atomic_store_n(&g_in_pad_tid, tid, __ATOMIC_RELEASE);
     int32_t r = HOOK_CONTINUE(scePadRead, int32_t (*)(int32_t, void *, int32_t), handle, data, num);
     if (r > 0 && data) pad_menu_step_h(handle, (PadDataRaw *)data, r > 64 ? 64 : r);
-    t_in_pad = 0;
+    __atomic_store_n(&g_in_pad_tid, 0, __ATOMIC_RELEASE);
     return r;
 }
 

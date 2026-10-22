@@ -145,7 +145,56 @@ HOOK_INIT(sceVideoOutSubmitFlip);
 HOOK_INIT(scePadReadState);
 HOOK_INIT(scePadRead);
 
-static __thread int g_in_submit = 0;
+int scePthreadGetthreadid(void);
+#define VCFG_TLS_SLOTS 32
+static volatile int g_in_submit_tid[VCFG_TLS_SLOTS];
+static volatile int g_in_submit_cnt[VCFG_TLS_SLOTS];
+
+static inline int vcfg_in_submit_get(void)
+{
+    int tid = scePthreadGetthreadid();
+    if (tid <= 0) tid = 1;
+    for (int i = 0; i < VCFG_TLS_SLOTS; i++) {
+        if (__atomic_load_n(&g_in_submit_tid[i], __ATOMIC_ACQUIRE) == tid)
+            return __atomic_load_n(&g_in_submit_cnt[i], __ATOMIC_RELAXED);
+    }
+    return 0;
+}
+
+static inline void vcfg_in_submit_inc(void)
+{
+    int tid = scePthreadGetthreadid();
+    if (tid <= 0) tid = 1;
+    for (int i = 0; i < VCFG_TLS_SLOTS; i++) {
+        if (__atomic_load_n(&g_in_submit_tid[i], __ATOMIC_ACQUIRE) == tid) {
+            __atomic_add_fetch(&g_in_submit_cnt[i], 1, __ATOMIC_ACQ_REL);
+            return;
+        }
+    }
+    for (int i = 0; i < VCFG_TLS_SLOTS; i++) {
+        int exp = 0;
+        if (__atomic_compare_exchange_n(&g_in_submit_tid[i], &exp, tid, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&g_in_submit_cnt[i], 1, __ATOMIC_RELEASE);
+            return;
+        }
+    }
+}
+
+static inline void vcfg_in_submit_dec(void)
+{
+    int tid = scePthreadGetthreadid();
+    if (tid <= 0) tid = 1;
+    for (int i = 0; i < VCFG_TLS_SLOTS; i++) {
+        if (__atomic_load_n(&g_in_submit_tid[i], __ATOMIC_ACQUIRE) == tid) {
+            if (__atomic_sub_fetch(&g_in_submit_cnt[i], 1, __ATOMIC_ACQ_REL) <= 0) {
+                __atomic_store_n(&g_in_submit_cnt[i], 0, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_in_submit_tid[i], 0, __ATOMIC_RELEASE);
+            }
+            return;
+        }
+    }
+}
+
 static volatile uint32_t g_wl_direct[2], g_wl_nested[2], g_vo_submit_flips = 0;
 static int g_diag_hooks = 0, g_pad_state_hooked = 0, g_pad_read_hooked = 0;
 
@@ -363,6 +412,9 @@ static long g_pre_gpu_phys = 0, g_pre_work_phys = 0, g_pre_mem_phys = 0, g_dump_
 
 static int g_safe = 0;            // 1: the title is not verified, observe first
 static int g_safe_active = 0;     // 1: the late set-up succeeded, FG may run
+static int g_safe_early = 0;      // 1: this start takes its memory early (state 1)
+static int g_safe_never = 0;      // 1: state 2, never touch the game
+static long g_low_sub2mb_end = 0x200000L; // end of initial partially-used sub-2MB region at boot
 
 #define FLEX_GPU_MAX 8
 typedef struct {
@@ -1275,9 +1327,8 @@ static void cfg_apply_title_defaults(fg_config_t *c)
 {
     if (!g_title_id[0]) return;
     if (vcfg_in_family(g_title_id, "CUSA11456")) {
-        // CUSA11456 / CUSA13323: registers a second buffer group 2..3 after 0..1 and maps via BatchMap.
+        // CUSA11456 / CUSA13323: registers extra buffer groups 2..3, 4..5 after 0..1 and maps arenas via BatchMap.
         c->reg_mode = 1;
-        c->shave_mode = 1;
     } else if (vcfg_in_family(g_title_id, "CUSA08519")) {
         c->shave_mode = 1;
     } else if (vcfg_in_family(g_title_id, "CUSA16734")) {
@@ -1514,11 +1565,11 @@ static void apply_adapt_ini(fg_config_t *c, uint32_t *hash_io)
 {
     if (!g_title_id[0] || strcmp(g_title_id, "UNKNOWN") == 0) return;
     fg_config_t ac;
-    cfg_defaults(&ac);
+    memset(&ac, 0, sizeof(ac));
     char apath[96];
     snprintf(apath, sizeof(apath), LOG_DIR "/adapt-%s.ini", g_title_id);
     if (!parse_ini_file_ex(apath, &ac, hash_io, 1)) return;
-    if (ac.shave_mode > c->shave_mode) c->shave_mode = ac.shave_mode;
+    if (ac.shave_mode > 0) c->shave_mode = ac.shave_mode;
     if (ac.reg_mode   > c->reg_mode)   c->reg_mode   = ac.reg_mode;
     if (c->pace_order == 0 && ac.pace_order > 0) c->pace_order = ac.pace_order;
     if (c->post_mid   == 0 && ac.post_mid   > 0) c->post_mid   = ac.post_mid;
@@ -1601,8 +1652,6 @@ static int is_verified_title(void)
 // 0/none = observe, then try to take memory late; 1 = the late set-up found no free memory (a game that claims the whole
 // pool at its start), so the next start takes the memory early like a verified title; 2 = such an early start did not
 // reach frame INJECT_AFTER_FLIPS (LOG_DIR/safe-<TITLE>.boot marker left behind), so this title only gets observed.
-static int g_safe_early = 0;      // 1: this start takes its memory early (state 1)
-static int g_safe_never = 0;      // 1: state 2, never touch the game
 static void safe_path(char *buf, size_t n, const char *ext) { snprintf(buf, n, LOG_DIR "/safe-%s.%s", g_title_id, ext); }
 static int safe_state_read(void)
 {
@@ -2898,7 +2947,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
 
 int32_t sceGnmSubmitAndFlipCommandBuffers_hook(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
 {
-    if (g_in_submit) {
+    if (vcfg_in_submit_get()) {
         return HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
                              int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
                              count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
@@ -2910,9 +2959,9 @@ int32_t sceGnmSubmitAndFlipCommandBuffers_hook(uint32_t count, void *dcb[], uint
     if (bf) STAGE("SubmitAndFlip #%u enter: count=%u handle=%u index=%u flipMode=%u", bf, count, handle, index, flipMode);
     uint32_t gn = gv_rewrite(count, dcb, dcbSz, ccb, ccbSz, gd, gs, gc, gcs, 1);
     if (gn) { count = gn; dcb = gd; dcbSz = gs; if (ccb) ccb = gc; if (ccbSz) ccbSz = gcs; }
-    g_in_submit++;
+    vcfg_in_submit_inc();
     int32_t rc = flip_inner_ex(0, 0, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
-    g_in_submit--;
+    vcfg_in_submit_dec();
     if (bf) STAGE("SubmitAndFlip #%u done = 0x%08x", bf, (unsigned)rc);
     gv_frame_end();
     return rc;
@@ -2931,7 +2980,7 @@ static volatile uint32_t g_vo_sub_w = 0;
 
 int32_t sceGnmSubmitCommandBuffers_hook(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz)
 {
-    if (g_in_submit) {
+    if (vcfg_in_submit_get()) {
         return HOOK_CONTINUE(sceGnmSubmitCommandBuffers, int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *),
                              count, dcb, dcbSz, ccb, ccbSz);
     }
@@ -2947,20 +2996,20 @@ int32_t sceGnmSubmitCommandBuffers_hook(uint32_t count, void *dcb[], uint32_t *d
     if (g_vt_on && count >= 1 && count <= 16 && dcb && dcbSz)
         vt_rec(VT_SUBMIT, count, dcbSz[count - 1], ccbSz ? ccbSz[count - 1] : 0, (uint32_t)(uintptr_t)dcb[count - 1], (const uint32_t *)dcb[count - 1], dcbSz[count - 1]);
     int32_t rc;
-    g_in_submit++;
+    vcfg_in_submit_inc();
     if (gn)
         rc = HOOK_CONTINUE(sceGnmSubmitCommandBuffers, int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *),
                            gn, gd, gs, ccb ? gc : NULL, ccbSz ? gcs : NULL);
     else
         rc = HOOK_CONTINUE(sceGnmSubmitCommandBuffers, int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *),
                            count, dcb, dcbSz, ccb, ccbSz);
-    g_in_submit--;
+    vcfg_in_submit_dec();
     return rc;
 }
 
 static void wl_count(int k, const char *name)
 {
-    if (g_in_submit) { g_wl_nested[k]++; return; }
+    if (vcfg_in_submit_get()) { g_wl_nested[k]++; return; }
     uint32_t n = ++g_wl_direct[k];
     if (n == 1 || (n % 600u) == 0)
         lg("DIAG: the game calls %s directly (%u calls, %u nested in ours): routed into FG/scanner pipeline\n",
@@ -2969,7 +3018,7 @@ static void wl_count(int k, const char *name)
 int32_t sceGnmSubmitCommandBuffersForWorkload_hook(uint32_t workload, uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], uint32_t *ccbSz)
 {
     wl_count(0, "sceGnmSubmitCommandBuffersForWorkload");
-    if (g_in_submit) {
+    if (vcfg_in_submit_get()) {
         return HOOK_CONTINUE(sceGnmSubmitCommandBuffersForWorkload,
                              int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *),
                              workload, count, dcb, dcbSz, ccb, ccbSz);
@@ -2986,7 +3035,7 @@ int32_t sceGnmSubmitCommandBuffersForWorkload_hook(uint32_t workload, uint32_t c
     if (g_vt_on && count >= 1 && count <= 16 && dcb && dcbSz)
         vt_rec(VT_SUBMIT, count, dcbSz[count - 1], ccbSz ? ccbSz[count - 1] : 0, (uint32_t)(uintptr_t)dcb[count - 1], (const uint32_t *)dcb[count - 1], dcbSz[count - 1]);
     int32_t rc;
-    g_in_submit++;
+    vcfg_in_submit_inc();
     if (gn)
         rc = HOOK_CONTINUE(sceGnmSubmitCommandBuffersForWorkload,
                            int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *),
@@ -2995,14 +3044,14 @@ int32_t sceGnmSubmitCommandBuffersForWorkload_hook(uint32_t workload, uint32_t c
         rc = HOOK_CONTINUE(sceGnmSubmitCommandBuffersForWorkload,
                            int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *),
                            workload, count, dcb, dcbSz, ccb, ccbSz);
-    g_in_submit--;
+    vcfg_in_submit_dec();
     return rc;
 }
 int32_t sceGnmSubmitAndFlipCommandBuffersForWorkload_hook(uint32_t workload, uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[],
                                                           uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg)
 {
     wl_count(1, "sceGnmSubmitAndFlipCommandBuffersForWorkload");
-    if (g_in_submit) {
+    if (vcfg_in_submit_get()) {
         return HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffersForWorkload,
                              int32_t (*)(uint32_t, uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
                              workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
@@ -3014,9 +3063,9 @@ int32_t sceGnmSubmitAndFlipCommandBuffersForWorkload_hook(uint32_t workload, uin
     if (bf) STAGE("SubmitAndFlipForWorkload #%u enter: wl=%u count=%u handle=%u index=%u flipMode=%u", bf, workload, count, handle, index, flipMode);
     uint32_t gn = gv_rewrite(count, dcb, dcbSz, ccb, ccbSz, gd, gs, gc, gcs, 1);
     if (gn) { count = gn; dcb = gd; dcbSz = gs; if (ccb) ccb = gc; if (ccbSz) ccbSz = gcs; }
-    g_in_submit++;
+    vcfg_in_submit_inc();
     int32_t rc = flip_inner_ex(1, workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
-    g_in_submit--;
+    vcfg_in_submit_dec();
     if (bf) STAGE("SubmitAndFlipForWorkload #%u done = 0x%08x", bf, (unsigned)rc);
     gv_frame_end();
     return rc;
@@ -3038,23 +3087,23 @@ static int32_t vout_submit_dcb(uint32_t *mine, uint32_t n_dwords)
     uint32_t send_dw = (n_dwords > 64u && mine[n_dwords - 64u] == k_nop64_pkt[0]) ? (n_dwords - 64u) : n_dwords;
     void *d2[1] = { mine };
     uint32_t s2[1] = { send_dw * 4u };
-    g_in_submit++;
+    vcfg_in_submit_inc();
     int32_t rc = HOOK_CONTINUE(sceGnmSubmitCommandBuffers,
                                int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *),
                                1u, d2, s2, NULL, NULL);
-    g_in_submit--;
+    vcfg_in_submit_dec();
     return rc;
 }
 
 // Full FrameGen + OSD/RCAS pipeline for games that separate sceGnmSubmitCommandBuffers and sceVideoOutSubmitFlip.
 int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode, int64_t arg)
 {
-    if (g_vt_hooked && !g_in_submit) {
+    if (g_vt_hooked && !vcfg_in_submit_get()) {
         if (g_vo_submit_flips + 1u >= VT_START_FLIP && !g_vt_dumped) g_vt_on = 1;
         vt_rec(VT_FLIP, (uint32_t)index, mode, (uint32_t)arg, (uint32_t)handle, NULL, 0);
     }
     // If called from inside sceGnmSubmitAndFlipCommandBuffers (or while SubmitAndFlip is active), pass through.
-    if (g_in_submit || g_flips > 0 || index < 0) {
+    if (vcfg_in_submit_get() || g_flips > 0 || index < 0) {
         int32_t vr = HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t), handle, index, mode, arg);
         if (g_vt_hooked && g_vt_n >= VT_N) vt_dump();
         return vr;
@@ -3399,27 +3448,23 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                                 vcfg_in_family(g_title_id, "CUSA09311") ||
                                 vcfg_in_family(g_title_id, "CUSA18534") ||
                                 vcfg_in_family(g_title_id, "CUSA10123")));
-            int cap_extra = want_pcopy ? (hi_res ? 4 : 6) : (stream_3buf ? 1 : ((hi_res || !g_known_game) ? 2 : 3));
+            int cap_extra = want_pcopy
+                ? (vcfg_in_family(g_title_id, "CUSA11456") ? 2 : (hi_res ? 4 : 6))
+                : (stream_3buf ? 1 : ((hi_res || !g_known_game) ? 2 : 3));
             if (max_extra > cap_extra) max_extra = cap_extra;
             if (one && g_pre_mem) {
                 nm = (int)(g_pre_size / one);
                 if (nm > max_extra) nm = max_extra;
                 if (nm >= 1) {
-                    m = (uint8_t *)g_pre_mem;
-                    // Return any unused 2MB-aligned tail of g_pre_mem to the DirectMemory pool immediately
-                    // (e.g. 8 MB freed in 3-buffer games CUSA17722/CUSA01154 where 3x8MB=24MB of 32MB is used,
-                    // or 14 MB freed in CUSA32946 where 1x17MB of 32MB is used).
+                    // Shrink g_pre_mem from the LOW end via shrink_early_mem_to(used_pre) BEFORE taking m = g_pre_mem,
+                    // so the retained display buffers stay at the very TOP of DirectMemory and the free DirectMemory
+                    // pool below g_pre_mem remains 100% contiguous for post-RegisterBuffers arenas (e.g. CUSA13323,
+                    // CUSA17722, CUSA01154, CUSA32946).
                     size_t used_pre = (one * (size_t)nm + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
                     if (used_pre > 0 && used_pre < g_pre_size) {
-                        size_t tail_free = g_pre_size - used_pre;
-                        long tail_phys = g_pre_mem_phys + (long)used_pre;
-                        sceKernelMunmap((uint8_t *)g_pre_mem + used_pre, tail_free);
-                        if (sceKernelReleaseDirectMemory(tail_phys, tail_free) == 0) {
-                            STAGE("mbufs: released unused 0x%zx tail of g_pre_mem (phys=0x%lx..0x%lx, kept 0x%zx)",
-                                  tail_free, tail_phys, tail_phys + (long)tail_free, used_pre);
-                            g_pre_size = used_pre;
-                        }
+                        shrink_early_mem_to(used_pre);
                     }
+                    m = (uint8_t *)g_pre_mem;
                 }
             }
             for (int want = (mem_tight ? 1 : max_extra); one && !m && want >= 1; want--) {
@@ -3525,7 +3570,7 @@ _Static_assert(sizeof(PadDataRaw) == 0x78, "PadDataRaw size must equal ScePadDat
 static uint64_t g_combo_t = 0, g_pad_last_ts = 0, g_pad_rep_t = 0, g_pad_swallow_until = 0;
 static uint32_t g_pad_prev_nav = 0, g_pad_last_raw = 0;
 static int g_combo_fired = 0;
-static __thread int t_in_pad = 0;
+static volatile int g_in_pad_tid[HOOK_GUARD_SLOTS];
 static volatile uint32_t g_pad_calls[4];
 
 static void pad_swallow(PadDataRaw *pkts, int count)
@@ -3668,21 +3713,21 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
 
 int32_t scePadReadState_hook(int32_t handle, void *data)
 {
-    if (t_in_pad) return HOOK_CONTINUE(scePadReadState, int32_t (*)(int32_t, void *), handle, data);
-    t_in_pad = 1;
+    int slot = tid_guard_enter(g_in_pad_tid, scePthreadGetthreadid());
+    if (slot == -1) return HOOK_CONTINUE(scePadReadState, int32_t (*)(int32_t, void *), handle, data);
     int32_t r = HOOK_CONTINUE(scePadReadState, int32_t (*)(int32_t, void *), handle, data);
     if (r == 0 && data) pad_menu_step((PadDataRaw *)data, 1);
-    t_in_pad = 0;
+    tid_guard_leave(g_in_pad_tid, slot);
     return r;
 }
 
 int32_t scePadRead_hook(int32_t handle, void *data, int32_t num)
 {
-    if (t_in_pad) return HOOK_CONTINUE(scePadRead, int32_t (*)(int32_t, void *, int32_t), handle, data, num);
-    t_in_pad = 1;
+    int slot = tid_guard_enter(g_in_pad_tid, scePthreadGetthreadid());
+    if (slot == -1) return HOOK_CONTINUE(scePadRead, int32_t (*)(int32_t, void *, int32_t), handle, data, num);
     int32_t r = HOOK_CONTINUE(scePadRead, int32_t (*)(int32_t, void *, int32_t), handle, data, num);
     if (r > 0 && data) pad_menu_step((PadDataRaw *)data, r > 64 ? 64 : r);
-    t_in_pad = 0;
+    tid_guard_leave(g_in_pad_tid, slot);
     return r;
 }
 
@@ -3899,9 +3944,11 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
                       g_title_id, INJECT_AFTER_FLIPS);
             }
         }
-        int late_alloc = (!g_bench_enabled && g_cfg.shave_mode == 2);
+        int late_alloc = (!g_bench_enabled &&
+                          (g_cfg.shave_mode == 2 || (g_cfg.shave_mode == 1 && g_cfg.reg_mode == 2)));
         if (late_alloc) {
-            STAGE("dev override: shave_mode=2 (LATE ALLOC) -> skipping all early DirectMemory allocations in plugin_load");
+            STAGE("dev override: late_alloc active (shave_mode=%d reg_mode=%d) -> skipping all early DirectMemory allocations in plugin_load",
+                  g_cfg.shave_mode, g_cfg.reg_mode);
         }
         if (m == 8 && !g_bench_enabled) gv_load(alloc_gv_dm);
 #if VCFG_BENCH
@@ -3943,15 +3990,25 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         if (m >= 1 && m <= 8 && !late_alloc) {
             g_gpu_sz = gv_armed() ? GPU_SZ : GPU_SZ_BASE;
             STAGE("alloc gpu sz=0x%zx (mode %d)", (size_t)g_gpu_sz, m);
-            // If the first 2 MB page [0, 0x200000) is ALREADY partially occupied by the system before plugin_load
-            // (so dm_avail_range(0, 0x200000, 0x200000) == 0, as in CUSA04529 / CUSA00918 / CUSA11456), pack
-            // g_pre_gpu + g_pre_work into [0, 0x200000) so they consume ZERO 2MB-aligned pages and survive intact!
-            // Otherwise (if [0, 0x200000) is a full 2 MB page, as in CUSA17419 / CUSA32946), place them in the
-            // 2 MB page immediately below g_pre_mem_phys so [0, 0x200000) stays unfragmented.
-            size_t low_2mb_full = dm_avail_range(0, 0x200000L, 0x200000u, NULL);
-            size_t low_sub_avail = (low_2mb_full == 0) ? dm_avail_range(0, 0x200000L, 0x10000u, NULL) : 0;
-            if (low_2mb_full == 0 && low_sub_avail >= (size_t)g_gpu_sz + WORK_SZ_8) {
-                g_pre_gpu = alloc_dm_range(0, 0x200000L, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+            // If the lowest 2 MB page below the first 2MB-aligned free address is ALREADY partially occupied by the
+            // system before plugin_load (e.g. [0, 0x200000) in CUSA04529/CUSA10249/CUSA07820/CUSA00918, or
+            // [0x18000000, 0x18200000) in CUSA11456/CUSA13323), pack g_pre_gpu + g_pre_work at the top of that
+            // sub-2MB page ([first_2mb_start - 0x1C0000, first_2mb_start)) so they consume ZERO 2MB-aligned pages,
+            // leave the bottom 128..192 KB of that sub-2MB page free for small game allocations, and survive intact!
+            // Otherwise (if 0x0 is a full 2 MB page, as in CUSA17419 / CUSA32946), place them in the 2 MB page
+            // immediately below g_pre_mem_phys so [0, 0x200000) stays unfragmented.
+            off_t first_2mb_start = 0;
+            size_t tot_2mb = dm_avail_range(0, (long)sceKernelGetDirectMemorySize(), 0x200000u, &first_2mb_start);
+            g_low_sub2mb_end = (tot_2mb > 0 && first_2mb_start >= 0x200000L) ? (long)first_2mb_start : 0x200000L;
+            if (tot_2mb > 0 && first_2mb_start >= 0x200000L) {
+                long sub_page_s = (long)first_2mb_start - 0x200000L;
+                long sub_top_s  = (long)first_2mb_start - 0x1C0000L;
+                size_t need_pack = (size_t)g_gpu_sz + WORK_SZ_8;
+                if (dm_avail_range(sub_top_s, (long)first_2mb_start, 0x10000u, NULL) >= need_pack) {
+                    g_pre_gpu = alloc_dm_range(sub_top_s, (long)first_2mb_start, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+                } else if (dm_avail_range(sub_page_s, (long)first_2mb_start, 0x10000u, NULL) >= need_pack) {
+                    g_pre_gpu = alloc_dm_range(sub_page_s, (long)first_2mb_start, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+                }
             }
             if (!g_pre_gpu && g_pre_mem && g_pre_mem_phys >= 0x200000L) {
                 g_pre_gpu = alloc_dm_range(g_pre_mem_phys - 0x200000L, g_pre_mem_phys, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);

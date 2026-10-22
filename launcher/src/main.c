@@ -1500,7 +1500,7 @@ static void do_telemetry_toggle(App *a)
 {
     a->net_telemetry = !a->net_telemetry;
     save_settings(a);
-    snprintf(a->status, sizeof(a->status), "NET CRASH AUTO-SEND: %s (%s)",
+    snprintf(a->status, sizeof(a->status), "NET TELEMETRY (AUTO-CRASH & REPORT UPLOAD): %s (%s)",
              a->net_telemetry ? "ON" : "OFF",
              a->telemetry_host[0] ? a->telemetry_host : "set host in /data/bb_probe/telemetry.ini");
     addlog(a, a->status);
@@ -1608,7 +1608,7 @@ static void do_report(App *a)
     if (jrc == 0) sys_sdk_unjailbreak(&jb);
     if (!usb) addlog(a, "NO USB STICK: SAVED TO /DATA/VCFG_REPORT.TXT");
 
-    if (a->telemetry_host[0]) {
+    if (a->net_telemetry && a->telemetry_host[0]) {
         const char *tid = (a->ngames && a->sel >= 0 && a->sel < a->ngames) ? a->games[a->sel].id : "GLOBAL";
         char rep_id[16] = "";
         int nrc = net_send_report(a->telemetry_host, a->telemetry_port, tid, "manual", r.b, r.n, rep_id, sizeof(rep_id));
@@ -1621,6 +1621,8 @@ static void do_report(App *a)
             addlog(a, m);
             snprintf(a->status, sizeof(a->status), "%s", m);
         }
+    } else if (!a->net_telemetry) {
+        snprintf(a->status, sizeof(a->status), "SAVED /DATA/VCFG_REPORT.TXT (NET UPLOAD OFF - PRESS L2 TO ENABLE)");
     } else {
         snprintf(a->status, sizeof(a->status), "SAVED /DATA/VCFG_REPORT.TXT (SET host IN telemetry.ini FOR VPS UPLOAD)");
     }

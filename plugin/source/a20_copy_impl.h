@@ -144,8 +144,14 @@ static unsigned a21_cs_first_full,a21_cs_first_partial,a21_cs_nodispatch,a21_ski
 static unsigned a21_carry_used,a21_carry_refused;
 static uint64_t a21_disc_report_at;
 static uint64_t a21_n_hold_repeat,a21_i_hold_repeat;
+int scePthreadGetthreadid(void);
 static volatile uint32_t a21_nonflip_submits; // game sceGnmSubmitCommandBuffers calls (A21_COUNT_SUBMITS hook)
-static __thread int a21_own_submit;
+static volatile int a21_own_submit_tid = 0;
+static inline int a21_is_own_submit(void)
+{
+    int tid = __atomic_load_n(&a21_own_submit_tid, __ATOMIC_ACQUIRE);
+    return tid != 0 && scePthreadGetthreadid() == tid;
+}
 static uint32_t a21_prev_full_known,a21_submits_at_prev;
 static const char *volatile a21_stop_reason="none";
 static volatile uint32_t *a21_label3;   // S9: WaitFlipDone label of index 3
@@ -1459,9 +1465,9 @@ static int a20_try_submit(uint32_t count,void **dcb,uint32_t *sizes,void **ccb,u
     if (!*result && !native_rc) {
         void *qd[1]={queue_fence};uint32_t qs[1]={(uint32_t)(queue_fence_end-queue_fence)*4u};
         // Our own fence submit passes through the counting hook; it changes no compute register, so exclude it.
-        a21_own_submit=1;
+        __atomic_store_n(&a21_own_submit_tid, scePthreadGetthreadid(), __ATOMIC_RELEASE);
         probe_rc=sceGnmSubmitCommandBuffers(1,qd,qs,NULL,NULL);
-        a21_own_submit=0;
+        __atomic_store_n(&a21_own_submit_tid, 0, __ATOMIC_RELEASE);
     }
 
     a20_copies++;
