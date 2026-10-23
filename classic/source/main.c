@@ -65,13 +65,21 @@ typedef struct {
     int reg_mode;        // 0 = auto (inline extend + auto-reloc), 1 = separate group at top (16-N), 2 = deferred (frame 120)
     int post_mid;        // 0 = auto, 1 = generated mid frames only, 2 = generated + real frames
     int manual_mode;     // 0 = auto (algorithm), 1 = manual dev overrides active in config-<TITLE>.ini
+    int vout_path;       // 0 = auto, 1 = decoupled sceVideoOutSubmitFlip path learned at runtime
+    int gv_conv;         // -1 = auto/uncalibrated, 0..15 = learned motion-vector convention
 } fg_config_t;
 
 static char g_title_id[16] = "UNKNOWN";
 static int g_known_game = 0;
 static int g_is_game_proc = 1;
-static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0 };
-static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0 };
+static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0, 0, -1 };
+static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0, 0, -1 };
+static volatile uint32_t g_mem_hibernate_count = 0;
+static volatile uint32_t g_vout_fg_inited = 0;
+static volatile uint32_t g_injects = 0;
+static uint32_t g_last_adapt_sig = 0;
+volatile int g_gv_cal_winner = -1;
+volatile int g_gv_cal_locked = 0;
 static volatile int g_last_pace_pre = 1;
 static volatile int g_menu_open = 0, g_menu_sel = 0, g_cfg_save_req = 0;
 static volatile uint64_t g_osd_toast_until = 0;
@@ -331,6 +339,15 @@ static uint32_t g_sh8_off[17];         // code offsets in g_gpu: 0..9 pyr8..mf8,
 static uint32_t g_st_n = 0, g_st_cut_max = 0, g_st_cuts = 0, g_st_fgf = 0, g_st_fades = 0;
 static uint64_t g_st_cut_sum = 0, g_st_fg_sum = 0;
 static int32_t g_st_gmx = 0, g_st_gmy = 0;
+static uint64_t g_pyr_last_cur_base = 0;
+static uint32_t g_pyr_last_w = 0, g_pyr_last_h = 0, g_pyr_parity = 0;
+static uint32_t g_pyr_warm_hits = 0, g_pyr_cold_misses = 0;
+static inline void pyr_cache_invalidate(void)
+{
+    g_pyr_last_cur_base = 0;
+    g_pyr_last_w = 0;
+    g_pyr_last_h = 0;
+}
 static int g_sh8_ok = 0;
 static int g_opt_phase = 0, g_opt_early = 0, g_opt_marker = 0;
 static volatile int g_fg_off = 0;
@@ -428,9 +445,28 @@ typedef struct {
 static FlexGpuSlot g_flex_gpu_slots[FLEX_GPU_MAX];
 
 static volatile int g_own_alloc;
+#ifndef VCFG_PBUF_STATE_DEFINED
+#define VCFG_PBUF_STATE_DEFINED
+static void *g_pbuf = NULL;
+static long g_pbuf_phys = 0;
+static size_t g_pbuf_sz = 0;
+static int g_pbuf_ycocg = 0;
+static int g_pbuf_valid = 0;
+static uint32_t g_pbuf_last_seq = 0;
+static uint64_t g_pbuf_prev_va = 0;
+static uint32_t g_flip_ring_hist[8] __attribute__((unused));
+static uint32_t g_flip_ring_cnt __attribute__((unused)) = 0;
+#endif
 
 static void free_dm_block(void **va, long *phys, size_t *sz, const char *tag)
 {
+    if (va != &g_pbuf && g_pbuf && (va == &g_pre_mem || (va == &g_pre_work && (g_flips > 0 || g_gpu_state > 0)))) {
+        free_dm_block(&g_pbuf, &g_pbuf_phys, &g_pbuf_sz, "pbuf");
+        g_pbuf_ycocg = 0;
+        g_pbuf_valid = 0;
+        g_pbuf_last_seq = 0;
+        g_pbuf_prev_va = 0;
+    }
     if (!*va || !*sz) return;
     void *v = *va;
     long p = *phys;
@@ -465,6 +501,14 @@ static void free_dm_block(void **va, long *phys, size_t *sz, const char *tag)
     STAGE("memory valve: released %s va=%p phys=0x%lx len=0x%zx unmap=0x%08x release=0x%08x",
           tag, v, p, s, (unsigned)um, (unsigned)rr);
 }
+static void release_pbuf(void)
+{
+    free_dm_block(&g_pbuf, &g_pbuf_phys, &g_pbuf_sz, "pbuf");
+    g_pbuf_ycocg = 0;
+    g_pbuf_valid = 0;
+    g_pbuf_last_seq = 0;
+    g_pbuf_prev_va = 0;
+}
 static void release_early_dump(void)
 {
     size_t sz = g_dump_mem ? (size_t)DUMP_SZ : 0;
@@ -475,12 +519,15 @@ static void release_early_dump(void)
 static void release_early_mem(void)
 {
     free_dm_block(&g_pre_mem, &g_pre_mem_phys, &g_pre_size, "display");
+    if (g_mbuf_state == 1) g_mbuf_state = -1;
+    pyr_cache_invalidate();
 }
 static void release_early_work(void)
 {
     free_dm_block(&g_pre_work, &g_pre_work_phys, &g_pre_work_sz, "work");
     g_work = NULL;
     g_work_garlic = 0;
+    pyr_cache_invalidate();
 }
 static void release_early_gpu(void)
 {
@@ -605,6 +652,52 @@ static void *alloc_gv_dm(size_t len, size_t align, int type)
     return alloc_dm(len, align, type);
 }
 
+// Allocate an offscreen history buffer (g_pbuf) for 2-buffer titles when VideoOut present-copy buffers (m2)
+// could not be allocated from DirectMemory (or to protect T#prev from being overwritten by Frame N+1).
+// Priority:
+//   1. If DirectMemory is not tight and has >= full_sz + 64 MB free, allocate full_sz from DirectMemory.
+//   2. Otherwise, query FlexibleMemory: if >= 24 MB is free, allocate full_sz (8 MB at 1080p) via alloc_flex_gpu
+//      (0 DirectMemory bytes).
+//   3. If FlexibleMemory is tight (< 24 MB free), fall back to a 50%-footprint 16-bit surface (half_sz = 4.25 MB
+//      at 1080p, g_pbuf_ycocg = 1) via alloc_flex_gpu (0 DirectMemory bytes).
+static void *alloc_pbuf_history(size_t surf_sz) __attribute__((unused));
+static void *alloc_pbuf_history(size_t surf_sz)
+{
+    if (g_pbuf && g_pbuf_sz > 0) return g_pbuf;
+    if (!surf_sz) surf_sz = 0x800000u;
+    size_t full_sz = (surf_sz + 0xFFFFu) & ~(size_t)0xFFFFu;
+    size_t half_sz = ((surf_sz >> 1) + 0x3FFFFu) & ~(size_t)0xFFFFu;
+    if (half_sz < 0x440000u && full_sz >= 0x7E9000u) half_sz = 0x440000u;
+    size_t flex_av = 0;
+    int fq = ((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av);
+    int prefer_half = (fq == 0 && flex_av > 0 && flex_av < 0x1800000u);
+    if (!prefer_half) {
+        void *fl = alloc_flex_gpu(full_sz, 0x10000u);
+        if (fl) {
+            g_pbuf = fl;
+            g_pbuf_phys = -1L;
+            g_pbuf_sz = full_sz;
+            g_pbuf_ycocg = 0;
+            g_pbuf_valid = 0;
+            STAGE("alloc_pbuf_history: full FlexibleMemory buffer va=%p sz=0x%zx (flex_av=0x%zx, 0 DirectMemory bytes)",
+                  fl, full_sz, flex_av);
+            return fl;
+        }
+    }
+    void *fl_half = alloc_flex_gpu(half_sz, 0x10000u);
+    if (fl_half) {
+        g_pbuf = fl_half;
+        g_pbuf_phys = -1L;
+        g_pbuf_sz = half_sz;
+        g_pbuf_ycocg = 1;
+        g_pbuf_valid = 0;
+        STAGE("alloc_pbuf_history: 50%% compressed YCoCg-R 16b FlexibleMemory buffer va=%p sz=0x%zx (flex_av=0x%zx, 0 DirectMemory bytes)",
+              fl_half, half_sz, flex_av);
+        return fl_half;
+    }
+    return NULL;
+}
+
 static void *alloc_work_early(size_t wsz, int type)
 {
     size_t dm_sz = sceKernelGetDirectMemorySize();
@@ -643,8 +736,13 @@ static int try_recover_hibernated_work_at(uint32_t cur_flips)
     if (!__atomic_load_n(&g_mem_hibernating, __ATOMIC_ACQUIRE)) return 0;
     uint32_t hib_flip = __atomic_load_n(&g_hibernated_at_flip, __ATOMIC_ACQUIRE);
     if (cur_flips < hib_flip + 180u) return 0;
+    if (g_mbuf_state == 1 && g_pre_mem == NULL) {
+        g_mbuf_state = -1;
+    }
+    if (g_mbuf_state < 0) return 0;
     if (g_pre_work) {
         g_work = (uint8_t *)g_pre_work;
+        pyr_cache_invalidate();
         __atomic_store_n(&g_mem_hibernating, 0, __ATOMIC_RELEASE);
         return 1;
     }
@@ -669,6 +767,7 @@ static int try_recover_hibernated_work_at(uint32_t cur_flips)
     g_pre_work = w;
     g_work = (uint8_t *)w;
     g_work_garlic = (g_pre_work_phys >= 0);
+    pyr_cache_invalidate();
     __atomic_store_n(&g_mem_hibernating, 0, __ATOMIC_RELEASE);
     STAGE("hibernation recovery at flip %u (hibernated at %u): re-allocated g_work=%p phys=0x%lx sz=0x%zx (dm_free_2m=0x%zx)",
           cur_flips, hib_flip, w, g_pre_work_phys, wsz, dm2m);
@@ -677,13 +776,15 @@ static int try_recover_hibernated_work_at(uint32_t cur_flips)
 
 static int try_recover_hibernated_work(void)
 {
-    return try_recover_hibernated_work_at(g_flips);
+    uint32_t total_flips = g_flips + g_vo_submit_flips;
+    return try_recover_hibernated_work_at(total_flips);
 }
 
 static int on_sub_hibernation_gate(uint32_t cur_flips)
 {
     if (!__atomic_load_n(&g_mem_hibernating, __ATOMIC_ACQUIRE)) return 0;
     if (try_recover_hibernated_work_at(cur_flips)) return 0;
+    pyr_cache_invalidate();
     return 1;
 }
 
@@ -805,6 +906,7 @@ static void gpu_init(void)
     g_gpu = (uint8_t *)addr;
     __atomic_store_n(&g_done, (volatile uint32_t *)((uint8_t *)addr + SLOT0 + 0x900), __ATOMIC_RELEASE);
     g_gpu_state = 1;
+    pyr_cache_invalidate();
     STAGE("gpu_init ok at %p work %p", addr, (void *)g_work);
     lg("gpu_init: ok at %p (%s), work %p\n", addr, g_pre_gpu ? "early" : "late", (void *)g_work);
 }
@@ -1125,6 +1227,7 @@ static uint32_t build_dcb_post8(uint32_t *p0, uint64_t C, uint32_t w, uint32_t h
     uint64_t lbl = (uint64_t)(uintptr_t)(slotb + 0x900), lbl2 = lbl + 8;
     uint64_t gb = (uint64_t)(uintptr_t)g_gpu;
     uint32_t rcas_con_bits = 0, rcas_flags = 0, osd_xy = 0, osd_wh = 0;
+    pyr_cache_invalidate();
 
     calc_rcas_params(2u /*cur only*/, &rcas_con_bits, &rcas_flags);
     if (g_sh8_off[15]) osd_build_slot(slotb + OSD_SLOT_OFF, &osd_xy, &osd_wh, 2u /*cur only*/);
@@ -1216,7 +1319,12 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
                                 uint64_t copy_dst, uint32_t copy_idx)
 {
     uint32_t *p = p0;
-    uint32_t r = seq & 1;
+    int pyr_warm = (P != 0 && P != C && P == g_pyr_last_cur_base && g_bw == g_pyr_last_w && g_bh == g_pyr_last_h);
+    uint32_t r = pyr_warm ? (g_pyr_parity ^ 1u) : 0u;
+    g_pyr_parity = r;
+    g_pyr_last_cur_base = C;
+    g_pyr_last_w = g_bw;
+    g_pyr_last_h = g_bh;
     uint8_t *slotb = g_gpu + SLOT0 + slot * SLOT_SZ;
     uint32_t *tb = (uint32_t *)(slotb + 0xB00);
     uint64_t tbl = (uint64_t)(uintptr_t)tb;
@@ -1229,8 +1337,10 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
                         | (g_opt_nocf ? 8u : 0u) | (g_opt_nofgk ? 16u : 0u) | (g_opt_noanc ? 32u : 0u)
                         | (g_opt_notp ? 64u : 0u) | (g_opt_nomf ? 128u : 0u) | (g_opt_notex ? 256u : 0u)
                         | (g_opt_notpg ? 512u : 0u) | (g_opt_sharp ? 1024u : 0u) | (g_opt_nostr ? 2048u : 0u)
+                        | (pyr_warm ? FG8_FLAG_PYR_WARM : 0u)
                         | (cut_blocks8() << 16);
     uint32_t mid1_packed = (mid1_idx & 0x7FFFu) | ((t1_q16 & 0xFFFFu) << 16);
+    if (!g_bench_offscreen) fg8_resolve_2buf_history(&P, C, &copy_dst, &copy_idx, seq);
 
     fill_table8_wh(tb, P, C, M1, g_bw, g_bh, pitch, tidx, r, mid1_packed, base_flags, g_work, g_mon, stats);
 
@@ -1379,15 +1489,15 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         g_dump_req = 0;
         g_dump_frame = seq;
     }
-    if (copy_dst && g_sh8_off[16]) {   // present copy: finished real frame -> own display buffer (see g_pcopy_avail)
+    if (copy_dst && g_sh8_off[16]) {   // present copy: finished real frame -> own display or history buffer (see g_pcopy_avail / g_pbuf)
         uint32_t *tb3 = (uint32_t *)(slotb + OSD_SLOT_OFF);   // old text-grid OSD area, unused since the bitmap overlay
         uint64_t tbl3 = (uint64_t)(uintptr_t)tb3;
-        memset(tb3, 0, 0x60);
-        make_t(tb3 + 8, C, g_bw, g_bh, pitch, tidx);
-        make_t(tb3 + 16, copy_dst, g_bw, g_bh, pitch, tidx);
-        int32_t fr3 = insert_wait_flip_done(p, 7, vo_handle, copy_idx);
-        if (fr3 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
-        p += 7;
+        fill_pcopy8_table(tb3, C, copy_dst, g_bw, g_bh, pitch, tidx, g_pcopy_dst_half16, g_pcopy_ycocg_mode);
+        if (copy_idx != 0xFFFFu) {
+            int32_t fr3 = insert_wait_flip_done(p, 7, vo_handle, copy_idx);
+            if (fr3 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
+            p += 7;
+        }
         PASS_BARRIER();
         *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; // inv scalar cache
         *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl3; *p++ = (uint32_t)(tbl3 >> 32);
@@ -1487,6 +1597,8 @@ static void cfg_defaults(fg_config_t *c)
     c->reg_mode       = 0;
     c->post_mid       = 0;
     c->manual_mode    = 0;
+    c->vout_path      = 0;
+    c->gv_conv        = -1;
     cfg_apply_title_defaults(c);
 }
 
@@ -1527,6 +1639,8 @@ static int parse_ini_file_ex(const char *path, fg_config_t *c, uint32_t *hash_io
                 else if (strcmp(key, "shave_mode") == 0) raw_shave = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "reg_mode") == 0) raw_reg = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "post_mid") == 0) raw_post = val < 0 ? 0 : (val > 2 ? 2 : val);
+                else if (strcmp(key, "vout_path") == 0) c->vout_path = (val != 0);
+                else if (strcmp(key, "gv_conv") == 0) c->gv_conv = val < -1 ? -1 : (val > 15 ? 15 : val);
                 else if (strcmp(key, "hud_protect") == 0) c->hud_protect = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "game_vectors") == 0) c->game_vectors = (val != 0);
                 else if (strcmp(key, "tile_idx") == 0) g_tile_override = val < 0 ? -1 : (val > 31 ? 31 : val);
@@ -1554,6 +1668,97 @@ static int parse_ini_file_ex(const char *path, fg_config_t *c, uint32_t *hash_io
 static int parse_ini_file(const char *path, fg_config_t *c, uint32_t *hash_io)
 {
     return parse_ini_file_ex(path, c, hash_io, 0);
+}
+
+static int load_adapt_ini(fg_config_t *c, uint32_t *hash_io)
+{
+    if (!g_title_id[0] || strcmp(g_title_id, "UNKNOWN") == 0) return 0;
+    fg_config_t ac;
+    memset(&ac, 0, sizeof(ac));
+    ac.gv_conv = -1;
+    char apath[96];
+    snprintf(apath, sizeof(apath), LOG_DIR "/adapt-%s.ini", g_title_id);
+    if (!parse_ini_file_ex(apath, &ac, hash_io, 1)) return 0;
+    if (ac.two_buffer) c->two_buffer = 1;
+    if (c->present_copy == 0 && ac.present_copy > 0) c->present_copy = ac.present_copy;
+    if (ac.shave_mode > 0) c->shave_mode = ac.shave_mode;
+    if (ac.reg_mode   > c->reg_mode)   c->reg_mode   = ac.reg_mode;
+    if (c->pace_order == 0 && ac.pace_order > 0) c->pace_order = ac.pace_order;
+    if (c->post_mid   == 0 && ac.post_mid   > 0) c->post_mid   = ac.post_mid;
+    if (ac.vout_path) c->vout_path = 1;
+    if (ac.gv_conv >= 0) {
+        c->gv_conv = ac.gv_conv;
+        g_gv_cal_winner = ac.gv_conv;
+    }
+    return 1;
+}
+
+static void apply_adapt_ini(fg_config_t *c, uint32_t *hash_io)
+{
+    load_adapt_ini(c, hash_io);
+}
+
+static int save_adapt_ini(void)
+{
+    if (!g_title_id[0] || strncmp(g_title_id, "CUSA", 4) != 0) return 0;
+    fg_config_t ac;
+    memset(&ac, 0, sizeof(ac));
+    ac.gv_conv = -1;
+    load_adapt_ini(&ac, NULL);
+    if (g_mem_hibernate_count > 0) {
+        if (ac.shave_mode == 0) ac.shave_mode = (g_cfg.shave_mode > 0) ? g_cfg.shave_mode : 2;
+        if (ac.reg_mode == 0)   ac.reg_mode   = (g_cfg.reg_mode > 0)   ? g_cfg.reg_mode   : 1;
+    }
+    if (g_ngame == 2) {
+        ac.two_buffer = 1;
+        if (g_game_idx_hi > 2 && ac.reg_mode == 0) ac.reg_mode = 1;
+    }
+    if (g_vout_fg_inited > 0 && g_injects == 0) {
+        ac.vout_path = 1;
+    }
+    if (g_gv_cal_locked > 0 && g_gv_cal_winner >= 0) {
+        ac.gv_conv = g_gv_cal_winner;
+    }
+    if (!ac.two_buffer && !ac.shave_mode && !ac.reg_mode && !ac.pace_order &&
+        !ac.post_mid && !ac.vout_path && ac.gv_conv < 0) {
+        return 0;
+    }
+    uint32_t sig = 2166136261u;
+    sig = fnv1a_bytes(sig, &ac.two_buffer, sizeof(ac.two_buffer));
+    sig = fnv1a_bytes(sig, &ac.shave_mode, sizeof(ac.shave_mode));
+    sig = fnv1a_bytes(sig, &ac.reg_mode, sizeof(ac.reg_mode));
+    sig = fnv1a_bytes(sig, &ac.pace_order, sizeof(ac.pace_order));
+    sig = fnv1a_bytes(sig, &ac.post_mid, sizeof(ac.post_mid));
+    sig = fnv1a_bytes(sig, &ac.vout_path, sizeof(ac.vout_path));
+    sig = fnv1a_bytes(sig, &ac.gv_conv, sizeof(ac.gv_conv));
+    if (sig == g_last_adapt_sig) return 0;
+    g_last_adapt_sig = sig;
+
+    char apath[96], abuf[320];
+    snprintf(apath, sizeof(apath), LOG_DIR "/adapt-%s.ini", g_title_id);
+    int pos = snprintf(abuf, sizeof(abuf), "; runtime auto-healer profile for %s\n", g_title_id);
+    if (ac.two_buffer > 0 && pos < (int)sizeof(abuf))
+        pos += snprintf(abuf + pos, sizeof(abuf) - (size_t)pos, "two_buffer = %d\n", ac.two_buffer);
+    if (ac.shave_mode > 0 && pos < (int)sizeof(abuf))
+        pos += snprintf(abuf + pos, sizeof(abuf) - (size_t)pos, "shave_mode = %d\n", ac.shave_mode);
+    if (ac.reg_mode > 0 && pos < (int)sizeof(abuf))
+        pos += snprintf(abuf + pos, sizeof(abuf) - (size_t)pos, "reg_mode = %d\n", ac.reg_mode);
+    if (ac.pace_order > 0 && pos < (int)sizeof(abuf))
+        pos += snprintf(abuf + pos, sizeof(abuf) - (size_t)pos, "pace_order = %d\n", ac.pace_order);
+    if (ac.post_mid > 0 && pos < (int)sizeof(abuf))
+        pos += snprintf(abuf + pos, sizeof(abuf) - (size_t)pos, "post_mid = %d\n", ac.post_mid);
+    if (ac.vout_path > 0 && pos < (int)sizeof(abuf))
+        pos += snprintf(abuf + pos, sizeof(abuf) - (size_t)pos, "vout_path = %d\n", ac.vout_path);
+    if (ac.gv_conv >= 0 && pos < (int)sizeof(abuf))
+        pos += snprintf(abuf + pos, sizeof(abuf) - (size_t)pos, "gv_conv = %d\n", ac.gv_conv);
+    sceKernelMkdir(LOG_DIR, 0777);
+    int fd = sceKernelOpen(apath, 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0666);
+    if (fd < 0 || pos <= 0) return 0;
+    sceKernelWrite(fd, abuf, (size_t)pos);
+    sceKernelClose(fd);
+    STAGE("self-adapt saved %s: two_buffer=%d shave_mode=%d reg_mode=%d pace_order=%d vout_path=%d gv_conv=%d",
+          apath, ac.two_buffer, ac.shave_mode, ac.reg_mode, ac.pace_order, ac.vout_path, ac.gv_conv);
+    return 1;
 }
 
 static void cfg_apply_live(const fg_config_t *c, const char *reason)
@@ -1609,6 +1814,7 @@ static int read_present_copy_raw(void)
         snprintf(gpath, sizeof(gpath), LOG_DIR "/config-%s.ini", g_title_id);
         parse_ini_file(gpath, &c, NULL);
     }
+    load_adapt_ini(&c, NULL);
     return c.present_copy; // 0 = Auto, 1 = 2-Buffer (Force On), 2 = Standard (Force Off)
 }
 static int read_two_buffer_raw(void)
@@ -1621,6 +1827,7 @@ static int read_two_buffer_raw(void)
         snprintf(gpath, sizeof(gpath), LOG_DIR "/config-%s.ini", g_title_id);
         parse_ini_file(gpath, &c, NULL);
     }
+    load_adapt_ini(&c, NULL);
     if (c.present_copy == 2) return 0;   // STANDARD buffer mode forced: no virtual queue
     if (c.present_copy == 1 || c.two_buffer) return 1;
     if (vcfg_in_family(g_title_id, "CUSA17419") || vcfg_in_family(g_title_id, "CUSA05571") ||
@@ -1699,20 +1906,6 @@ static void check_title_version_upgrade(void)
     }
 }
 
-static void apply_adapt_ini(fg_config_t *c, uint32_t *hash_io)
-{
-    if (!g_title_id[0] || strcmp(g_title_id, "UNKNOWN") == 0) return;
-    fg_config_t ac;
-    memset(&ac, 0, sizeof(ac));
-    char apath[96];
-    snprintf(apath, sizeof(apath), LOG_DIR "/adapt-%s.ini", g_title_id);
-    if (!parse_ini_file_ex(apath, &ac, hash_io, 1)) return;
-    if (ac.shave_mode > 0) c->shave_mode = ac.shave_mode;
-    if (ac.reg_mode   > c->reg_mode)   c->reg_mode   = ac.reg_mode;
-    if (c->pace_order == 0 && ac.pace_order > 0) c->pace_order = ac.pace_order;
-    if (c->post_mid   == 0 && ac.post_mid   > 0) c->post_mid   = ac.post_mid;
-}
-
 static void load_early_adapt_cfg(void)
 {
     fg_config_t c;
@@ -1724,10 +1917,13 @@ static void load_early_adapt_cfg(void)
         parse_ini_file(gpath, &c, NULL);
     }
     apply_adapt_ini(&c, NULL);
+    g_cfg.two_buffer = c.two_buffer;
     g_cfg.pace_order = c.pace_order;
     g_cfg.shave_mode = c.shave_mode;
     g_cfg.reg_mode   = c.reg_mode;
     g_cfg.post_mid   = c.post_mid;
+    g_cfg.vout_path  = c.vout_path;
+    g_cfg.gv_conv    = c.gv_conv;
 }
 
 static void *alloc_mbufs(size_t total)
@@ -1779,7 +1975,86 @@ static uint32_t game_idx_end(void)
 static int mbufs_ready(uint32_t handle)
 {
     (void)handle;
+    if (g_mbuf_state == 1 && !g_pre_mem) {
+        g_mbuf_state = -1;
+        g_pcopy_avail = (g_pbuf != NULL) ? 1 : 0;
+        g_pcopy_on = 0;
+        return 0;
+    }
     return g_mbuf_state == 1;
+}
+
+static size_t safe_surface_stride(void);
+static void on_register_buffers_2buf(int count, size_t surf_sz)
+{
+    g_flip_ring_cnt = 0;
+    g_pbuf_valid = 0;
+    g_pbuf_last_seq = 0;
+    g_pbuf_prev_va = 0;
+    g_t_prev_half16 = 0;
+    g_pcopy_dst_half16 = 0;
+    g_pcopy_ycocg_mode = 0;
+    if (count == 2 || g_cfg.present_copy == 1 || g_cfg.two_buffer == 1) {
+        if (count == 2) g_runtime_2buf = 1;
+        if (g_cfg.present_copy != 2) {
+            if (count == 2 || g_cfg.two_buffer == 1) g_vq_on = 1;
+            if (!g_pcopy_avail || g_pcopy_k < 2) {
+                if (alloc_pbuf_history(surf_sz)) {
+                    g_pcopy_avail = 1;
+                }
+            }
+        }
+        STAGE("2-buffer setup at RegisterBuffers (count=%d): runtime_2buf=%d vq_on=%d pcopy_avail=%d pbuf=%p (sz=0x%zx ycocg=%d)",
+              count, g_runtime_2buf, g_vq_on, g_pcopy_avail, g_pbuf, g_pbuf_sz, g_pbuf_ycocg);
+    } else {
+        g_runtime_2buf = 0;
+        if (g_pbuf) release_pbuf();
+    }
+}
+
+static void on_flip_2buf_track(uint32_t idx)
+{
+    g_flip_ring_hist[g_flip_ring_cnt & 7u] = idx;
+    g_flip_ring_cnt++;
+    if (g_flip_ring_cnt >= 6u) {
+        uint32_t b0 = g_flip_ring_hist[(g_flip_ring_cnt - 1u) & 7u];
+        uint32_t b1 = 0xFFFFFFFFu;
+        int only_two = 1;
+        for (uint32_t k = 1; k < 6u; k++) {
+            uint32_t v = g_flip_ring_hist[(g_flip_ring_cnt - 1u - k) & 7u];
+            if (v == b0) continue;
+            if (b1 == 0xFFFFFFFFu) { b1 = v; continue; }
+            if (v != b1) { only_two = 0; break; }
+        }
+        if (only_two && b1 != 0xFFFFFFFFu && b0 != b1) {
+            if (!g_runtime_2buf) {
+                g_runtime_2buf = 1;
+                if (g_cfg.present_copy != 2) {
+                    g_vq_on = 1;
+                    if (!g_pbuf && (!g_pcopy_avail || g_pcopy_k < 2)) {
+                        if (alloc_pbuf_history(safe_surface_stride())) {
+                            g_pcopy_avail = 1;
+                        }
+                    }
+                }
+                pyr_cache_invalidate();
+                STAGE("2-buffer flip ring detected at runtime (indices %u,%u): vq_on=%d pcopy_avail=%d pbuf=%p (sz=0x%zx ycocg=%d)",
+                      b0, b1, g_vq_on, g_pcopy_avail, g_pbuf, g_pbuf_sz, g_pbuf_ycocg);
+            }
+        } else if (g_runtime_2buf && g_ngame > 2 && g_cfg.two_buffer == 0 && g_cfg.present_copy != 1) {
+            g_runtime_2buf = 0;
+            g_vq_on = 0;
+            g_pbuf_valid = 0;
+            g_pbuf_prev_va = 0;
+            pyr_cache_invalidate();
+        }
+    }
+    if ((g_ngame == 2 || g_runtime_2buf || g_vq_on) && g_cfg.present_copy != 2 &&
+        !g_pbuf && (!g_pcopy_avail || g_pcopy_k < 2)) {
+        if (alloc_pbuf_history(safe_surface_stride())) {
+            g_pcopy_avail = 1;
+        }
+    }
 }
 
 // ---- safe mode (titles not verified on hardware) ----
@@ -1980,6 +2255,7 @@ static void safe_try_activate(uint32_t handle)
     g_pcopy_k = nm >= 6 ? 3 : (nm >= 4 ? 2 : 1);
     g_nmid = g_pcopy_avail ? g_pcopy_k : (nm < 3 ? nm : 3);
     g_mbuf_state = 1;
+    on_register_buffers_2buf(g_ngame, one);
     int32_t rr = HOOK_CONTINUE(sceVideoOutSetFlipRate, int32_t (*)(int32_t, int32_t), (int32_t)handle, 0);
     g_safe_active = 1;
     g_inert_reason[0] = 0;
@@ -2215,6 +2491,7 @@ static void *io_thread(void *arg)
                   rw ? g_api_ring[(rw - 1u) % API_RING_N] : "none");
         }
         if ((poll_n % 250) == 0 && g_inject_on == 8 && !g_bench_enabled) {
+            save_adapt_ini();
             cfg_reload_from_disk(0);
         }
         if (g_dump_frame && g_dump_frame != 0xFFFFFFFFu && g_dump_mem && g_flips > g_dump_frame + 2 &&
@@ -2833,6 +3110,8 @@ static void vout_fg_ctx_init(uint32_t handle, int from_vout)
     if (g_inject_on >= 6) mon_start();
     gv_set_display(g_buf, g_nbuf, g_bw, g_bh);
     gv_start(g_inject_on == 8 && fg_res_supported(g_bw, g_bh) && !g_detected_60fps);
+    if (from_vout) g_vout_fg_inited = 1;
+    save_adapt_ini();
 }
 
 static int32_t gnm_submit_and_flip_raw(int has_wl, uint32_t workload, uint32_t count, void *dcb[], uint32_t *dcbSz,
@@ -3027,6 +3306,10 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                fg_res_supported(g_bw, g_bh) && g_prev_idx < game_idx_end() && mbufs_ready(handle));
                 int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);
 
+                if (!(can_fg8 && want_fg)) {
+                    pyr_cache_invalidate();
+                }
+
                 if (can_fg8 && want_fg) {
                     g_inert_reason[0] = 0;
                     uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
@@ -3097,14 +3380,21 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         }
                     }
 
+                    on_flip_2buf_track(index);
+                    int two_buf_now = (g_cfg.two_buffer || g_runtime_2buf || g_ngame == 2 || g_cfg.present_copy == 1);
+                    if (!pcopy && two_buf_now && g_pbuf && g_cfg.present_copy != 2) pcopy = 1;
                     uint32_t ci = 0;
                     if (pcopy) {
                         static uint32_t pc_flip;
                         pc_flip = (pc_flip + 1u) % (uint32_t)g_pcopy_k;
                         ci = (uint32_t)g_mbase + (uint32_t)g_pcopy_k + pc_flip;
                         if (!tb_fast) { two_mids = 0; third_flip = 0; }   // FAST 3-step needs a second mid buffer: only the test-3 pulldown keeps it
-                        show_idx = ci;
-                        if (index < 16u && ci < 16u) __atomic_store_n(&g_sub_t[ci], __atomic_load_n(&g_sub_t[index], __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+                        if (ci < (uint32_t)g_nbuf && ci < 16u && g_buf[ci]) {
+                            show_idx = ci;
+                            if (index < 16u) __atomic_store_n(&g_sub_t[ci], __atomic_load_n(&g_sub_t[index], __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+                        } else {
+                            pcopy = 0;
+                        }
                     }
                     if (tb_fast) {
                         tb_mid_cursor = (tb_mid_cursor + (two_mids ? 2u : 1u)) % (uint32_t)g_pcopy_k;
@@ -3256,6 +3546,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 g_last_submit_enter_t = t_s1;
                 __atomic_store_n(&g_done, (volatile uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0x900), __ATOMIC_RELEASE);
                 __atomic_store_n(&g_last_seq, g_flips, __ATOMIC_RELEASE);
+                g_injects++;
                 int32_t rc = gnm_submit_and_flip_raw(has_wl, workload, ncount, d2, s2, ccb ? c2 : ccb, ccbSz ? cs2 : ccbSz, handle, flip_idx, flipMode, flipArg);
                 uint64_t t_s1e = sceKernelGetProcessTime(), t_hold = t_s1e, t_s2e = t_s1e;
                 if (third_flip) {
@@ -3528,7 +3819,8 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
     uint64_t raw_dt_us = (prev_flip_t && g_freq) ? ((g_last - prev_flip_t) * 1000000ull / g_freq) : 33366ull;
 
 #if INJECT
-    if (vf == INJECT_AFTER_FLIPS && g_flips < INJECT_AFTER_FLIPS) {
+    if (vf == INJECT_AFTER_FLIPS || (vf > INJECT_AFTER_FLIPS && !g_vout_fg_inited) ||
+        (g_cfg.vout_path && !g_vout_fg_inited && (vf + g_flips) >= INJECT_AFTER_FLIPS)) {
         vout_fg_ctx_init((uint32_t)handle, 1);
     }
 
@@ -3541,7 +3833,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
         return vr_hib;
     }
 
-    if (g_inject_on && (vf >= INJECT_AFTER_FLIPS || g_flips >= INJECT_AFTER_FLIPS) && u_idx < (uint32_t)g_nbuf) {
+    if (g_inject_on && (vf >= INJECT_AFTER_FLIPS || g_flips >= INJECT_AFTER_FLIPS || g_vout_fg_inited) && u_idx < (uint32_t)g_nbuf) {
         if (g_gpu_state == 0) gpu_init();
         if (g_gpu_state == 1) {
             uint32_t slot = vf & 3u;
@@ -3602,14 +3894,21 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                     }
                 }
 
+                on_flip_2buf_track(u_idx);
+                int vo_two_buf_now = (g_cfg.two_buffer || g_runtime_2buf || g_ngame == 2 || g_cfg.present_copy == 1);
+                if (!pcopy && vo_two_buf_now && g_pbuf && g_cfg.present_copy != 2) pcopy = 1;
                 uint32_t ci = 0;
                 if (pcopy) {
                     static uint32_t vo_pc_flip;
                     vo_pc_flip = (vo_pc_flip + 1u) % (uint32_t)g_pcopy_k;
                     ci = (uint32_t)g_mbase + (uint32_t)g_pcopy_k + vo_pc_flip;
-                    show_idx = ci;
-                    if (u_idx < 16u && ci < 16u)
-                        __atomic_store_n(&g_sub_t[ci], __atomic_load_n(&g_sub_t[u_idx], __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+                    if (ci < (uint32_t)g_nbuf && ci < 16u && g_buf[ci]) {
+                        show_idx = ci;
+                        if (u_idx < 16u)
+                            __atomic_store_n(&g_sub_t[ci], __atomic_load_n(&g_sub_t[u_idx], __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+                    } else {
+                        pcopy = 0;
+                    }
                 }
                 n = build_dcb_flow8(mine, g_buf[g_prev_idx], g_buf[u_idx], g_buf[mi1], g_buf[mi2], g_pitch,
                                     tidx, px * 4u, slot, vf, k_nop64_pkt, handle, mi1, mi2,
@@ -3620,6 +3919,8 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                 uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
                 uint32_t tidx = tile_idx_now();
                 n = build_dcb_post8(mine, g_buf[u_idx], g_bw, g_bh, g_pitch, tidx, px * 4u, slot, vf, k_nop64_pkt);
+            } else {
+                pyr_cache_invalidate();
             }
 
             int pace_p2 = (int)g_prev2_idx, pace_p1 = (int)g_prev_idx;
@@ -3747,6 +4048,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
         if (startIndex == 0) {
             seen_dfmt = 0; g_fmt_supported = 1; g_game_idx_hi = 0; g_nbuf = 0;
             g_prev_idx = 0xFFFFFFFFu; g_prev2_idx = 0xFFFFFFFFu;
+            pyr_cache_invalidate();
         }
         if (!dfmt || (seen_dfmt && seen_dfmt != dfmt)) g_fmt_supported = 0;
         else { seen_dfmt = dfmt; g_t_dfmt = dfmt; }
@@ -3827,6 +4129,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
     if (g_safe && attr && startIndex == 0 && bufferNum >= 2 && bufferNum <= 8) g_ngame = bufferNum;   // observed only: see safe_try_activate()
     if (attr && startIndex == 0 && bufferNum >= 2 && bufferNum <= 8 && addresses && (g_mbuf_state >= 0 || g_pre_mem != NULL) && !g_safe) {
         g_ngame = bufferNum;
+        if (g_ngame == 2 && g_status_hooked && !g_bench_enabled && read_present_copy_raw() != 2) g_vq_on = 1;
         int m_raw = read_mode_raw();
         int want4 = (m_raw == 4 || m_raw == 6 || m_raw == 7 || m_raw == 8);
         if (want4) {
@@ -3962,7 +4265,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                 g_pcopy_avail = (want_pcopy && nm >= 2);
                 g_pcopy_k = nm >= 6 ? 3 : (nm >= 4 ? 2 : 1);
                 if (g_pcopy_avail) g_nmid = g_pcopy_k;
-                if (g_cfg.reg_mode == 1 && 16 - nm >= g_ngame) {
+                if (g_cfg.reg_mode == 1 && (g_cfg.manual_mode || g_game_idx_hi > g_ngame) && 16 - nm >= g_ngame) {
                     int base = 16 - nm;
                     int32_t r0 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
                                                handle, startIndex, addresses, bufferNum, attr);
@@ -3995,6 +4298,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                                 g_inert_reason[0] = 0;
                             }
                         }
+                        on_register_buffers_2buf(g_ngame, one);
                         return r0;
                     }
                     g_pcopy_avail = 0;
@@ -4020,6 +4324,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                             g_inert_reason[0] = 0;
                         }
                     }
+                    on_register_buffers_2buf(g_ngame, one);
                     return r;
                 }
             }
@@ -4567,6 +4872,7 @@ s32 attr_public plugin_unload(s32 argc, const char *argv[])
     if (!g_bench_enabled) return 0;  // bootstrap may have returned without installing hooks
 #endif
     if (g_status_hooked) UNHOOK(sceVideoOutGetFlipStatus);
+    release_pbuf();
     debug_hooks_remove();
 #if VCFG_2BUF_TEST
     if (g_tb_hooks) {

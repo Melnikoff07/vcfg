@@ -27,7 +27,19 @@ def bil(img, u, v):
 
 
 def diff3(a, b):
-    return np.abs(a - b).sum(-1)
+    return np.abs(a[..., :3] - b[..., :3]).sum(-1)
+
+
+def diff3_k(a, b):
+    a3, b3 = a[..., :3], b[..., :3]
+    mx = np.maximum(a3, b3)
+    mn = np.minimum(a3, b3)
+    l_hi = mx[..., 0] + mx[..., 1] + mx[..., 2]
+    l_lo = mn[..., 0] + mn[..., 1] + mn[..., 2]
+    e_raw = l_hi - l_lo
+    den = (F32(1.0) + np.maximum(l_hi - F32(1.95), F32(0.0)) * F32(1.25) +
+           np.maximum(l_lo - F32(0.90), F32(0.0)) * F32(0.75))
+    return (e_raw / den).astype(F32)
 
 
 def lerp4(a, b, t):
@@ -49,7 +61,7 @@ def crw(f, c):
     return w0, w12, w3, w2 / w12
 
 
-def cr(img, u, v, csh):
+def cr(img, u, v, csh, return_hl=False):
     """Catmull-Rom style 5-tap resample (tapsq): centre tap + 4 axis taps using bilinear taps at weighted offsets"""
     ub, vb = u - F32(0.5), v - F32(0.5)
     fu, fv = np.floor(ub), np.floor(vb)
@@ -59,13 +71,33 @@ def cr(img, u, v, csh):
     wy0, wy12, wy3, oy = crw(fy, csh)
     x12, y12 = cx + ox, cy + oy
     x0, x3, y0, y3 = cx - F32(1.0), cx + F32(2.0), cy - F32(1.0), cy + F32(2.0)
-    taps = [(x12, y12, wx12 * wy12), (x0, y12, wx0 * wy12), (x3, y12, wx3 * wy12), (x12, y0, wx12 * wy0), (x12, y3, wx12 * wy3)]
-    acc = 0
-    ws = 0
-    for tx, ty, k in taps:
-        acc = acc + bil(img, tx, ty) * k[..., None]
-        ws = ws + k
-    return np.clip(acc / ws[..., None], F32(0.0), F32(1.0)).astype(F32)
+    s0 = bil(img, x12, y12)
+    s1 = bil(img, x0, y12)
+    s2 = bil(img, x3, y12)
+    s3 = bil(img, x12, y0)
+    s4 = bil(img, x12, y3)
+    k0, k1, k2, k3, k4 = wx12 * wy12, wx0 * wy12, wx3 * wy12, wx12 * wy0, wx12 * wy3
+    acc = (s0 * k0[..., None] + s1 * k1[..., None]) + (s2 * k2[..., None] + s3 * k3[..., None]) + s4 * k4[..., None]
+    ws = (k0 + k1) + (k2 + k3) + k4
+    res = acc / ws[..., None]
+    mn_out = np.minimum(np.minimum(s1, s2), np.minimum(s3, s4))
+    mn_all = np.minimum(mn_out, s0)
+    mx_out = np.maximum(np.maximum(s1, s2), np.maximum(s3, s4))
+    mx5 = np.maximum(mx_out, s0)
+    lo = np.maximum(res, mn_all)
+    hi = np.minimum(lo, mx5).astype(F32)
+    cpos = np.asarray(csh > F32(0.0))
+    out = np.where(cpos[..., None], hi, s0).astype(F32)
+    if not return_hl:
+        return out
+    l_mx5 = sum3(mx5)
+    l_mn5 = sum3(mn_all)
+    l_s0 = sum3(s0)
+    hl_rng0 = (l_mx5 - l_mn5) * sat((l_mx5 - F32(1.5)) * F32(2.0))
+    is_wt = (l_mx5 > F32(1.80)) & ((l_mx5 - l_s0) > F32(0.15))
+    hl_rng = np.where(is_wt, hl_rng0 + F32(4.0), hl_rng0)
+    hl_out = np.where(cpos, hl_rng, F32(0.0)).astype(F32)
+    return out, hl_out
 
 
 W_DIM, H_DIM = 1920.0, 1080.0
@@ -116,7 +148,7 @@ def mlp_cw(x0, x1, x2, x3, x4, x5, x6):
             h3 * F32(-0.40481237) + h4 * F32(-0.08111887) + h5 * F32(0.29362506))
 
 
-def _taps(tp, tc, u, v, vx, vy, t, sp, sc, es, str_en, quad, csh=0.5, use_cr=False):
+def _taps(tp, tc, u, v, vx, vy, t, sp, sc, es, str_en, quad, csh=0.5, use_cr=False, return_hl=False):
     """one candidate vector (vx, vy): returns (a2, b2, e) as @taps / @tapsq (no overlay rectangle)"""
     tc1 = F32(1.0) - F32(t)
     up, vp = u + vx * F32(t), v + vy * F32(t)
@@ -126,17 +158,31 @@ def _taps(tp, tc, u, v, vx, vy, t, sp, sc, es, str_en, quad, csh=0.5, use_cr=Fal
     oobc = (uc < F32(0.5)) | (uc > Wd - F32(0.5)) | (vc < F32(0.5)) | (vc > Hd - F32(0.5))
     if quad or use_cr:
         csh_b = np.where(oobp | oobc, F32(0.0), F32(csh))
-        a, b = cr(tp, up, vp, csh_b), cr(tc, uc, vc, csh_b)
+        a, hla = cr(tp, up, vp, csh_b, return_hl=True)
+        b, hlb = cr(tc, uc, vc, csh_b, return_hl=True)
     else:
         a, b = bil(tp, up, vp), bil(tc, uc, vc)
+        hla = hlb = np.zeros(u.shape, F32)
     onlyp, onlyc = oobp & ~oobc, oobc & ~oobp
     one = onlyp | onlyc
     a2 = np.where(onlyp[..., None], b, a)
     b2 = np.where(onlyc[..., None], a, b)
-    e0 = diff3(a2, b2)
-    eb = np.where(one, F32(0.02), e0)
+    hla2 = np.where(onlyp, hlb, hla)
+    hlb2 = np.where(onlyc, hla, hlb)
+    e0_r = diff3_k(a2, b2)
     if quad:
+        hl_mn = np.minimum(hla2, hlb2)
+        both_w = hl_mn >= F32(4.0)
+        hla_c = np.where(hla2 >= F32(4.0), hla2 - F32(4.0), hla2)
+        hlb_c = np.where(hlb2 >= F32(4.0), hlb2 - F32(4.0), hlb2)
+        hl_mx = np.maximum(hla_c, hlb_c)
+        e0 = e0_r / (F32(1.0) + hl_mx * F32(4.0))
+        eb = np.where(one, F32(0.02), e0)
+        hl_tag = np.where(both_w, hl_mx + F32(4.0), hl_mx)
+        if return_hl:
+            return a2, b2, eb, hl_tag
         return a2, b2, eb
+    eb = np.where(one, F32(0.02), e0_r)
     both = ~oobp & ~oobc
     fastc = (np.abs(vx) + np.abs(vy)) > 16
     st_on = str_en & both & fastc
@@ -168,8 +214,10 @@ def _eval_sub_corner(raw_x0y0, raw_x1y0, raw_x0y1, raw_x1y1, qx, qy):
     return np.stack([vx, vy], axis=-1), m, use2
 
 
-def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut_thr=0, cut_emov=0.3, wp=None):
+def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut_thr=0, cut_emov=0.3, wp=None, prevF=None):
     wp = wp or {}
+    if prevF is None:
+        prevF = wp.get("prevF")
     """mid frame (H, W, 3) float32 for the interpolation phase t (no overlay rectangle, no marker)"""
     tp, tc = tp[..., :3].astype(F32), tc[..., :3].astype(F32)
     H, W = tp.shape[:2]
@@ -190,13 +238,32 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         X, Y = np.meshgrid(xs, ys)
         u, v = X + F32(0.5), Y + F32(0.5)
         sp, sc = tp[y0:y1], tc[y0:y1]
-        es = diff3(sp, sc)
-        # fractional phase advection (zero at t == 0.5)
+        es = diff3_k(sp, sc)
+        # fractional phase advection (zero at t == 0.5) + second-order quadratic trajectory offset
         cbx, cby = np.minimum(X.astype(np.int64) // block, nbx - 1), np.minimum(Y.astype(np.int64) // block, nby - 1)
+        fcx, fcy = F[cby, cbx, 0], F[cby, cbx, 1]
+        if prevF is not None:
+            up_bx = np.clip(((u + fcx) * F32(1.0 / block)).astype(np.int64), 0, nbx - 1)
+            up_by = np.clip(((v + fcy) * F32(1.0 / block)).astype(np.int64), 0, nby - 1)
+            fpx, fpy = prevF[up_by, up_bx, 0], prevF[up_by, up_bx, 1]
+            ax_q, ay_q = fcx - fpx, fcy - fpy
+            dot_v = fcx * fpx + fcy * fpy
+            vm_c = np.abs(fcx) + np.abs(fcy)
+            vm_p = np.abs(fpx) + np.abs(fpy)
+            am_q = np.abs(ax_q) + np.abs(ay_q)
+            vmin_cp = np.minimum(vm_c, vm_p)
+            q_ok = (dot_v > F32(0.0)) & (vmin_cp > F32(2.0)) & (am_q <= F32(1.25) * vmin_cp)
+            q_s = F32(-0.5) * F32(t) * (F32(1.0) - F32(t))
+            dqx = np.where(q_ok, np.clip(ax_q * q_s, F32(-4.0), F32(4.0)), F32(0.0)).astype(F32)
+            dqy = np.where(q_ok, np.clip(ay_q * q_s, F32(-4.0), F32(4.0)), F32(0.0)).astype(F32)
+        else:
+            dqx = np.zeros_like(u)
+            dqy = np.zeros_like(v)
         dt05 = F32(t) - F32(0.5)
-        shx = np.clip(dt05 * F[cby, cbx, 0], -16, 16).astype(F32)
-        shy = np.clip(dt05 * F[cby, cbx, 1], -16, 16).astype(F32)
-        xfs, yfs = X + shx, Y + shy
+        shx = np.clip(dt05 * fcx, -16, 16).astype(F32)
+        shy = np.clip(dt05 * fcy, -16, 16).astype(F32)
+        xfs, yfs = X + shx + dqx, Y + shy + dqy
+        u, v = u + dqx, v + dqy
         scale, centre = F32(1.0 / block), F32(0.5 - 0.5 / block)
         fbx, fby = xfs * scale - centre, yfs * scale - centre
         flx, fly = np.floor(fbx), np.floor(fby)
@@ -247,29 +314,33 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         mov = np.zeros((y1 - y0, W, 3), F32)
         emov = np.zeros((y1 - y0, W), F32)
         vmg = np.zeros((y1 - y0, W), F32)
+        hl_mov = np.zeros((y1 - y0, W), F32)
         # ---- coherent pixels
         vbx = (f00[..., 0] * w00 + f10[..., 0] * w10) + (f01[..., 0] * w01 + f11[..., 0] * w11)
         vby = (f00[..., 1] * w00 + f10[..., 1] * w10) + (f01[..., 1] * w01 + f11[..., 1] * w11)
         zv = (vbx == 0) & (vby == 0)
         zm = lerp4(sp, sc, t)
         vmb = np.abs(vbx) + np.abs(vby)
-        vms = sat((vmb - F32(9.0)) * F32(0.14))
+        vms = sat((vmb - F32(12.0)) * F32(0.14))
         csh_e = F32(wp.get("csh", 0.5)) * (F32(1.0) - vms)
-        a2, b2, fe = _taps(tp, tc, u, v, vbx, vby, t, sp, sc, es, None, True, csh=csh_e)
+        a2, b2, fe, hl_tag = _taps(tp, tc, u, v, vbx, vby, t, sp, sc, es, None, True, csh=csh_e, return_hl=True)
         if wp.get("fast_bil") is not None:   # cloud-report idea: bilinear instead of Catmull-Rom above this vector length
             ab, bb, feb = _taps(tp, tc, u, v, vbx, vby, t, sp, sc, es, np.zeros(es.shape, bool), False)
             usebil = ((np.abs(vbx) + np.abs(vby)) > F32(wp["fast_bil"]))[..., None]
             a2, b2 = np.where(usebil, ab, a2), np.where(usebil, bb, b2)
             fe = np.where(usebil[..., 0], feb, fe)
-        eac_f, ebp_f = diff3(a2, sc), diff3(b2, sp)
+            hl_tag = np.where(usebil[..., 0], F32(0.0), hl_tag)
+        eac_f, ebp_f = diff3_k(a2, sc), diff3_k(b2, sp)
         fm, fad = side_lerp(a2, b2, sp, sc, fe, eac_f, ebp_f, t, vmb, F32(0.0), F32(0.0))
         frel = np.minimum(fad * F32(0.10), fe * F32(0.60))
         fe_rel = np.maximum(fe - frel, F32(0.0))
         fast_mov = np.where(zv[..., None], zm, fm)
         fast_e = np.where(zv, es, fe_rel)
+        fast_hl = np.where(zv, F32(0.0), hl_tag)
         mov = np.where(coh[..., None], fast_mov, mov)
         emov = np.where(coh, fast_e, emov)
         vmg = np.where(coh, vmb, vmg)
+        hl_mov = np.where(coh, fast_hl, hl_mov)
         # ---- non-coherent pixels: per-corner vectors, edge-weighted accumulation
         slow = ~coh
         if slow.any():
@@ -288,7 +359,7 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
             ranked = []
             for fv, w, u2 in ((f00, w00, u00), (f10, w10, u10), (f01, w01, u01), (f11, w11, u11)):
                 a2, b2, e_raw = _taps(tp, tc, u, v, fv[..., 0], fv[..., 1], t, sp, sc, es, str_en, False, csh=wp.get("csh", 0.5), use_cr=bool(wp.get("slow_cr", False)))
-                eb = diff3(a2, b2)
+                eb = diff3_k(a2, b2)
                 spen = e_raw - eb
                 vmag = np.abs(fv[..., 0]) + np.abs(fv[..., 1])
                 v_ex = np.maximum(vmag - vmn, F32(0.0))
@@ -348,11 +419,16 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         mx_ch = np.maximum(np.maximum(d_sm[..., 0], d_sm[..., 1]), d_sm[..., 2])
         pos_c = np.maximum(l_stat - F32(2.56), mx_ch * F32(3.0) - dl_s - F32(0.60))
         ws0_raw = sat((F32(0.006) - es) * F32(333.33334))
-        dk_spot = (vmg > F32(2.0)) & (emov < F32(0.015)) & (dl_s < F32(-0.48))
+        mv_act = vmg > F32(2.0)
+        is_wire_fol = hl_mov >= F32(4.0)
+        is_glint = (hl_mov > F32(0.40)) & (dl_s < F32(-0.05))
+        hl_act = mv_act & (is_wire_fol | is_glint)
+        dk_spot = (mv_act & (emov < F32(0.015)) & (dl_s < F32(-0.48))) | hl_act
         ws0 = np.where(dk_spot, F32(0.0), ws0_raw)
         gk = GK[np.clip(gby, 0, gny - 1), np.clip(gbx, 0, gnx - 1)]
         hasfg = gk >= (1 << 20)
-        nfgk = ~hasfg
+        hud_kill = hasfg | (mv_act & is_wire_fol)
+        nfgk = ~hud_kill
         w_hv = sat((vmg + spr) * F32(2.0))
         w_he = sat((F32(0.08) - es) * F32(32.0))
         w_hc = sat(pos_c * F32(64.0))
@@ -361,13 +437,13 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         ws0_h = np.maximum(ws0, w_hud)
         mov_obj = hasfg | (vmg > F32(8.0))
         fgkill_ws = hasfg & (emov < 0.25) & ((flags & 16) == 0)
-        fgkill = mov_obj & (emov < 0.25) & ((flags & 16) == 0)
+        fgkill = (mov_obj & (emov < 0.25) & ((flags & 16) == 0)) | hl_act
         ws = np.where(fgkill_ws, F32(0.0), ws0_h)
         if flags & 4096:
             ws = ws * F32(0.0)
-        dmp = diff3(mov, sp)
-        dmc = diff3(mov, sc)
-        dmv = diff3(mov, stat)
+        dmp = diff3_k(mov, sp)
+        dmc = diff3_k(mov, sc)
+        dmv = diff3_k(mov, stat)
         ddm = dmp - dmc
         k_ddm = F32(0.45) + F32(0.45) * w_occ_m
         lim_hi = F32(0.30) + F32(0.20) * w_occ_m
@@ -384,7 +460,19 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         dcw = sat((emov - F32(0.15)) * F32(10.0)) * res_cw
         cw3_0 = sat(cw_base + dcw)
         gcw = sat((emov - es) * F32(4.0))
-        cw3 = np.where(fgkill, F32(0.0), cw3_0 * gcw)
+        cw3_1 = cw3_0 * gcw
+        if prevF is not None:
+            gbx_m = np.where(wx < F32(0.5), ix0, ix1)
+            gby_m = np.where(wy < F32(0.5), iy0, iy1)
+            fg_cx, fg_cy = F[gby_m, gbx_m, 0], F[gby_m, gbx_m, 1]
+            fg_bx = np.clip(gbx_m + (fg_cx * F32(1.0 / block)).astype(np.int64), 0, nbx - 1)
+            fg_by = np.clip(gby_m + (fg_cy * F32(1.0 / block)).astype(np.int64), 0, nby - 1)
+            fg_px, fg_py = prevF[fg_by, fg_bx, 0], prevF[fg_by, fg_bx, 1]
+            tc_err = np.abs(fg_cx - fg_px) + np.abs(fg_cy - fg_py)
+            tc_pm = np.abs(fg_px) + np.abs(fg_py)
+            tc_w = sat(tc_pm - F32(2.0)) * sat((F32(2.0) - tc_err) * F32(0.5)) * sat((F32(0.35) - emov) * F32(4.0))
+            cw3_1 = cw3_1 * (F32(1.0) - F32(0.30) * tc_w)
+        cw3 = np.where(fgkill, F32(0.0), cw3_1)
         cw = np.where(np.bool_((flags & 8) != 0), F32(0.0), cw3)
         if wp.get("vis_fill"):   # cloud-report idea: fill from the visible side (the real frame that matches the warp) instead of a blend
             dmsc, dmsp = diff3(mov, sc), diff3(mov, sp)
@@ -452,18 +540,26 @@ def rcas8(mid, con, emode):
     mn5, mx5 = np.minimum(mn4, lM), np.maximum(mx4, lM)
     rng5 = mx5 - mn5
     eps = F32(2.0 ** -14)
-    hmin = mn4 / ((mx4 + eps) * F32(4.0))
-    hmax = (F32(1.0) - mx4) / ((mn4 - F32(1.0)) * F32(4.0) - eps)
+    mn9 = np.minimum(mn5, np.minimum(np.minimum(lNW, lNE), np.minimum(lSW, lSE)))
+    mx9 = np.maximum(mx5, np.maximum(np.maximum(lNW, lNE), np.maximum(lSW, lSE)))
+    rng9 = mx9 - mn9
+    rng9e = rng9 + eps
+    dNS, dWE = np.abs(lN - lS), np.abs(lW - lE)
+    dCard = np.maximum(dNS, dWE)
+    dDiag = np.maximum(np.abs(lNE - lSW), np.abs(lNW - lSE)) * F32(0.5)
+    tex_gate = sat((dCard + dDiag) / rng9e * F32(1.5))
+    hmin = mn5 / ((mx5 + eps) * F32(4.0))
+    hmax = (F32(1.0) - mx5) / ((mn5 - F32(1.0)) * F32(4.0) - eps)
     lobe = np.maximum(np.maximum(-hmin, hmax), -F32(con))
-    w0 = np.minimum(lobe, F32(0.0))
+    w_karis = F32(1.0) / (F32(1.0) + mx5)
+    w0 = np.minimum(lobe, F32(0.0)) * w_karis
     s4l = (lN + lW) + (lE + lS)
     nz = sat(np.abs(s4l * F32(0.25) - lM) / (rng5 + eps))
-    w_rcas = w0 * (F32(1.0) - nz * F32(0.5))
+    dn = sat(F32(1.0) - nz * F32(0.85)) * tex_gate
+    w_sharp = w0 * dn
+    w_shim = (F32(1.0) - tex_gate) * sat((nz - F32(0.45)) * F32(2.0)) * F32(0.10) * w_karis * sat(F32(con) * F32(8.0))
+    w_rcas = w_sharp + w_shim
     if emode > 0:
-        mn9 = np.minimum(mn5, np.minimum(np.minimum(lNW, lNE), np.minimum(lSW, lSE)))
-        mx9 = np.maximum(mx5, np.maximum(np.maximum(lNW, lNE), np.maximum(lSW, lSE)))
-        rng9 = mx9 - mn9
-        rng9e = rng9 + eps
         is_str = emode >= 2
         thr_abs, thr_rel = (F32(0.015625), F32(0.0625)) if is_str else (F32(0.0234375), F32(0.09375))
         ethr = np.maximum(thr_abs, mx9 * thr_rel)
@@ -471,9 +567,6 @@ def rcas8(mid, con, emode):
         edgeH = np.abs(lNW + lSW - lW * 2) + np.abs(lN + lS - lM * 2) * 2 + np.abs(lNE + lSE - lE * 2)
         edgeV = np.abs(lNW + lNE - lN * 2) + np.abs(lW + lE - lM * 2) * 2 + np.abs(lSW + lSE - lS * 2)
         horz = edgeH >= edgeV
-        dCard = np.maximum(np.abs(lN - lS), np.abs(lW - lE))
-        dDiag = np.maximum(np.abs(lNE - lSW), np.abs(lNW - lSE)) * F32(0.5)
-        tex_gate = sat((dCard + dDiag) / rng9e * F32(1.5))
         lNeg, lPos = np.where(horz, lN, lW), np.where(horz, lS, lE)
         h3 = horz[..., None]
         rgbNeg, rgbPos = np.where(h3, N, Wc), np.where(h3, S, E)
@@ -518,6 +611,8 @@ def rcas8(mid, con, emode):
         wSpan = np.where(goodSpan, F32(0.5) - dMin / dSum, F32(0.0))
         s3x3 = s4l * F32(2.0) + ((lNW + lNE) + (lSW + lSE))
         subpx = sat(np.abs(s3x3 * F32(0.083333336) - lM) / rng9e)
+        gMin = np.minimum(gNeg, gPos)
+        r_gate = F32(1.0) - F32(0.85) * (gMin / (gMax + eps))
         wSubpx = subpx * F32(1.0 if is_str else 0.75) * tex_gate
         NW, NE, SW, SE = C(-1, -1), C(-1, 1), C(1, -1), C(1, 1)
         un = useNeg[..., None]
@@ -528,12 +623,17 @@ def rcas8(mid, con, emode):
         rgbTarget = rgbOpp * F32(0.4375) + rgbTanAvg * F32(0.3125) + rgbDiag * F32(0.25)
         wComb = np.maximum(wSpan * F32(1.5), wSubpx)
         wClp = np.minimum(wComb, F32(0.75 if is_str else 0.5625))
-        wAA = edge_ramp * wClp
+        wAA = edge_ramp * wClp * r_gate
         base_c = M + (rgbTarget - M) * wAA[..., None]
         w_eff = w_rcas * (F32(1.0) - edge_ramp)
     else:
         base_c, w_eff = M, w_rcas
-    v4 = (N + S) + (Wc + E)
+    a_ns0 = (dNS * F32(2.0)) / (dNS + dWE + eps)
+    a_we0 = F32(2.0) - a_ns0
+    is_sh = w_eff < F32(0.0)
+    a_ns = np.where(is_sh, a_ns0, F32(1.0))
+    a_we = np.where(is_sh, a_we0, F32(1.0))
+    v4 = (N + S) * a_ns[..., None] + (Wc + E) * a_we[..., None]
     num = v4 * w_eff[..., None] + base_c
     res0 = num * (F32(1.0) / (F32(1.0) + w_eff * F32(4.0)))[..., None]
     c_mn = np.minimum(np.minimum(np.minimum(N, Wc), np.minimum(E, S)), base_c)

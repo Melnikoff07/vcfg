@@ -55,3 +55,5 @@ void gv_set_gpu_rate(double ticks_per_s);
 // shader code / RSRC of the new passes (from shaders.h, set by main.c)
 extern uint32_t gv_rsrc_gv8[2], gv_rsrc_gvc8[2], gv_rsrc_warp8g[2];
 extern uint32_t gv_off_gv8, gv_off_warp8g;
+extern volatile int g_gv_cal_winner;
+extern volatile int g_gv_cal_locked;

@@ -64,8 +64,8 @@ def motion(A, B, params=None):
     GK, hist = vm.fgs8(L2a, L2b, V2, S2, gm)
     sum_a = int(L3a.sum()) if p['prev_luma_sum'] is None else p['prev_luma_sum']
     FT, cutn, fade = vm.me1(L1a, L1b, V2, GK, gm, sum_b, sum_a, prevF, p.get('mp'))
-    F = vm.mf8(L1a, L1b, FT, GK, V2, gm, fade, p.get('mp'))
-    return dict(V3=V3, V2=V2, S2=S2, gm=gm, GK=GK, FT=FT, F=F, cutn=cutn, fade=fade)
+    F = vm.mf8(L1a, L1b, FT, GK, V2, gm, fade, p.get('mp'), prevF=prevF)
+    return dict(V3=V3, V2=V2, S2=S2, gm=gm, GK=GK, FT=FT, F=F, cutn=cutn, fade=fade, prevF=prevF)
 
 
 def render(A, B, st, params=None, return_all=False):
@@ -73,7 +73,7 @@ def render(A, B, st, params=None, return_all=False):
     p = dict(PARAMS)
     if params:
         p.update(params)
-    mid = vw.warp8(A, B, st['F'], st['GK'], st['cutn'], t=p['t'], flags=p.get('warp_flags', 0), flags_cut_thr=p.get('cut_thr', 0), cut_emov=p.get('cut_emov', 0.3), wp=p.get('wp'))
+    mid = vw.warp8(A, B, st['F'], st['GK'], st['cutn'], t=p['t'], flags=p.get('warp_flags', 0), flags_cut_thr=p.get('cut_thr', 0), cut_emov=p.get('cut_emov', 0.3), wp=p.get('wp'), prevF=st.get('prevF', p.get('prevF')))
     mid_q = quant(mid, p['qmax'])
     out = quant(vw.rcas8(mid_q, vw.rcas_con(p['sharpness']), p['enhance']) if (p['sharpness'] > 0 or p['enhance'] > 0) else mid_q,
                 p['qmax'])

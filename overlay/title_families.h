@@ -243,6 +243,8 @@ static const VcfgTitleAlias k_vcfg_title_aliases[] = {
     { "CUSA33277", "CUSA33277" },
     { "CUSA40994", "CUSA40994" },
     { "CUSA42311", "CUSA42311" },
+    { "CUSA02962", "CUSA02962" },
+    { "CUSA01004", "CUSA01004" },
 };
 
 static inline const char *vcfg_title_family(const char *id)
@@ -273,7 +275,7 @@ static inline int vcfg_is_verified_family(const char *id)
         "CUSA11260", "CUSA32946", "CUSA28561", "CUSA01154", "CUSA04841", "CUSA17722",
         "CUSA32836", "CUSA01113", "CUSA00009", "CUSA00093", "CUSA00265", "CUSA00362",
         "CUSA01766", "CUSA02703", "CUSA02902", "CUSA18824", "CUSA24360", "CUSA29008",
-        "CUSA33277", "CUSA40994", "CUSA42311"
+        "CUSA33277", "CUSA40994", "CUSA42311", "CUSA02962", "CUSA01004"
     };
     for (unsigned i = 0; i < sizeof(k_ver) / sizeof(k_ver[0]); i++) {
         if (!strcmp(f, k_ver[i])) return 1;

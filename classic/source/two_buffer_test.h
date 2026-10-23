@@ -23,8 +23,9 @@ static int tb_title(void)
 
 HOOK_INIT(sceVideoOutGetFlipStatus);
 static int g_status_hooked;   // sceVideoOutGetFlipStatus is hooked (virtual queue or a test build on a test title)
-static int g_vq_on;           // two_buffer=1 for this title (read once in plugin_load)
-static int vq_active(void) { return (g_vq_on || g_ngame == 2 || (VCFG_2BUF_TEST == 4 && tb_title())) && (g_pcopy_on || g_mbuf_state == 1) && !g_fg_off; }
+static int g_vq_on;           // two_buffer=1 for this title (read in plugin_load or auto-armed on 2-buffer detection)
+static int g_runtime_2buf;    // 1: 2-buffer display ring detected via RegisterBuffers(count==2) or flip index ring
+static int vq_active(void) { return (g_vq_on || g_ngame == 2 || g_runtime_2buf || (VCFG_2BUF_TEST == 4 && tb_title())) && (g_pcopy_on || g_mbuf_state == 1) && !g_fg_off; }
 
 // What the game saw in its last status poll before it submitted a frame (= the value that let it out of its wait):
 // raw queue numbers and the ones it was given. Index 7 = 7 or more.
@@ -88,7 +89,7 @@ int32_t sceVideoOutGetFlipStatus_hook(int32_t h, VoFlipStatus *s)
                     s->flipPendingNum = (s->flipPendingNum + 1) / 2;
                 }
                 if (s->gcQueueNum > 0) s->gcQueueNum = (s->gcQueueNum + 1) / 2;
-                if (on_our_buf && g_ngame == 2) {
+                if (on_our_buf && (g_ngame == 2 || g_runtime_2buf || g_vq_on)) {
                     s->currentBuffer = (g_prev_idx < (uint32_t)g_ngame) ? (int32_t)g_prev_idx : 0;
                 }
                 __atomic_add_fetch(&g_tb_virt_calls, 1u, __ATOMIC_RELAXED);

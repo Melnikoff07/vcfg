@@ -24,6 +24,48 @@
 static uint32_t g_t_dfmt = 10u;
 static int g_t_is_neo = 0;
 static int g_t6_bit_override = -1; // optional INI override (0..31); -1 = default bit 24 (GNM_T6_ALT_TILE_MODE_NEO)
+static int g_t_prev_half16 = 0;      // 1: T#prev is a 50%-footprint 16-bpp (2 bytes/px) linear history surface (dfmt=3, tidx=8)
+static int g_pcopy_dst_half16 = 0;   // 1: pcopy8 T#out is a 50%-footprint 16-bpp (2 bytes/px) linear history surface
+static int g_pcopy_ycocg_mode = 0;   // pcopy8 mode: 0 = direct copy, 1 = YCoCg-R 4:2:0 16b encode, 2 = YCoCg-R 4:2:0 16b decode
+
+#ifndef VCFG_PBUF_STATE_DEFINED
+#define VCFG_PBUF_STATE_DEFINED
+static void *g_pbuf = 0;
+static long g_pbuf_phys = 0;
+static size_t g_pbuf_sz = 0;
+static int g_pbuf_ycocg = 0;
+static int g_pbuf_valid = 0;
+static uint32_t g_pbuf_last_seq = 0;
+static uint64_t g_pbuf_prev_va = 0;
+static uint32_t g_flip_ring_hist[8] __attribute__((unused));
+static uint32_t g_flip_ring_cnt __attribute__((unused)) = 0;
+#endif
+
+static inline void fg8_resolve_2buf_history(uint64_t *P_io, uint64_t C, uint64_t *copy_dst_io, uint32_t *copy_idx_io, uint32_t seq)
+{
+    uint64_t pbuf_va = (uint64_t)(uintptr_t)g_pbuf;
+    g_t_prev_half16 = 0;
+    g_pcopy_dst_half16 = 0;
+    if (!pbuf_va && *copy_dst_io == 0ull) return;
+    if (g_pbuf_valid && g_pbuf_prev_va != 0ull && g_pbuf_prev_va != C && (g_pbuf_last_seq + 1u == seq)) {
+        *P_io = g_pbuf_prev_va;
+        if (pbuf_va != 0ull && *P_io == pbuf_va && g_pbuf_ycocg) {
+            g_t_prev_half16 = 1;
+        }
+    }
+    if (*copy_dst_io == 0ull && pbuf_va != 0ull) {
+        *copy_dst_io = pbuf_va;
+        *copy_idx_io = 0xFFFFu;
+    }
+    if (*copy_dst_io != 0ull) {
+        if (pbuf_va != 0ull && *copy_dst_io == pbuf_va && g_pbuf_ycocg) {
+            g_pcopy_dst_half16 = 1;
+        }
+        g_pbuf_prev_va = *copy_dst_io;
+        g_pbuf_valid = 1;
+        g_pbuf_last_seq = seq;
+    }
+}
 
 static inline void make_t_ex(uint32_t *t, uint64_t a, uint32_t w, uint32_t h, uint32_t pitch, uint32_t tidx, int is_neo)
 {
@@ -44,9 +86,111 @@ static inline void make_t(uint32_t *t, uint64_t a, uint32_t w, uint32_t h, uint3
 {
     make_t_ex(t, a, w, h, pitch, tidx, g_t_is_neo);
 }
+static inline void make_t_pbuf(uint32_t *t, uint64_t a, uint32_t w, uint32_t h, uint32_t pitch, uint32_t tidx, int is_half_16b)
+{
+    if (!is_half_16b) {
+        make_t(t, a, w, h, pitch, tidx);
+        return;
+    }
+    t[0] = (uint32_t)(a >> 8);
+    t[1] = (uint32_t)((a >> 40) & 0xFFu) | (3u << 20);
+    t[2] = (w - 1u) | ((h - 1u) << 14);
+    t[3] = 4u | (5u << 3) | (6u << 6) | (7u << 9) | (8u << 20) | (9u << 28);
+    t[4] = (pitch - 1u) << 13;
+    t[5] = 0;
+    t[6] = 0;
+    t[7] = 0;
+}
 static inline void make_v(uint32_t *v, uint64_t a, uint32_t nbytes)
 {
     v[0] = (uint32_t)a; v[1] = (uint32_t)(a >> 32) & 0xFFFFu; v[2] = nbytes; v[3] = 0x00027FAC;
+}
+
+static inline void fill_pcopy8_table(uint32_t *tb3, uint64_t C, uint64_t copy_dst, uint32_t w, uint32_t h,
+                                     uint32_t pitch, uint32_t tidx, int is_half_16b, int ycocg_mode)
+{
+    for (int i = 0; i < 32; i++) tb3[i] = 0u;
+    make_t(tb3 + 8, C, w, h, pitch, tidx);
+    make_t_pbuf(tb3 + 16, copy_dst, w, h, pitch, tidx, is_half_16b);
+    if (is_half_16b || ycocg_mode > 0) {
+        uint32_t eff_pitch = (pitch > w) ? pitch : w;
+        uint32_t nbytes = (eff_pitch * h * 2u + 255u) & ~255u;
+        make_v(tb3 + 24, copy_dst, nbytes);
+        tb3[28] = (uint32_t)ycocg_mode;
+        tb3[29] = eff_pitch;
+        tb3[30] = w;
+        tb3[31] = h;
+    }
+}
+
+// YCoCg-R 4:2:0 16-bit (2 bytes/pixel = 4.15 MB at 1080p) reference helpers matching pcopy8.ll Mode 1 / Mode 2:
+// Packs a horizontal pixel pair (2k, y) and (2k+1, y) with 2x2 box-filtered Co/Cg into a single uint32_t:
+//   bits  [7:0]  = Y0  (full-res luma of pixel 2k)
+//   bits [15:8]  = Y1  (full-res luma of pixel 2k+1)
+//   bits [23:16] = Co  (2x2 chroma orange, biased by +128)
+//   bits [31:24] = Cg  (2x2 chroma green, biased by +128)
+static inline uint8_t ycocg_clamp_u8(int32_t v)
+{
+    return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+static inline void ycocg_rgb_to_ycocg(uint32_t rgba, int32_t *y_out, int32_t *co_out, int32_t *cg_out)
+{
+    int32_t r = (int32_t)(rgba & 0xFFu);
+    int32_t g = (int32_t)((rgba >> 8) & 0xFFu);
+    int32_t b = (int32_t)((rgba >> 16) & 0xFFu);
+    int32_t co_h = (r - b) >> 1;
+    int32_t t    = b + co_h;
+    int32_t cg_h = (g - t) >> 1;
+    int32_t y    = t + cg_h;
+    *y_out  = (int32_t)ycocg_clamp_u8(y);
+    *co_out = (int32_t)ycocg_clamp_u8(co_h + 128);
+    *cg_out = (int32_t)ycocg_clamp_u8(cg_h + 128);
+}
+static inline void ycocg420_compress_frame(const uint32_t *rgba_in, uint32_t *ycocg_out, uint32_t w, uint32_t h, uint32_t pitch)
+{
+    uint32_t half_w = w >> 1;
+    for (uint32_t y = 0; y + 1 < h; y += 2) {
+        const uint32_t *row0 = rgba_in + (size_t)y * pitch;
+        const uint32_t *row1 = rgba_in + (size_t)(y + 1u) * pitch;
+        uint32_t *dst0 = ycocg_out + (size_t)y * half_w;
+        uint32_t *dst1 = ycocg_out + (size_t)(y + 1u) * half_w;
+        for (uint32_t x = 0; x + 1 < w; x += 2) {
+            int32_t y00, co00, cg00, y10, co10, cg10, y01, co01, cg01, y11, co11, cg11;
+            ycocg_rgb_to_ycocg(row0[x],      &y00, &co00, &cg00);
+            ycocg_rgb_to_ycocg(row0[x + 1u], &y10, &co10, &cg10);
+            ycocg_rgb_to_ycocg(row1[x],      &y01, &co01, &cg01);
+            ycocg_rgb_to_ycocg(row1[x + 1u], &y11, &co11, &cg11);
+            uint32_t co_avg = (uint32_t)ycocg_clamp_u8((co00 + co10 + co01 + co11 + 2) >> 2);
+            uint32_t cg_avg = (uint32_t)ycocg_clamp_u8((cg00 + cg10 + cg01 + cg11 + 2) >> 2);
+            uint32_t chroma = (co_avg << 16) | (cg_avg << 24);
+            dst0[x >> 1] = (uint32_t)y00 | ((uint32_t)y10 << 8) | chroma;
+            dst1[x >> 1] = (uint32_t)y01 | ((uint32_t)y11 << 8) | chroma;
+        }
+    }
+}
+static inline uint32_t ycocg420_unpack_pixel(uint32_t packed_pair, uint32_t x_odd)
+{
+    int32_t y  = (int32_t)((x_odd ? (packed_pair >> 8) : packed_pair) & 0xFFu);
+    int32_t co = (int32_t)((packed_pair >> 16) & 0xFFu) - 128;
+    int32_t cg = (int32_t)((packed_pair >> 24) & 0xFFu) - 128;
+    int32_t t  = y - cg;
+    uint32_t g = (uint32_t)ycocg_clamp_u8(y + cg);
+    uint32_t b = (uint32_t)ycocg_clamp_u8(t - co);
+    uint32_t r = (uint32_t)ycocg_clamp_u8(t + co);
+    return r | (g << 8) | (b << 16) | 0xFF000000u;
+}
+static inline void ycocg420_decompress_frame(const uint32_t *ycocg_in, uint32_t *rgba_out, uint32_t w, uint32_t h, uint32_t pitch)
+{
+    uint32_t half_w = w >> 1;
+    for (uint32_t y = 0; y < h; y++) {
+        const uint32_t *src = ycocg_in + (size_t)y * half_w;
+        uint32_t *dst = rgba_out + (size_t)y * pitch;
+        for (uint32_t x = 0; x + 1 < w; x += 2) {
+            uint32_t pk = src[x >> 1];
+            dst[x]      = ycocg420_unpack_pixel(pk, 0u);
+            dst[x + 1u] = ycocg420_unpack_pixel(pk, 1u);
+        }
+    }
 }
 
 // work memory layout of mode 8 (GPU only; WC_GARLIC when it could be allocated so, see plugin_load)
@@ -67,19 +211,26 @@ static inline void make_v(uint32_t *v, uint64_t a, uint32_t nbytes)
 #define W8_FT  0x17C000u   // 120x68 float2: raw me1 field, filtered by mf8 into F cur (8.3)
 #define W8_END 0x18C000u
 
+// consts.flags (tb[30], offset +0x78) bit 12: Warm Single-Frame Pyramid Mode in pyr8.ll & me3.ll.
+// When set, V#L1prev (+0x90), V#L2prev (+0xB0), V#L3prev (+0xD0), and W8_MISC[2 + (r^1)] are reused directly
+// from the previous frame's cur pyramid buffers via ping-pong descriptor swap (0 B extra DirectMemory),
+// and pyr8.ll skips all T#prev texture fetches and V#L1prev..L3prev buffer stores (-50% pyr8 bandwidth & ALU).
+#define FG8_FLAG_PYR_WARM 0x1000u
+
 // table read by the mode 8 shaders (offsets are hard-coded in shaders/*8.ll and me*.ll)
 #define WA(off) ((uint64_t)(uintptr_t)(work + (off)))
 static inline void fill_table8_wh(uint32_t *tb, uint64_t P, uint64_t C, uint64_t M, uint32_t w, uint32_t h,
                                   uint32_t pitch, uint32_t tidx, uint32_t r, uint32_t mid_idx, uint32_t flags,
                                   uint8_t *work, volatile uint32_t *mon, volatile uint32_t *stats)
 {
-    make_t(tb + 0, P, w, h, pitch, tidx);                            // +0x00 T#prev
+    make_t_pbuf(tb + 0, P, w, h, pitch, tidx, g_t_prev_half16);      // +0x00 T#prev
     make_t(tb + 8, C, w, h, pitch, tidx);                            // +0x20 T#cur
     make_t(tb + 16, M, w, h, pitch, tidx);                           // +0x40 T#out
     // +0x60 S#: clamp-to-edge x/y/z, FORCE_UNNORMALIZED, bilinear mag/min, no mips
     tb[24] = 2u | (2u << 3) | (2u << 6) | (1u << 15); tb[25] = 0; tb[26] = (1u << 20) | (1u << 22); tb[27] = 0;
     // +0x70 consts; tb[29] holds mid_idx | (t_override_q16 << 16); flags: bit 0 adaptive phase, bit 1 FG off,
-    // bit 2 debug marker, bit 3 'k', bit 4 'g', bit 5 'L', bit 6 'T', bit 7 'M', bit 8 'G', bit 9 'P', bit 10 'S', bit 11 'b'
+    // bit 2 debug marker, bit 3 'k', bit 4 'g', bit 5 'L', bit 6 'T', bit 7 'M', bit 8 'G', bit 9 'P', bit 10 'S', bit 11 'b',
+    // bit 12 FG8_FLAG_PYR_WARM (single-frame warm pyramid fast path)
     tb[28] = r; tb[29] = mid_idx; tb[30] = flags; tb[31] = g_hud_packed;
     if (work) {
         // buffers get 16 bytes of slack: me*.ll read 12 bytes at an aligned-down row start

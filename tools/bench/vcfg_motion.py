@@ -130,17 +130,31 @@ def me3(L3p, L3c, prevF=None, dc_comp=True):
     bx, by = _grid(nbx, nby)
     X, Y = bx * 8, by * 8
     N = bx.size
-    tdx = np.zeros(N, np.int64)
-    tdy = np.zeros(N, np.int64)
+    zero = np.zeros(N, np.int64)
     if prevF is not None:
         tx, ty = np.minimum(bx * 4 + 2, 119), np.minimum(by * 4 + 2, 67)
-        tdx = rnd(prevF[ty, tx, 0] * np.float32(0.125))
-        tdy = rnd(prevF[ty, tx, 1] * np.float32(0.125))
-    zero = np.zeros(N, np.int64)
-    s0 = sad_cur_grid(L3p, L3c, X, Y, zero, zero, dc_comp=dc_comp)
-    s1 = sad_cur_grid(L3p, L3c, X, Y, tdx, tdy, dc_comp=dc_comp)
-    usetemp = (s1 + 256 - 4) < (s0 + 256)   # lane 1 (temporal, bias 4) wins only with a strictly lower key
-    cx, cy = np.where(usetemp, tdx, 0), np.where(usetemp, tdy, 0)
+        tvx, tvy = prevF[ty, tx, 0], prevF[ty, tx, 1]
+        tdx, tdy = rnd(tvx * np.float32(0.125)), rnd(tvy * np.float32(0.125))
+        upx, upy = rnd(tvx * np.float32(0.0625)), rnd(tvy * np.float32(0.0625))
+        txu, tyu = np.clip(tx + upx, 0, 119), np.clip(ty + upy, 0, 67)
+        tvux, tvuy = prevF[tyu, txu, 0], prevF[tyu, txu, 1]
+        tdxu, tdyu = rnd(tvux * np.float32(0.125)), rnd(tvuy * np.float32(0.125))
+        tdxa = rnd((tvux * np.float32(2.0) - tvx) * np.float32(0.125))
+        tdya = rnd((tvuy * np.float32(2.0) - tvy) * np.float32(0.125))
+        tdxf = rnd((tvx * np.float32(2.0) - tvux) * np.float32(0.125))
+        tdyf = rnd((tvy * np.float32(2.0) - tvuy) * np.float32(0.125))
+    else:
+        tdx = tdy = tdxu = tdyu = tdxa = tdya = tdxf = tdyf = zero
+    cands_a = [(zero, zero), (tdx, tdy), (tdxu, tdyu), (tdxa, tdya), (tdxf, tdyf)]
+    best_a = np.full(N, BIG, np.int64)
+    cx, cy = zero.copy(), zero.copy()
+    for tid_a, (ax, ay) in enumerate(cands_a):
+        sa = sad_cur_grid(L3p, L3c, X, Y, ax, ay, dc_comp=dc_comp)
+        ca = sa + 256 - (4 if tid_a >= 1 else 0)
+        ka = (ca << 8) | tid_a
+        better_a = ka < best_a
+        best_a = np.where(better_a, ka, best_a)
+        cx, cy = np.where(better_a, ax, cx), np.where(better_a, ay, cy)
     best = np.full(N, BIG, np.int64)
     bk = np.zeros(N, np.int64)
     for k in range(435):
@@ -182,6 +196,18 @@ def me2(L2p, L2c, V3, prevF=None):
         ty = np.clip(ty0 + oy, 0, 67)
         return rnd(prevF[ty, tx, 0] * np.float32(0.25)), rnd(prevF[ty, tx, 1] * np.float32(0.25))
 
+    if prevF is not None:
+        tv0x, tv0y = prevF[ty0, tx0, 0], prevF[ty0, tx0, 1]
+        upx, upy = rnd(tv0x * np.float32(0.0625)), rnd(tv0y * np.float32(0.0625))
+        txu, tyu = np.clip(tx0 + upx, 0, 119), np.clip(ty0 + upy, 0, 67)
+        tvux, tvuy = prevF[tyu, txu, 0], prevF[tyu, txu, 1]
+        tdv_adv = (rnd(tvux * np.float32(0.25)), rnd(tvuy * np.float32(0.25)))
+        tdv_acc = (rnd((tvux * np.float32(2.0) - tv0x) * np.float32(0.25)),
+                   rnd((tvuy * np.float32(2.0) - tv0y) * np.float32(0.25)))
+    else:
+        tdv_adv = (zero, zero)
+        tdv_acc = (zero, zero)
+
     ixm1 = np.maximum(ix0 - 1, 0)
     ixp1 = np.minimum(ix1 + 1, n3x - 1)
     iym1 = np.maximum(iy0 - 1, 0)
@@ -191,7 +217,8 @@ def me2(L2p, L2c, V3, prevF=None):
         [(v[:, 0] * 2, v[:, 1] * 2) for v in nb] +                         # lanes 0..3
         [tdv2(0, 0), (zero, zero)] +                                       # lanes 4, 5
         [tdv2(2, 0), tdv2(-2, 0), tdv2(0, 2), tdv2(0, -2)] +               # lanes 6..9 (symmetric temporal)
-        [(v[:, 0] * 2, v[:, 1] * 2) for v in outer]                        # lanes 10..13 (outer L3 ring)
+        [(v[:, 0] * 2, v[:, 1] * 2) for v in outer] +                      # lanes 10..13 (outer L3 ring)
+        [tdv_adv, tdv_acc]                                                 # lanes 14..15 (self-advected & accel)
     )
     best = np.full(N, BIG, np.int64)
     cdx_b, cdy_b, zcost = zero.copy(), zero.copy(), None
@@ -199,7 +226,7 @@ def me2(L2p, L2c, V3, prevF=None):
         s = sad_cur_grid(L2p, L2c, X, Y, cdx, cdy, dc_comp=True)
         oob_m = (X + cdx < 0) | (X + cdx > w - 8) | (Y + cdy < 0) | (Y + cdy > h - 8)
         msh = np.where(oob_m, 3, 2)
-        ist = (sub == 4) or (6 <= sub <= 9)
+        ist = (sub == 4) or (6 <= sub <= 9) or (14 <= sub <= 15)
         isout = 10 <= sub <= 13
         cost = s + 256 + ((np.abs(cdx - medx) + np.abs(cdy - medy)) << msh) + (8 if isout else 0) - (8 if ist else 0)
         if sub == 5:
@@ -351,11 +378,43 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
     out_nbv = [V2[a, b].astype(np.int64) * 2 for a, b in out_nbi]              # outer L2 ring for lanes 12..15
     zero = np.zeros(N, np.int64)
 
-    def tdv(ex, ey):
-        if prevF is None:
-            return zero, zero
-        tx, ty = np.clip(bx + ex, 0, 119), np.clip(by + ey, 0, 67)
-        return (rnd(prevF[ty, tx, 0] * np.float32(0.5)), rnd(prevF[ty, tx, 1] * np.float32(0.5)))
+    if prevF is not None:
+        tv0x, tv0y = prevF[by, bx, 0], prevF[by, bx, 1]
+        upx, upy = rnd(tv0x * np.float32(0.0625)), rnd(tv0y * np.float32(0.0625))
+        up_nz = (upx != 0) | (upy != 0)
+        txu, tyu = np.clip(bx + upx, 0, 119), np.clip(by + upy, 0, 67)
+        tvux, tvuy = prevF[tyu, txu, 0], prevF[tyu, txu, 1]
+
+        def td_nb(tox, toy):
+            tx1, ty1 = np.clip(bx + tox, 0, 119), np.clip(by + toy, 0, 67)
+            v1x, v1y = prevF[ty1, tx1, 0], prevF[ty1, tx1, 1]
+            low = (np.abs(v1x) + np.abs(v1y)) < np.float32(8.0)
+            tx2, ty2 = np.clip(bx + 2 * tox, 0, 119), np.clip(by + 2 * toy, 0, 67)
+            v2x, v2y = prevF[ty2, tx2, 0], prevF[ty2, tx2, 1]
+            return np.where(low, v2x, v1x), np.where(low, v2y, v1y)
+
+        nb5x, nb5y = td_nb(1, 0)
+        nb6x, nb6y = td_nb(0, 1)
+        nb10x, nb10y = td_nb(-1, 0)
+        nb11x, nb11y = td_nb(0, -1)
+
+        fwx, fwy = tv0x * np.float32(2.0) - tvux, tv0y * np.float32(2.0) - tvuy
+        acx, acy = tvux * np.float32(2.0) - tv0x, tvuy * np.float32(2.0) - tv0y
+        midx = tvux + nbv[2][:, 0].astype(np.float32)
+        midy = tvuy + nbv[2][:, 1].astype(np.float32)
+
+        t4 = (rnd(tv0x * np.float32(0.5)), rnd(tv0y * np.float32(0.5)))
+        t5 = (rnd(np.where(up_nz, fwx, nb5x) * np.float32(0.5)),
+              rnd(np.where(up_nz, fwy, nb5y) * np.float32(0.5)))
+        sc6 = np.where(up_nz, np.float32(0.25), np.float32(0.5))
+        t6 = (rnd(np.where(up_nz, midx, nb6x) * sc6),
+              rnd(np.where(up_nz, midy, nb6y) * sc6))
+        t10 = (rnd(np.where(up_nz, tvux, nb10x) * np.float32(0.5)),
+               rnd(np.where(up_nz, tvuy, nb10y) * np.float32(0.5)))
+        t11 = (rnd(np.where(up_nz, acx, nb11x) * np.float32(0.5)),
+               rnd(np.where(up_nz, acy, nb11y) * np.float32(0.5)))
+    else:
+        t4 = t5 = t6 = t10 = t11 = (zero, zero)
 
     gk = GK[by, bx]
     hasfg = gk != 0
@@ -364,9 +423,9 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
     gv = V2.reshape(-1, 2)[gk & 4095].astype(np.int64) * 2
     gdx, gdy = gv[:, 0], gv[:, 1]
     cand = [(nbv[k][:, 0], nbv[k][:, 1]) for k in range(4)]                    # slots 0..3: inner 2x2 L2
-    cand += [tdv(0, 0), tdv(1, 0), tdv(0, 1)]                                  # slots 4..6: temporal (0, +x, +y)
+    cand += [t4, t5, t6]                                                        # slots 4..6: temporal / forward / mid
     cand += [(zero, zero), (gdx, gdy), (np.full(N, gmx2), np.full(N, gmy2))]   # slots 7, 8, 9: zero, GK, camera
-    cand += [tdv(-1, 0), tdv(0, -1)]                                           # slots 10..11: symmetric temporal (-x, -y)
+    cand += [t10, t11]                                                          # slots 10..11: advected / accel temporal
     cand += [(out_nbv[k][:, 0], out_nbv[k][:, 1]) for k in range(4)]           # slots 12..15: outer cardinal L2 ring
 
     def nbdist(a, b, cdx, cdy):
@@ -488,8 +547,10 @@ def unpack_f_8x8(F):
     return F8
 
 
-def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None):
+def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
     mp = mp or {}
+    if prevF is None:
+        prevF = mp.get("prevF")
     nby, nbx = FT.shape[:2]
     bx, by = _grid(nbx, nby)
     X, Y = bx * 8, by * 8
@@ -522,6 +583,18 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None):
     outer_offs = [(0, -2), (0, 2), (-2, 0), (2, 0), (-1, -2), (1, 2)]             # sub 10..15: 2-hop outer contour ring
     outer_nbrs = [ldT(ox, oy) for ox, oy in outer_offs]
     nbq = [(rnd(v[:, 0] * np.float32(0.5)), rnd(v[:, 1] * np.float32(0.5))) for v in nbrs]
+    if prevF is not None:
+        fp0x, fp0y = prevF[by, bx, 0], prevF[by, bx, 1]
+        upx, upy = rnd(fp0x * np.float32(0.0625)), rnd(fp0y * np.float32(0.0625))
+        up_nz = (upx != 0) | (upy != 0)
+        ubx, uby = np.clip(bx + upx, 0, 119), np.clip(by + upy, 0, 67)
+        fpux, fpuy = prevF[uby, ubx, 0], prevF[uby, ubx, 1]
+        tpx_u, tpy_u = rnd(fpux * np.float32(0.5)), rnd(fpuy * np.float32(0.5))
+        tpx_a = rnd((fpux * np.float32(2.0) - fp0x) * np.float32(0.5))
+        tpy_a = rnd((fpuy * np.float32(2.0) - fp0y) * np.float32(0.5))
+    else:
+        up_nz = np.zeros(N, bool)
+        tpx_u = tpy_u = tpx_a = tpy_a = np.zeros(N, np.int64)
     best = np.full(N, BIG, np.int64)
     winv = np.zeros((N, 2), np.float32)
     wincx = np.zeros(N, np.int64)
@@ -580,7 +653,10 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None):
         qexc = np.maximum(sad0 - (qmin * 4 + 256), 0)
         qtrim = qexc - (qexc >> 2)
         sad = np.minimum(sad0 - np.where(qmin <= 88, qtrim, 0), 65535)
-        bias = np.where(hasfg & ((sc > 3) | (sm0 < 16)), 96, 0) if sub == 0 else 0
+        dtu = np.abs(cx - tpx_u) + np.abs(cy - tpy_u)
+        dta = np.abs(cx - tpx_a) + np.abs(cy - tpy_a)
+        tbias = np.where(up_nz & (np.minimum(dtu, dta) <= 2), 16, 0)
+        bias = (np.where(hasfg & ((sc > 3) | (sm0 < 16)), 96, 0) if sub == 0 else 0) + tbias
         apen = np.where(ap, 512, 0)
         xc_0 = Xu - (cx >> 1)
         xp_0 = xc_0 + cx
@@ -665,3 +741,174 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None):
     vx_out = np.where(has_split, bxi_spl, bxi_hom).astype(np.uint32).view(np.float32)
     vy_out = np.where(has_split, byi_spl, byi).astype(np.uint32).view(np.float32)
     return np.stack([vx_out, vy_out], axis=-1).reshape(nby, nbx, 2)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# R13: Temporal Pyramid Ping-Pong Cache & Warm Single-Frame Fast Path
+# ---------------------------------------------------------------------------------------------------------------
+FG8_FLAG_PYR_WARM = 0x1000
+
+
+def pyr8_shader(rgb):
+    """Exact 1:1 port of classic/shaders/pyr8.ll:
+    2x2 hardware bilinear box mean -> sqrt((r + 2g + b) * 0.25) -> unquantized float LDS cascade -> u8 floor(x*255 + 0.5).
+    """
+    f = np.asarray(rgb[..., :3], np.float32)
+    H, W = f.shape[:2]
+    q = (f[0:H:2, 0:W:2] + f[0:H:2, 1:W:2] + f[1:H:2, 0:W:2] + f[1:H:2, 1:W:2]) * np.float32(0.25)
+    l1 = np.sqrt(np.maximum((q[..., 0] + np.float32(2.0) * q[..., 1] + q[..., 2]) * np.float32(0.25), np.float32(0.0)))
+
+    def down(x):
+        h, w = x.shape
+        xp = np.pad(x, ((0, h % 2), (0, w % 2)), mode='edge')
+        return (xp[0::2, 0::2] + xp[0::2, 1::2] + xp[1::2, 0::2] + xp[1::2, 1::2]) * np.float32(0.25)
+
+    def q8(x):
+        return np.clip(np.floor(x * np.float32(255.0) + np.float32(0.5)), 0.0, 255.0).astype(np.int64)
+
+    l2 = down(l1)
+    l3 = down(l2)
+    return q8(l1), q8(l2), q8(l3)
+
+
+def me3_dual(L3p, L3c, prevF=None, dc_comp=True):
+    """me3 with R13 packed (sv_p << 16) | sv_c luma sum reduction for both L3c (sumc) and L3p (sump)."""
+    V3, sumc = me3(L3p, L3c, prevF=prevF, dc_comp=dc_comp)
+    h, w = L3p.shape
+    nbx, nby = (w + 7) // 8, (h + 7) // 8
+    bx, by = _grid(nbx, nby)
+    X, Y = bx * 8, by * 8
+    r = np.arange(8)[None, :]
+    sump = int(_blocks(L3p, np.clip(X, 0, w - 8), np.clip(Y[:, None] + r, 0, h - 1)).sum())
+    return V3, sumc, sump
+
+
+def _pack_slot(L1, L2, L3):
+    """Pack pyramid levels with both (L1, L2, L3) and (L0, L1, L2, E) views for verification tests."""
+    return {
+        "L1": L1,
+        "L2": L2,
+        "L3": L3,
+        "L0": L1,
+        "E": L3,
+    }
+
+
+class PyramidPingPongCache:
+    """Host + GPU state machine for the R13 Temporal Pyramid Ping-Pong Cache (classic/source/main.c + pyr8.ll + me3.ll).
+
+    - Tracks `last_cur_base`, `last_w`, `last_h`, and `parity` (0 = Bank A cur / Bank B prev, 1 = Bank B cur / Bank A prev).
+    - On a Warm Hit (`prev_base != 0` and `prev_base == last_cur_base` and resolution unchanged):
+      - Toggles `parity ^= 1` and sets `FG8_FLAG_PYR_WARM` (`0x1000`).
+      - `pyr8.ll` builds ONLY `T#cur` into `slots[parity]` and zeroes only `W8_MISC[2 + parity]`, cutting pyramid work by 50%.
+      - `slots[parity ^ 1]` (`L1prev..L3prev`) and `W8_MISC[2 + (parity ^ 1)]` (`sump`) are reused directly from the previous
+        frame's `cur` slot — Zero extra DirectMemory and Zero contamination from in-place OSD/RCAS passes on frame N-1.
+    - On a Cold Miss (first frame, skipped frame / discontinuity, scene-cut reset, or resolution change):
+      - Resets `parity = 0` and clears `FG8_FLAG_PYR_WARM`.
+      - `pyr8.ll` builds BOTH `T#cur` -> `slots[0]` and `T#prev` -> `slots[1]`, and zeroes both `W8_MISC[2..3]`.
+      - `me3.ll` accumulates BOTH `sumc -> W8_MISC[2 + 0]` and `sump -> W8_MISC[2 + 1]`.
+    """
+
+    def __init__(self, use_shader_luma=True):
+        self.use_shader_luma = use_shader_luma
+        self.slots = [None, None]
+        self.misc_luma_sums = [0, 0]
+        self.last_cur_base = 0
+        self.last_w = 0
+        self.last_h = 0
+        self.parity = 0
+        self.warm_hits = 0
+        self.cold_misses = 0
+
+    def invalidate(self):
+        self.last_cur_base = 0
+        self.last_w = 0
+        self.last_h = 0
+
+    def _build_pyr(self, rgb):
+        fn = pyr8_shader if self.use_shader_luma else pyr8
+        L1, L2, L3 = fn(rgb)
+        return _pack_slot(L1, L2, L3)
+
+    def step(self, prev_rgb, cur_rgb, prev_base, cur_base, width=None, height=None,
+             prevF=None, anchor_hist=None, mp=None, force_cold=False):
+        h, w = cur_rgb.shape[:2]
+        if width is not None:
+            w = int(width)
+        if height is not None:
+            h = int(height)
+
+        pyr_warm = (
+            not force_cold
+            and prev_base != 0
+            and prev_base == self.last_cur_base
+            and w == self.last_w
+            and h == self.last_h
+            and self.slots[self.parity] is not None
+        )
+        r = (self.parity ^ 1) if pyr_warm else 0
+        self.parity = r
+        self.last_cur_base = int(cur_base)
+        self.last_w = w
+        self.last_h = h
+        flags = FG8_FLAG_PYR_WARM if pyr_warm else 0
+
+        # pyr8.ll execution
+        self.slots[r] = self._build_pyr(cur_rgb)
+        self.misc_luma_sums[r] = 0
+        if pyr_warm:
+            self.warm_hits += 1
+            pyr_evals = 1
+        else:
+            self.cold_misses += 1
+            self.slots[r ^ 1] = self._build_pyr(prev_rgb)
+            self.misc_luma_sums[r ^ 1] = 0
+            pyr_evals = 2
+
+        slot_prev = self.slots[r ^ 1]
+        slot_cur = self.slots[r]
+        L1p, L2p, L3p = slot_prev["L1"], slot_prev["L2"], slot_prev["L3"]
+        L1c, L2c, L3c = slot_cur["L1"], slot_cur["L2"], slot_cur["L3"]
+
+        # me3.ll execution
+        V3, sum_c, sum_p = me3_dual(L3p, L3c, prevF=prevF)
+        self.misc_luma_sums[r] += sum_c
+        if not pyr_warm:
+            self.misc_luma_sums[r ^ 1] += sum_p
+
+        lumasum_cur = self.misc_luma_sums[r]
+        lumasum_prev = self.misc_luma_sums[r ^ 1]
+
+        # me2 -> gm8 -> fgs8 -> me1 -> mf8
+        V2, S2 = me2(L2p, L2c, V3, prevF=prevF)
+        gm = gm8(V2, S2)
+        GK, new_hist = fgs8(L2p, L2c, V2, S2, gm, anchor_hist=anchor_hist)
+        FT, cutn, fade = me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=prevF, mp=mp)
+        F = mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=mp)
+
+        return {
+            "pyr_warm": pyr_warm,
+            "flags": flags,
+            "parity": r,
+            "pyr_evals": pyr_evals,
+            "slot_prev": slot_prev,
+            "slot_cur": slot_cur,
+            "L1p": L1p,
+            "L2p": L2p,
+            "L3p": L3p,
+            "L1c": L1c,
+            "L2c": L2c,
+            "L3c": L3c,
+            "lumasum_prev": lumasum_prev,
+            "lumasum_cur": lumasum_cur,
+            "V3": V3,
+            "V2": V2,
+            "S2": S2,
+            "gm": gm,
+            "GK": GK,
+            "anchor_hist": new_hist,
+            "FT": FT,
+            "F": F,
+            "cutn": cutn,
+            "fade": fade,
+        }

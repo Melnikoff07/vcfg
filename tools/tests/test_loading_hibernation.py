@@ -110,6 +110,8 @@ static long g_low_sub2mb_end = 0;
 static size_t g_gpu_sz = GPU_SZ_BASE;
 static int g_work_garlic = 0;
 
+static volatile uint32_t g_mem_hibernate_count = 0;
+static inline void pyr_cache_invalidate(void) {}
 static void *g_pre_gpu = NULL;
 static void *g_pre_work = NULL;
 static void *g_pre_mem = NULL;

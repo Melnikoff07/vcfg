@@ -342,7 +342,7 @@ entry:
   %vt = load <4 x i32>, ptr addrspace(4) %pt, align 16, !invariant.load !0
   %X = shl i32 %gx, 3
   %Y = shl i32 %gy, 3
-  ; ---- temporal predictor: previous field at L1 block (4bx+2, 4by+2), full-res px -> L3 px
+  ; ---- temporal predictor: previous field at L1 block (4bx+2, 4by+2) + self-advected upstream & accel, full-res px -> L3 px
   %tbx0 = shl i32 %gx, 2
   %tbx1 = add i32 %tbx0, 2
   %tbx = call i32 @llvm.smin.i32(i32 %tbx1, i32 119)
@@ -359,23 +359,78 @@ entry:
   %tvyq = fmul float %tvy, 0.125
   %tdx = call i32 @rnd(float %tvxq)
   %tdy = call i32 @rnd(float %tvyq)
-  ; ---- phase A: lane 0 zero, lane 1 temporal
+  %upx0 = fmul float %tvx, 0.0625
+  %upy0 = fmul float %tvy, 0.0625
+  %upx = call i32 @rnd(float %upx0)
+  %upy = call i32 @rnd(float %upy0)
+  %tbxu0 = add i32 %tbx, %upx
+  %tbxu1 = call i32 @llvm.smax.i32(i32 %tbxu0, i32 0)
+  %tbxu = call i32 @llvm.smin.i32(i32 %tbxu1, i32 119)
+  %tbyu0 = add i32 %tby, %upy
+  %tbyu1 = call i32 @llvm.smax.i32(i32 %tbyu0, i32 0)
+  %tbyu = call i32 @llvm.smin.i32(i32 %tbyu1, i32 67)
+  %trowu = mul i32 %tbyu, 120
+  %tidxu = add i32 %trowu, %tbxu
+  %toffu = shl i32 %tidxu, 3
+  %tvu = call <2 x float> @llvm.amdgcn.raw.buffer.load.v2f32(<4 x i32> %vt, i32 %toffu, i32 0, i32 0)
+  %tvux = extractelement <2 x float> %tvu, i32 0
+  %tvuy = extractelement <2 x float> %tvu, i32 1
+  %tvuxq = fmul float %tvux, 0.125
+  %tvuyq = fmul float %tvuy, 0.125
+  %tdxu = call i32 @rnd(float %tvuxq)
+  %tdyu = call i32 @rnd(float %tvuyq)
+  %tvux2 = fmul float %tvux, 2.0
+  %tvuy2 = fmul float %tvuy, 2.0
+  %tvax = fsub float %tvux2, %tvx
+  %tvay = fsub float %tvuy2, %tvy
+  %tvaxq = fmul float %tvax, 0.125
+  %tvayq = fmul float %tvay, 0.125
+  %tdxa = call i32 @rnd(float %tvaxq)
+  %tdya = call i32 @rnd(float %tvayq)
+  %tvx2 = fmul float %tvx, 2.0
+  %tvy2 = fmul float %tvy, 2.0
+  %tvfx = fsub float %tvx2, %tvux
+  %tvfy = fsub float %tvy2, %tvuy
+  %tvfxq = fmul float %tvfx, 0.125
+  %tvfyq = fmul float %tvfy, 0.125
+  %tdxf = call i32 @rnd(float %tvfxq)
+  %tdyf = call i32 @rnd(float %tvfyq)
+  ; ---- phase A: lane 0 zero, lane 1 temporal, lane 2 advected temporal, lane 3 accel, lane 4 forward
   %is1 = icmp eq i32 %tid, 1
-  %ax = select i1 %is1, i32 %tdx, i32 0
-  %ay = select i1 %is1, i32 %tdy, i32 0
+  %is2 = icmp eq i32 %tid, 2
+  %is3 = icmp eq i32 %tid, 3
+  %is4 = icmp eq i32 %tid, 4
+  %ist_a = icmp uge i32 %tid, 1
+  %ax1 = select i1 %is1, i32 %tdx, i32 0
+  %ay1 = select i1 %is1, i32 %tdy, i32 0
+  %ax2 = select i1 %is2, i32 %tdxu, i32 %ax1
+  %ay2 = select i1 %is2, i32 %tdyu, i32 %ay1
+  %ax3 = select i1 %is3, i32 %tdxa, i32 %ax2
+  %ay3 = select i1 %is3, i32 %tdya, i32 %ay2
+  %ax = select i1 %is4, i32 %tdxf, i32 %ax3
+  %ay = select i1 %is4, i32 %tdyf, i32 %ay3
   %sa = call i32 @bsadu(<4 x i32> %vp, <4 x i32> %vc, i32 240, i32 135, i32 %X, i32 %Y, i32 %ax, i32 %ay)
-  %ba = select i1 %is1, i32 4, i32 0
+  %ba = select i1 %ist_a, i32 4, i32 0
   %ca0 = add i32 %sa, 256
   %ca = sub i32 %ca0, %ba
   %kah = shl i32 %ca, 8
   %ka = or i32 %kah, %tid
-  %vala = icmp ult i32 %tid, 2
+  %vala = icmp ult i32 %tid, 5
   %keya = select i1 %vala, i32 %ka, i32 -1
   %ma = call i32 @reduce(i32 %tid, i32 %keya, i32 0, i32 64)
   %wa = and i32 %ma, 255
-  %usetemp = icmp eq i32 %wa, 1
-  %cx = select i1 %usetemp, i32 %tdx, i32 0
-  %cy = select i1 %usetemp, i32 %tdy, i32 0
+  %w1 = icmp eq i32 %wa, 1
+  %w2 = icmp eq i32 %wa, 2
+  %w3 = icmp eq i32 %wa, 3
+  %w4 = icmp eq i32 %wa, 4
+  %cx1 = select i1 %w1, i32 %tdx, i32 0
+  %cy1 = select i1 %w1, i32 %tdy, i32 0
+  %cx2 = select i1 %w2, i32 %tdxu, i32 %cx1
+  %cy2 = select i1 %w2, i32 %tdyu, i32 %cy1
+  %cx3 = select i1 %w3, i32 %tdxa, i32 %cx2
+  %cy3 = select i1 %w3, i32 %tdya, i32 %cy2
+  %cx = select i1 %w4, i32 %tdxf, i32 %cx3
+  %cy = select i1 %w4, i32 %tdyf, i32 %cy3
   br label %pre
 pre:
   ; ---- phase B: full search +-14x+-7 around the centre (29x15 = 435 candidates, raster order), lane handles k = tid + 64 i
@@ -402,9 +457,11 @@ gdone:
   %vy0 = add i32 %cy, %wyu
   %vy = sub i32 %vy0, 7
   ; ---- sum of this L3 block of the current frame -> misc dword 2 + parity (global fade detector, read by me1)
+  ; In Cold Mode (consts.flags bit 12 == 0), also pack and accumulate L3prev into misc dword 2 + (parity ^ 1).
   %pcn = getelementptr i8, ptr addrspace(4) %tbl, i64 112
   %cn = load <4 x i32>, ptr addrspace(4) %pcn, align 16, !invariant.load !0
   %par = extractelement <4 x i32> %cn, i32 0
+  %flags = extractelement <4 x i32> %cn, i32 2
   %pm = getelementptr i8, ptr addrspace(4) %tbl, i64 288
   %vm = load <4 x i32>, ptr addrspace(4) %pm, align 16, !invariant.load !0
   %sr = lshr i32 %tid, 3
@@ -415,8 +472,12 @@ gdone:
   %srow = mul i32 %sy, 240
   %soff = add i32 %srow, %sx
   %sb = call i8 @llvm.amdgcn.raw.buffer.load.i8(<4 x i32> %vc, i32 %soff, i32 0, i32 0)
+  %sbp = call i8 @llvm.amdgcn.raw.buffer.load.i8(<4 x i32> %vp, i32 %soff, i32 0, i32 0)
   %sv0 = zext i8 %sb to i32
-  %sv = select i1 %syok, i32 %sv0, i32 0
+  %svp0 = zext i8 %sbp to i32
+  %svp1 = shl i32 %svp0, 16
+  %sv_both = or i32 %sv0, %svp1
+  %sv = select i1 %syok, i32 %sv_both, i32 0
   %psv = getelementptr [64 x i32], ptr addrspace(3) @vecs, i32 0, i32 %tid
   store i32 %sv, ptr addrspace(3) %psv, align 4
   fence syncscope("workgroup") release
@@ -436,7 +497,17 @@ sum:
 st:
   %moff0 = shl i32 %par, 2
   %moff = add i32 %moff0, 8
-  %old = call i32 @llvm.amdgcn.raw.buffer.atomic.add.i32(i32 %sacc1, <4 x i32> %vm, i32 %moff, i32 0, i32 0)
+  %sum_c = and i32 %sacc1, 65535
+  %old = call i32 @llvm.amdgcn.raw.buffer.atomic.add.i32(i32 %sum_c, <4 x i32> %vm, i32 %moff, i32 0, i32 0)
+  %warm_bit = and i32 %flags, 4096
+  %is_warm = icmp ne i32 %warm_bit, 0
+  br i1 %is_warm, label %st_v3, label %st_cold_p
+st_cold_p:
+  %sum_p = lshr i32 %sacc1, 16
+  %moff_p = xor i32 %moff, 4
+  %oldp = call i32 @llvm.amdgcn.raw.buffer.atomic.add.i32(i32 %sum_p, <4 x i32> %vm, i32 %moff_p, i32 0, i32 0)
+  br label %st_v3
+st_v3:
   %pv = call i32 @pack(i32 %vx, i32 %vy)
   %orow = mul i32 %gy, 30
   %oidx = add i32 %orow, %gx

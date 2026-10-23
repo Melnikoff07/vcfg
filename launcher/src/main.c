@@ -99,6 +99,8 @@ static const Supported k_sup[] = {
     { "CUSA33277", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
     { "CUSA40994", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
     { "CUSA42311", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA02962", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA01004", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
 static const char *k_files[] = { "vcfg16.prx", "vcfg_classic51.prx", "vcfg_alt_16.prx" };
@@ -113,7 +115,8 @@ static int auto_2buf(const char *id)
            vcfg_in_family(id, "CUSA02299") || vcfg_in_family(id, "CUSA08344") ||
            vcfg_in_family(id, "CUSA10454") || vcfg_in_family(id, "CUSA11100") ||
            vcfg_in_family(id, "CUSA15090") || vcfg_in_family(id, "CUSA18723") ||
-           vcfg_in_family(id, "CUSA00009") || vcfg_in_family(id, "CUSA42311");
+           vcfg_in_family(id, "CUSA00009") || vcfg_in_family(id, "CUSA42311") ||
+           vcfg_in_family(id, "CUSA02962") || vcfg_in_family(id, "CUSA01004");
 }
 static int auto_alt(const char *id)
 {
@@ -1050,7 +1053,16 @@ static int map_of(const char *hdr)
 typedef struct { char *o; size_t n, cap; int bad; } Out;
 static void emit(Out *w, const char *s)
 {
-    size_t L = strlen(s); if (w->bad || w->n + L + 2 >= w->cap) { w->bad = 1; return; }
+    size_t L = strlen(s);
+    if (w->bad) return;
+    if (w->n + L + 2 >= w->cap) {
+        size_t new_cap = w->cap * 2 + L + 65536;
+        if (new_cap > (4u << 20)) { w->bad = 1; return; }
+        char *nb = realloc(w->o, new_cap);
+        if (!nb) { w->bad = 1; return; }
+        w->o = nb;
+        w->cap = new_cap;
+    }
     memcpy(w->o + w->n, s, L); w->n += L;
 }
 static void emit_new(Out *w, int t)
@@ -1077,7 +1089,7 @@ static void sec_flush(Out *w, Section *s, int install, int *done)
 }
 static char *ini_update(const char *old, int install, size_t *outn)
 {
-    size_t cap = strlen(old) + 8192;
+    size_t cap = strlen(old) + (size_t)MAPMAX * 96 + 65536;
     Out w = { malloc(cap), 0, cap, 0 }; if (!w.o) return NULL;
     static Section sec; memset(&sec, 0, sizeof(sec)); sec.cur = -1;
     static int done[MAPMAX]; memset(done, 0, sizeof(done)); int defaults_seen = 0; char line[512];

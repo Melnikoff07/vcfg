@@ -279,8 +279,9 @@ static int32_t bench_flip(uint32_t count, void **dcb, uint32_t *sizes, void **cc
         p = bench_pass(p, tb, g_sh8_off[16], PCOPY8_RSRC1, PCOPY8_RSRC2, 240, 135);
         uint32_t *py = g_bench_tables + 160;
         memset(py, 0, 140u * sizeof(uint32_t));
-        fill_table8(py, saved_a, saved_a, mid, 1920, tidx, 0, 0, 0, g_work, g_mon, NULL);
+        fill_table8(py, saved_a, saved_a, mid, 1920, tidx, 0, 0, FG8_FLAG_PYR_WARM, g_work, g_mon, NULL);
         p = bench_pass(p, py, g_sh8_off[0], PYR8_RSRC1, PYR8_RSRC2, 30, 68);
+        g_pyr_last_cur_base = saved_a; g_pyr_last_w = 1920; g_pyr_last_h = 1080; g_pyr_parity = 0;
     } else if (stage == 2) {
         g_bench_offscreen = 1;
         uint32_t n = build_dcb_flow8(p, saved_a, current, mid, mid, 1920, tidx, 1920u * 1088u * 4u,

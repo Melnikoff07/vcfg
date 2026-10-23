@@ -128,7 +128,10 @@ static void record_flex_vmap_ex(void *va, size_t len, long phys, int prot, int t
     if (!arena_vs || !arena_ve) { arena_vs = vs; arena_ve = ve; arena_phys = phys; }
     uint32_t n = __atomic_load_n(&g_flex_vmap_n, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < n && i < FLEX_VMAP_MAX; i++) {
-        if (g_flex_vmap[i].va_start == vs && g_flex_vmap[i].va_end == ve) {
+        if ((g_flex_vmap[i].va_start == vs && g_flex_vmap[i].va_end == ve) ||
+            (g_flex_vmap[i].va_start == 0 && g_flex_vmap[i].va_end == 0)) {
+            g_flex_vmap[i].va_start = vs;
+            g_flex_vmap[i].va_end = ve;
             g_flex_vmap[i].phys_start = phys;
             g_flex_vmap[i].prot = prot;
             g_flex_vmap[i].type = type;
@@ -138,6 +141,7 @@ static void record_flex_vmap_ex(void *va, size_t len, long phys, int prot, int t
             return;
         }
     }
+    if (n >= FLEX_VMAP_MAX) return;
     uint32_t idx = __atomic_fetch_add(&g_flex_vmap_n, 1u, __ATOMIC_ACQ_REL);
     if (idx < FLEX_VMAP_MAX) {
         g_flex_vmap[idx].va_start = vs;
@@ -422,9 +426,15 @@ static void crash_sig_handler(int sig, void *info, void *uctx)
                 next_reg = 2;
             }
             if (next_shave != g_cfg.shave_mode || next_reg != g_cfg.reg_mode) {
+                int keep_2buf = (g_cfg.two_buffer > 0 || g_ngame == 2) ? 1 : 0;
+                int keep_vout = (g_cfg.vout_path > 0) ? 1 : 0;
                 int an = snprintf(abuf, sizeof(abuf),
-                                  "; auto-generated on boot/alloc crash\nshave_mode = %d\nreg_mode = %d\npace_order = %d\n",
-                                  next_shave, next_reg, g_cfg.pace_order);
+                                  "; auto-generated on boot/alloc crash\nshave_mode = %d\nreg_mode = %d\npace_order = %d\n%s%s",
+                                  next_shave, next_reg, g_cfg.pace_order,
+                                  keep_2buf ? "two_buffer = 1\n" : "",
+                                  keep_vout ? "vout_path = 1\n" : "");
+                if (g_cfg.gv_conv >= 0 && an > 0 && an < (int)sizeof(abuf))
+                    an += snprintf(abuf + an, sizeof(abuf) - (size_t)an, "gv_conv = %d\n", g_cfg.gv_conv);
                 int fd_a = sceKernelOpen(apath, 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0666);
                 if (fd_a >= 0 && an > 0) { sceKernelWrite(fd_a, abuf, (size_t)an); sceKernelClose(fd_a); }
                 char bmarker[64];
@@ -437,9 +447,15 @@ static void crash_sig_handler(int sig, void *info, void *uctx)
         } else if ((g_flips >= INJECT_AFTER_FLIPS && g_flips < INJECT_AFTER_FLIPS + 600) ||
                    (g_vo_submit_flips >= INJECT_AFTER_FLIPS && g_vo_submit_flips < INJECT_AFTER_FLIPS + 600)) {
             int next_pace = (g_cfg.pace_order == 2) ? 3 : (g_last_pace_pre ? 2 : 1);
+            int keep_2buf = (g_cfg.two_buffer > 0 || g_ngame == 2) ? 1 : 0;
+            int keep_vout = (g_cfg.vout_path > 0) ? 1 : 0;
             int an = snprintf(abuf, sizeof(abuf),
-                              "; auto-generated on early FG crash (flips=%u)\nshave_mode = %d\nreg_mode = %d\npace_order = %d\n",
-                              g_flips, g_cfg.shave_mode, g_cfg.reg_mode, next_pace);
+                              "; auto-generated on early FG crash (flips=%u)\nshave_mode = %d\nreg_mode = %d\npace_order = %d\n%s%s",
+                              g_flips, g_cfg.shave_mode, g_cfg.reg_mode, next_pace,
+                              keep_2buf ? "two_buffer = 1\n" : "",
+                              keep_vout ? "vout_path = 1\n" : "");
+            if (g_cfg.gv_conv >= 0 && an > 0 && an < (int)sizeof(abuf))
+                an += snprintf(abuf + an, sizeof(abuf) - (size_t)an, "gv_conv = %d\n", g_cfg.gv_conv);
             int fd_a = sceKernelOpen(apath, 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0666);
             if (fd_a >= 0 && an > 0) { sceKernelWrite(fd_a, abuf, (size_t)an); sceKernelClose(fd_a); }
             crash_write_both(fd_c, fd_b,
@@ -506,6 +522,7 @@ int32_t sceVideoOutOpen_hook(int32_t u, int32_t bus, int32_t idx, const void *p)
 int32_t sceVideoOutClose_hook(int32_t h)
 {
     flush_map_run();
+    release_pbuf();
     STAGE("game VideoOutClose(handle=%d)", h);
     int32_t r = HOOK_CONTINUE(sceVideoOutClose, int32_t (*)(int32_t), h);
     api_ring_push("VideoOutClose(h=%d) = 0x%08x", h, (unsigned)r);
@@ -520,10 +537,11 @@ static int try_recover_hibernated_work(void);
 // releasing physical DirectMemory at runtime (g_flips > 0).
 static void valve_hibernate_and_drain_gpu(void)
 {
-    __atomic_store_n(&g_hibernated_at_flip, g_flips ? g_flips : 1u, __ATOMIC_RELEASE);
+    uint32_t tot_flips = g_flips + g_vo_submit_flips;
+    __atomic_store_n(&g_hibernated_at_flip, tot_flips ? tot_flips : 1u, __ATOMIC_RELEASE);
     g_hibernated_releases_base = __atomic_load_n(&g_dbg_releases, __ATOMIC_ACQUIRE);
     __atomic_store_n(&g_mem_hibernating, 1, __ATOMIC_SEQ_CST);
-    if (g_flips > 0 || g_gpu_state > 0) {
+    if (tot_flips > 0 || g_gpu_state > 0) {
         for (int wait_i = 0; wait_i < 50; wait_i++) {
             volatile uint32_t *done_ptr = (volatile uint32_t *)__atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
             uint32_t target_seq = __atomic_load_n(&g_last_seq, __ATOMIC_ACQUIRE);
@@ -543,6 +561,7 @@ static int hibernate_work_dm(long s, long e, size_t eff_align)
     long work_2mb_page = g_pre_work_phys & ~0x1FFFFFL;
     g_hibernated_work_sz = g_pre_work_sz ? g_pre_work_sz : WORK_SZ_8;
     valve_hibernate_and_drain_gpu();
+    __atomic_add_fetch(&g_mem_hibernate_count, 1u, __ATOMIC_ACQ_REL);
     g_own_alloc++;
     release_early_work();
     if (g_gpu_state == 0 && !g_gpu && !g_mon && g_pre_gpu && g_pre_gpu_phys >= 0 &&
@@ -923,9 +942,14 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
         // region [0, g_low_sub2mb_end) (where a 2MB-aligned allocation can never be placed by the kernel anyway).
         // When g_flips > 0 (!boot_phase), atomically gate on_sub (g_mem_hibernating = 1) and drain any in-flight GPU
         // command buffer (*g_done == g_last_seq, up to 25 ms) before releasing g_work_phys.
-        if (pre_gpu_phase && (uint32_t)r == 0x80020023u && ((g_pre_work && g_pre_work_phys > 0) || (g_pre_gpu && g_pre_gpu_phys > 0))) {
+        if (pre_gpu_phase && (uint32_t)r == 0x80020023u &&
+            ((g_pre_work && g_pre_work_phys > 0) || (g_pre_gpu && g_pre_gpu_phys > 0) || (g_pbuf && g_pbuf_phys > 0))) {
             int rel_any = 0;
             g_own_alloc++;
+            if (g_pbuf && g_pbuf_phys > 0 && g_pbuf_phys < e && g_pbuf_phys + (long)g_pbuf_sz > s) {
+                release_pbuf();
+                rel_any = 1;
+            }
             if (g_pre_work && g_pre_work_phys > 0 && g_pre_work_phys < e && g_pre_work_phys + (long)g_pre_work_sz > s &&
                 !(eff_align >= 0x200000u && g_pre_work_phys + (long)g_pre_work_sz <= g_low_sub2mb_end)) {
                 release_early_work();
@@ -998,7 +1022,9 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
             if (cur_av + g_pre_size >= len || (boot_phase && len >= 0x4000000u)) {
                 if (!boot_phase) {
                     valve_hibernate_and_drain_gpu();
-                    g_hibernated_at_flip = g_flips ? g_flips : 1u;
+                    uint32_t tot_f = g_flips + g_vo_submit_flips;
+                    g_hibernated_at_flip = tot_f ? tot_f : 1u;
+                    __atomic_add_fetch(&g_mem_hibernate_count, 1u, __ATOMIC_ACQ_REL);
                 }
                 g_own_alloc++;
                 release_early_mem();
@@ -1007,6 +1033,24 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
                                   s, e, len, align, type, phys);
                 if ((uint32_t)r == 0x80020023u && boot_phase)
                     r = shave_game_alloc(s, e, len, align, type, phys, boot_phase, is_desc_probe);
+            }
+        }
+        // Step 6: Runtime memory hibernation for post-menu world-arena allocations when normal shaving cannot satisfy
+        // the request while g_pre_mem holds DirectMemory. Always drains GPU / VideoOut scanout before releasing g_pre_mem.
+        if (!boot_phase && (uint32_t)r == 0x80020023u && g_pre_mem && g_pre_mem_phys > 0 && len >= 0x1000000u) {
+            size_t cur_av = dm_avail_range(s, e, eff_align, NULL);
+            if (cur_av + g_pre_size >= len) {
+                valve_hibernate_and_drain_gpu();
+                uint32_t tot_f = g_flips + g_vo_submit_flips;
+                g_hibernated_at_flip = tot_f ? tot_f : 1u;
+                g_own_alloc++;
+                release_early_mem();
+                g_own_alloc--;
+                __atomic_add_fetch(&g_mem_hibernate_count, 1u, __ATOMIC_ACQ_REL);
+                STAGE("memory hibernate #%u: released display DirectMemory at flip=%u for post-menu arena len=0x%zx",
+                      g_mem_hibernate_count, g_flips, len);
+                r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
+                                  s, e, len, align, type, phys);
             }
         }
         if ((uint32_t)r == 0x80020023u) {

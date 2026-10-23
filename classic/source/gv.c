@@ -906,6 +906,19 @@ static void cfg_depth_update(void)
     cfg_publish(&S.cfg);
 }
 
+static int gv_conv_from_res(const gvcal_result_t *r)
+{
+    if (!r) return -1;
+    float k = r->ax < 0.0f ? -r->ax : r->ax;
+    int sign_bit = (r->ax < 0.0f) ? 1 : 0;
+    int yflip_bit = ((r->ax < 0.0f) != (r->ay < 0.0f)) ? 2 : 0;
+    int unit_cls = 0;
+    if (k > 2800.0f) unit_cls = 3;
+    else if (k > 1400.0f) unit_cls = 2;
+    else if (k > 400.0f) unit_cls = 1;
+    return (unit_cls << 2) | yflip_bit | sign_bit;
+}
+
 static void start_candidate(int i)
 {
     S.cur = i;
@@ -1317,6 +1330,8 @@ void gv_io_tick(void)
                 prof_write("accepted", c, &S.res, cap, "calibrated");
                 S.prof = S.res; S.prof_cand = *c; S.have_prof = 1;
                 S.st = ST_ACTIVE; S.fails = 0;
+                g_gv_cal_winner = gv_conv_from_res(&S.prof);
+                g_gv_cal_locked = 1;
                 cfg_for(c, &S.res, 1);
             } else if (d == -1 || S.snaps > 120) {
                 c->state = d == -1 ? (S.res.soft ? -2 : -1) : -2;
@@ -1335,10 +1350,13 @@ void gv_io_tick(void)
             if (S.st == ST_TRIAL && S.passes >= 3) {
                 lg("GV profile confirmed: hybrid ON\n");
                 S.st = ST_ACTIVE; S.fails = 0;
+                g_gv_cal_winner = gv_conv_from_res(&S.prof);
+                g_gv_cal_locked = 1;
                 cfg_for(&S.prof_cand, &S.prof, 1);
             } else if (S.fails >= 3) {
                 lg("GV profile does not fit any more (3 failed checks): hybrid OFF, calibrating again\n");
                 S.have_prof = 1; S.st = ST_SCAN; S.passes = S.fails = 0;
+                g_gv_cal_locked = 0;
                 cfg_for(NULL, NULL, 0);
                 g_scan_state = 1;
             }

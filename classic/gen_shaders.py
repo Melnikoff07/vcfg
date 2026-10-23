@@ -130,7 +130,7 @@ def build(llc,sdir,out):
         lines += ['};','']
         print(f'{name}: {len(words)} words, vgprs={nv} sgprs={ns} user={int(m[1])} lds={lds} scratch={scratch} rsrc1={r1:08X} rsrc2={r2:08X}')
     # Build-time region check: the mode-8 + velocity + rcas8/osd8 shaders start at 0x8000 (256 B aligned) and must end below DCB8_OFF (0x1C000)
-    used=[n for n in ('pyr8','me3','me2','me1','phase8','warp8','dump8','gm8','fgs8','mf8','gv8','gvc8','warp8g','gvz8','rcas8','osd8') if n in sizes]
+    used=[n for n in ('pyr8','me3','me2','me1','mf8','gm8','fgs8','phase8','warp8','warp8g','rcas8','gv8','gvc8','gvz8','ui8','osd8','pcopy8') if n in sizes]
     if 'pyr8' in used:
         aligned=sum(((sizes[n]*4+255)&~255) for n in used)
         print(f'shader region: 0x8000 + 0x{aligned:x} = 0x{0x8000+aligned:x} (limit 0x1C000)')

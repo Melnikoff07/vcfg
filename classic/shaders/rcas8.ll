@@ -191,42 +191,7 @@ ld_sync:
   %mx5 = call float @llvm.maxnum.f32(float %mx4, float %lM)
   %rng5 = fsub float %mx5, %mn5
 
-  ; RCAS adaptive lobe weight
-  %mx4e = fadd float %mx4, 0x3F10000000000000 ; 2^-14
-  %den0 = fmul float %mx4e, 4.0
-  %hmin = fdiv arcp afn float %mn4, %den0
-  %nhmin = fsub float 0.0, %hmin
-  %num1 = fsub float 1.0, %mx4
-  %mn4m1 = fsub float %mn4, 1.0
-  %den1a = fmul float %mn4m1, 4.0
-  %den1 = fsub float %den1a, 0x3F10000000000000
-  %hmax = fdiv arcp afn float %num1, %den1
-  %lobe0 = call float @llvm.maxnum.f32(float %nhmin, float %hmax)
-  %ncon = fsub float 0.0, %con
-  %lobe1 = call float @llvm.maxnum.f32(float %ncon, float %lobe0)
-  %w0 = call float @llvm.minnum.f32(float %lobe1, float 0.0)
-  %s_nw = fadd float %lN, %lW
-  %s_es = fadd float %lE, %lS
-  %s4l = fadd float %s_nw, %s_es
-  %avg4 = fmul float %s4l, 0.25
-  %nz0 = fsub float %avg4, %lM
-  %anz = call float @llvm.fabs.f32(float %nz0)
-  %rng5e = fadd float %rng5, 0x3F10000000000000
-  %nz1 = fdiv arcp afn float %anz, %rng5e
-  %nz = call float @sat(float %nz1)
-  %dn0 = fmul float %nz, 0.5
-  %dn = fsub float 1.0, %dn0
-  %w_rcas = fmul float %w0, %dn
-
-  %has_enh = icmp ugt i32 %emode, 0
-  br i1 %has_enh, label %do_aa, label %rcas_only
-
-do_aa:
-  %NW = call <4 x float> @rd_c(i32 %iNW)
-  %NE = call <4 x float> @rd_c(i32 %iNE)
-  %SW = call <4 x float> @rd_c(i32 %iSW)
-  %SE = call <4 x float> @rd_c(i32 %iSE)
-
+  ; 5-tap & 9-tap local extrema + directional structure gate (shared by RCAS & Enhance AA)
   %mn_d0 = call float @llvm.minnum.f32(float %lNW, float %lNE)
   %mn_d1 = call float @llvm.minnum.f32(float %lSW, float %lSE)
   %mn_d  = call float @llvm.minnum.f32(float %mn_d0, float %mn_d1)
@@ -236,7 +201,77 @@ do_aa:
   %mx_d  = call float @llvm.maxnum.f32(float %mx_d0, float %mx_d1)
   %mx9   = call float @llvm.maxnum.f32(float %mx5, float %mx_d)
   %rng9  = fsub float %mx9, %mn9
-  %rng9e = fadd float %rng9, 0x3F10000000000000
+  %rng9e = fadd float %rng9, 0x3F10000000000000 ; 2^-14
+
+  ; Directional gradient gate (distinguishes coherent edges/wires from Nyquist foliage/glint speckles)
+  %dNS0 = fsub float %lN, %lS
+  %dNS  = call float @llvm.fabs.f32(float %dNS0)
+  %dWE0 = fsub float %lW, %lE
+  %dWE  = call float @llvm.fabs.f32(float %dWE0)
+  %dCard = call float @llvm.maxnum.f32(float %dNS, float %dWE)
+  %dD10 = fsub float %lNE, %lSW
+  %dD1  = call float @llvm.fabs.f32(float %dD10)
+  %dD20 = fsub float %lNW, %lSE
+  %dD2  = call float @llvm.fabs.f32(float %dD20)
+  %dDiag0 = call float @llvm.maxnum.f32(float %dD1, float %dD2)
+  %dDiag = fmul float %dDiag0, 0.5
+  %gDir = fadd float %dCard, %dDiag
+  %tg0 = fdiv arcp afn float %gDir, %rng9e
+  %tg1 = fmul float %tg0, 1.5
+  %tex_gate = call float @sat(float %tg1)
+
+  ; RCAS adaptive lobe weight (5-tap extrema + Karis highlight compression)
+  %mx5e = fadd float %mx5, 0x3F10000000000000 ; 2^-14
+  %den0 = fmul float %mx5e, 4.0
+  %hmin = fdiv arcp afn float %mn5, %den0
+  %nhmin = fsub float 0.0, %hmin
+  %num1 = fsub float 1.0, %mx5
+  %mn5m1 = fsub float %mn5, 1.0
+  %den1a = fmul float %mn5m1, 4.0
+  %den1 = fsub float %den1a, 0x3F10000000000000
+  %hmax = fdiv arcp afn float %num1, %den1
+  %lobe0 = call float @llvm.maxnum.f32(float %nhmin, float %hmax)
+  %ncon = fsub float 0.0, %con
+  %lobe1 = call float @llvm.maxnum.f32(float %ncon, float %lobe0)
+  %w0_raw = call float @llvm.minnum.f32(float %lobe1, float 0.0)
+  %k_den = fadd float 1.0, %mx5
+  %w_karis = fdiv arcp afn float 1.0, %k_den
+  %w0 = fmul float %w0_raw, %w_karis
+
+  %s_nw = fadd float %lN, %lW
+  %s_es = fadd float %lE, %lS
+  %s4l = fadd float %s_nw, %s_es
+  %avg4 = fmul float %s4l, 0.25
+  %nz0 = fsub float %avg4, %lM
+  %anz = call float @llvm.fabs.f32(float %nz0)
+  %rng5e = fadd float %rng5, 0x3F10000000000000
+  %nz1 = fdiv arcp afn float %anz, %rng5e
+  %nz = call float @sat(float %nz1)
+  %dn0 = fmul float %nz, 0x3FEB333340000000 ; 0.85
+  %dn1 = fsub float 1.0, %dn0
+  %dn_s = call float @sat(float %dn1)
+  %dn = fmul float %dn_s, %tex_gate
+  %w_sharp = fmul float %w0, %dn
+  %om_tg = fsub float 1.0, %tex_gate
+  %nz_ex0 = fsub float %nz, 0x3FDCCCCCC0000000 ; 0.45
+  %nz_ex1 = fmul float %nz_ex0, 2.0
+  %nz_g = call float @sat(float %nz_ex1)
+  %con_g0 = fmul float %con, 8.0
+  %con_g = call float @sat(float %con_g0)
+  %w_sh0 = fmul float %om_tg, %nz_g
+  %w_sh1 = fmul float %w_sh0, 0x3FB99999A0000000 ; 0.10
+  %w_sh2 = fmul float %w_sh1, %w_karis
+  %w_shim = fmul float %w_sh2, %con_g
+  %w_rcas = fadd float %w_sharp, %w_shim
+
+  %has_enh = icmp ugt i32 %emode, 0
+  br i1 %has_enh, label %do_aa, label %rcas_only
+
+do_aa:
+  %NW = call <4 x float> @rd_c(i32 %iNW)
+  %NE = call <4 x float> @rd_c(i32 %iNE)
+  %SW = call <4 x float> @rd_c(i32 %iSW)
+  %SE = call <4 x float> @rd_c(i32 %iSE)
 
   %is_str = icmp uge i32 %emode, 2
   %thr_abs = select i1 %is_str, float 0.015625, float 0.0234375 ; 4/256 vs 6/256
@@ -279,23 +314,6 @@ do_aa:
   %ev01 = fadd float %ev0, %ev1
   %edgeV = fadd float %ev01, %ev2
   %horz = fcmp oge float %edgeH, %edgeV
-
-  ; Directional gradient gate (protects fine isotropic grass/hair dots while passing true edges)
-  %dNS0 = fsub float %lN, %lS
-  %dNS  = call float @llvm.fabs.f32(float %dNS0)
-  %dWE0 = fsub float %lW, %lE
-  %dWE  = call float @llvm.fabs.f32(float %dWE0)
-  %dCard = call float @llvm.maxnum.f32(float %dNS, float %dWE)
-  %dD10 = fsub float %lNE, %lSW
-  %dD1  = call float @llvm.fabs.f32(float %dD10)
-  %dD20 = fsub float %lNW, %lSE
-  %dD2  = call float @llvm.fabs.f32(float %dD20)
-  %dDiag0 = call float @llvm.maxnum.f32(float %dD1, float %dD2)
-  %dDiag = fmul float %dDiag0, 0.5
-  %gDir = fadd float %dCard, %dDiag
-  %tg0 = fdiv arcp afn float %gDir, %rng9e
-  %tg1 = fmul float %tg0, 1.5
-  %tex_gate = call float @sat(float %tg1)
 
   %lNeg = select i1 %horz, float %lN, float %lW
   %lPos = select i1 %horz, float %lS, float %lE
@@ -396,6 +414,11 @@ do_aa:
   %sp1 = fdiv arcp afn float %asp0, %rng9e
   %subpx = call float @sat(float %sp1)
   %sp_sc = select i1 %is_str, float 1.0, float 0.75
+  %gMin = call float @llvm.minnum.f32(float %gNeg, float %gPos)
+  %gMaxe = fadd float %gMax, 0x3F10000000000000 ; 2^-14
+  %r_rat = fdiv arcp afn float %gMin, %gMaxe
+  %r_at0 = fmul float %r_rat, 0x3FEB333340000000 ; 0.85
+  %r_gate = fsub float 1.0, %r_at0
   %wSub0 = fmul float %subpx, %sp_sc
   %wSubpx = fmul float %wSub0, %tex_gate
 
@@ -426,7 +449,8 @@ do_aa:
   %wComb = call float @llvm.maxnum.f32(float %wSpan15, float %wSubpx)
   %max_w = select i1 %is_str, float 0.75, float 0.5625
   %wClp = call float @llvm.minnum.f32(float %wComb, float %max_w)
-  %wAA = fmul float %edge_ramp, %wClp
+  %wAA0 = fmul float %edge_ramp, %wClp
+  %wAA = fmul float %wAA0, %r_gate
 
   %difAA = fsub <4 x float> %rgbTarget, %M
   %stepAA = call <4 x float> @scale4(<4 x float> %difAA, float %wAA)
@@ -443,8 +467,18 @@ rcas_apply:
   %base_c = phi <4 x float> [ %aa_rgb, %do_aa ], [ %M, %rcas_only ]
   %w_eff  = phi float [ %w_eff_aa, %do_aa ], [ %w_rcas, %rcas_only ]
 
-  %v_ns = fadd <4 x float> %N, %S
-  %v_we = fadd <4 x float> %W, %E
+  %dSum_c0 = fadd float %dNS, %dWE
+  %dSum_c = fadd float %dSum_c0, 0x3F10000000000000 ; 2^-14
+  %dNS2 = fmul float %dNS, 2.0
+  %a_ns0 = fdiv arcp afn float %dNS2, %dSum_c
+  %a_we0 = fsub float 2.0, %a_ns0
+  %is_sh = fcmp olt float %w_eff, 0.0
+  %a_ns = select i1 %is_sh, float %a_ns0, float 1.0
+  %a_we = select i1 %is_sh, float %a_we0, float 1.0
+  %v_ns0 = fadd <4 x float> %N, %S
+  %v_we0 = fadd <4 x float> %W, %E
+  %v_ns = call <4 x float> @scale4(<4 x float> %v_ns0, float %a_ns)
+  %v_we = call <4 x float> @scale4(<4 x float> %v_we0, float %a_we)
   %v4   = fadd <4 x float> %v_ns, %v_we
   %wv4  = call <4 x float> @scale4(<4 x float> %v4, float %w_eff)
   %num  = fadd <4 x float> %wv4, %base_c

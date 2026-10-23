@@ -53,6 +53,10 @@ if ($Target -eq 'plugin') {
     # Shader arrays must be byte-identical to the headers (never text-edit machine arrays).
     & $cfg.python -I (Join-Path $root 'tools\elf_arrays.py') $elf (Join-Path $src 'source')
     if ($LASTEXITCODE -ne 0) { throw 'Shader array check failed' }
+    & $cfg.python -I (Join-Path $root 'tools\tests\test_lowmem_valve.py')
+    if ($LASTEXITCODE -ne 0) { throw 'Low-memory regression test failed' }
+    & $cfg.python -I (Join-Path $root 'tools\tests\test_real_traces.py')
+    if ($LASTEXITCODE -ne 0) { throw 'Real hardware trace replay test failed' }
 }
 Write-Host "flags: $($Defs -join ' ')"
 Get-FileHash -Algorithm SHA256 "$out\$Name.prx" | Format-List

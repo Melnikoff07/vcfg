@@ -1,10 +1,18 @@
 ; user_sgprs=2
 ; tgid_y=1
-; mode 8, pass 1: luma pyramid of the CURRENT frame in one dispatch (30 x 68 groups of 64 threads).
-; table: +0x20 T#cur, +0x60 S# (bilinear, clamp, unnormalised), +0x80 V#L1 (960x540 u8), +0xA0 V#L2 (480x270 u8),
-;        +0xC0 V#L3 (240x135 u8), +0x70 consts {parity}, +0x120 V#misc (dword 0 = scene-change counter and
-;        dword 2 + parity = luma sum of this frame, dword 6 = foreground block count, all zeroed here;
-;        me1 / me3 / fgs8 accumulate them),
+; mode 8, pass 1: luma pyramid in one dispatch (30 x 68 groups of 64 threads).
+; Supports two execution modes controlled by consts.flags bit 12 (FG8_FLAG_PYR_WARM = 0x1000):
+;  - Warm Single-Frame Mode (flags & 0x1000 != 0): prev_base == last_cur_base && w == last_w && h == last_h.
+;    The descriptor table swaps ping-pong slots (A <-> B) so V#L1prev (+0x90), V#L2prev (+0xB0), V#L3prev (+0xD0)
+;    already hold the previous frame's clean cur pyramid (captured before osd8/rcas8 touched T#cur).
+;    pyr8 skips all texture fetches from T#prev (+0x00) and all stores to V#L1prev..V#L3prev, computing ONLY T#cur.
+;  - Cold Dual-Frame Mode (flags & 0x1000 == 0): cold start, skipped frame, cut/repeat, resolution change, or
+;    hibernation recovery. pyr8 builds both T#cur (+0x20 -> +0x80/+0xA0/+0xC0) and T#prev (+0x00 -> +0x90/+0xB0/+0xD0).
+; table: +0x00 T#prev, +0x20 T#cur, +0x60 S# (bilinear, clamp, unnormalised),
+;        +0x80 V#L1cur (960x540 u8), +0x90 V#L1prev, +0xA0 V#L2cur (480x270 u8), +0xB0 V#L2prev,
+;        +0xC0 V#L3cur (240x135 u8), +0xD0 V#L3prev, +0x70 consts {parity, mid_idx, flags, hud},
+;        +0x120 V#misc (dword 0 = scene-change counter, dword 2 + parity = luma sum of cur,
+;        dword 2 + (parity^1) = luma sum of prev [zeroed here in Cold Mode], dword 6 = foreground block count),
 ;        +0x150 V#GK (120x68 foreground splat keys, zeroed here by the first 8160 threads; fgs8 fills, me1 reads).
 ; thread (tx = tid&7, ty = tid>>3) of group (gx, gy): L1 pixels x = gx*32 + tx*4 + k (k = 0..3), y = gy*8 + ty.
 ; Supports arbitrary input resolution (720p/900p/1080p/1440p/2160p) by reading W-1 and H-1 from T#cur dword 2
@@ -43,54 +51,14 @@ define internal i32 @q8(float %l) alwaysinline {
   ret i32 %i
 }
 
-define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 inreg %gy, i32 %tid) #0 {
+define internal void @build_pyr(<8 x i32> %t, <4 x i32> %sm, <4 x i32> %v1, <4 x i32> %v2, <4 x i32> %v3,
+                                i32 %gx, i32 %gy, i32 %tid, i32 %tx, i32 %ty, i32 %x1, i32 %y1,
+                                float %u0, float %u1, float %u2, float %u3, float %vf) alwaysinline {
 entry:
-  %pt = getelementptr i8, ptr addrspace(4) %tbl, i64 32
-  %tc = load <8 x i32>, ptr addrspace(4) %pt, align 32, !invariant.load !0
-  %ps = getelementptr i8, ptr addrspace(4) %tbl, i64 96
-  %sm = load <4 x i32>, ptr addrspace(4) %ps, align 16, !invariant.load !0
-  %p1 = getelementptr i8, ptr addrspace(4) %tbl, i64 128
-  %v1 = load <4 x i32>, ptr addrspace(4) %p1, align 16, !invariant.load !0
-  %p2 = getelementptr i8, ptr addrspace(4) %tbl, i64 160
-  %v2 = load <4 x i32>, ptr addrspace(4) %p2, align 16, !invariant.load !0
-  %p3 = getelementptr i8, ptr addrspace(4) %tbl, i64 192
-  %v3 = load <4 x i32>, ptr addrspace(4) %p3, align 16, !invariant.load !0
-  %pm = getelementptr i8, ptr addrspace(4) %tbl, i64 288
-  %vm = load <4 x i32>, ptr addrspace(4) %pm, align 16, !invariant.load !0
-  %tc2 = extractelement <8 x i32> %tc, i32 2
-  %wm1 = and i32 %tc2, 16383
-  %hm1_0 = lshr i32 %tc2, 14
-  %hm1 = and i32 %hm1_0, 16383
-  %w_i = add i32 %wm1, 1
-  %h_i = add i32 %hm1, 1
-  %wf = uitofp i32 %w_i to float
-  %hf = uitofp i32 %h_i to float
-  %sx = fmul float %wf, 0x3F41111120000000 ; 1.0 / 1920.0
-  %sy = fmul float %hf, 0x3F4E573AC0000000 ; 1.0 / 1080.0
-  %sx2 = fmul float %sx, 2.0
-  %tx = and i32 %tid, 7
-  %ty = lshr i32 %tid, 3
-  %gxb = shl i32 %gx, 5
-  %txb = shl i32 %tx, 2
-  %x1 = add i32 %gxb, %txb
-  %gyb = shl i32 %gy, 3
-  %y1 = add i32 %gyb, %ty
-  ; full-res sample positions (unnormalised texel space: texel i spans [i, i+1), scaled from 960x540 L1 to WxH)
-  %x2 = shl i32 %x1, 1
-  %y2 = shl i32 %y1, 1
-  %y2o = or i32 %y2, 1
-  %vf0 = uitofp i32 %y2o to float
-  %vf = fmul float %vf0, %sy
-  %u0i = or i32 %x2, 1
-  %u0_0 = uitofp i32 %u0i to float
-  %u0 = fmul float %u0_0, %sx
-  %u1 = fadd float %u0, %sx2
-  %u2 = fadd float %u1, %sx2
-  %u3 = fadd float %u2, %sx2
-  %l0 = call float @luma(<8 x i32> %tc, <4 x i32> %sm, float %u0, float %vf)
-  %l1 = call float @luma(<8 x i32> %tc, <4 x i32> %sm, float %u1, float %vf)
-  %l2 = call float @luma(<8 x i32> %tc, <4 x i32> %sm, float %u2, float %vf)
-  %l3 = call float @luma(<8 x i32> %tc, <4 x i32> %sm, float %u3, float %vf)
+  %l0 = call float @luma(<8 x i32> %t, <4 x i32> %sm, float %u0, float %vf)
+  %l1 = call float @luma(<8 x i32> %t, <4 x i32> %sm, float %u1, float %vf)
+  %l2 = call float @luma(<8 x i32> %t, <4 x i32> %sm, float %u2, float %vf)
+  %l3 = call float @luma(<8 x i32> %t, <4 x i32> %sm, float %u3, float %vf)
   ; ---- L1 store (one packed dword = 4 pixels)
   %iny1 = icmp ult i32 %y1, 540
   br i1 %iny1, label %st1, label %lds1
@@ -205,6 +173,80 @@ st3:
   call void @llvm.amdgcn.raw.buffer.store.i8(i8 %b3, <4 x i32> %v3, i32 %off3, i32 0, i32 0)
   br label %l3done
 l3done:
+  ret void
+}
+
+define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 inreg %gy, i32 %tid) #0 {
+entry:
+  %pt = getelementptr i8, ptr addrspace(4) %tbl, i64 32
+  %tc = load <8 x i32>, ptr addrspace(4) %pt, align 32, !invariant.load !0
+  %ps = getelementptr i8, ptr addrspace(4) %tbl, i64 96
+  %sm = load <4 x i32>, ptr addrspace(4) %ps, align 16, !invariant.load !0
+  %pcn = getelementptr i8, ptr addrspace(4) %tbl, i64 112
+  %cn = load <4 x i32>, ptr addrspace(4) %pcn, align 16, !invariant.load !0
+  %p1 = getelementptr i8, ptr addrspace(4) %tbl, i64 128
+  %v1 = load <4 x i32>, ptr addrspace(4) %p1, align 16, !invariant.load !0
+  %p2 = getelementptr i8, ptr addrspace(4) %tbl, i64 160
+  %v2 = load <4 x i32>, ptr addrspace(4) %p2, align 16, !invariant.load !0
+  %p3 = getelementptr i8, ptr addrspace(4) %tbl, i64 192
+  %v3 = load <4 x i32>, ptr addrspace(4) %p3, align 16, !invariant.load !0
+  %pm = getelementptr i8, ptr addrspace(4) %tbl, i64 288
+  %vm = load <4 x i32>, ptr addrspace(4) %pm, align 16, !invariant.load !0
+  %tc2 = extractelement <8 x i32> %tc, i32 2
+  %wm1 = and i32 %tc2, 16383
+  %hm1_0 = lshr i32 %tc2, 14
+  %hm1 = and i32 %hm1_0, 16383
+  %w_i = add i32 %wm1, 1
+  %h_i = add i32 %hm1, 1
+  %wf = uitofp i32 %w_i to float
+  %hf = uitofp i32 %h_i to float
+  %sx = fmul float %wf, 0x3F41111120000000 ; 1.0 / 1920.0
+  %sy = fmul float %hf, 0x3F4E573AC0000000 ; 1.0 / 1080.0
+  %sx2 = fmul float %sx, 2.0
+  %tx = and i32 %tid, 7
+  %ty = lshr i32 %tid, 3
+  %gxb = shl i32 %gx, 5
+  %txb = shl i32 %tx, 2
+  %x1 = add i32 %gxb, %txb
+  %gyb = shl i32 %gy, 3
+  %y1 = add i32 %gyb, %ty
+  ; full-res sample positions (unnormalised texel space: texel i spans [i, i+1), scaled from 960x540 L1 to WxH)
+  %x2 = shl i32 %x1, 1
+  %y2 = shl i32 %y1, 1
+  %y2o = or i32 %y2, 1
+  %vf0 = uitofp i32 %y2o to float
+  %vf = fmul float %vf0, %sy
+  %u0i = or i32 %x2, 1
+  %u0_0 = uitofp i32 %u0i to float
+  %u0 = fmul float %u0_0, %sx
+  %u1 = fadd float %u0, %sx2
+  %u2 = fadd float %u1, %sx2
+  %u3 = fadd float %u2, %sx2
+  ; ---- Always build the CURRENT frame pyramid (T#cur -> V#L1cur, V#L2cur, V#L3cur)
+  call void @build_pyr(<8 x i32> %tc, <4 x i32> %sm, <4 x i32> %v1, <4 x i32> %v2, <4 x i32> %v3,
+                       i32 %gx, i32 %gy, i32 %tid, i32 %tx, i32 %ty, i32 %x1, i32 %y1,
+                       float %u0, float %u1, float %u2, float %u3, float %vf)
+  ; ---- Warm Mode check (consts.flags bit 12 = 4096): skip T#prev when ping-pong cache is warm
+  %flags = extractelement <4 x i32> %cn, i32 2
+  %warm_bit = and i32 %flags, 4096
+  %is_warm = icmp ne i32 %warm_bit, 0
+  br i1 %is_warm, label %after_prev, label %cold_prev
+cold_prev:
+  fence syncscope("workgroup") release
+  call void @llvm.amdgcn.s.barrier()
+  fence syncscope("workgroup") acquire
+  %tp = load <8 x i32>, ptr addrspace(4) %tbl, align 32, !invariant.load !0
+  %p1p = getelementptr i8, ptr addrspace(4) %tbl, i64 144
+  %v1p = load <4 x i32>, ptr addrspace(4) %p1p, align 16, !invariant.load !0
+  %p2p = getelementptr i8, ptr addrspace(4) %tbl, i64 176
+  %v2p = load <4 x i32>, ptr addrspace(4) %p2p, align 16, !invariant.load !0
+  %p3p = getelementptr i8, ptr addrspace(4) %tbl, i64 208
+  %v3p = load <4 x i32>, ptr addrspace(4) %p3p, align 16, !invariant.load !0
+  call void @build_pyr(<8 x i32> %tp, <4 x i32> %sm, <4 x i32> %v1p, <4 x i32> %v2p, <4 x i32> %v3p,
+                       i32 %gx, i32 %gy, i32 %tid, i32 %tx, i32 %ty, i32 %x1, i32 %y1,
+                       float %u0, float %u1, float %u2, float %u3, float %vf)
+  br label %after_prev
+after_prev:
   ; ---- clear the foreground splat keys (thread index (gy * 30 + gx) * 64 + tid < 120 * 68)
   %lg0 = mul i32 %gy, 30
   %lg1 = add i32 %lg0, %gx
@@ -226,14 +268,16 @@ zkd:
   br i1 %first, label %zc, label %exit
 zc:
   call void @llvm.amdgcn.raw.buffer.store.i32(i32 0, <4 x i32> %vm, i32 0, i32 0, i32 0)
-  %pcn = getelementptr i8, ptr addrspace(4) %tbl, i64 112
-  %cn = load <4 x i32>, ptr addrspace(4) %pcn, align 16, !invariant.load !0
   %par = extractelement <4 x i32> %cn, i32 0
   %so0 = shl i32 %par, 2
   %so = add i32 %so0, 8
   call void @llvm.amdgcn.raw.buffer.store.i32(i32 0, <4 x i32> %vm, i32 %so, i32 0, i32 0)
   call void @llvm.amdgcn.raw.buffer.store.i32(i32 0, <4 x i32> %vm, i32 24, i32 0, i32 0)    ; foreground count (fgs8)
   call void @llvm.amdgcn.raw.buffer.store.i32(i32 0, <4 x i32> %vm, i32 28, i32 0, i32 0)    ; fade flag (me1)
+  br i1 %is_warm, label %exit, label %zc_cold
+zc_cold:
+  %sop = xor i32 %so, 4
+  call void @llvm.amdgcn.raw.buffer.store.i32(i32 0, <4 x i32> %vm, i32 %sop, i32 0, i32 0)   ; prev luma sum (cold mode)
   br label %exit
 exit:
   ret void
