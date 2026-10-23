@@ -104,6 +104,7 @@ int32_t sceGnmSubmitCommandBuffersForWorkload(uint32_t workload, uint32_t count,
 int32_t sceGnmSubmitAndFlipCommandBuffersForWorkload(uint32_t workload, uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[],
                                                      uint32_t *ccbSz, uint32_t handle, uint32_t index, uint32_t flipMode, int64_t flipArg);
 int32_t sceVideoOutRegisterBuffers(int32_t handle, int32_t startIndex, void *const *addresses, int32_t bufferNum, const VoAttr *attr);
+int32_t sceVideoOutUnregisterBuffers(int32_t handle, int32_t attributeIndex);
 int32_t sceVideoOutSetFlipRate(int32_t handle, int32_t rate);
 int32_t sceKernelAllocateDirectMemory(long searchStart, long searchEnd, size_t length, size_t alignment, int type, long *physAddrOut);
 int32_t sceKernelReleaseDirectMemory(long start, size_t len);
@@ -306,7 +307,6 @@ static uint32_t g_gpu_sz = GPU_SZ_BASE;
 #define DCB8_OFF 0x1C000u
 #define DCB8_SZ  0x1000u
 static uint8_t *g_gpu = NULL;
-static uint8_t *g_work = NULL;
 static uint64_t g_slot_cpu[4], g_ts_slot_seen = 0, g_ts_first = 0, g_ts_cpu_first = 0, g_ts_last = 0, g_ts_cpu_last = 0, g_ts_sum = 0;
 static uint32_t g_ts_n = 0;
 static uint64_t g_praw[12];
@@ -417,6 +417,9 @@ static int g_safe_never = 0;      // 1: state 2, never touch the game
 static long g_low_sub2mb_end = 0x200000L; // end of initial partially-used sub-2MB region at boot
 
 #define FLEX_GPU_MAX 8
+#define g_work_phys  g_pre_work_phys
+#define g_extra_phys g_pre_mem_phys
+static uint8_t *g_work = NULL;
 typedef struct {
     void *aligned_va;
     void *raw_va;
@@ -424,14 +427,22 @@ typedef struct {
 } FlexGpuSlot;
 static FlexGpuSlot g_flex_gpu_slots[FLEX_GPU_MAX];
 
+static volatile int g_own_alloc;
+
 static void free_dm_block(void **va, long *phys, size_t *sz, const char *tag)
 {
     if (!*va || !*sz) return;
-    if (*phys < 0) {
-        void *unmap_va = *va;
-        size_t unmap_sz = (*sz + 0x3FFFu) & ~(size_t)0x3FFFu;
+    void *v = *va;
+    long p = *phys;
+    size_t s = *sz;
+    *va = NULL;
+    *phys = 0;
+    *sz = 0;
+    if (p < 0) {
+        void *unmap_va = v;
+        size_t unmap_sz = (s + 0x3FFFu) & ~(size_t)0x3FFFu;
         for (int i = 0; i < FLEX_GPU_MAX; i++) {
-            if (g_flex_gpu_slots[i].aligned_va == *va) {
+            if (g_flex_gpu_slots[i].aligned_va == v) {
                 unmap_va = g_flex_gpu_slots[i].raw_va;
                 unmap_sz = g_flex_gpu_slots[i].raw_sz;
                 g_flex_gpu_slots[i].aligned_va = NULL;
@@ -440,21 +451,19 @@ static void free_dm_block(void **va, long *phys, size_t *sz, const char *tag)
                 break;
             }
         }
+        g_own_alloc++;
         int um = sceKernelMunmap(unmap_va, unmap_sz);
+        g_own_alloc--;
         STAGE("memory valve: released flex %s va=%p (raw=%p len=0x%zx) unmap=0x%08x",
-              tag, *va, unmap_va, unmap_sz, (unsigned)um);
-        *va = NULL;
-        *phys = 0;
-        *sz = 0;
+              tag, v, unmap_va, unmap_sz, (unsigned)um);
         return;
     }
-    int um = sceKernelMunmap(*va, *sz);
-    int rr = um == 0 ? sceKernelReleaseDirectMemory(*phys, *sz) : -1;
+    g_own_alloc++;
+    int um = sceKernelMunmap(v, s);
+    int rr = um == 0 ? sceKernelReleaseDirectMemory(p, s) : -1;
+    g_own_alloc--;
     STAGE("memory valve: released %s va=%p phys=0x%lx len=0x%zx unmap=0x%08x release=0x%08x",
-          tag, *va, *phys, *sz, (unsigned)um, (unsigned)rr);
-    *va = NULL;
-    *phys = 0;
-    *sz = 0;
+          tag, v, p, s, (unsigned)um, (unsigned)rr);
 }
 static void release_early_dump(void)
 {
@@ -470,6 +479,7 @@ static void release_early_mem(void)
 static void release_early_work(void)
 {
     free_dm_block(&g_pre_work, &g_pre_work_phys, &g_pre_work_sz, "work");
+    g_work = NULL;
     g_work_garlic = 0;
 }
 static void release_early_gpu(void)
@@ -587,36 +597,103 @@ static void *alloc_gv_dm(size_t len, size_t align, int type)
         void *dm = alloc_dm(len, align, type);
         if (dm) return dm;
     }
-    void *flex = alloc_flex_gpu(len, align);
-    if (flex) return flex;
+    size_t flex_av = 0;
+    if (((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av) == 0 && flex_av >= len + 0x1000000u) {
+        void *flex = alloc_flex_gpu(len, align);
+        if (flex) return flex;
+    }
     return alloc_dm(len, align, type);
 }
 
 static void *alloc_work_early(size_t wsz, int type)
 {
     size_t dm_sz = sceKernelGetDirectMemorySize();
-    // 1. If g_pre_gpu sits in a partially used 2MB page whose tail >= wsz (e.g. CUSA00918, CUSA11456), place work
-    //    right after g_pre_gpu so it costs zero 2MB-aligned pages.
+    // 1. If g_pre_gpu sits in a partially used 2MB page whose remainder >= wsz (e.g. CUSA00918, CUSA11456), place work
+    //    in the same 2MB page so it costs zero 2MB-aligned pages. Prefer the lower part [page_base, g_pre_gpu_phys)
+    //    when g_pre_gpu sits at the top of the 2MB page so hibernating work merges directly with the free pool below.
     if (g_pre_gpu && g_pre_gpu_phys >= 0) {
+        long page_base = g_pre_gpu_phys & ~0x1FFFFFL;
+        if (g_pre_gpu_phys - page_base >= (long)wsz) {
+            void *w = alloc_dm_range(page_base, g_pre_gpu_phys, wsz, 0x10000, type, &g_pre_work_phys);
+            if (w) { g_pre_work_sz = wsz; g_work = (uint8_t *)w; return w; }
+        }
         long end_gpu = g_pre_gpu_phys + (long)g_gpu_sz;
         long next_2mb = (end_gpu + 0x1FFFFFL) & ~0x1FFFFFL;
         if (next_2mb - end_gpu >= (long)wsz) {
             void *w = alloc_dm_range(end_gpu, next_2mb, wsz, 0x10000, type, &g_pre_work_phys);
-            if (w) { g_pre_work_sz = wsz; return w; }
+            if (w) { g_pre_work_sz = wsz; g_work = (uint8_t *)w; return w; }
         }
     }
     // 2. Otherwise, if g_pre_mem was placed at the top of the pool (e.g. CUSA17419), place work right below g_pre_mem
     //    at the top so the game's contiguous arena from 0 upward is not fragmented at its start.
     if (g_pre_mem && g_pre_mem_phys >= 0x200000L) {
         void *w = alloc_dm_range(g_pre_mem_phys - 0x200000L, g_pre_mem_phys, wsz, 0x10000, type, &g_pre_work_phys);
-        if (w) { g_pre_work_sz = wsz; return w; }
+        if (w) { g_pre_work_sz = wsz; g_work = (uint8_t *)w; return w; }
     }
     // 3. Fallback: anywhere in the pool (or FlexibleMemory via alloc_flex_gpu if DirectMemory is exhausted).
     void *w = alloc_dm_range(0, (long)dm_sz, wsz, 0x10000, type, &g_pre_work_phys);
-    if (w) { g_pre_work_sz = wsz; return w; }
+    if (w) { g_pre_work_sz = wsz; g_work = (uint8_t *)w; return w; }
     w = alloc_flex_gpu(wsz, 0x10000);
-    if (w) { g_pre_work_phys = -1L; g_pre_work_sz = wsz; }
+    if (w) { g_pre_work_phys = -1L; g_pre_work_sz = wsz; g_work = (uint8_t *)w; }
     return w;
+}
+
+static int try_recover_hibernated_work_at(uint32_t cur_flips)
+{
+    if (!__atomic_load_n(&g_mem_hibernating, __ATOMIC_ACQUIRE)) return 0;
+    uint32_t hib_flip = __atomic_load_n(&g_hibernated_at_flip, __ATOMIC_ACQUIRE);
+    if (cur_flips < hib_flip + 180u) return 0;
+    if (g_pre_work) {
+        g_work = (uint8_t *)g_pre_work;
+        __atomic_store_n(&g_mem_hibernating, 0, __ATOMIC_RELEASE);
+        return 1;
+    }
+    size_t dm2m = dm_avail(0x200000u);
+    uint32_t rel_now = __atomic_load_n(&g_dbg_releases, __ATOMIC_ACQUIRE);
+    if (dm2m < 0x400000u && rel_now <= g_hibernated_releases_base && cur_flips < hib_flip + 360u) {
+        return 0;
+    }
+    size_t wsz = g_hibernated_work_sz ? g_hibernated_work_sz : WORK_SZ_8;
+    void *w = NULL;
+    if (dm2m >= 0x400000u || dm_avail(0x10000u) >= wsz) {
+        w = alloc_work_early(wsz, 3 /*WC_GARLIC*/);
+        if (!w) w = alloc_work_early(wsz, 0 /*WB_ONION*/);
+    } else {
+        w = alloc_flex_gpu(wsz, 0x10000u);
+        if (w) {
+            g_pre_work_phys = -1L;
+            g_pre_work_sz = wsz;
+        }
+    }
+    if (!w) return 0;
+    g_pre_work = w;
+    g_work = (uint8_t *)w;
+    g_work_garlic = (g_pre_work_phys >= 0);
+    __atomic_store_n(&g_mem_hibernating, 0, __ATOMIC_RELEASE);
+    STAGE("hibernation recovery at flip %u (hibernated at %u): re-allocated g_work=%p phys=0x%lx sz=0x%zx (dm_free_2m=0x%zx)",
+          cur_flips, hib_flip, w, g_pre_work_phys, wsz, dm2m);
+    return 1;
+}
+
+static int try_recover_hibernated_work(void)
+{
+    return try_recover_hibernated_work_at(g_flips);
+}
+
+static int on_sub_hibernation_gate(uint32_t cur_flips)
+{
+    if (!__atomic_load_n(&g_mem_hibernating, __ATOMIC_ACQUIRE)) return 0;
+    if (try_recover_hibernated_work_at(cur_flips)) return 0;
+    return 1;
+}
+
+// Fast-path FG submit entry helper used by the rendering hook and unit-test harness:
+// returns 0 (pass-through native flip) while g_mem_hibernating is active, or 1 when FG is active.
+static int on_sub(void)
+{
+    uint32_t cf = ++g_flips;
+    if (on_sub_hibernation_gate(cf)) return 0;
+    return (g_work != NULL) ? 1 : 0;
 }
 
 static void gpu_init(void)
@@ -651,6 +728,8 @@ static void gpu_init(void)
         long hi_s = (g_pre_mem && g_pre_mem_phys >= 0x200000L) ? (g_pre_mem_phys - 0x200000L) : (top_e > 0x2000000L ? top_e - 0x2000000L : 0L);
         long hi_e = (g_pre_mem && g_pre_mem_phys >= 0x200000L) ? g_pre_mem_phys : top_e;
         if (hi_e > hi_s) addr = alloc_dm_range(hi_s, hi_e, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+        if (!addr && dm_avail(0x200000u) == 0 && dm_avail(g_gpu_sz) >= g_gpu_sz)
+            addr = alloc_dm(g_gpu_sz, g_gpu_sz, 0 /*WB_ONION*/);
         if (!addr) addr = alloc_flex_gpu(g_gpu_sz, g_gpu_sz);
         if (!addr) addr = alloc_dm(g_gpu_sz, g_gpu_sz, 0 /*WB_ONION*/);
     }
@@ -724,6 +803,7 @@ static void gpu_init(void)
     if (!g_work) lg("gpu_init: work memory unavailable, mode 6 disabled\n");
     g_mon = (volatile uint32_t *)((uint8_t *)addr + MON_OFF);
     g_gpu = (uint8_t *)addr;
+    __atomic_store_n(&g_done, (volatile uint32_t *)((uint8_t *)addr + SLOT0 + 0x900), __ATOMIC_RELEASE);
     g_gpu_state = 1;
     STAGE("gpu_init ok at %p work %p", addr, (void *)g_work);
     lg("gpu_init: ok at %p (%s), work %p\n", addr, g_pre_gpu ? "early" : "late", (void *)g_work);
@@ -922,14 +1002,17 @@ static char g_vov_title[48];
 static int vov_ready(void)
 {
     if (g_vov_state) return g_vov_state > 0;
-    size_t vsz = ((g_mem_tight ? 0x30000u : VOV_MEM_SZ) + 0xFFFFu) & ~(size_t)0xFFFFu;
+    const size_t min_full_vsz = (VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu; // 0x60000 (384 KB): full 720 px height (fits all 9 rows)
+    const size_t dbl_full_vsz = (2u * VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu;
+    size_t vsz = ((g_mem_tight ? dbl_full_vsz : VOV_MEM_SZ) + 0xFFFFu) & ~(size_t)0xFFFFu;
     void *mem = alloc_flex_gpu(vsz, 0x10000);
-    if (!mem && !g_mem_tight) { vsz = (2u * VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu; mem = alloc_flex_gpu(vsz, 0x10000); }
-    if (!mem) { vsz = 0x30000u; mem = alloc_flex_gpu(vsz, 0x10000); }
+    if (!mem && !g_mem_tight) { vsz = dbl_full_vsz; mem = alloc_flex_gpu(vsz, 0x10000); }
+    if (!mem) { vsz = min_full_vsz; mem = alloc_flex_gpu(vsz, 0x10000); }
     if (!mem && !g_mem_tight) { vsz = (VOV_MEM_SZ + 0xFFFFu) & ~(size_t)0xFFFFu; mem = alloc_dm(vsz, 0x10000, 0 /*WB_ONION*/); }
     if (!mem && !g_mem_tight) { vsz = (4u * VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu; mem = alloc_dm(vsz, 0x10000, 0); }
-    if (!mem && !g_mem_tight) { vsz = (2u * VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu; mem = alloc_dm(vsz, 0x10000, 0); }   // fewer bitmaps, fits tight-memory games
-    if (!mem && !g_mem_tight) { vsz = 0x30000u; mem = alloc_dm(vsz, 0x10000, 0); }
+    if (!mem && !g_mem_tight) { vsz = dbl_full_vsz; mem = alloc_dm(vsz, 0x10000, 0); }
+    if (!mem && (!g_mem_tight || dm_avail(0x10000) >= 0x100000u)) { vsz = min_full_vsz; mem = alloc_dm(vsz, 0x10000, 0); }
+    if (!mem) { vsz = 0x30000u; mem = alloc_flex_gpu(vsz, 0x10000); }
     if (!mem) { g_vov_state = -1; lg("overlay: no memory, menu disabled\n"); return 0; }
     vov_init_size((uint8_t *)mem, vsz);
     vov_read_title(g_vov_title, sizeof(g_vov_title));
@@ -1375,6 +1458,10 @@ static void cfg_apply_title_defaults(fg_config_t *c)
         c->pace_order = 2;
     } else if (vcfg_in_family(g_title_id, "CUSA28561")) {
         c->shave_mode = 2;
+    } else if (vcfg_in_family(g_title_id, "CUSA17722")) {
+        // CUSA17722: late activation (reg_mode=2) keeps g_mbuf_state=0 during boot so g_pre_mem shrinks to 8 MB on the
+        // game's post-RegisterBuffers 0x3a00000 allocation (shaving only 1 MB instead of 25 MB) and activates at flip 120.
+        c->reg_mode = 2;
     }
 }
 
@@ -1479,7 +1566,8 @@ static void cfg_apply_live(const fg_config_t *c, const char *reason)
     g_opt_nocf = (c->hud_protect <= 0) ? 1 : 0;
     g_hud_packed = (c->hud_protect >= 1) ? g_hud_file_packed : 0u;
     uint32_t gl = g_gv_letters_base;
-    if (c->game_vectors) gl |= GVL_ON; else gl &= ~GVL_ON;
+    if (c->game_vectors && c->framegen && !g_detected_60fps) gl |= GVL_ON;
+    else if (!(g_gv_letters_base & GVL_ON)) gl &= ~GVL_ON;
     gv_set_letters(gl);
     if (reason) {
         lg("config (%s): framegen=%d mode=%d preset=%d sharpness=%d enhance=%d hud_protect=%d game_vectors=%d fps_lock=%d overlay=%d opacity=%d%%\n",
@@ -1751,7 +1839,7 @@ static void safe_refuse(const char *why)
     release_early_mem();
     release_early_work();
     release_early_gpu();
-    if (!strncmp(why, "NO ", 3) && strstr(why, "MEM")) {   // no free memory late: next start takes it early
+    if (g_safe && !strncmp(why, "NO ", 3) && strstr(why, "MEM")) {   // no free memory late: next start takes it early
         safe_state_write(1);
         STAGE("safe mode: state saved -> the next start takes its memory early (a start that does not reach frame %d is then given up)", INJECT_AFTER_FLIPS);
     }
@@ -1803,12 +1891,26 @@ static void safe_try_activate(uint32_t handle)
     int want_pcopy = (g_cfg.present_copy == 1) || (g_cfg.present_copy == 0 && g_ngame == 2);
     int hi_res = (g_bw > 1920 || g_bh > 1080);
     int stream_3buf = (!want_pcopy &&
-                       ((!g_known_game && g_dbg_allocs >= 64u) ||
+                       ((!g_known_game && g_dbg_allocs >= 32u) ||
                         vcfg_in_family(g_title_id, "CUSA09311") ||
                         vcfg_in_family(g_title_id, "CUSA18534") ||
                         vcfg_in_family(g_title_id, "CUSA10123")));
+    // Find the highest contiguous range of unused buffer indices [free_base, free_end) in [g_ngame, 16).
+    int free_base = hi < 16 ? hi : 16;
+    int free_end = 16;
+    if (free_base >= 16) {
+        for (int e = 16; e > g_ngame; e--) {
+            if (g_buf[e - 1] != 0) continue;
+            int s = e - 1;
+            while (s > g_ngame && g_buf[s - 1] == 0) s--;
+            free_base = s;
+            free_end = e;
+            break;
+        }
+    }
+    int avail_idx = free_end - free_base;
     int want = want_pcopy ? (hi_res ? 4 : 6) : (stream_3buf ? 1 : (hi_res ? 2 : 3));
-    if (want > 16 - hi) want = 16 - hi;
+    if (want > avail_idx) want = avail_idx;
     if (want < 1) { safe_refuse("NO INDICES"); return; }
     // Allocate display buffers (m) FIRST before g_pre_gpu / g_pre_work so our 2MB-aligned scanout allocation never
     // competes with GPU/work buffers (which can fall back to FlexibleMemory via alloc_flex_gpu).
@@ -1818,7 +1920,7 @@ static void safe_try_activate(uint32_t handle)
         if (nm > want) nm = want;
         size_t used_pre = (one * (size_t)nm + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
         if (used_pre > 0 && used_pre < g_pre_size) {
-            shrink_early_mem_to(used_pre);
+            shrink_early_mem_to_ex(used_pre, 0);
         }
         m = (uint8_t *)g_pre_mem;
     }
@@ -1837,6 +1939,10 @@ static void safe_try_activate(uint32_t handle)
         g_pre_gpu_phys = -1;
     }
     if (!g_pre_gpu) g_pre_gpu = alloc_dm_range(0, (long)sceKernelGetDirectMemorySize(), g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+    if (!g_pre_gpu) {
+        g_pre_gpu = alloc_flex_gpu(g_gpu_sz, g_gpu_sz);
+        g_pre_gpu_phys = -1;
+    }
     if (!g_pre_gpu) { safe_refuse("NO GPU MEM"); return; }
     if (!g_pre_work && stream_3buf) {
         g_pre_work = alloc_flex_gpu(WORK_SZ_8, 0x10000);
@@ -1850,12 +1956,17 @@ static void safe_try_activate(uint32_t handle)
     }
     if (!g_pre_work) g_pre_work = alloc_work_early(WORK_SZ_8, 0);
     if (!g_pre_work) { safe_refuse("NO WORK MEM"); return; }
-    int base = 16 - nm;   // top of the index range: the game's own indices stay free
-    if (base < hi) { safe_refuse("NO INDICES"); return; }
+    int base = free_end - nm;   // top of the available index range: the game's own indices stay free
+    if (base < free_base) { safe_refuse("NO INDICES"); return; }
     void *ext[8];
     for (int i = 0; i < nm; i++) ext[i] = m + (size_t)i * one;
     int32_t r1 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
                                (int32_t)handle, base, ext, nm, &g_attr);
+    if (r1 == (int32_t)0x80290010) {
+        for (int sl = 1; sl < 4; sl++) sceVideoOutUnregisterBuffers((int32_t)handle, sl);
+        r1 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                           (int32_t)handle, base, ext, nm, &g_attr);
+    }
     STAGE("safe mode RegisterBuffers (late group at %d, %d x 0x%zx) = 0x%08x", base, nm, one, (unsigned)r1);
     if (r1 < 0) { safe_refuse("REGISTER FAILED"); return; }
     g_ext_attr_slot = r1;
@@ -1903,9 +2014,61 @@ static uint32_t g_mon_missed = 0, g_pace_timeouts = 0, g_pace_resync = 0, g_pace
 static volatile uint64_t g_rel_t = 0;
 static volatile uint64_t g_vblank_t_us = 0;
 static volatile uint64_t g_vblank_cnt = 0;
+static volatile uint64_t g_pll_phi_us = 0;
+static volatile uint64_t g_pll_vb_cnt = 0;
+static volatile uint32_t g_pll_period_q8 = (16683u << 8) | 85u; // 16683.33 us (59.94 Hz) in Q24.8
+static volatile uint64_t g_pll_last_real_vb_us = 0;
+static volatile uint32_t g_pll_t_interp_q16 = 32768u;
+static volatile uint32_t g_pll_t_permille = 500u;
+static volatile uint32_t g_pll_lock = 0;
 static uint64_t g_last_submit_enter_t = 0;
 static uint64_t g_vo_last_submit_enter_t = 0;
 static uint32_t g_pll_shortened = 0;
+
+// Update VBlank Phase-Locked Loop (PLL) estimator from (vs.count, vs.processTime):
+// Tracks hardware refresh period T_vb (EWMA alpha=1/16 in Q24.8 us) and phase offset phi_vb (EWMA alpha=1/4)
+// to filter out OS thread wakeup/polling jitter and predict exact upcoming VBlank edges t_vb(k) = phi_vb + k * T_vb.
+static void vblank_pll_update(uint64_t vb_cnt, uint64_t vb_time_us)
+{
+    if (!vb_time_us) return;
+    if (__atomic_exchange_n(&g_pll_lock, 1u, __ATOMIC_ACQUIRE)) return;
+    uint64_t prev_phi = g_pll_phi_us;
+    uint64_t prev_cnt = g_pll_vb_cnt;
+    uint32_t period_q8 = g_pll_period_q8;
+    if (!prev_phi || vb_cnt <= prev_cnt || (vb_cnt - prev_cnt) > 120ull || vb_time_us <= prev_phi) {
+        if (vb_cnt != prev_cnt) {
+            g_pll_phi_us = vb_time_us;
+            g_pll_vb_cnt = vb_cnt;
+        }
+    } else {
+        uint64_t dc = vb_cnt - prev_cnt;
+        uint64_t dt_us = vb_time_us - prev_phi;
+        uint64_t meas_q8 = (dt_us << 8) / dc;
+        if (meas_q8 >= (10000ull << 8) && meas_q8 <= (25000ull << 8)) {
+            uint64_t pred_us = prev_phi + ((dc * (uint64_t)period_q8 + 128ull) >> 8);
+            int64_t err_us = (int64_t)vb_time_us - (int64_t)pred_us;
+            if (err_us > -4000ll && err_us < 4000ll) {
+                // Alpha-beta PLL filter: alpha = 1/8 for phase, beta = 1/1024 in Q8 for sub-us crystal period tracking
+                g_pll_phi_us = (uint64_t)((int64_t)pred_us + (err_us >> 3));
+                int64_t p_adj = err_us / (int64_t)(dc << 2);
+                int64_t new_p = (int64_t)period_q8 + p_adj;
+                int64_t nom_p = (int64_t)((16683u << 8) | 85u);
+                if (new_p >= nom_p - 32 && new_p <= nom_p + 32) {
+                    g_pll_period_q8 = (uint32_t)new_p;
+                }
+            } else {
+                period_q8 = (uint32_t)(((uint64_t)period_q8 * 15ull + meas_q8 + 8ull) >> 4);
+                g_pll_period_q8 = period_q8;
+                g_pll_phi_us = vb_time_us;
+            }
+            g_pll_vb_cnt = vb_cnt;
+        } else {
+            g_pll_phi_us = vb_time_us;
+            g_pll_vb_cnt = vb_cnt;
+        }
+    }
+    __atomic_store_n(&g_pll_lock, 0u, __ATOMIC_RELEASE);
+}
 static volatile uint32_t g_cpu_n = 0, g_cpu_sum_us = 0, g_cpu_max_us = 0;
 static uint32_t g_cpu_ema_us = 0;   // game time release -> next submit (its own work, without our waits)
 
@@ -1929,7 +2092,8 @@ static int file_flags_ex(uint32_t *hash_io)
     }
     g_ab_x_flag = (f & 1) ? 1 : 0;
     g_gv_letters_base = g;
-    if (g_cfg.game_vectors) g |= GVL_ON; else g &= ~GVL_ON;
+    if (g_cfg.game_vectors && g_cfg.framegen && !g_detected_60fps) g |= GVL_ON;
+    else if (!(g_gv_letters_base & GVL_ON)) g &= ~GVL_ON;
     gv_set_letters(g);
     return f;
 }
@@ -2094,6 +2258,7 @@ static void *mon_thread(void *arg)
         if (sceVideoOutGetVblankStatus(g_handle, &vs) == 0 && vs.processTime) {
             __atomic_store_n(&g_vblank_t_us, vs.processTime, __ATOMIC_RELEASE);
             __atomic_store_n(&g_vblank_cnt, vs.count, __ATOMIC_RELEASE);
+            vblank_pll_update(vs.count, vs.processTime);
         }
         __atomic_store_n(&g_cur_pending_flips, (uint32_t)(fs.flipPendingNum > 0 ? fs.flipPendingNum : 0), __ATOMIC_RELEASE);
         __atomic_store_n(&g_cur_gcq, (uint32_t)(fs.gcQueueNum > 0 ? fs.gcQueueNum : 0), __ATOMIC_RELEASE);
@@ -2114,9 +2279,10 @@ static void *mon_thread(void *arg)
                         uint32_t dtu = dt > 66732u ? 66732u : (uint32_t)dt;
                         __atomic_store_n(&g_last_real_hold_us, dtu, __ATOMIC_RELEASE);
                         ema_dt = (ema_dt * 3u + dtu) >> 2;
-                        uint32_t t_q16 = (ema_dt << 16) / (ema_dt + 16683u);
-                        if (t_q16 < 32768u) t_q16 = 32768u;
-                        if (t_q16 > 49152u) t_q16 = 49152u;
+                        uint32_t pll_t = __atomic_load_n(&g_pll_t_interp_q16, __ATOMIC_ACQUIRE);
+                        uint32_t t_q16 = pll_t ? pll_t : ((ema_dt << 16) / (ema_dt + 16683u));
+                        if (t_q16 < 21845u) t_q16 = 21845u;
+                        if (t_q16 > 43691u) t_q16 = 43691u;
                         g_mon[3] = t_q16;
                     }
                 }
@@ -2239,17 +2405,22 @@ static void mon_start(void)
     lg("cadence monitor thread: 0x%08x\n", (unsigned)r);
 }
 
-#define PLL_LEAD_US 1200u
+#define PLL_LEAD_US  2200u
+#define PLL_LATCH_US 1550u
 
 static uint32_t vblank_period_us(void)
 {
+    uint32_t p_q8 = __atomic_load_n(&g_pll_period_q8, __ATOMIC_ACQUIRE);
+    if (p_q8 >= (10000u << 8) && p_q8 <= (25000u << 8)) {
+        return (p_q8 + 128u) >> 8;
+    }
     uint32_t hz10 = (g_last_hz_x10 > 400u && g_last_hz_x10 < 800u) ? g_last_hz_x10 : 599u;
     uint32_t vb_us = (10000000u + (hz10 >> 1)) / hz10;
     return (vb_us >= 10000u && vb_us <= 25000u) ? vb_us : 16683u;
 }
 
-// Compute microseconds remaining until the upcoming vblank edge using mon_thread's vs.processTime
-// (with direct sceVideoOutGetVblankStatus fallback if mon_thread has not sampled within 2 vblanks).
+// Compute microseconds remaining until the upcoming vblank edge using the VBlank PLL predictor
+// t_vb(k) = phi_vb + k * T_vb (with direct sceVideoOutGetVblankStatus fallback if mon_thread has not sampled within 2 vblanks).
 static uint32_t vblank_to_next_edge_us(int32_t handle, uint64_t now_us, uint32_t *out_vb_us)
 {
     uint32_t vb_us = vblank_period_us();
@@ -2262,26 +2433,100 @@ static uint32_t vblank_to_next_edge_us(int32_t handle, uint64_t now_us, uint32_t
             vt = vs.processTime;
             __atomic_store_n(&g_vblank_t_us, vt, __ATOMIC_RELEASE);
             __atomic_store_n(&g_vblank_cnt, vs.count, __ATOMIC_RELEASE);
+            vblank_pll_update(vs.count, vt);
         }
     }
-    if (!vt || now_us <= vt) return vb_us >> 1;
-    uint32_t phase_us = (uint32_t)((now_us - vt) % (uint64_t)vb_us);
-    uint32_t rem_us = vb_us - phase_us;
+    uint64_t phi = __atomic_load_n(&g_pll_phi_us, __ATOMIC_ACQUIRE);
+    uint32_t p_q8 = __atomic_load_n(&g_pll_period_q8, __ATOMIC_ACQUIRE);
+    if (!phi) phi = vt;
+    if (p_q8 < (10000u << 8) || p_q8 > (25000u << 8)) p_q8 = vb_us << 8;
+    if (!phi) return vb_us >> 1;
+    if (now_us <= phi) {
+        uint64_t diff = phi - now_us;
+        return (diff > 0 && diff <= (uint64_t)vb_us) ? (uint32_t)diff : (vb_us >> 1);
+    }
+    uint64_t elapsed_q8 = (now_us - phi) << 8;
+    uint64_t k = (elapsed_q8 / (uint64_t)p_q8) + 1ull;
+    uint64_t next_edge_us = phi + ((k * (uint64_t)p_q8 + 128ull) >> 8);
+    if (next_edge_us <= now_us) {
+        k++;
+        next_edge_us = phi + ((k * (uint64_t)p_q8 + 128ull) >> 8);
+    }
+    uint32_t rem_us = (uint32_t)(next_edge_us - now_us);
     return rem_us ? rem_us : vb_us;
 }
 
+// Predict the true display-time interpolation fraction t_interp = clamp((V_M - V_P) / (V_C - V_P), 0.333, 0.667)
+// based on the PLL-predicted VBlank slots for previous real frame P, mid-frame M, and current real frame C.
+static uint32_t pll_predict_t_interp_q16(int32_t handle, uint64_t now_us, uint64_t dt_enter_us, uint32_t hold_mid_us)
+{
+    uint32_t vb_us = 16683u;
+    uint32_t to_next_vb_us = vblank_to_next_edge_us(handle, now_us, &vb_us);
+    uint32_t to_mid_vb_us = (to_next_vb_us >= PLL_LATCH_US) ? to_next_vb_us : (to_next_vb_us + vb_us);
+    uint64_t v_m_us = now_us + (uint64_t)to_mid_vb_us;
+    uint64_t v_p_us = __atomic_load_n(&g_pll_last_real_vb_us, __ATOMIC_ACQUIRE);
+    if (v_p_us > 0 && v_m_us < v_p_us + (uint64_t)vb_us) {
+        v_m_us = v_p_us + (uint64_t)vb_us;
+    }
+
+    uint32_t extra_mid_vb = (hold_mid_us > (vb_us >> 1)) ? ((hold_mid_us + (vb_us >> 1)) / vb_us) : 0u;
+    uint32_t vb_m_to_c = 1u + extra_mid_vb;
+
+    uint32_t vb_p_to_m = 1u;
+    if (v_p_us > 0 && v_m_us > v_p_us && (v_m_us - v_p_us) <= (uint64_t)vb_us * 6ull) {
+        vb_p_to_m = (uint32_t)(((v_m_us - v_p_us) + (vb_us >> 1)) / vb_us);
+        if (vb_p_to_m < 1u) vb_p_to_m = 1u;
+    } else {
+        uint64_t dt_ref = (dt_enter_us >= (uint64_t)vb_us && dt_enter_us <= (uint64_t)vb_us * 6ull)
+                          ? dt_enter_us
+                          : (uint64_t)(g_ema_frame_us > 20000u ? g_ema_frame_us : (vb_us * 2u));
+        uint32_t total_vb = (uint32_t)((dt_ref + (vb_us >> 1)) / vb_us);
+        if (total_vb < 2u) total_vb = 2u;
+        if (total_vb > 5u) total_vb = 5u;
+        vb_p_to_m = (total_vb > vb_m_to_c) ? (total_vb - vb_m_to_c) : 1u;
+    }
+
+    uint32_t vb_p_to_c = vb_p_to_m + vb_m_to_c;
+    uint32_t t_q16 = ((vb_p_to_m << 16) + (vb_p_to_c >> 1)) / vb_p_to_c;
+    if (t_q16 < 21845u) t_q16 = 21845u;
+    if (t_q16 > 43691u) t_q16 = 43691u;
+
+    uint32_t t_permille = (vb_p_to_m * 1000u + (vb_p_to_c >> 1)) / vb_p_to_c;
+    if (t_permille < 333u) t_permille = 333u;
+    if (t_permille > 667u) t_permille = 667u;
+
+    __atomic_store_n(&g_pll_t_interp_q16, t_q16, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_pll_t_permille, t_permille, __ATOMIC_RELEASE);
+    return t_q16;
+}
+
+static void pll_commit_frame_vblank(int32_t handle, uint64_t submit_us, uint32_t hold_mid_us)
+{
+    uint32_t vb_us = 16683u;
+    uint32_t to_next_vb_us = vblank_to_next_edge_us(handle, submit_us, &vb_us);
+    uint32_t to_mid_vb_us = (to_next_vb_us >= PLL_LATCH_US) ? to_next_vb_us : (to_next_vb_us + vb_us);
+    uint64_t v_m_us = submit_us + (uint64_t)to_mid_vb_us;
+    uint64_t prev_vp = __atomic_load_n(&g_pll_last_real_vb_us, __ATOMIC_ACQUIRE);
+    if (prev_vp > 0 && v_m_us < prev_vp + (uint64_t)vb_us) {
+        v_m_us = prev_vp + (uint64_t)vb_us;
+    }
+    uint32_t extra_mid_vb = (hold_mid_us > (vb_us >> 1)) ? ((hold_mid_us + (vb_us >> 1)) / vb_us) : 0u;
+    uint64_t v_c_us = v_m_us + (uint64_t)(1u + extra_mid_vb) * (uint64_t)vb_us;
+    __atomic_store_n(&g_pll_last_real_vb_us, v_c_us, __ATOMIC_RELEASE);
+}
+
 // Vblank-Phase-Aware Adaptive Hold (PRE-SUBMIT PLL):
-// Uses the vblank timestamp tracked by mon_thread (vs.processTime / sceVideoOutGetVblankStatus)
-// and elapsed CPU frame interval (now - last_submit_enter_t) so that when a game frame arrives
-// late in the 2-vblank window (e.g. 23..28 fps, 36..43 ms frame time), the pre-submit sleep
-// automatically shortens to target the upcoming vblank edge (guaranteeing mid is latched on the
-// next vblank without delaying the game's CPU thread past that vblank).
+// Uses the vblank PLL estimator (t_vb(k) = phi_vb + k * T_vb) and elapsed CPU frame interval
+// (now - last_submit_enter_t) so that when a game frame arrives late in the 2-vblank window
+// (e.g. 23..28 fps, 36..43 ms frame time), the pre-submit sleep automatically shortens to target
+// the upcoming vblank edge with PLL_LEAD_US safety margin (guaranteeing mid is latched on the
+// target vblank without slipping across the edge).
 static uint32_t pll_adaptive_hold_us(int32_t handle, uint64_t now_us, uint64_t dt_enter_us, uint32_t req_hold_us)
 {
     uint32_t vb_us = 16683u;
     uint32_t to_next_vb_us = vblank_to_next_edge_us(handle, now_us, &vb_us);
     uint32_t win_2vb_us = vb_us * 2u;
-    uint32_t target_edge_us = (dt_enter_us > 0 && dt_enter_us < (uint64_t)vb_us)
+    uint32_t target_edge_us = (dt_enter_us > 0 && (dt_enter_us < (uint64_t)vb_us || to_next_vb_us < PLL_LEAD_US))
                               ? (to_next_vb_us + vb_us)
                               : to_next_vb_us;
     uint32_t vb_budget_us = (target_edge_us > PLL_LEAD_US) ? (target_edge_us - PLL_LEAD_US) : 0u;
@@ -2294,6 +2539,13 @@ static uint32_t pll_adaptive_hold_us(int32_t handle, uint64_t now_us, uint64_t d
     uint32_t hold_us = req_hold_us;
     if (hold_us > rem_2vb_us) hold_us = rem_2vb_us;
     if (hold_us > vb_budget_us) hold_us = vb_budget_us;
+    if (to_next_vb_us > hold_us) {
+        uint32_t rem_after = to_next_vb_us - hold_us;
+        if (rem_after >= (PLL_LATCH_US - 200u) && rem_after <= (PLL_LATCH_US + 200u)) {
+            uint32_t nudge_us = rem_after - (PLL_LATCH_US - 250u);
+            if (hold_us + nudge_us <= req_hold_us) hold_us += nudge_us;
+        }
+    }
     if (hold_us < req_hold_us) g_pll_shortened++;
     return hold_us;
 }
@@ -2477,7 +2729,9 @@ static void tick(uint32_t n, uint32_t handle, uint32_t index, uint32_t mode)
             if (g_detected_60fps && n > INJECT_AFTER_FLIPS && low_fps_wins >= 2) {
                 g_detected_60fps = 0;
                 g_inert_reason[0] = 0;
+                if (g_known_game && !g_menu_open) { g_cfg.framegen = 1; g_fg_off = 0; }
                 g_last_disk_hash = 0;
+                gv_start(g_inject_on == 8 && fg_res_supported(g_bw, g_bh));
                 lg("auto-detect: game dropped to %.1f fps (30 fps class) -> FrameGen auto-enabled\n", rfps);
             }
         }
@@ -2499,6 +2753,15 @@ static int dcb_mem_ok(uintptr_t a, size_t n)
     if (!a || !n || a + n < a) return 0;
     uintptr_t end = a + n, cur = a;
     while (cur < end) {
+        OrbisKernelVirtualQueryInfo vq;
+        memset(&vq, 0, sizeof(vq));
+        if (sceKernelVirtualQuery((const void *)cur, 0, &vq, sizeof(vq)) == 0 &&
+            (uintptr_t)vq.unk01 <= cur && (uintptr_t)vq.unk02 > cur) {
+            if (!vq.isCommitted) return 0;
+            if ((vq.unk04 & 0x01 /*PROT_CPU_READ*/) == 0) return 0;
+            cur = (uintptr_t)vq.unk02;
+            continue;
+        }
         void *s = NULL, *en = NULL;
         int32_t prot = 0;
         if (sceKernelQueryMemoryProtection((void *)cur, &s, &en, &prot) != 0) return 0;
@@ -2541,17 +2804,20 @@ static void vout_fg_ctx_init(uint32_t handle, int from_vout)
         STAGE("safe mode: the early start reached frame %d (%s) -> marker & stale crash removed", INJECT_AFTER_FLIPS,
               from_vout ? "VideoOutSubmitFlip" : "SubmitAndFlip");
     }
+    if (g_ngame < 2 && g_game_idx_hi >= 2 && g_game_idx_hi <= 8) g_ngame = g_game_idx_hi;
     if (g_safe && g_safe_never) { g_safe_done = 1; snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: SAFE GIVEN UP"); }
     if (g_safe && !g_safe_done) {
         if (g_inject_on == 8) safe_try_activate(handle);
         else safe_refuse("MODE");
+    } else if (!g_safe && !g_safe_done && g_mbuf_state != 1 && g_inject_on == 8 && g_ngame >= 2) {
+        safe_try_activate(handle);
     }
     memcpy(safe_reason, g_inert_reason, sizeof(safe_reason));
     if (g_safe && !g_safe_active) g_inject_on = 0;   // unverified title that was refused: observe only
     if (!g_fmt_supported) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: HDR/FMT 0x%x", g_attr.format);
     else if (!fg_res_supported(g_bw, g_bh)) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: RES %ux%u", g_bw, g_bh);
     else if (!mbufs_ready(handle)) snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: NO MBUF (%d)", g_nbuf);
-    else if (g_detected_60fps && g_cfg.fps_lock != 30) snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)");
+    else if (g_detected_60fps && g_fg_off) snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)");
     else g_inert_reason[0] = 0;
 
     if (g_safe && !g_safe_active && safe_reason[0]) memcpy(g_inert_reason, safe_reason, sizeof(g_inert_reason));
@@ -2566,7 +2832,7 @@ static void vout_fg_ctx_init(uint32_t handle, int from_vout)
     lg("tile index: override %d, sweep %d (sweep default off; L3 + D-pad Left/Right changes the index in game)\n", (int)g_tile_override, (int)g_tile_sweep);
     if (g_inject_on >= 6) mon_start();
     gv_set_display(g_buf, g_nbuf, g_bw, g_bh);
-    gv_start(g_inject_on == 8 && fg_res_supported(g_bw, g_bh));
+    gv_start(g_inject_on == 8 && fg_res_supported(g_bw, g_bh) && !g_detected_60fps);
 }
 
 static int32_t gnm_submit_and_flip_raw(int has_wl, uint32_t workload, uint32_t count, void *dcb[], uint32_t *dcbSz,
@@ -2611,6 +2877,13 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
         vout_fg_ctx_init(handle, 0);
     }
 
+    if (on_sub_hibernation_gate(g_flips)) {
+        g_prev2_idx = g_prev_idx;
+        g_prev_idx = index;
+        g_last_submit_enter_t = sceKernelGetProcessTime();
+        return gnm_submit_and_flip_raw(has_wl, workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+    }
+
     if (g_inject_on && g_flips >= INJECT_AFTER_FLIPS && count >= 1 && count <= (GV_MAXE - 1u) && dcb && dcbSz && index < (uint32_t)g_nbuf) {
         int dcb_valid = 1;
         for (uint32_t i = 0; i < count; i++) {
@@ -2628,9 +2901,33 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
         if (dcb_valid && g_gpu_state == 1) {
             uint32_t last = count - 1;
             uint32_t nd = dcbSz[last] / 4;
-            const uint32_t *tail = nd >= 64 ? (const uint32_t *)dcb[last] + (nd - 64) : NULL;
-            // CUSA00411: the same 64-dword flip packet but its second dword is 0x68750778 instead of 0x68750777
-            if (tail && tail[0] == 0xC03E1000u && (tail[1] >> 8) == 0x687507u) {
+            uint32_t tail_dw = 0;
+            const uint32_t *tail = NULL;
+            if (nd >= 64) {
+                const uint32_t *t64 = (const uint32_t *)dcb[last] + (nd - 64);
+                // CUSA00411: the same 64-dword flip packet but its second dword is 0x68750778 instead of 0x68750777
+                if (t64[0] == 0xC03E1000u && (t64[1] >> 8) == 0x687507u) {
+                    tail = t64;
+                    tail_dw = 64u;
+                }
+            }
+            if (!tail && nd >= 16) {
+                const uint32_t *dw = (const uint32_t *)dcb[last];
+                uint32_t scan_s = (nd > 128u) ? (nd - 128u) : 0u;
+                for (uint32_t ti = scan_s; ti + 2u <= nd; ti++) {
+                    uint32_t h = dw[ti];
+                    uint32_t pk_len = ((h >> 16) & 0x3FFFu) + 2u;
+                    if ((h & 0xC000FF00u) == 0xC0001000u && (dw[ti + 1u] >> 8) == 0x687507u &&
+                        ti + pk_len == nd && pk_len >= 16u && pk_len <= 128u) {
+                        tail = dw + ti;
+                        tail_dw = pk_len;
+                        break;
+                    }
+                }
+            }
+            if (tail) {
+                static const uint32_t k_nop64_pkt[64] = { 0 };
+                const uint32_t *tail64 = (tail_dw >= 64u) ? tail : k_nop64_pkt;
                 uint32_t slot = g_flips & 3;
                 int dcb8 = g_inject_on == 8 && g_gpu_sz == GPU_SZ;
                 uint32_t *mine = (uint32_t *)(g_gpu + (dcb8 ? DCB8_OFF + slot * DCB8_SZ : SLOT0 + slot * SLOT_SZ));
@@ -2791,15 +3088,13 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             }
                         }
                     } else if (!g_fg_off) {
-                        // 1.1 FG Quality (strict 2x): 1 mid frame per real frame, real-timestamp midpoint phase
-                        uint32_t prev_hold = __atomic_load_n(&g_last_real_hold_us, __ATOMIC_ACQUIRE);
-                        uint32_t tot_us = g_ema_frame_us > 20000u ? g_ema_frame_us : 33366u;
-                        uint32_t t_real = (prev_hold << 16) / tot_us;
-                        // Blend 50/50 with 0.5 (32768) for jitter-free midpoint placement
-                        t1_q16 = (t_real + 32768u) >> 1;
-                        if (t1_q16 < 22937u) t1_q16 = 22937u; // 0.35
-                        if (t1_q16 > 42598u) t1_q16 = 42598u; // 0.65
+                        // 1.1 FG Quality (strict 2x): 1 mid frame per real frame, VBlank-PLL display-slot phase
                         g_q2x_hold_acc = 0;
+                        if (force_repeat) {
+                            t1_q16 = 0u;
+                        } else {
+                            t1_q16 = pll_predict_t_interp_q16((int32_t)handle, sceKernelGetProcessTime(), dt_enter_us, hold_mid_us);
+                        }
                     }
 
                     uint32_t ci = 0;
@@ -2818,7 +3113,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                two_mids ? 2 : 1, mi1, mi2, ci, __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE));
                     }
                     n = build_dcb_flow8(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi1], g_buf[mi2], g_pitch,
-                                        tidx, px * 4, slot, g_flips, tail, (int32_t)handle, mi1, mi2,
+                                        tidx, px * 4, slot, g_flips, tail64, (int32_t)handle, mi1, mi2,
                                         t1_q16, t2_q16, two_mids, force_repeat, pcopy ? g_buf[ci] : 0ull, ci);
                     flip_idx = mi1;
                     second_flip = 1;
@@ -2826,34 +3121,40 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     // 1.4: Native / Post-only path (FG off in menu, or 60fps game): draw OSD menu/overlay + RCAS/Enhance on cur.
                     uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
                     uint32_t tidx = tile_idx_now();
-                    n = build_dcb_post8(mine, g_buf[index], g_bw, g_bh, g_pitch, tidx, px * 4, slot, g_flips, tail);
+                    n = build_dcb_post8(mine, g_buf[index], g_bw, g_bh, g_pitch, tidx, px * 4, slot, g_flips, tail64);
                 } else if ((g_inject_on == 4 || g_inject_on == 6 || g_inject_on == 7) && g_prev_idx < game_idx_end() && mbufs_ready(handle)) {
                     uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
                     uint32_t mi = (uint32_t)g_mbase + (g_flips % (uint32_t)g_nmid);
                     if (g_inject_on >= 6 && g_work && g_bw >= 1280 && (g_bw % 640) == 0 && g_bh == g_bw * 9 / 16 && g_bw / 640 <= 4)
                         n = build_dcb_flow(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi], g_bw, g_bh, g_pitch,
-                                           tile_idx_now(), px * 4, slot, g_flips, tail,
+                                           tile_idx_now(), px * 4, slot, g_flips, tail64,
                                            (int32_t)handle, mi, g_inject_on >= 7);
                     else
-                        n = build_dcb_ghost(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi], (px + 63) / 64, px * 4, slot, g_flips, tail);
+                        n = build_dcb_ghost(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi], (px + 63) / 64, px * 4, slot, g_flips, tail64);
                     flip_idx = mi;
                     second_flip = 1;
                 } else if (g_inject_on == 2 || g_inject_on == 3) {
                     uint32_t px = g_pitch * ((g_bh + 63u) & ~63u);
                     uint64_t prev = (g_inject_on == 3) ? g_buf[index] : g_buf[g_prev_idx < (uint32_t)g_nbuf ? g_prev_idx : index];
-                    n = build_dcb_ghost(mine, prev, g_buf[index], g_buf[index], (px + 63) / 64, px * 4, slot, g_flips, tail);
+                    n = build_dcb_ghost(mine, prev, g_buf[index], g_buf[index], (px + 63) / 64, px * 4, slot, g_flips, tail64);
                 } else if (g_inject_on == 5) {
                     uint32_t px = g_pitch * ((g_bh + 63u) & ~63u);
                     uint32_t tidx = tile_idx_now();
-                    n = build_dcb_rect(mine, g_buf[index], g_bw, g_bh, g_pitch, tidx, 32, 16, px * 4, slot, g_flips, tail);
+                    n = build_dcb_rect(mine, g_buf[index], g_bw, g_bh, g_pitch, tidx, 32, 16, px * 4, slot, g_flips, tail64);
                 } else if (g_inject_on == 1) {
                     if ((g_flips & 7) == 1 && !g_pend_seq) {
                         for (int i = 0; i < 64; i++) scr[i] = 0xDEADBEEFu;
-                        n = build_dcb(mine, (uint64_t)(uintptr_t)scr, 1, 256, slot, g_flips, tail);
+                        n = build_dcb(mine, (uint64_t)(uintptr_t)scr, 1, 256, slot, g_flips, tail64);
                         g_pend_seq = g_flips; g_pend_slot = slot;
                     } else {
-                        n = build_dcb(mine, g_buf[index], 1024, 0x40000, slot, g_flips, tail);
+                        n = build_dcb(mine, g_buf[index], 1024, 0x40000, slot, g_flips, tail64);
                     }
+                }
+
+                if (n >= 64u && tail_dw != 64u) {
+                    uint32_t base_n = n - 64u;
+                    for (uint32_t ti = 0; ti < tail_dw; ti++) mine[base_n + ti] = tail[ti];
+                    n = base_n + tail_dw;
                 }
 
                 int pace_p2 = (int)g_prev2_idx, pace_p1 = (int)g_prev_idx;
@@ -2876,7 +3177,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 }
                 for (uint32_t i = 0; i < count; i++) { d2[i] = dcb[i]; s2[i] = dcbSz[i]; c2[i] = ccb ? ccb[i] : 0; cs2[i] = ccbSz ? ccbSz[i] : 0; }
                 uint32_t ncount = count + 1;
-                if (s2[last] == 64 * 4) {
+                if (s2[last] == tail_dw * 4u) {
                     d2[last] = mine; s2[last] = n * 4;
                     {
                         static int ccb_logged = 0;
@@ -2887,7 +3188,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     }
                     c2[last] = 0; cs2[last] = 0; ncount = count;
                 } else {
-                    s2[last] -= 64 * 4;
+                    s2[last] -= tail_dw * 4u;
                     d2[count] = mine; s2[count] = n * 4; c2[count] = 0; cs2[count] = 0;
                 }
                 if (g_flips >= INJECT_AFTER_FLIPS && g_flips < INJECT_AFTER_FLIPS + 3) {
@@ -2909,8 +3210,8 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     lg("inject #%u: count %u->%u, our DCB %u dw, out buf[%u]=%llx\n", g_flips, count, ncount, n, index, (unsigned long long)g_buf[index]);
                 uint32_t *fb2 = (uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + SLOT_FB2_OFF);
                 uint32_t *fb  = (uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0xE00);
-                if (third_flip)  { for (int i = 0; i < 64; i++) fb2[i] = tail[i]; }
-                if (second_flip) { for (int i = 0; i < 64; i++) fb[i]  = tail[i]; }
+                if (third_flip)  { for (uint32_t i = 0; i < tail_dw; i++) fb2[i] = tail[i]; }
+                if (second_flip) { for (uint32_t i = 0; i < tail_dw; i++) fb[i]  = tail[i]; }
                 static int last_show = -1;                  // with present copy the shown real buffers are the copies
                 int pace_pre = (g_cfg.pace_order == 1) ? 1 : (g_cfg.pace_order == 2) ? 0 : (!g_pcopy_on);
                 g_last_pace_pre = pace_pre;
@@ -2943,19 +3244,30 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     t_p1 = sceKernelGetProcessTime();
                 }
                 uint64_t t_s1 = t_p1;
+                if (can_fg8 && want_fg && !g_fg_off && raw_dt_us <= 66667ull) {
+                    if (g_cfg.preset != 1 && !(VCFG_2BUF_TEST == 3 && tb_title() && g_pcopy_on)) {
+                        uint32_t t_pll_q16 = pll_predict_t_interp_q16((int32_t)handle, t_s1, dt_enter_us, hold_mid_us);
+                        uint32_t *tb_slot = (uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0xB00);
+                        tb_slot[29] = (tb_slot[29] & 0xFFFFu) | ((t_pll_q16 & 0xFFFFu) << 16);
+                        if (g_mon) g_mon[3] = t_pll_q16;
+                    }
+                    pll_commit_frame_vblank((int32_t)handle, t_s1, hold_mid_us);
+                }
                 g_last_submit_enter_t = t_s1;
+                __atomic_store_n(&g_done, (volatile uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0x900), __ATOMIC_RELEASE);
+                __atomic_store_n(&g_last_seq, g_flips, __ATOMIC_RELEASE);
                 int32_t rc = gnm_submit_and_flip_raw(has_wl, workload, ncount, d2, s2, ccb ? c2 : ccb, ccbSz ? cs2 : ccbSz, handle, flip_idx, flipMode, flipArg);
                 uint64_t t_s1e = sceKernelGetProcessTime(), t_hold = t_s1e, t_s2e = t_s1e;
                 if (third_flip) {
                     void *dm2[1] = { fb2 };
-                    uint32_t sm2[1] = { 64 * 4 };
+                    uint32_t sm2[1] = { tail_dw * 4u };
                     gnm_submit_and_flip_raw(has_wl, workload, 1, dm2, sm2, NULL, NULL, handle, mid2_flip_idx, flipMode, flipArg);
                 }
                 if (second_flip) {
                     if (hold_mid_us > 0) sceKernelUsleep(hold_mid_us);
                     t_hold = sceKernelGetProcessTime();
                     void *d3[1] = { fb };
-                    uint32_t s3[1] = { 64 * 4 };
+                    uint32_t s3[1] = { tail_dw * 4u };
                     // Experiment 2: the first mid keeps the game's opaque argument;
                     // tag only the real copy. This does not virtualize status or labels.
                     int64_t real_arg = flipArg;
@@ -3181,14 +3493,16 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
         if (g_vo_submit_flips + 1u >= VT_START_FLIP && !g_vt_dumped) g_vt_on = 1;
         vt_rec(VT_FLIP, (uint32_t)index, mode, (uint32_t)arg, (uint32_t)handle, NULL, 0);
     }
-    // If called from inside sceGnmSubmitAndFlipCommandBuffers (or while SubmitAndFlip is active), pass through.
-    if (vcfg_in_submit_get() || g_flips > 0 || index < 0) {
+    uint64_t t_hook_in = sceKernelGetProcessTime();
+    int gnm_flip_active = (g_flips > 0 && g_last_submit_enter_t && t_hook_in >= g_last_submit_enter_t &&
+                           (t_hook_in - g_last_submit_enter_t) < 250000ull);
+    // If called from inside sceGnmSubmitAndFlipCommandBuffers (or while SubmitAndFlip is actively used), pass through.
+    if (vcfg_in_submit_get() || gnm_flip_active || index < 0) {
         int32_t vr = HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t), handle, index, mode, arg);
         if (g_vt_hooked && g_vt_n >= VT_N) vt_dump();
         return vr;
     }
 
-    uint64_t t_hook_in = sceKernelGetProcessTime();
     uint64_t dt_enter_us = g_vo_last_submit_enter_t ? (t_hook_in - g_vo_last_submit_enter_t) : 33366ull;
     uint32_t u_idx = (uint32_t)index;
     if (u_idx < 16u) __atomic_store_n(&g_sub_t[u_idx], t_hook_in, __ATOMIC_RELEASE);
@@ -3214,11 +3528,20 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
     uint64_t raw_dt_us = (prev_flip_t && g_freq) ? ((g_last - prev_flip_t) * 1000000ull / g_freq) : 33366ull;
 
 #if INJECT
-    if (vf == INJECT_AFTER_FLIPS) {
+    if (vf == INJECT_AFTER_FLIPS && g_flips < INJECT_AFTER_FLIPS) {
         vout_fg_ctx_init((uint32_t)handle, 1);
     }
 
-    if (g_inject_on && vf >= INJECT_AFTER_FLIPS && u_idx < (uint32_t)g_nbuf) {
+    if (on_sub_hibernation_gate(vf + g_flips)) {
+        g_prev2_idx = g_prev_idx;
+        g_prev_idx = u_idx;
+        g_vo_last_submit_enter_t = sceKernelGetProcessTime();
+        int32_t vr_hib = HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t), handle, index, mode, arg);
+        if (g_vt_hooked && g_vt_n >= VT_N) vt_dump();
+        return vr_hib;
+    }
+
+    if (g_inject_on && (vf >= INJECT_AFTER_FLIPS || g_flips >= INJECT_AFTER_FLIPS) && u_idx < (uint32_t)g_nbuf) {
         if (g_gpu_state == 0) gpu_init();
         if (g_gpu_state == 1) {
             uint32_t slot = vf & 3u;
@@ -3272,12 +3595,11 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                         t1_q16 = (uint32_t)p1;
                     }
                 } else if (!g_fg_off) {
-                    uint32_t prev_hold = __atomic_load_n(&g_last_real_hold_us, __ATOMIC_ACQUIRE);
-                    uint32_t tot_us = g_ema_frame_us > 20000u ? g_ema_frame_us : 33366u;
-                    uint32_t t_real = (prev_hold << 16) / tot_us;
-                    t1_q16 = (t_real + 32768u) >> 1;
-                    if (t1_q16 < 22937u) t1_q16 = 22937u;
-                    if (t1_q16 > 42598u) t1_q16 = 42598u;
+                    if (force_repeat) {
+                        t1_q16 = 0u;
+                    } else {
+                        t1_q16 = pll_predict_t_interp_q16(handle, sceKernelGetProcessTime(), dt_enter_us, hold_mid_us);
+                    }
                 }
 
                 uint32_t ci = 0;
@@ -3334,7 +3656,19 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                         hold_mid_us = 0;
                     }
                 }
-                g_vo_last_submit_enter_t = sceKernelGetProcessTime();
+                uint64_t vo_t_s1 = sceKernelGetProcessTime();
+                if (can_fg8 && want_fg && !g_fg_off && raw_dt_us <= 66667ull) {
+                    if (g_cfg.preset != 1) {
+                        uint32_t t_pll_q16 = pll_predict_t_interp_q16(handle, vo_t_s1, dt_enter_us, hold_mid_us);
+                        uint32_t *tb_slot = (uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0xB00);
+                        tb_slot[29] = (tb_slot[29] & 0xFFFFu) | ((t_pll_q16 & 0xFFFFu) << 16);
+                        if (g_mon) g_mon[3] = t_pll_q16;
+                    }
+                    pll_commit_frame_vblank(handle, vo_t_s1, hold_mid_us);
+                }
+                g_vo_last_submit_enter_t = vo_t_s1;
+                __atomic_store_n(&g_done, (volatile uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0x900), __ATOMIC_RELEASE);
+                __atomic_store_n(&g_last_seq, vf, __ATOMIC_RELEASE);
                 int32_t s_rc = vout_submit_dcb(mine, n);
                 if (vf == INJECT_AFTER_FLIPS || (vf % 600u) == 0)
                     lg("vout inject #%u: dcb=%u dw submit=0x%08x flip_idx=%u show_idx=%u pcopy=%d pace_pre=%d\n",
@@ -3387,6 +3721,14 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
     flush_map_run();
     if (g_dbg_hooks) crash_handlers_install();
     STAGE("RegisterBuffers enter: handle=%d start=%d num=%d", handle, startIndex, bufferNum);
+    VoAttr fixed_attr;
+    if (attr && attr->tilingMode == 0 && (attr->pitchInPixel & 127u) != 0) {
+        fixed_attr = *attr;
+        fixed_attr.pitchInPixel = (attr->pitchInPixel + 127u) & ~127u;
+        STAGE("RegisterBuffers: aligned macro-tiled pitch %u -> %u for %ux%u",
+              attr->pitchInPixel, fixed_attr.pitchInPixel, attr->width, attr->height);
+        attr = &fixed_attr;
+    }
     if (attr)
         STAGE("  attr: fmt=0x%x tiling=%u aspect=%u %ux%u pitch=%u option=%u", attr->format, attr->tilingMode,
               attr->aspectRatio, attr->width, attr->height, attr->pitchInPixel, attr->option);
@@ -3533,12 +3875,12 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
             int nm = 0;
             int max_extra = 16 - g_ngame;
             int stream_3buf = (!want_pcopy &&
-                               ((!g_known_game && g_dbg_allocs >= 64u) ||
+                               ((!g_known_game && g_dbg_allocs >= 32u) ||
                                 vcfg_in_family(g_title_id, "CUSA09311") ||
                                 vcfg_in_family(g_title_id, "CUSA18534") ||
                                 vcfg_in_family(g_title_id, "CUSA10123")));
             int cap_extra = want_pcopy
-                ? (vcfg_in_family(g_title_id, "CUSA11456") ? 2 : (hi_res ? 4 : 6))
+                ? (vcfg_in_family(g_title_id, "CUSA11456") ? 1 : ((!g_known_game && g_dbg_allocs >= 32u) ? 2 : (hi_res ? 4 : 6)))
                 : (stream_3buf ? 1 : ((hi_res || !g_known_game) ? 2 : 3));
             if (max_extra > cap_extra) max_extra = cap_extra;
             if (one && g_pre_mem) {
@@ -3550,16 +3892,18 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                     // pool below g_pre_mem remains 100% contiguous for post-RegisterBuffers arenas (e.g. CUSA13323,
                     // CUSA17722, CUSA01154, CUSA32946).
                     size_t used_pre = (one * (size_t)nm + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
+                    if (used_pre < 0x800000u) used_pre = 0x800000u;
                     if (used_pre > 0 && used_pre < g_pre_size) {
                         long old_pm = g_pre_mem_phys;
-                        shrink_early_mem_to(used_pre);
+                        shrink_early_mem_to_ex(used_pre, 0);
                         // If g_pre_gpu / g_pre_work were packed in the 2 MB page right below old_pm, move them right below
                         // the new g_pre_mem_phys so the reclaimed range [old_pm, g_pre_mem_phys) is not pinned in the middle.
                         if (g_pre_mem && g_pre_mem_phys > old_pm && g_pre_mem_phys >= 0x200000L && !g_gpu && !g_work) {
                             long new_pack_s = g_pre_mem_phys - 0x200000L, new_pack_e = g_pre_mem_phys;
                             if (g_pre_gpu && g_pre_gpu_phys >= old_pm - 0x200000L && g_pre_gpu_phys < old_pm) {
                                 long np = 0;
-                                void *nv = alloc_dm_range(new_pack_s, new_pack_e, g_gpu_sz, g_gpu_sz, 0, &np);
+                                void *nv = alloc_dm_range(new_pack_e - (long)g_gpu_sz, new_pack_e, g_gpu_sz, g_gpu_sz, 0, &np);
+                                if (!nv) nv = alloc_dm_range(new_pack_s, new_pack_e, g_gpu_sz, g_gpu_sz, 0, &np);
                                 if (nv) {
                                     size_t osz = g_gpu_sz;
                                     free_dm_block(&g_pre_gpu, &g_pre_gpu_phys, &osz, "gpu_repack");
@@ -3569,9 +3913,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                             if (g_pre_work && g_pre_work_phys >= old_pm - 0x200000L && g_pre_work_phys < old_pm) {
                                 long np = 0;
                                 size_t wsz = g_pre_work_sz;
-                                long ws = (g_pre_gpu && g_pre_gpu_phys >= new_pack_s && g_pre_gpu_phys < new_pack_e)
-                                          ? (g_pre_gpu_phys + (long)g_gpu_sz) : new_pack_s;
-                                void *nv = (ws < new_pack_e) ? alloc_dm_range(ws, new_pack_e, wsz, 0x10000, g_work_garlic ? 3 : 0, &np) : NULL;
+                                void *nv = alloc_dm_range(new_pack_s, new_pack_e, wsz, 0x10000, g_work_garlic ? 3 : 0, &np);
                                 if (nv) {
                                     free_dm_block(&g_pre_work, &g_pre_work_phys, &g_pre_work_sz, "work_repack");
                                     g_pre_work = nv; g_pre_work_phys = np; g_pre_work_sz = wsz;
@@ -3588,19 +3930,20 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
             }
             // Double-buffered game (or forced 2-Buffer mode): mid buffers + present-copy buffers.
             // Never allocate a second DirectMemory block m2 when g_pre_mem already provides nm >= 2 buffers
-            // (nm = 4 for 1080p = 2 mids + 2 present-copy buffers), so we don't consume an extra 16 MB of un-valved
-            // DirectMemory in games that allocate arenas after RegisterBuffers (CUSA13323, CUSA11456, CUSA32946).
+            // (nm = 4 for 1080p = 2 mids + 2 present-copy buffers), or when surface size >= 16 MB (4K/1800p where m2
+            // would consume an extra 16..32 MB of un-valved DirectMemory), so we don't starve games that allocate
+            // arenas after RegisterBuffers (CUSA13323, CUSA11456, CUSA32946).
             static uint8_t *s_pcopy_m2 = NULL;
             static size_t s_pcopy_m2_sz = 0;
             uint8_t *m2 = NULL; int nm2 = 0;
             STAGE("pcopy gate: ngame=%d pcopy_cfg=%d want_pcopy=%d tight=%d m=%p nm=%d one=0x%zx pre=%p pre_size=0x%zx max_extra=%d",
                   g_ngame, pcopy_cfg, want_pcopy, mem_tight, (void *)m, nm, one, g_pre_mem, g_pre_size, max_extra);
-            if (want_pcopy && m && nm < 2) {
+            if (want_pcopy && m && nm < 2 && one < 0x1000000u) {
                 size_t need2 = (one * (size_t)(2 - nm) + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
                 if (s_pcopy_m2 && s_pcopy_m2_sz >= need2) {
                     m2 = s_pcopy_m2;
                     nm2 = 2 - nm;
-                } else if (!mem_tight || dm_avail(0x200000) >= need2 + 0x4000000u) {
+                } else if (!mem_tight && dm_avail(0x200000) >= need2 + 0x4000000u) {
                     m2 = (uint8_t *)alloc_mbufs(need2);
                     if (m2) { s_pcopy_m2 = m2; s_pcopy_m2_sz = need2; nm2 = 2 - nm; }
                 }
@@ -3644,6 +3987,14 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                         for (int i = 0; i < nm; i++) g_buf[base + i] = (uint64_t)(uintptr_t)ext[g_ngame + i];
                         g_nbuf = base + nm;
                         g_mbuf_state = 1;
+                        if (g_flips >= INJECT_AFTER_FLIPS) {
+                            gv_set_display(g_buf, g_nbuf, g_bw, g_bh);
+                            if (g_fmt_supported && fg_res_supported(g_bw, g_bh) &&
+                                (strncmp(g_inert_reason, "INERT: NO MBUF", 14) == 0 ||
+                                 strncmp(g_inert_reason, "INERT: HDR/FMT", 14) == 0)) {
+                                g_inert_reason[0] = 0;
+                            }
+                        }
                         return r0;
                     }
                     g_pcopy_avail = 0;
@@ -3661,6 +4012,14 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                     for (int i = 0; i < nm; i++) g_buf[g_ngame + i] = (uint64_t)(uintptr_t)ext[g_ngame + i];
                     g_nbuf = g_ngame + nm;
                     g_mbuf_state = 1;
+                    if (g_flips >= INJECT_AFTER_FLIPS) {
+                        gv_set_display(g_buf, g_nbuf, g_bw, g_bh);
+                        if (g_fmt_supported && fg_res_supported(g_bw, g_bh) &&
+                            (strncmp(g_inert_reason, "INERT: NO MBUF", 14) == 0 ||
+                             strncmp(g_inert_reason, "INERT: HDR/FMT", 14) == 0)) {
+                            g_inert_reason[0] = 0;
+                        }
+                    }
                     return r;
                 }
             }
@@ -4141,12 +4500,18 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
                 }
             }
             if (!g_pre_gpu && g_pre_mem && g_pre_mem_phys >= 0x200000L) {
-                g_pre_gpu = alloc_dm_range(g_pre_mem_phys - 0x200000L, g_pre_mem_phys, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+                g_pre_gpu = alloc_dm_range(g_pre_mem_phys - (long)g_gpu_sz, g_pre_mem_phys, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+                if (!g_pre_gpu) {
+                    g_pre_gpu = alloc_dm_range(g_pre_mem_phys - 0x200000L, g_pre_mem_phys, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+                }
             }
             if (!g_pre_gpu) {
                 long top_e = (long)(dm_sz & ~(size_t)0x1FFFFFu);
                 if (top_e >= 0x200000L) {
-                    g_pre_gpu = alloc_dm_range(top_e - 0x200000L, top_e, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+                    g_pre_gpu = alloc_dm_range(top_e - (long)g_gpu_sz, top_e, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+                    if (!g_pre_gpu) {
+                        g_pre_gpu = alloc_dm_range(top_e - 0x200000L, top_e, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
+                    }
                 }
             }
             if (!g_pre_gpu) {

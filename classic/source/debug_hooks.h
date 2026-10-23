@@ -50,12 +50,21 @@ static ShaveEntry g_shaves[SHAVE_MAX];
 static int g_shave_n = 0;
 static size_t g_syn_phys_cursor = 0;
 
-static long g_shave_phys = 0;
+static long g_shave_phys = 0, g_shave_end = 0;
 static size_t g_shave_real_len = 0, g_shave_orig_len = 0;
 static int g_shave_type = 0, g_shave_tail_mapped = 0, g_mem_tight = 0;
 static long g_shave_last_probe_s = -1, g_shave_last_probe_e = -1;
 static size_t g_shave_last_probe_len = 0;
 static int g_shave_last_probe_tid = -1;
+
+// ---- Loading-Screen Memory Hibernation & GPU Drain state ----
+static volatile int g_mem_hibernating = 0;
+static volatile uint32_t g_hibernated_at_flip = 0;
+static size_t g_hibernated_work_sz = 0;
+static uint32_t g_hibernated_releases_base = 0;
+static volatile uint32_t *g_done = NULL;
+static volatile uint32_t g_last_seq = 0;
+static volatile uint32_t g_gpu_drain_waits = 0;
 
 // ---- Lock-free API flight ring buffer (dumped on crash) ----
 #define API_RING_N 64
@@ -504,15 +513,58 @@ int32_t sceVideoOutClose_hook(int32_t h)
     return r;
 }
 
-static void shrink_early_mem_to(size_t keep)
+static int try_recover_hibernated_work(void);
+
+// Atomically gate FG submission (g_mem_hibernating = 1) and wait up to 25 ms (50 x 500 us) for any
+// in-flight FG command buffer (*g_done != g_last_seq) to finish writing g_work / g_mid before
+// releasing physical DirectMemory at runtime (g_flips > 0).
+static void valve_hibernate_and_drain_gpu(void)
+{
+    __atomic_store_n(&g_hibernated_at_flip, g_flips ? g_flips : 1u, __ATOMIC_RELEASE);
+    g_hibernated_releases_base = __atomic_load_n(&g_dbg_releases, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&g_mem_hibernating, 1, __ATOMIC_SEQ_CST);
+    if (g_flips > 0 || g_gpu_state > 0) {
+        for (int wait_i = 0; wait_i < 50; wait_i++) {
+            volatile uint32_t *done_ptr = (volatile uint32_t *)__atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
+            uint32_t target_seq = __atomic_load_n(&g_last_seq, __ATOMIC_ACQUIRE);
+            if (!done_ptr || *done_ptr == target_seq) break;
+            __atomic_add_fetch(&g_gpu_drain_waits, 1u, __ATOMIC_RELAXED);
+            sceKernelUsleep(500);
+        }
+    }
+}
+
+static int hibernate_work_dm(long s, long e, size_t eff_align)
+{
+    int has_work_dm = (g_pre_work && g_pre_work_phys >= 0 &&
+                       g_pre_work_phys < e && g_pre_work_phys + (long)g_pre_work_sz > s &&
+                       !(eff_align >= 0x200000u && g_pre_work_phys + (long)g_pre_work_sz <= g_low_sub2mb_end));
+    if (!has_work_dm) return 0;
+    long work_2mb_page = g_pre_work_phys & ~0x1FFFFFL;
+    g_hibernated_work_sz = g_pre_work_sz ? g_pre_work_sz : WORK_SZ_8;
+    valve_hibernate_and_drain_gpu();
+    g_own_alloc++;
+    release_early_work();
+    if (g_gpu_state == 0 && !g_gpu && !g_mon && g_pre_gpu && g_pre_gpu_phys >= 0 &&
+        (g_pre_gpu_phys & ~0x1FFFFFL) == work_2mb_page && eff_align >= 0x200000u) {
+        release_early_gpu();
+    }
+    g_own_alloc--;
+    STAGE("memory valve (step 2 hibernation): drained GPU (waits=%u) and released g_work_phys at flip %u",
+          g_gpu_drain_waits, g_hibernated_at_flip);
+    return 1;
+}
+
+static void shrink_early_mem_to_ex(size_t keep, int mark_tight)
 {
     if (!g_pre_mem || g_pre_size <= keep) return;
+    if (g_flips > 0 || g_gpu_state > 0) valve_hibernate_and_drain_gpu();
     size_t drop = g_pre_size - keep;
     long new_phys = g_pre_mem_phys + (long)drop;
     int um = sceKernelMunmap(g_pre_mem, g_pre_size);
+    g_own_alloc++;
     int rr = um == 0 ? sceKernelReleaseDirectMemory(g_pre_mem_phys, drop) : -1;
     void *new_va = NULL;
-    g_own_alloc++;
     int mr = (um == 0 && rr == 0) ? sceKernelMapDirectMemory(&new_va, keep, 0x33, 0, new_phys, 0x200000) : -1;
     g_own_alloc--;
     if (mr == 0 && new_va) {
@@ -521,13 +573,22 @@ static void shrink_early_mem_to(size_t keep)
         g_pre_mem = new_va;
         g_pre_mem_phys = new_phys;
         g_pre_size = keep;
-        g_mem_tight = 1;
+        if (mark_tight) g_mem_tight = 1;
     } else {
-        if (um == 0) sceKernelReleaseDirectMemory(new_phys, keep);
+        if (um == 0) {
+            g_own_alloc++;
+            sceKernelReleaseDirectMemory(new_phys, keep);
+            g_own_alloc--;
+        }
         g_pre_mem = NULL;
         g_pre_mem_phys = 0;
         g_pre_size = 0;
     }
+}
+
+static void shrink_early_mem_to(size_t keep)
+{
+    shrink_early_mem_to_ex(keep, 1);
 }
 
 static size_t total_shaved_bytes(void)
@@ -540,12 +601,33 @@ static size_t total_shaved_bytes(void)
     return sum;
 }
 
+static void refresh_shave_globals(void)
+{
+    while (g_shave_n > 0 && g_shaves[g_shave_n - 1].orig_len == 0)
+        g_shave_n--;
+    if (g_shave_n > 0) {
+        ShaveEntry *last = &g_shaves[g_shave_n - 1];
+        g_shave_phys = last->phys;
+        g_shave_real_len = last->real_len;
+        g_shave_orig_len = last->orig_len;
+        g_shave_type = last->type;
+        g_shave_end = last->phys + (long)last->orig_len;
+    } else {
+        g_shave_phys = 0;
+        g_shave_real_len = 0;
+        g_shave_orig_len = 0;
+        g_shave_type = 0;
+        g_shave_end = 0;
+    }
+}
+
 static void record_shave_entry(long phys, size_t real_len, size_t orig_len, int type)
 {
     g_shave_phys = phys;
     g_shave_real_len = real_len;
     g_shave_orig_len = orig_len;
     g_shave_type = type;
+    g_shave_end = orig_len ? (phys + (long)orig_len) : 0;
     for (int i = 0; i < g_shave_n; i++) {
         if (g_shaves[i].phys == phys && g_shaves[i].orig_len == orig_len) {
             g_shaves[i].real_len = real_len;
@@ -579,6 +661,7 @@ static int relocate_early_mem_outside(long avoid_s, long avoid_e)
     long pm_s = g_pre_mem_phys;
     long pm_e = g_pre_mem_phys + (long)g_pre_size;
     if (pm_e <= avoid_s || pm_s >= avoid_e) return 0;
+    if (g_flips > 0 || g_gpu_state > 0) valve_hibernate_and_drain_gpu();
 
     // If [avoid_s, avoid_e) only overlaps the upper tail of g_pre_mem (e.g. CUSA08809/CUSA08034 requesting top 2.125 MB
     // 0x127de0000..0x128000000), trim the overlapping tail in-place so g_pre_mem keeps its non-overlapping prefix
@@ -592,7 +675,9 @@ static int relocate_early_mem_outside(long avoid_s, long avoid_e)
                 size_t rel_sz = g_pre_size - keep_prefix;
                 long rel_phys = pm_s + (long)keep_prefix;
                 int um = sceKernelMunmap((uint8_t *)g_pre_mem + keep_prefix, rel_sz);
+                g_own_alloc++;
                 int rr = (um == 0) ? sceKernelReleaseDirectMemory(rel_phys, rel_sz) : -1;
+                g_own_alloc--;
                 if (um == 0 && rr == 0) {
                     STAGE("memory valve: trimmed overlapping tail of g_pre_mem in-place 0x%zx->0x%zx (kept phys=0x%lx..0x%lx, freed 0x%lx..0x%lx for 0x%lx..0x%lx)",
                           g_pre_size, keep_prefix, pm_s, rel_phys, rel_phys, pm_e, avoid_s, avoid_e);
@@ -627,7 +712,11 @@ static int relocate_early_mem_outside(long avoid_s, long avoid_e)
         if (ar == 0 && mr == 0 && new_va) {
             memset(new_va, 0, keep);
             int um = sceKernelMunmap(g_pre_mem, g_pre_size);
-            if (um == 0) sceKernelReleaseDirectMemory(g_pre_mem_phys, g_pre_size);
+            if (um == 0) {
+                g_own_alloc++;
+                sceKernelReleaseDirectMemory(g_pre_mem_phys, g_pre_size);
+                g_own_alloc--;
+            }
             STAGE("memory valve: relocated display 0x%zx->0x%zx from phys=0x%lx to phys=0x%lx va=%p (outside 0x%lx..0x%lx)",
                   g_pre_size, keep, g_pre_mem_phys, new_phys, new_va, avoid_s, avoid_e);
             g_pre_mem = new_va;
@@ -636,7 +725,11 @@ static int relocate_early_mem_outside(long avoid_s, long avoid_e)
             if (keep < 0x2000000u) g_mem_tight = 1;
             return 1;
         }
-        if (ar == 0) sceKernelReleaseDirectMemory(new_phys, keep);
+        if (ar == 0) {
+            g_own_alloc++;
+            sceKernelReleaseDirectMemory(new_phys, keep);
+            g_own_alloc--;
+        }
     }
     return 0;
 }
@@ -685,7 +778,7 @@ int32_t sceKernelAvailableDirectMemorySize_hook(off_t s, off_t e, size_t align, 
         g_gpu_state == 0 && g_mbuf_state <= 0) {
         // If g_pre_mem is not yet held (e.g. shave_mode=2 LATE ALLOC) and the game queries the remaining pool,
         // reserve 8 MB (0x800000) in the reported size when < 8 MB is free outside [s, e) so the game leaves 8 MB for 1 mid buffer.
-        if (!g_pre_mem && g_cfg.shave_mode != 1 && *sizeOut >= 0x1000000u) {
+        if (!g_pre_mem && g_cfg.shave_mode != 1 && g_cfg.shave_mode != 3 && *sizeOut >= 0x1000000u) {
             size_t dm_sz = sceKernelGetDirectMemorySize();
             size_t out_lo = (s > 0) ? dm_avail_range(0, (long)s, 0x200000u, NULL) : 0;
             size_t out_hi = ((size_t)e < dm_sz) ? dm_avail_range((long)e, (long)dm_sz, 0x200000u, NULL) : 0;
@@ -701,6 +794,98 @@ int32_t sceKernelAvailableDirectMemorySize_hook(off_t s, off_t e, size_t align, 
         }
     }
     return r;
+}
+
+static int32_t shave_game_alloc(long s, long e, size_t len, size_t align, int type, long *phys, int boot_phase, int is_desc_probe)
+{
+    size_t eff_align = align ? align : 0x4000u;
+    // Post-Menu World-Streaming Arena Shave (e.g. CUSA09311 loading screen):
+    // If a title has NOT triggered any boot arena shave yet (g_shave_end == 0) and allocates its large
+    // world arena (len >= 256 MB) during the transition from main menu to gameplay (g_flips > 0),
+    // allow shaving the tail of that first >= 256 MB world arena even when g_flips >= 120 (unless shave_mode == 1 or 3).
+    int post_menu_world_arena = (!boot_phase && g_shave_end == 0 && len >= 0x10000000u);
+    int has_large_arena_shave = (g_shave_n >= 1 && g_shaves[0].orig_len >= 0x10000000u && g_shaves[0].real_len > 0);
+    size_t min_shave_len = (g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) ? 0x4000u : 0x400000u;
+    int non_2mb_giant_bundle = (len >= 0x20000000u && (len & 0xFFFFFu) != 0);
+    if (non_2mb_giant_bundle ||
+        g_cfg.shave_mode == 1 || g_cfg.shave_mode == 3 ||
+        len < min_shave_len ||
+        !(g_pre_mem || g_pre_work || g_mbuf_state == 1 || !boot_phase || post_menu_world_arena)) {
+        return (int32_t)0x80020023u;
+    }
+    off_t av_start = 0;
+    size_t shave_av = dm_avail_range(s, e, eff_align, &av_start);
+    size_t reserve = 0;
+    size_t already_shaved = total_shaved_bytes();
+    size_t max_total_shave = (len >= 0x40000000u || post_menu_world_arena)
+                             ? 0x2400000u
+                             : (g_pre_size ? g_pre_size + 0x400000u : 0x800000u);
+    if (post_menu_world_arena && shave_av <= len && shave_av > 0x200000u &&
+        (len - (shave_av - 0x200000u)) <= 0x2400000u) {
+        reserve = 0x200000u;
+        shave_av -= reserve;
+    } else if (boot_phase && len >= 0x10000000u && len < 0x40000000u && shave_av >= 0x1000000u) {
+        if (shave_av <= len && len - shave_av < 0x800000u) {
+            reserve = 0x800000u - (len - shave_av);
+            shave_av -= reserve;
+        }
+        if (reserve && max_total_shave < (len - shave_av) + already_shaved)
+            max_total_shave = (len - shave_av) + already_shaved;
+    }
+    if ((g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) && max_total_shave < already_shaved + 0x2400000u)
+        max_total_shave = already_shaved + 0x2400000u;
+    if ((g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) && shave_av < len) {
+        size_t flex_av = 0;
+        if (((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av) == 0 &&
+            flex_av >= (len - shave_av) + 0x400000u && max_total_shave < 0x4000000u) {
+            max_total_shave = 0x4000000u;
+        }
+    }
+    if (shave_av < len && (len - shave_av) <= 0x2400000u &&
+        already_shaved + (len - shave_av) <= max_total_shave) {
+        if (shave_av >= 0x4000u && (len >= 0x100000u || has_large_arena_shave) &&
+            !(is_desc_probe && len > 0x400000u && shave_av >= 0x40000u)) {
+            int32_t sr = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
+                                       s, e, shave_av, align, type, phys);
+            if (sr == 0 && phys) {
+                record_shave_entry(*phys, shave_av, len, type);
+                g_mem_tight = 1;
+                STAGE("arena shave #%d OK%s: game asked len=0x%zx, allocated 0x%zx at phys=0x%lx (shaved 0x%zx, reserve=0x%zx)",
+                      g_shave_n, post_menu_world_arena ? " (post-menu world arena)" : "",
+                      len, shave_av, *phys, len - shave_av, reserve);
+                return 0;
+            }
+        } else if (shave_av == 0 && (g_pre_mem || g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) &&
+                   ((g_pre_mem && len <= g_pre_size && already_shaved + len <= g_pre_size) ||
+                    ((g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) && len <= 0x1000000u && already_shaved + len <= max_total_shave)) &&
+                   (!is_desc_probe || len <= 0x400000u)) {
+            size_t flex_av = 0;
+            int flex_ok = (((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av) != 0 ||
+                           flex_av >= len);
+            if (flex_ok) {
+                // Exact final chunk (or runtime streaming chunk up to 16 MB) when 0 bytes of unallocated DirectMemory
+                // remain outside our scanout buffers, and not an intermediate step of a descending-size probe loop:
+                // synthesize a tail-only shave entry backed by FlexibleMemory on MapDirectMemory/BatchMap while keeping
+                // scanout buffers intact.
+                long base_syn = (g_pre_mem && g_pre_mem_phys > 0)
+                    ? g_pre_mem_phys
+                    : (long)(sceKernelGetDirectMemorySize() - 0x2000000u);
+                size_t cur_off = (g_syn_phys_cursor > already_shaved) ? g_syn_phys_cursor : already_shaved;
+                if (eff_align > 0x4000u && (eff_align & (eff_align - 1u)) == 0) {
+                    cur_off = (cur_off + eff_align - 1u) & ~(eff_align - 1u);
+                }
+                long syn_phys = base_syn + (long)cur_off;
+                g_syn_phys_cursor = cur_off + len;
+                if (phys) *phys = syn_phys;
+                record_shave_entry(syn_phys, 0, len, type);
+                g_mem_tight = 1;
+                STAGE("arena shave #%d (tail-only chunk) OK: game asked len=0x%zx, synthetic phys=0x%lx (backed by flex on map)",
+                      g_shave_n, len, syn_phys);
+                return 0;
+            }
+        }
+    }
+    return (int32_t)0x80020023u;
 }
 
 int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t align, int type, long *phys)
@@ -726,15 +911,21 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
         int boot_phase = (g_flips == 0 && g_gpu_state == 0);
         int pre_gpu_phase = (g_gpu_state == 0);
         if (pre_gpu_phase && g_dump_mem) {
+            g_own_alloc++;
             release_early_dump();
+            g_own_alloc--;
             r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                               s, e, len, align, type, phys);
         }
-        // Step 1: Yield DirectMemory-backed g_pre_work and g_pre_gpu FIRST when their physical range overlaps [s, e),
+        // Step 1 (boot) / Step 2 (runtime loading-screen hibernation):
+        // Yield DirectMemory-backed g_pre_work (g_work_phys) and g_pre_gpu FIRST when their physical range overlaps [s, e),
         // EXCEPT when the game requests >= 2 MB alignment and g_pre_work/g_pre_gpu sit completely inside the sub-2MB
         // region [0, g_low_sub2mb_end) (where a 2MB-aligned allocation can never be placed by the kernel anyway).
+        // When g_flips > 0 (!boot_phase), atomically gate on_sub (g_mem_hibernating = 1) and drain any in-flight GPU
+        // command buffer (*g_done == g_last_seq, up to 25 ms) before releasing g_work_phys.
         if (pre_gpu_phase && (uint32_t)r == 0x80020023u && ((g_pre_work && g_pre_work_phys > 0) || (g_pre_gpu && g_pre_gpu_phys > 0))) {
             int rel_any = 0;
+            g_own_alloc++;
             if (g_pre_work && g_pre_work_phys > 0 && g_pre_work_phys < e && g_pre_work_phys + (long)g_pre_work_sz > s &&
                 !(eff_align >= 0x200000u && g_pre_work_phys + (long)g_pre_work_sz <= g_low_sub2mb_end)) {
                 release_early_work();
@@ -745,113 +936,77 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
                 release_early_gpu();
                 rel_any = 1;
             }
+            g_own_alloc--;
             if (rel_any) {
                 r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                                   s, e, len, align, type, phys);
             }
+        } else if (!boot_phase && (uint32_t)r == 0x80020023u && g_pre_work && g_pre_work_phys >= 0) {
+            size_t cur_av = dm_avail_range(s, e, eff_align, NULL);
+            if (len < 0x10000000u || cur_av + 0x200000u >= len || g_cfg.shave_mode == 1 || g_cfg.shave_mode == 3) {
+                if (hibernate_work_dm(s, e, eff_align)) {
+                    r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
+                                      s, e, len, align, type, phys);
+                }
+            }
         }
         // Step 2: If the game requested a specific physical subrange [s, e) that overlaps g_pre_mem while other
         // DirectMemory outside [s, e) is still free, relocate g_pre_mem outside [s, e) and retry.
-        if (pre_gpu_phase && (uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && g_pre_mem && relocate_early_mem_outside(s, e)) {
+        if ((uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && g_pre_mem && relocate_early_mem_outside(s, e)) {
             r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                               s, e, len, align, type, phys);
         }
-        // Step 3: For sub-1GB allocations (multi-arena games like CUSA04529/CUSA10249/CUSA07820/CUSA00341 4th arena,
-        // or sequential chunk allocators), shrink g_pre_mem 32 MB -> 8 MB and retry unshaved FIRST so the arena
-        // succeeds 100% in real DirectMemory whenever it fits (consuming 0 bytes of FlexibleMemory).
-        if (pre_gpu_phase && (uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && len < 0x40000000u && g_pre_mem && g_pre_size > 0x800000u) {
+        // Step 3: For sub-1GB allocations or any arena that fits in real DirectMemory once g_pre_mem is shrunk to 8 MB
+        // (e.g. CUSA04529/CUSA10249/CUSA07820/CUSA00341 4th arena on both Base PS4 0x2a000000 and PS4 Pro 0x50c00000),
+        // shrink g_pre_mem 32 MB -> 8 MB and retry unshaved FIRST so the arena succeeds 100% in real DirectMemory.
+        if ((uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && g_pre_mem && g_pre_size > 0x800000u &&
+            (len < 0x40000000u || dm_avail_range(s, e, eff_align, NULL) + (g_pre_size - 0x800000u) >= len)) {
             shrink_early_mem_to(0x800000u);
             r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                               s, e, len, align, type, phys);
         }
-        // Step 4: Multi-block, sequential-chunk & runtime streaming Arena Shaving:
-        // - Single-arena games (len >= 1 GB, e.g. CUSA17419): shave up to 36 MB while keeping 32 MB g_pre_mem intact.
-        // - Multi-arena games (len >= 64 MB, e.g. CUSA13323/CUSA11456 8th arena 0x4000000): shave up to 32 MB and map
-        //   the shaved tail via MapDirectMemory / MapDirectMemory2 / BatchMap / BatchMap2.
-        // - Post-arena or runtime streaming chunks when 0 bytes of unallocated DirectMemory remain outside our scanout
-        //   buffers (e.g. CUSA10249/CUSA07820/CUSA04529 6 MB Alloc 5, or CUSA32946/CUSA06548/CUSA10237/CUSA11260/
-        //   CUSA10123/CUSA00010/CUSA02819/CUSA09311/CUSA18534): synthesize a flex-backed chunk (>= 16 KB).
-        size_t min_shave_len = (g_mbuf_state == 1 || !boot_phase || g_dbg_allocs >= 64u) ? 0x4000u : 0x400000u;
-        int non_2mb_giant_bundle = (len >= 0x10000000u && (len & 0x1FFFFFu) != 0);
+        // Step 4: Multi-block, sequential-chunk, post-menu world-arena & runtime streaming Arena Shaving:
+        int non_2mb_giant_bundle = (len >= 0x20000000u && (len & 0xFFFFFu) != 0);
         int cur_tid = scePthreadGetthreadid();
         int is_desc_probe = (cur_tid == g_shave_last_probe_tid &&
                              g_shave_last_probe_s == s &&
                              g_shave_last_probe_e == e &&
                              g_shave_last_probe_len > len);
-        if ((uint32_t)r == 0x80020023u && !non_2mb_giant_bundle &&
-            g_cfg.shave_mode != 1 && len >= min_shave_len &&
-            (g_pre_mem || g_pre_work || g_mbuf_state == 1 || !boot_phase)) {
-            off_t av_start = 0;
-            size_t shave_av = dm_avail_range(s, e, eff_align, &av_start);
-            size_t reserve = 0;
-            size_t already_shaved = total_shaved_bytes();
-            size_t max_total_shave = (len >= 0x40000000u) ? 0x2400000u : (g_pre_size ? g_pre_size + 0x400000u : 0x800000u);
-            if (boot_phase && len >= 0x10000000u && len < 0x40000000u && shave_av >= 0x1000000u) {
-                if (shave_av <= len && len - shave_av < 0x800000u) {
-                    reserve = 0x800000u - (len - shave_av);
-                    shave_av -= reserve;
-                }
-                if (reserve && max_total_shave < (len - shave_av) + already_shaved)
-                    max_total_shave = (len - shave_av) + already_shaved;
-            }
-            if ((g_mbuf_state == 1 || !boot_phase || g_dbg_allocs >= 64u) && max_total_shave < already_shaved + 0x2400000u)
-                max_total_shave = already_shaved + 0x2400000u;
-            if (shave_av < len && (len - shave_av) <= 0x2400000u &&
-                already_shaved + (len - shave_av) <= max_total_shave) {
-                if (shave_av >= 0x4000u && !(is_desc_probe && len > 0x400000u && shave_av >= 0x40000u)) {
-                    int32_t sr = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
-                                               s, e, shave_av, align, type, phys);
-                    if (sr == 0 && phys) {
-                        record_shave_entry(*phys, shave_av, len, type);
-                        g_mem_tight = 1;
-                        r = 0;
-                        STAGE("arena shave #%d OK: game asked len=0x%zx, allocated 0x%zx at phys=0x%lx (shaved 0x%zx, reserve=0x%zx)",
-                              g_shave_n, len, shave_av, *phys, len - shave_av, reserve);
-                    }
-                } else if (shave_av == 0 && (g_pre_mem || g_mbuf_state == 1 || !boot_phase || g_dbg_allocs >= 64u) &&
-                           ((g_pre_mem && len <= g_pre_size && already_shaved + len <= g_pre_size) ||
-                            ((g_mbuf_state == 1 || !boot_phase || g_dbg_allocs >= 64u) && len <= 0x1000000u && already_shaved + len <= 0x2400000u)) &&
-                           (!is_desc_probe || len <= 0x400000u)) {
-                    size_t flex_av = 0;
-                    int flex_ok = (((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av) != 0 ||
-                                   flex_av >= len);
-                    if (flex_ok) {
-                        // Exact final chunk (or runtime streaming chunk up to 16 MB) when 0 bytes of unallocated DirectMemory
-                        // remain outside our scanout buffers, and not an intermediate step of a descending-size probe loop:
-                        // synthesize a tail-only shave entry backed by FlexibleMemory on MapDirectMemory/BatchMap while keeping
-                        // scanout buffers intact.
-                        long base_syn = (g_pre_mem && g_pre_mem_phys > 0)
-                            ? g_pre_mem_phys
-                            : (long)(sceKernelGetDirectMemorySize() - 0x2000000u);
-                        size_t cur_off = (g_syn_phys_cursor > already_shaved) ? g_syn_phys_cursor : already_shaved;
-                        if (eff_align > 0x4000u && (eff_align & (eff_align - 1u)) == 0) {
-                            cur_off = (cur_off + eff_align - 1u) & ~(eff_align - 1u);
-                        }
-                        long syn_phys = base_syn + (long)cur_off;
-                        g_syn_phys_cursor = cur_off + len;
-                        if (phys) *phys = syn_phys;
-                        record_shave_entry(syn_phys, 0, len, type);
-                        g_mem_tight = 1;
-                        r = 0;
-                        STAGE("arena shave #%d (tail-only chunk) OK: game asked len=0x%zx, synthetic phys=0x%lx (backed by flex on map)",
-                              g_shave_n, len, syn_phys);
-                    }
+        if ((uint32_t)r == 0x80020023u) {
+            r = shave_game_alloc(s, e, len, align, type, phys, boot_phase, is_desc_probe);
+            if ((uint32_t)r == 0x80020023u && !boot_phase && g_pre_work && g_pre_work_phys >= 0) {
+                if (hibernate_work_dm(s, e, eff_align)) {
+                    r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
+                                      s, e, len, align, type, phys);
+                    if ((uint32_t)r == 0x80020023u)
+                        r = shave_game_alloc(s, e, len, align, type, phys, boot_phase, is_desc_probe);
                 }
             }
         }
-        // Step 5: Memory valve fallback if the allocation still failed (only before RegisterBuffers).
+        // Step 5: Memory valve fallback if the allocation still failed.
         if (pre_gpu_phase && (uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && g_pre_mem && g_pre_size > 0x800000u) {
             shrink_early_mem_to(0x800000u);
             r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                               s, e, len, align, type, phys);
+            if ((uint32_t)r == 0x80020023u)
+                r = shave_game_alloc(s, e, len, align, type, phys, boot_phase, is_desc_probe);
         }
-        if (boot_phase && (uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && g_pre_mem &&
+        if ((uint32_t)r == 0x80020023u && g_pre_mem &&
+            (g_mbuf_state <= 0 || (!boot_phase && (g_cfg.shave_mode == 1 || g_cfg.shave_mode == 3))) &&
             !(non_2mb_giant_bundle && g_cfg.shave_mode == 2) && total_shaved_bytes() < g_pre_size) {
             size_t cur_av = dm_avail_range(s, e, eff_align, NULL);
-            if (cur_av + g_pre_size >= len) {
+            if (cur_av + g_pre_size >= len || (boot_phase && len >= 0x4000000u)) {
+                if (!boot_phase) {
+                    valve_hibernate_and_drain_gpu();
+                    g_hibernated_at_flip = g_flips ? g_flips : 1u;
+                }
+                g_own_alloc++;
                 release_early_mem();
+                g_own_alloc--;
                 r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                                   s, e, len, align, type, phys);
+                if ((uint32_t)r == 0x80020023u && boot_phase)
+                    r = shave_game_alloc(s, e, len, align, type, phys, boot_phase, is_desc_probe);
             }
         }
         if ((uint32_t)r == 0x80020023u) {
@@ -935,43 +1090,76 @@ static int32_t call_orig_map(void **addr, size_t len, int type, int prot, int fl
                          addr, len, prot, flags, dmStart, maxPageSize);
 }
 
+// Map FlexibleMemory at a fixed VA `want_va`, safely overwriting a PROT_NONE (prot==0, !isDirectMemory,
+// !isFlexibleMemory) virtual address reservation if the game pre-reserved the arena VA space (e.g. CUSA50688),
+// while NEVER overwriting live PRX modules or committed DirectMemory/FlexibleMemory mappings.
+static int32_t map_flex_at_va(void *want_va, size_t len, int prot)
+{
+    if (!want_va || !len) return -1;
+    void *got_va = want_va;
+    int32_t rf = sceKernelMapFlexibleMemory(&got_va, len, prot, 0x90 /*MAP_FIXED | MAP_NO_OVERWRITE*/);
+    if (rf == 0 && got_va == want_va) return 0;
+    if (rf == 0 && got_va) sceKernelMunmap(got_va, len);
+
+    // Check if [want_va, want_va + len) is a PROT_NONE (unk04 == 0) virtual reservation (e.g. CUSA50688 anon:...)
+    OrbisKernelVirtualQueryInfo vq;
+    memset(&vq, 0, sizeof(vq));
+    if (sceKernelVirtualQuery(want_va, 0, &vq, sizeof(vq)) == 0 &&
+        vq.unk04 == 0 && !vq.isDirectMemory && !vq.isFlexibleMemory &&
+        (uintptr_t)vq.unk01 <= (uintptr_t)want_va &&
+        (uintptr_t)vq.unk02 >= (uintptr_t)want_va + len) {
+        size_t flex_av = 0;
+        if (((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av) != 0 ||
+            flex_av >= len) {
+            got_va = want_va;
+            rf = sceKernelMapFlexibleMemory(&got_va, len, prot, 0x10 /*MAP_FIXED*/);
+            if (rf == 0 && got_va == want_va) return 0;
+            if (rf == 0 && got_va) sceKernelMunmap(got_va, len);
+            if (sceKernelMunmap(want_va, len) == 0) {
+                got_va = want_va;
+                rf = sceKernelMapFlexibleMemory(&got_va, len, prot, 0x90 /*MAP_FIXED | MAP_NO_OVERWRITE*/);
+                if (rf == 0 && got_va == want_va) return 0;
+                if (rf == 0 && got_va) sceKernelMunmap(got_va, len);
+            }
+        }
+    }
+
+    got_va = want_va;
+    rf = sceKernelMapFlexibleMemory(&got_va, len, prot, 0);
+    if (rf == 0 && got_va != want_va) {
+        sceKernelMunmap(got_va, len);
+        rf = -1;
+    }
+    return (rf == 0 && got_va == want_va) ? 0 : (rf ? rf : -1);
+}
+
 static int32_t map_shaved_flex_tail(void *want_va, size_t tail_part, long shave_cut, int prot, int type,
                                     uintptr_t arena_vs, uintptr_t arena_ve, long arena_phys)
 {
-    void *got_va = want_va;
     g_own_alloc++;
-    int32_t rf = sceKernelMapFlexibleMemory(&got_va, tail_part, prot, 0x90 /*MAP_FIXED | MAP_NO_OVERWRITE*/);
-    if (rf != 0 || got_va != want_va) {
-        if (rf == 0 && got_va) sceKernelMunmap(got_va, tail_part);
-        got_va = want_va;
-        rf = sceKernelMapFlexibleMemory(&got_va, tail_part, prot, 0);
-        if (rf == 0 && got_va != want_va) {
-            sceKernelMunmap(got_va, tail_part);
-            rf = -1;
-        }
-    }
-    if (rf == 0 && got_va == want_va) {
+    int32_t rf = map_flex_at_va(want_va, tail_part, prot);
+    if (rf == 0) {
         g_own_alloc--;
         record_flex_vmap_ex(want_va, tail_part, shave_cut, prot, type, arena_vs, arena_ve, arena_phys);
         return 0;
     }
-    if (tail_part >= 0x200000u) {
+    if (tail_part >= 0x10000u) {
         // Partial FlexibleMemory fallback when the process has < tail_part of free FlexibleMemory
-        // (e.g. CUSA17722 0x8002000c): map the final 1 MB sentinel page first (so end-of-arena heap
-        // footer writes at want_va + tail_part - 0x10 never fault), then map as much of the prefix as fits.
-        void *sent_want = (uint8_t *)want_va + tail_part - 0x100000u;
-        void *sent_got = sent_want;
-        if (sceKernelMapFlexibleMemory(&sent_got, 0x100000u, prot, 0x90 /*MAP_FIXED | MAP_NO_OVERWRITE*/) == 0 &&
-            sent_got == sent_want) {
-            record_flex_vmap_ex(sent_want, 0x100000u, shave_cut + (long)(tail_part - 0x100000u), prot, type,
+        // (e.g. CUSA17722 / CUSA13323 0x8002000c, or sub-2MB tails like CUSA50688 0x12c000):
+        // map the final sentinel page first (so end-of-arena heap footer writes never fault),
+        // then map as much of the prefix as fits.
+        size_t sent_sz = (tail_part >= 0x200000u) ? 0x100000u : 0x10000u;
+        size_t step_sz = (tail_part >= 0x200000u) ? 0x200000u : 0x10000u;
+        void *sent_want = (uint8_t *)want_va + tail_part - sent_sz;
+        if (map_flex_at_va(sent_want, sent_sz, prot) == 0) {
+            record_flex_vmap_ex(sent_want, sent_sz, shave_cut + (long)(tail_part - sent_sz), prot, type,
                                 arena_vs, arena_ve, arena_phys);
         }
-        for (size_t try_flex = (tail_part - 0x100000u) & ~(size_t)0x1FFFFFu;
-             try_flex >= 0x200000u; try_flex -= 0x200000u) {
-            got_va = want_va;
-            rf = sceKernelMapFlexibleMemory(&got_va, try_flex, prot, 0x90 /*MAP_FIXED | MAP_NO_OVERWRITE*/);
-            if (rf == 0 && got_va == want_va) {
+        for (size_t try_flex = (tail_part - sent_sz) & ~(step_sz - 1u);
+             try_flex >= step_sz; try_flex -= step_sz) {
+            if (map_flex_at_va(want_va, try_flex, prot) == 0) {
                 record_flex_vmap_ex(want_va, try_flex, shave_cut, prot, type, arena_vs, arena_ve, arena_phys);
+                rf = (try_flex + sent_sz >= tail_part) ? 0 : 1; // 1 = partial/sentinel
                 break;
             }
         }
@@ -987,11 +1175,22 @@ static int32_t map_flex_aligned(void **addr, void *orig_addr_in, size_t len, int
     // on Orbis OS, bare MAP_FIXED (0x10) calls vm_map_delete(orig_addr_in, len) BEFORE checking if
     // FlexibleMemory pages are available, which would unmap existing PRX modules (e.g. libc.prx at
     // 0x80190000 in CUSA07820) when the game probes candidate VAs with flags=0x90!
-    int flex_flags = orig_addr_in ? 0x90 /*MAP_FIXED | MAP_NO_OVERWRITE*/ : 0;
     g_own_alloc++;
-    int32_t rf = sceKernelMapFlexibleMemory(addr, len, prot, flex_flags);
-    if (rf != 0 && flex_flags != 0 && !(flags & 0x90)) {
+    int32_t rf;
+    if (orig_addr_in) {
+        rf = map_flex_at_va(orig_addr_in, len, prot);
+        if (rf == 0) {
+            *addr = orig_addr_in;
+            g_own_alloc--;
+            return 0;
+        }
+        if (flags & 0x90) {
+            g_own_alloc--;
+            return rf;
+        }
         *addr = NULL;
+        rf = sceKernelMapFlexibleMemory(addr, len, prot, 0);
+    } else {
         rf = sceKernelMapFlexibleMemory(addr, len, prot, 0);
     }
     if (rf == 0 && *addr && !orig_addr_in && align > 0x4000u && (align & (align - 1u)) == 0 &&
@@ -1029,11 +1228,12 @@ static int32_t handle_game_map_inner(void **addr, size_t len, int type, int prot
         record_shave_entry(g_shave_phys, g_shave_real_len, g_shave_orig_len, g_shave_type);
     } else if (g_shave_orig_len == 0 && g_shave_n > 0) {
         g_shave_n = 0;
+        g_shave_end = 0;
     }
 
     if (!g_own_alloc && g_shave_n > 0) {
         long req_end = dmStart + (long)len;
-        for (int si = 0; si < g_shave_n; si++) {
+        for (int si = g_shave_n - 1; si >= 0; si--) {
             ShaveEntry *se = &g_shaves[si];
             if (!se->orig_len) continue;
             long shave_cut = se->phys + (long)se->real_len;
@@ -1060,7 +1260,9 @@ static int32_t handle_game_map_inner(void **addr, size_t len, int type, int prot
                 }
                 if (addr) *addr = orig_addr_in;
                 if (dmStart == se->phys && g_flips == 0 && g_gpu_state == 0 && g_mbuf_state <= 0) {
+                    g_own_alloc++;
                     int rr = sceKernelReleaseDirectMemory(se->phys, se->real_len);
+                    g_own_alloc--;
                     release_early_mem();
                     release_early_work();
                     long full_phys = 0;
@@ -1071,10 +1273,7 @@ static int32_t handle_game_map_inner(void **addr, size_t len, int type, int prot
                           (unsigned)rr, (unsigned)ar, full_phys);
                     se->orig_len = 0;
                     se->real_len = 0;
-                    if (si == g_shave_n - 1) {
-                        g_shave_orig_len = 0;
-                        g_shave_real_len = 0;
-                    }
+                    refresh_shave_globals();
                     if (ar == 0)
                         dmStart = full_phys;
                 }
@@ -1108,7 +1307,7 @@ static int32_t handle_game_map_inner(void **addr, size_t len, int type, int prot
     int32_t r = call_orig_map(addr, len, type, prot, flags, dmStart, maxPageSize, name, map_kind);
     if (r != 0 && !g_own_alloc && g_shave_n > 0 && addr) {
         long req_end = dmStart + (long)len;
-        for (int si = 0; si < g_shave_n; si++) {
+        for (int si = g_shave_n - 1; si >= 0; si--) {
             ShaveEntry *se = &g_shaves[si];
             if (!se->orig_len) continue;
             long shave_cut = se->phys + (long)se->real_len;
@@ -1189,58 +1388,139 @@ int32_t sceKernelMapDirectMemory2_hook(void **addr, size_t len, int type, int pr
     return handle_game_map(addr, len, type, prot, flags, dmStart, maxPageSize, NULL, 2, __builtin_return_address(0));
 }
 
-static void debug_hooks_install(void);
-
-static Detour Detour_sceKernelAllocateMainDirectMemory;
-static int g_main_dm_hooked = 0;
+static Detour Detour_sceKernelAllocateMainDirectMemory __attribute__((unused));
+static int g_main_dm_hooked __attribute__((unused)) = 0;
 int32_t sceKernelAllocateMainDirectMemory_hook(size_t len, size_t align, int type, long *phys)
 {
     return sceKernelAllocateDirectMemory_hook(0, (long)sceKernelGetDirectMemorySize(), len, align, type, phys);
 }
 
-static Detour Detour_sceKernelReleaseDirectMemory;
-static int g_rel_dm_hooked = 0;
+static void unmap_shave_flex_vmaps(long phys_s, long phys_e)
+{
+    uint32_t fn = __atomic_load_n(&g_flex_vmap_n, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < fn && i < FLEX_VMAP_MAX; i++) {
+        if (g_flex_vmap[i].va_end <= g_flex_vmap[i].va_start || g_flex_vmap[i].phys_start < 0) continue;
+        size_t vlen = (size_t)(g_flex_vmap[i].va_end - g_flex_vmap[i].va_start);
+        long vp_s = g_flex_vmap[i].phys_start;
+        long vp_e = vp_s + (long)vlen;
+        if (vp_s >= phys_s && vp_e <= phys_e) {
+            void *va = (void *)g_flex_vmap[i].va_start;
+            g_flex_vmap[i].va_start = 0;
+            g_flex_vmap[i].va_end = 0;
+            g_flex_vmap[i].arena_va_start = 0;
+            g_flex_vmap[i].arena_va_end = 0;
+            g_own_alloc++;
+            sceKernelMunmap(va, vlen);
+            g_own_alloc--;
+        }
+    }
+}
+
+static Detour Detour_sceKernelReleaseDirectMemory __attribute__((unused));
+static int g_rel_dm_hooked __attribute__((unused)) = 0;
 int32_t sceKernelReleaseDirectMemory_hook(off_t start, size_t len)
 {
-    int is_ours = (g_own_alloc > 0) ||
-                  (g_pre_mem && start >= (off_t)g_pre_mem_phys && start < (off_t)(g_pre_mem_phys + (long)g_pre_size)) ||
-                  (g_pre_work && start == (off_t)g_pre_work_phys) ||
-                  (g_pre_gpu && start == (off_t)g_pre_gpu_phys) ||
-                  (g_dump_mem && start == (off_t)g_dump_phys);
-    if (!is_ours && g_shave_n > 0) {
+    if (!g_own_alloc && g_shave_n > 0) {
         long rel_s = (long)start;
         long rel_e = rel_s + (long)len;
-        for (int si = 0; si < g_shave_n; si++) {
+        for (int si = g_shave_n - 1; si >= 0; si--) {
             ShaveEntry *se = &g_shaves[si];
             if (!se->orig_len) continue;
+            long shave_cut = se->phys + (long)se->real_len;
             long se_end = se->phys + (long)se->orig_len;
+            // Case A: Full release covering [se->phys, se_end)
             if (rel_s <= se->phys && rel_e >= se_end) {
                 size_t real_len = se->real_len;
                 long real_phys = se->phys;
+                unmap_shave_flex_vmaps(shave_cut, se_end);
                 se->orig_len = 0;
                 se->real_len = 0;
-                if (si == g_shave_n - 1) { g_shave_orig_len = 0; g_shave_real_len = 0; }
+                refresh_shave_globals();
                 if (real_len == 0) {
-                    __atomic_add_fetch(&g_dbg_releases, 1u, __ATOMIC_RELAXED);
+                    __atomic_add_fetch(&g_dbg_releases, 1u, __ATOMIC_ACQ_REL);
                     api_ring_push("ReleaseDM(shave-syn phys=0x%lx len=0x%zx) = 0", rel_s, len);
+                    if (__atomic_load_n(&g_mem_hibernating, __ATOMIC_ACQUIRE))
+                        try_recover_hibernated_work();
                     return 0;
                 }
                 if (rel_s == real_phys && len > real_len) len = real_len;
                 break;
             }
+            // Case B: Sub-range release completely inside the shaved tail [shave_cut, se_end)
+            // (e.g. CUSA10213 / CUSA11260 / CUSA12607 releasing tail pages): never pass to kernel!
+            if (rel_s >= shave_cut && rel_e <= se_end) {
+                unmap_shave_flex_vmaps(rel_s, rel_e);
+                if (rel_e == se_end) {
+                    se->orig_len = (size_t)(rel_s - se->phys);
+                    if (se->orig_len <= se->real_len && se->real_len == 0) se->orig_len = 0;
+                    refresh_shave_globals();
+                }
+                __atomic_add_fetch(&g_dbg_releases, 1u, __ATOMIC_ACQ_REL);
+                api_ring_push("ReleaseDM(shave-tail-sub phys=0x%lx len=0x%zx) = 0", rel_s, len);
+                if (__atomic_load_n(&g_mem_hibernating, __ATOMIC_ACQUIRE))
+                    try_recover_hibernated_work();
+                return 0;
+            }
+            // Case C: Sub-range release straddling shave_cut (rel_s < shave_cut && rel_e > shave_cut)
+            // (e.g. CUSA10213 / CUSA11260 / CUSA12607 freeing the upper portion of a shaved allocation):
+            // clamp len to [rel_s, shave_cut) so we NEVER release our own g_pre_gpu_phys / g_pre_mem_phys at shave_cut!
+            if (rel_s >= se->phys && rel_s < shave_cut && rel_e > shave_cut && rel_e <= se_end) {
+                unmap_shave_flex_vmaps(shave_cut, rel_e);
+                len = (size_t)(shave_cut - rel_s);
+                se->real_len = (size_t)(rel_s - se->phys);
+                se->orig_len = se->real_len;
+                refresh_shave_globals();
+                break;
+            }
         }
     }
+    // Hard physical-range guard: never allow a game ReleaseDirectMemory call (!g_own_alloc) to release
+    // physical pages owned by our live g_pre_gpu, g_pre_work, or g_pre_mem blocks.
+    if (!g_own_alloc && len > 0) {
+        long rel_s = (long)start;
+        long rel_e = rel_s + (long)len;
+        long prot_s[3] = {
+            (g_pre_gpu && g_pre_gpu_phys > 0) ? g_pre_gpu_phys : -1L,
+            (g_pre_work && g_pre_work_phys > 0) ? g_pre_work_phys : -1L,
+            (g_pre_mem && g_pre_mem_phys > 0) ? g_pre_mem_phys : -1L
+        };
+        long prot_e[3] = {
+            (g_pre_gpu && g_pre_gpu_phys > 0) ? (g_pre_gpu_phys + (long)g_gpu_sz) : -1L,
+            (g_pre_work && g_pre_work_phys > 0) ? (g_pre_work_phys + (long)g_pre_work_sz) : -1L,
+            (g_pre_mem && g_pre_mem_phys > 0) ? (g_pre_mem_phys + (long)g_pre_size) : -1L
+        };
+        for (int pi = 0; pi < 3; pi++) {
+            if (prot_s[pi] < 0) continue;
+            if (rel_s < prot_e[pi] && rel_e > prot_s[pi]) {
+                if (rel_s < prot_s[pi]) {
+                    len = (size_t)(prot_s[pi] - rel_s);
+                    rel_e = prot_s[pi];
+                } else {
+                    return 0;
+                }
+            }
+        }
+    }
+    int is_ours = (g_own_alloc > 0) ||
+                  (g_pre_mem && start >= (off_t)g_pre_mem_phys && start < (off_t)(g_pre_mem_phys + (long)g_pre_size)) ||
+                  (g_pre_work && start == (off_t)g_pre_work_phys) ||
+                  (g_pre_gpu && start == (off_t)g_pre_gpu_phys) ||
+                  (g_dump_mem && start == (off_t)g_dump_phys);
     int32_t r = HOOK_CONTINUE(sceKernelReleaseDirectMemory, int32_t (*)(off_t, size_t), start, len);
     if (!is_ours) {
         void *caller = __builtin_return_address(0);
-        uint32_t rcnt = __atomic_add_fetch(&g_dbg_releases, 1u, __ATOMIC_RELAXED);
+        uint32_t rcnt = __atomic_add_fetch(&g_dbg_releases, 1u, __ATOMIC_ACQ_REL);
         api_ring_push("ReleaseDM(phys=0x%lx len=0x%zx) = 0x%08x c=%p", (long)start, len, (unsigned)r, caller);
         int early_boot = (g_flips < INJECT_AFTER_FLIPS && g_vo_submit_flips < INJECT_AFTER_FLIPS);
         if (r != 0 || (early_boot && (len >= 0x100000u || rcnt <= 32u)))
             STAGE("game ReleaseDirectMemory(phys=0x%lx len=0x%zx) = 0x%08x caller=%p", (long)start, len, (unsigned)r, caller);
+        if (r == 0 && __atomic_load_n(&g_mem_hibernating, __ATOMIC_ACQUIRE))
+            try_recover_hibernated_work();
     }
     return r;
 }
+
+static void debug_hooks_install(void);
 
 typedef struct {
     void *start;
@@ -1364,11 +1644,15 @@ static int32_t handle_game_batch_map(void *entries, int numEntries, int *numOut,
             } else {
                 void *orig_va = ent[i].start;
                 void *got_va = orig_va;
-                int flex_flags = orig_va ? 0x90 /*MAP_FIXED | MAP_NO_OVERWRITE*/ : 0;
                 g_own_alloc++;
-                int32_t rf = sceKernelMapFlexibleMemory(&got_va, orig_len, prot, flex_flags);
-                if (rf != 0 && flex_flags != 0) {
-                    got_va = NULL;
+                int32_t rf;
+                if (orig_va) {
+                    rf = map_flex_at_va(orig_va, orig_len, prot);
+                    if (rf != 0) {
+                        got_va = NULL;
+                        rf = sceKernelMapFlexibleMemory(&got_va, orig_len, prot, 0);
+                    }
+                } else {
                     rf = sceKernelMapFlexibleMemory(&got_va, orig_len, prot, 0);
                 }
                 g_own_alloc--;

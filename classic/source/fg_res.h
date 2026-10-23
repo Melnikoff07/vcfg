@@ -56,5 +56,7 @@ static inline int fg_res_supported(uint32_t w, uint32_t h)
 {
     for (unsigned i = 0; i < sizeof(k_fg_res) / sizeof(k_fg_res[0]); i++)
         if (k_fg_res[i].w == w && k_fg_res[i].h == h) return k_fg_res[i].ready;
+    if (w >= 960u && w <= 3840u && h >= 540u && h <= 2160u && (w & 7u) == 0u && (h & 3u) == 0u)
+        return 1;
     return 0;
 }

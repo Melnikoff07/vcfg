@@ -45,6 +45,7 @@ static int g_gv_neo = 0;
 #define GVF_SENT  64u
 #define GVF_JIT   128u
 #define GVF_ANCHOR 256u     // merged build: warp8g anchor penalty (letter 'a')
+#define GVF_SWAPXY 512u     // X/Y velocity channels swapped in the game buffer
 
 static uint8_t *g_gvw = NULL, *g_gvo = NULL, *g_gpu_ = NULL;
 static uint32_t g_off_gvc8 = 0;
@@ -71,7 +72,7 @@ typedef struct {
     int cap_fixed; uint64_t vfix; uint32_t vfw, vfh;   // end-of-frame copy at a fixed address (no tracking)
     uint64_t vscan_addr; uint32_t vscan_w, vscan_h;    // non-aliased scan base address fallback for huge-DCB games
     int depth_on; pm4_desc_t zd; uint64_t zaddr; uint32_t zw, zh; int zrev;
-    int apply, warp, sent, jitter;
+    int apply, warp, sent, jitter, swap_xy;
     float ax, ay, bx, by; uint32_t sx, sy;
     uint32_t cal_w, cal_h; int drs_scale;
     uint32_t biasg, biasz;
@@ -123,11 +124,9 @@ static int mem_ok(uintptr_t a, size_t n, int32_t need)
             (uintptr_t)vq.unk01 <= cur && (uintptr_t)vq.unk02 > cur) {
             s = vq.unk01;
             en = vq.unk02;
+            // Trust vq.unk04 directly: a committed guard page has isCommitted==1 and unk04==0 (PROT_NONE),
+            // whereas sceKernelQueryMemoryProtection can return the parent arena's 0x33 protection.
             prot = vq.isCommitted ? (int32_t)vq.unk04 : 0;
-            if (vq.isCommitted && !prot) {
-                void *ps = NULL, *pe = NULL; int32_t pprot = 0;
-                if (sceKernelQueryMemoryProtection((void *)cur, &ps, &pe, &pprot) == 0) prot = pprot;
-            }
         } else if (sceKernelQueryMemoryProtection((void *)cur, &s, &en, &prot) != 0 ||
                    (uintptr_t)s > cur || (uintptr_t)en <= cur) {
             // Cache negative dword at cur so repeated checks of the same unmapped pointer do not repeat syscalls
@@ -432,7 +431,7 @@ static gv_rec_t g_snapcopy[GV_NB];
 
 void gv_start(int mode8)
 {
-    if (!g_armed || !mode8) return;
+    if (!g_armed || !mode8 || g_started) return;
     memset(&S, 0, sizeof(S));
     S.cfg.biasg = 48; S.cfg.biasz = 96;
     S.st = ST_OFF;
@@ -544,16 +543,21 @@ uint32_t gv_rewrite(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], u
         if (count + 3u > (is_flip ? GV_MAXE - 1u : GV_MAXE)) goto out;
         uint32_t nfrag0 = R.nfrag;
         for (uint32_t i = 0; i < count; i++) {
+            uint32_t kw = k->w, kh = k->h;
+            if (kw == R.cfg.vd.pitch && kh == R.cfg.vd.alloc_h && R.cfg.vscan_w >= 320u && R.cfg.vscan_h >= 180u &&
+                (R.cfg.vscan_w < kw || R.cfg.vscan_h < kh)) {
+                kw = R.cfg.vscan_w; kh = R.cfg.vscan_h;
+            }
             if ((int)i == before || (int)i == split) {
                 pm4_csregs_t rs = (int)i == before ? R.pf.entry_cs[i] : k->al_cs;
                 void *fd; uint32_t fsz; int sl;
                 // build the fragment first: an entry is only ever split when our copy really goes in between
-                if (frag_capture(&fd, &fsz, k->addr, &R.cfg.vcap, k->w, k->h, 0, R.cfg.swz, &rs, &sl)) {
+                if (frag_capture(&fd, &fsz, k->addr, &R.cfg.vcap, kw, kh, 0, R.cfg.swz, &rs, &sl)) {
                     if ((int)i == split) {           // first part of the game's entry, then ours, then the rest
                         od[nout] = dcb[i]; os[nout] = k->al_off * 4u; oc[nout] = ccb ? ccb[i] : NULL; ocs[nout] = ccbSz ? ccbSz[i] : 0; nout++;
                     }
                     od[nout] = fd; os[nout] = fsz; oc[nout] = NULL; ocs[nout] = 0; nout++;
-                    R.vcaptured = 1; R.vcap_slot = sl; R.vaddr = k->addr; R.vw = k->w; R.vh = k->h;
+                    R.vcaptured = 1; R.vcap_slot = sl; R.vaddr = k->addr; R.vw = kw; R.vh = kh;
                     if ((int)i == split) {
                         R.cap_split++;
                         od[nout] = (uint8_t *)dcb[i] + k->al_off * 4u; os[nout] = dcbSz[i] - k->al_off * 4u;
@@ -568,7 +572,7 @@ uint32_t gv_rewrite(uint32_t count, void *dcb[], uint32_t *dcbSz, void *ccb[], u
                 pm4_csregs_t rs;
                 if (i + 1 < count) rs = R.pf.entry_cs[i + 1]; else cs_now(&rs);
                 void *fd; uint32_t fsz; int sl;
-                if (frag_capture(&fd, &fsz, k->addr, &R.cfg.vcap, k->w, k->h, 2, R.cfg.swz, &rs, &sl)) {
+                if (frag_capture(&fd, &fsz, k->addr, &R.cfg.vcap, kw, kh, 2, R.cfg.swz, &rs, &sl)) {
                     od[nout] = fd; os[nout] = fsz; oc[nout] = NULL; ocs[nout] = 0; nout++;
                     R.val_slot[R.nval++] = sl;
                 }
@@ -598,9 +602,13 @@ uint32_t *gv_emit_eof(uint32_t *p, uint32_t seq, uint32_t slot)
         } else if ((R.mode & PM4_TRACK) && R.pf.trk.written && !R.pf.trk.aliased &&
                    ((!R.incomplete && !R.pf.abort) || (R.pf.abort == PM4_ABORT_TIME && c->vscan_addr != 0))) {
             a = R.pf.trk.addr; w = R.pf.trk.w; h = R.pf.trk.h; mode = 0;
+            if (w == c->vd.pitch && h == c->vd.alloc_h && c->vscan_w >= 320u && c->vscan_h >= 180u &&
+                (c->vscan_w < w || c->vscan_h < h)) {
+                w = c->vscan_w; h = c->vscan_h;
+            }
         } else if (c->cap_fixed) {
             a = c->vfix; w = c->vfw; h = c->vfh; mode = 0;
-        } else if (c->vscan_addr && (R.wd_track_off || R.pf.abort == PM4_ABORT_TIME)) {
+        } else if (c->vscan_addr && !R.pf.trk.aliased && (!R.pf.trk.written || R.wd_track_off || R.pf.abort == PM4_ABORT_TIME)) {
             a = c->vscan_addr; w = c->vscan_w; h = c->vscan_h; mode = 0;
         } else if (R.mode & PM4_TRACK) {
             if (!R.pf.trk.written) R.not_written++;
@@ -657,6 +665,7 @@ void gv_fill_table(uint32_t *tb, uint32_t seq, uint32_t slot)
     if (c->depth_on && R.eof_zslot >= 0) f |= GVF_DEPTH | (c->zrev ? GVF_ZREV : 0u);
     if (c->sent) f |= GVF_SENT;
     if (c->jitter) f |= GVF_JIT;
+    if (c->swap_xy) f |= GVF_SWAPXY;
     if (g_snap_state == 1) {
         f |= GVF_SNAP;
         R.snap_seq = seq;
@@ -669,8 +678,9 @@ void gv_fill_table(uint32_t *tb, uint32_t seq, uint32_t slot)
     float ax = c->ax, ay = c->ay, bx = c->bx, by = c->by;
     if (c->drs_scale && c->cal_w && c->cal_h && R.vw >= 320u && R.vh >= 180u &&
         (R.vw != c->cal_w || R.vh != c->cal_h)) {
-        ax *= (float)c->cal_w / (float)R.vw;
-        ay *= (float)c->cal_h / (float)R.vh;
+        float sx = (float)c->cal_w / (float)R.vw, sy = (float)c->cal_h / (float)R.vh;
+        ax *= sx; bx *= sx;
+        ay *= sy; by *= sy;
     }
     memcpy(tb + 108, &ax, 4); memcpy(tb + 109, &ay, 4); memcpy(tb + 110, &bx, 4); memcpy(tb + 111, &by, 4);
     tb[112] = f; tb[113] = c->sx; tb[114] = c->sy; tb[115] = (c->biasg & 1023u) | ((c->biasz & 1023u) << 16);
@@ -743,10 +753,15 @@ void gv_slot_stats(uint32_t slot)
     volatile uint32_t *gs = (volatile uint32_t *)GVO(GVO_GSTAT + slot * 16u);
     if (gs[3]) {   // seq set = gv8 statistics of that frame exist
         R.gs_valid += gs[0]; R.gs_agree += gs[1]; R.gs_used += gs[2]; R.gs_n++;
-        // emergency switch (shadow mode) on a buffer that suddenly disagrees everywhere (stale address, menu)
-        if (gs[0] >= 1000u) {
-            if (gs[1] * 100u < gs[0] * 15u) { __atomic_add_fetch(&S.emerg_bad, 1u, __ATOMIC_RELAXED); __atomic_store_n(&S.emerg_good, 0u, __ATOMIC_RELAXED); }
-            else if (gs[1] * 100u >= gs[0] * 40u) { __atomic_add_fetch(&S.emerg_good, 1u, __ATOMIC_RELAXED); __atomic_store_n(&S.emerg_bad, 0u, __ATOMIC_RELAXED); }
+        // emergency switch (shadow mode / unlock) on a buffer that suddenly disagrees everywhere (stale address, menu)
+        if (gs[0] >= 500u) {
+            if (gs[1] * 100u < gs[0] * 15u && gs[2] * 100u < gs[0] * 10u) {
+                __atomic_add_fetch(&S.emerg_bad, 1u, __ATOMIC_RELAXED);
+                __atomic_store_n(&S.emerg_good, 0u, __ATOMIC_RELAXED);
+            } else if (gs[1] * 100u >= gs[0] * 35u || gs[2] * 100u >= gs[0] * 25u) {
+                __atomic_add_fetch(&S.emerg_good, 1u, __ATOMIC_RELAXED);
+                __atomic_store_n(&S.emerg_bad, 0u, __ATOMIC_RELAXED);
+            }
         }
         gs[3] = 0;
     }
@@ -789,6 +804,8 @@ static void prof_write(const char *state, const cand_t *c, const gvcal_result_t 
                 r->sent_y, r->units, r->frames, r->blocks);
         if (r->cal_w && r->cal_h)
             fprintf(f, "cal_w=%u\ncal_h=%u\ndrs_scale=%d\n", r->cal_w, r->cal_h, r->drs_scale);
+        if (r->swap_xy)
+            fprintf(f, "swap_xy=%d\n", r->swap_xy);
     }
     for (int i = 0; i < S.ncand; i++)
         if (S.cand[i].state == -1) {
@@ -837,6 +854,7 @@ static int prof_read(void)
         else if (sscanf(line, "cal_w=%u", &u) == 1) S.prof.cal_w = u;
         else if (sscanf(line, "cal_h=%u", &u) == 1) S.prof.cal_h = u;
         else if (sscanf(line, "drs_scale=%u", &u) == 1) S.prof.drs_scale = (int)u;
+        else if (sscanf(line, "swap_xy=%u", &u) == 1) S.prof.swap_xy = (int)u;
     }
     fclose(f);
     if (!okv) { lg("GV profile %s: unknown version, ignored\n", path); return 0; }
@@ -862,8 +880,9 @@ static void cfg_for(const cand_t *c, const gvcal_result_t *r, int apply)
         g->vcap = c->d;
         if (c->tok & 1) g->vcap.tile = c->ttile;
         if ((c->tok & 2) && c->tpitch && c->tpitch * 2u >= c->d.pitch && c->tpitch <= c->d.pitch * 2u) g->vcap.pitch = c->tpitch;
+        g->vscan_w = c->w; g->vscan_h = c->h;
         if (!(c->flags & PM4RT_ALIASED) && c->base && c->w && c->h) {
-            g->vscan_addr = c->base; g->vscan_w = c->w; g->vscan_h = c->h;
+            g->vscan_addr = c->base;
         }
     }
     g->apply = apply; g->warp = apply;
@@ -872,9 +891,10 @@ static void cfg_for(const cand_t *c, const gvcal_result_t *r, int apply)
         g->sent = r->sentinel; g->sx = r->sent_x; g->sy = r->sent_y;
         g->jitter = r->jit_x > 0.25f || r->jit_y > 0.25f;
         g->cal_w = r->cal_w; g->cal_h = r->cal_h; g->drs_scale = r->drs_scale;
+        g->swap_xy = r->swap_xy;
     } else {
         g->ax = g->ay = 1.0f; g->bx = g->by = 0.0f; g->sent = 0; g->jitter = 0;
-        g->cal_w = g->cal_h = 0; g->drs_scale = 0;
+        g->cal_w = g->cal_h = 0; g->drs_scale = 0; g->swap_xy = 0;
     }
     g->depth_on = S.depth_ok; g->zd = S.zd; g->zcap = S.zcap; g->zaddr = S.zaddr; g->zw = S.zw; g->zh = S.zh; g->zrev = S.zrev;
     cfg_publish(g);
@@ -1220,9 +1240,17 @@ void gv_io_tick(void)
     if (!(L & GVL_DUMP)) S.letters_seen &= ~GVL_DUMP;
     if (g_scan_state == 2) { g_scan_state = 0; process_scan(); }   // clear first: process_scan() may re-arm the retry
     process_validation();
-    // emergency shadow switch from the per-frame gv8 statistics (hysteresis: 60 bad frames off, 60 good frames on)
-    if (!S.shadow && S.emerg_bad >= 60) { S.shadow = 1; lg("GV: game vectors disagree with the image in 60 frames: shadow mode (flow only)\n"); }
-    if (S.shadow && S.emerg_good >= 60) { S.shadow = 0; lg("GV: agreement back: hybrid on again\n"); }
+    // emergency shadow / unlock switch from the per-frame gv8 statistics (8 consecutive bad frames -> shadow, 16 -> rescan)
+    if (!S.shadow && S.emerg_bad >= 8) {
+        S.shadow = 1;
+        lg("GV: game vectors failed photometric validation in 8 consecutive frames: shadow mode (flow only)\n");
+    }
+    if (S.shadow && S.st == ST_ACTIVE && S.emerg_bad >= 16) {
+        lg("GV: 16 consecutive bad frames: unlocking velocity buffer and re-scanning\n");
+        S.shadow = 0; S.emerg_bad = 0; S.passes = S.fails = 0;
+        S.st = ST_SCAN; cfg_for(NULL, NULL, 0); g_scan_state = 1;
+    }
+    if (S.shadow && S.emerg_good >= 8) { S.shadow = 0; lg("GV: agreement back: hybrid on again\n"); }
     if (now - S.t_log > 4000000) { S.t_log = now; log_status(); }
     // per-frame tracking stopped by the watchdog: if the target always sat at the same address (or scan found a non-aliased base), copy it there
     if (R.wd_track_off && S.cfg.vel_on && !S.cfg.cap_fixed &&

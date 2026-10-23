@@ -163,6 +163,49 @@ static inline void vcfg_build_stub(Detour *d, uint64_t fn_ptr, size_t ins_sz)
                 return;
             }
         }
+        // Relocate 2-byte conditional jump Jcc rel8 (0x70..0x7F) if target is outside the copied prologue
+        if (len == 2 && p[off] >= 0x70u && p[off] <= 0x7Fu) {
+            int8_t orig_rel8 = (int8_t)p[off + 1];
+            uint64_t orig_dst = (uint64_t)((intptr_t)(fn_ptr + off + 2) + (intptr_t)orig_rel8);
+            if (orig_dst < fn_ptr || orig_dst >= fn_ptr + ins_sz) {
+                uint64_t cur_end = (uint64_t)(uintptr_t)(dst + out + 6);
+                if (vcfg_in_rel32(cur_end, orig_dst)) {
+                    dst[out] = 0x0Fu;
+                    dst[out + 1] = (uint8_t)(p[off] + 0x10u);
+                    *(int32_t *)(dst + out + 2) = (int32_t)((int64_t)orig_dst - (int64_t)cur_end);
+                    out += 6;
+                } else {
+                    // Invert condition (p[off] ^ 1) to skip 14-byte absolute jump
+                    dst[out] = (uint8_t)(p[off] ^ 1u);
+                    dst[out + 1] = 14u;
+                    Detour_WriteJump64(d, dst + out + 2, orig_dst);
+                    out += 16;
+                }
+                off += len;
+                continue;
+            }
+        }
+        // Relocate 6-byte conditional jump 0F 80..8F rel32 if target is outside the copied prologue
+        if (len == 6 && p[off] == 0x0Fu && p[off + 1] >= 0x80u && p[off + 1] <= 0x8Fu) {
+            int32_t orig_rel = *(const int32_t *)(p + off + 2);
+            uint64_t orig_dst = (uint64_t)((intptr_t)(fn_ptr + off + 6) + (intptr_t)orig_rel);
+            if (orig_dst < fn_ptr || orig_dst >= fn_ptr + ins_sz) {
+                uint64_t cur_end = (uint64_t)(uintptr_t)(dst + out + 6);
+                if (vcfg_in_rel32(cur_end, orig_dst)) {
+                    dst[out] = 0x0Fu;
+                    dst[out + 1] = p[off + 1];
+                    *(int32_t *)(dst + out + 2) = (int32_t)((int64_t)orig_dst - (int64_t)cur_end);
+                    out += 6;
+                } else {
+                    dst[out] = (uint8_t)((p[off + 1] - 0x10u) ^ 1u);
+                    dst[out + 1] = 14u;
+                    Detour_WriteJump64(d, dst + out + 2, orig_dst);
+                    out += 16;
+                }
+                off += len;
+                continue;
+            }
+        }
         // Relocate 5-byte call rel32 (E8)
         if (len == 5 && p[off] == 0xE8u) {
             int32_t orig_rel = *(const int32_t *)(p + off + 1);
@@ -204,12 +247,9 @@ static inline void vcfg_build_stub(Detour *d, uint64_t fn_ptr, size_t ins_sz)
 
 static inline int vcfg_can_patch_pi14(uint64_t fn_ptr, const char *name, size_t *out_ins_sz)
 {
-    if (!name || (strcmp(name, "sceGnmSubmitAndFlipCommandBuffers") != 0 &&
-                  strcmp(name, "sceGnmSubmitAndFlipCommandBuffersForWorkload") != 0)) {
-        return 0;
-    }
+    (void)name;
     const uint8_t *p = (const uint8_t *)(uintptr_t)fn_ptr;
-    // If an earlier plugin already placed a 5-byte E9 jump at fn_ptr, its StubPtr jumps back to fn_ptr + 5..13,
+    // If an earlier plugin already placed a 5-byte E9/EB jump at fn_ptr, its StubPtr jumps back to fn_ptr + 5..13,
     // so we must only patch the first 5 bytes.
     if (p[0] == 0xE9u || p[0] == 0xEBu) return 0;
     size_t off = 0;
@@ -218,13 +258,15 @@ static inline int vcfg_can_patch_pi14(uint64_t fn_ptr, const char *name, size_t 
         memset(&hs, 0, sizeof(hs));
         size_t len = hde64_disasm((const void *)(uintptr_t)(fn_ptr + off), &hs);
         if (len == 0 || (hs.flags & F_ERROR)) return 0;
-        // Reject returns, syscalls, conditional branches (Jcc rel8/rel32, loop/jrcxz), or jumps inside bytes 0..13
-        if (hs.opcode == 0xC3 || hs.opcode == 0xC2 ||
+        // Reject returns, traps, syscalls, conditional branches (Jcc rel8/rel32, loop/jrcxz), or jumps inside bytes 0..13
+        if (hs.opcode == 0xC3 || hs.opcode == 0xC2 || hs.opcode == 0xCC ||
             (hs.opcode >= 0x70 && hs.opcode <= 0x7F) ||
             (hs.opcode >= 0xE0 && hs.opcode <= 0xE3) ||
-            (hs.opcode == 0x0F && (hs.opcode2 == 0x05 || (hs.opcode2 >= 0x80 && hs.opcode2 <= 0x8F))) ||
+            (hs.opcode == 0x0F && (hs.opcode2 == 0x05 || hs.opcode2 == 0x0B || (hs.opcode2 >= 0x80 && hs.opcode2 <= 0x8F))) ||
             (off > 0 && (hs.opcode == 0xE9 || hs.opcode == 0xEB ||
-                         (hs.opcode == 0xFF && (hs.modrm & 0x38) == 0x20)))) {
+                         (hs.opcode == 0xFF && (hs.modrm & 0x38) == 0x20))) ||
+            (off == 0 && hs.opcode == 0xFF && (hs.modrm & 0x38) == 0x20 &&
+             !(p[0] == 0xFFu && p[1] == 0x25u && *(const uint32_t *)(p + 2) == 0u))) {
             return 0;
         }
         off += len;

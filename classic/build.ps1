@@ -42,3 +42,7 @@ Run "$ll/ld.lld.exe" (@("$sdk/build/crtprx.o") + $objects + @('-o', "$out/vcfg_c
 Run "$tc/bin/windows/create-fself.exe" @("-in=$out/vcfg_classic.elf", "-out=$out/vcfg_classic.oelf", "-lib=$out/vcfg_classic.prx", '--paid', '0x3800000000000011')
 Get-Item "$out/vcfg_classic.prx" | Select-Object FullName, Length
 Write-Host "SHA256 $((Get-FileHash "$out/vcfg_classic.prx" -Algorithm SHA256).Hash)"
+if (-not $Bench -and $Test -eq 0) {
+    Run $cfg.python @('-I', "$root/tools/tests/test_lowmem_valve.py")
+    Run $cfg.python @('-I', "$root/tools/tests/test_real_traces.py")
+}

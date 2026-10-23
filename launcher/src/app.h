@@ -110,7 +110,7 @@ typedef struct {
 } Fonts;
 
 typedef struct {
-    Game games[160]; int ngames;   // verified table + every installed CUSA on the internal drive and ext0..ext3 (48 was tight with an HDD)
+    Game games[512]; int ngames;   // verified table + every installed CUSA on the internal drive and ext0..ext3 (512 supports large multi-TB libraries)
     int tab, sel, detail, row;
     Settings defaults;
     int overlay_pos, overlay_detail, overlay_opacity;   // shared overlay style

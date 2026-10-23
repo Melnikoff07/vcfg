@@ -1,9 +1,9 @@
 ; user_sgprs=2
 ; mode 8, pass 5 (one wave, after the flip-done fence): interpolation phase t for this mid frame -> misc dword 1.
 ; Supports three phase sources:
-;  1) CPU explicit fractional phase override in consts dword 1 upper 16 bits (tb[29] >> 16, Q0.16 in [1..65535]):
-;     used by FG Quality (2x real-timestamp midpoint) and FG Fast (60 Hz fractional pulldown t1, t2).
-;  2) Hardware vblank / flip monitor in mon[0..3] when adaptive phase (flags bit 0) is active.
+;  1) CPU explicit fractional phase override in consts dword 1 upper 16 bits (tb[29] >> 16, permille [250..750] or Q0.16 [1001..65535]):
+;     used by FG Quality (PLL-predicted VBlank slot ratio t_interp in [0.333, 0.667]) and FG Fast (60 Hz fractional pulldown t1, t2).
+;  2) Hardware vblank / flip monitor in mon[0..3] when adaptive phase (flags bit 0) is active (clamped to [0.333, 0.667]).
 ;  3) Fixed t = 0.5 fallback.
 ; Also copies the frame statistics misc dwords {0 = unmatched blocks (scene-change test), 4, 5 = dominant motion,
 ; 6 = foreground L2 blocks, 7 = fade decision of me1} to the slot's stats area unless bit 15 of consts dword 1
@@ -14,6 +14,8 @@ declare void @llvm.amdgcn.raw.buffer.store.f32(float, <4 x i32>, i32, i32, i32 i
 declare void @llvm.amdgcn.raw.buffer.store.v4i32(<4 x i32>, <4 x i32>, i32, i32, i32 immarg)
 declare i32 @llvm.smax.i32(i32, i32)
 declare i32 @llvm.smin.i32(i32, i32)
+declare float @llvm.maxnum.f32(float, float)
+declare float @llvm.minnum.f32(float, float)
 
 define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 %tid) #0 {
 entry:
@@ -32,8 +34,12 @@ go:
   %skip_st = icmp ne i32 %skip_st0, 0
   %tover_q16 = lshr i32 %mid_raw, 16
   %has_over = icmp ugt i32 %tover_q16, 0
+  %ov_pm = icmp ule i32 %tover_q16, 1000
   %tover_f = uitofp i32 %tover_q16 to float
-  %t_over = fmul float %tover_f, 0x3EF0000000000000 ; 1.0 / 65536.0
+  %ov_sc = select i1 %ov_pm, float 0x3F50624DE0000000, float 0x3EF0000000000000 ; 0.001 vs 1.0 / 65536.0
+  %t_over0 = fmul float %tover_f, %ov_sc
+  %t_over1 = call float @llvm.maxnum.f32(float %t_over0, float 0.25)
+  %t_over = call float @llvm.minnum.f32(float %t_over1, float 0.75)
   %flags = extractelement <4 x i32> %cn, i32 2
   %mon = call <4 x i32> @llvm.amdgcn.raw.buffer.load.v4i32(<4 x i32> %vv, i32 0, i32 0, i32 3)
   %vbnow = extractelement <4 x i32> %mon, i32 0
@@ -50,12 +56,13 @@ go:
   %ta0 = fdiv float %nf, %n1f
   %tq16 = extractelement <4 x i32> %mon, i32 3
   %has_tq = icmp ugt i32 %tq16, 0
+  %tq_pm = icmp ule i32 %tq16, 1000
   %tqf = uitofp i32 %tq16 to float
-  %tqn = fmul float %tqf, 0x3EF0000000000000 ; 1.0 / 65536.0
-  %t_blend = fmul float %ta0, 0.5
-  %t_blend2 = fmul float %tqn, 0.5
-  %ta_ema = fadd float %t_blend, %t_blend2
-  %ta = select i1 %has_tq, float %ta_ema, float %ta0
+  %tq_sc = select i1 %tq_pm, float 0x3F50624DE0000000, float 0x3EF0000000000000 ; 0.001 vs 1.0 / 65536.0
+  %tqn = fmul float %tqf, %tq_sc
+  %ta_raw = select i1 %has_tq, float %tqn, float %ta0
+  %ta_lo = call float @llvm.maxnum.f32(float %ta_raw, float 0x3FD5555560000000) ; 0.33333334
+  %ta = call float @llvm.minnum.f32(float %ta_lo, float 0x3FE5555560000000) ; 0.6666667
   %ad = and i32 %flags, 1
   %adb = icmp ne i32 %ad, 0
   %t_mon = select i1 %adb, float %ta, float 0.5

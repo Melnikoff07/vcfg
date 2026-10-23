@@ -29,7 +29,7 @@ declare float @llvm.fabs.f32(float)
 declare float @llvm.maxnum.f32(float, float)
 declare float @llvm.minnum.f32(float, float)
 
-@red = internal addrspace(3) global [192 x i32] undef, align 16
+@red = internal addrspace(3) global [256 x i32] undef, align 16
 
 define internal void @bar() alwaysinline {
   fence syncscope("workgroup") release
@@ -85,7 +85,7 @@ define internal void @sum(i32 %tid, i32 %v, i32 %k, <4 x i32> %vs) alwaysinline 
 entry:
   %k64 = shl i32 %k, 6
   %me = add i32 %k64, %tid
-  %p = getelementptr [192 x i32], ptr addrspace(3) @red, i32 0, i32 %me
+  %p = getelementptr [256 x i32], ptr addrspace(3) @red, i32 0, i32 %me
   store i32 %v, ptr addrspace(3) %p, align 4
   call void @bar()
   %is0 = icmp eq i32 %tid, 0
@@ -94,7 +94,7 @@ loop:
   %i = phi i32 [ 0, %entry ], [ %i1, %loop ]
   %s = phi i32 [ 0, %entry ], [ %s1, %loop ]
   %ix = add i32 %k64, %i
-  %q = getelementptr [192 x i32], ptr addrspace(3) @red, i32 0, i32 %ix
+  %q = getelementptr [256 x i32], ptr addrspace(3) @red, i32 0, i32 %ix
   %x = load i32, ptr addrspace(3) %q, align 4
   %s1 = add i32 %s, %x
   %i1 = add i32 %i, 1
@@ -250,10 +250,29 @@ stats:
   %ify = call i32 @isinf(float %hvy)
   %if0 = or i32 %ifx, %ify
   %if = select i1 %in, i32 %if0, i32 0
+  ; stats[3]: active non-static cells (neither 0.0 nor UNORM 0.5 bias within +-1/255, and finite)
+  %ahx = call float @llvm.fabs.f32(float %hvx)
+  %ahy = call float @llvm.fabs.f32(float %hvy)
+  %uhx0 = fsub float %hvx, 0.5
+  %uhy0 = fsub float %hvy, 0.5
+  %uhx = call float @llvm.fabs.f32(float %uhx0)
+  %uhy = call float @llvm.fabs.f32(float %uhy0)
+  %actx0 = fcmp ogt float %ahx, 0x3EE4F8B580000000 ; 1e-5
+  %actx1 = fcmp ogt float %uhx, 0x3F70624DE0000000 ; 0.004
+  %actx = and i1 %actx0, %actx1
+  %acty0 = fcmp ogt float %ahy, 0x3EE4F8B580000000 ; 1e-5
+  %acty1 = fcmp ogt float %uhy, 0x3F70624DE0000000 ; 0.004
+  %acty = and i1 %acty0, %acty1
+  %act0 = or i1 %actx, %acty
+  %fin = icmp eq i32 %if0, 0
+  %act1 = and i1 %act0, %fin
+  %act2 = and i1 %act1, %in
+  %act = zext i1 %act2 to i32
 
   call void @sum(i32 %tid, i32 %hz, i32 0, <4 x i32> %vs)
   call void @sum(i32 %tid, i32 %nz, i32 1, <4 x i32> %vs)
   call void @sum(i32 %tid, i32 %if, i32 2, <4 x i32> %vs)
+  call void @sum(i32 %tid, i32 %act, i32 3, <4 x i32> %vs)
   ret void
 }
 

@@ -93,7 +93,7 @@ typedef struct {
 
 static fg_config_t g_cfg = { 0 };
 static int g_dm_hooks = 1;
-static int g_own_alloc = 0;
+static volatile int g_own_alloc = 0;
 static uint32_t g_dbg_allocs = 0;
 static uint32_t g_dbg_maps = 0;
 static uint32_t g_dbg_alloc_fail = 0;
@@ -101,6 +101,7 @@ static uint32_t g_flips = 0;
 static volatile uint32_t g_vo_submit_flips = 0;
 static int g_gpu_state = 0;
 static int g_mbuf_state = 0;
+static void *g_gpu = NULL, *g_mon = NULL;
 static int g_safe_never = 0, g_fg_off = 0;
 static long g_low_sub2mb_end = 0;
 static size_t g_gpu_sz = GPU_SZ_BASE;
@@ -165,6 +166,26 @@ static int32_t sceKernelAvailableFlexibleMemorySize(size_t *out)
 {
     if (out) *out = g_sim_flex_avail;
     return 0;
+}
+
+typedef struct {
+    void *unk01;
+    void *unk02;
+    off_t offset;
+    int prot;
+    int unk04;
+    unsigned isFlexibleMemory : 1;
+    unsigned isDirectMemory : 1;
+    unsigned isStack : 1;
+    unsigned isPooledMemory : 1;
+    unsigned isCommitted : 1;
+    char name[32];
+} OrbisKernelVirtualQueryInfo;
+
+static int32_t sceKernelVirtualQuery(const void *addr, int flags, OrbisKernelVirtualQueryInfo *info, size_t infoSize)
+{
+    (void)addr; (void)flags; (void)info; (void)infoSize;
+    return -1;
 }
 
 static void sim_reset(size_t dm_total)
@@ -308,7 +329,7 @@ static int32_t raw_sceKernelAllocateDirectMemory(long s, long e, size_t len, siz
     return (int32_t)0x80020023u;
 }
 
-static int32_t sceKernelReleaseDirectMemory(long phys, size_t len)
+static int32_t raw_sceKernelReleaseDirectMemory(long phys, size_t len)
 {
     long rel_end = phys + (long)len;
     for (int i = 0; i < MAX_DM_BLOCKS; i++) {
@@ -330,6 +351,12 @@ static int32_t sceKernelReleaseDirectMemory(long phys, size_t len)
         }
     }
     return -1;
+}
+
+static int32_t sceKernelUsleep(uint32_t usec)
+{
+    (void)usec;
+    return 0;
 }
 
 static int32_t raw_sceKernelMapDirectMemory2(void **addr, size_t len, int type, int prot, int flags, long dmStart, size_t maxPageSize)
@@ -429,11 +456,13 @@ static int32_t raw_sceVideoOutClose(int32_t h) { (void)h; return 0; }
 
 int32_t sceKernelAvailableDirectMemorySize_hook(off_t s, off_t e, size_t align, off_t *startOut, size_t *sizeOut);
 int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t align, int type, long *phys);
+int32_t sceKernelReleaseDirectMemory_hook(off_t start, size_t len);
 int32_t sceKernelMapDirectMemory_hook(void **addr, size_t len, int prot, int flags, long dmStart, size_t maxPageSize);
 int32_t sceKernelMapNamedDirectMemory_hook(void **addr, size_t len, int prot, int flags, long dmStart, size_t maxPageSize, const char *name);
 
 #define sceKernelAvailableDirectMemorySize sceKernelAvailableDirectMemorySize_hook
 #define sceKernelAllocateDirectMemory      sceKernelAllocateDirectMemory_hook
+#define sceKernelReleaseDirectMemory       sceKernelReleaseDirectMemory_hook
 #define sceKernelMapDirectMemory           sceKernelMapDirectMemory_hook
 #define sceKernelMapNamedDirectMemory      sceKernelMapNamedDirectMemory_hook
 #define sceVideoOutOpen                    raw_sceVideoOutOpen
@@ -450,7 +479,15 @@ static void reset_shave_state(void)
     g_shave_orig_len = 0;
     g_shave_type = 0;
     g_shave_tail_mapped = 0;
+    g_shave_end = 0;
     g_mem_tight = 0;
+    g_mem_hibernating = 0;
+    g_hibernated_at_flip = 0;
+    g_hibernated_work_sz = 0;
+    g_hibernated_releases_base = 0;
+    g_done = NULL;
+    g_last_seq = 0;
+    g_work = NULL;
     g_shave_last_probe_s = -1;
     g_shave_last_probe_e = -1;
     g_shave_last_probe_len = 0;
@@ -778,6 +815,34 @@ static void test_runtime_streaming_and_batchmap_guards(void)
     ASSERT(sceKernelMapDirectMemory(&fixed_va, 0x200000u, 0x33, 0x90, fallback2m, 0x200000u) == 0);
     ASSERT(fixed_va == (void *)0x40000000ULL);
     ASSERT((g_sim_last_flex_flags & 0x90) == 0x90);
+    ASSERT(on_sub() == 0);
+
+    // 6. CUSA01967 scatter-gather power-of-two sub-1MB page allocator (0x80000 -> 0x40000 -> 0x20000 -> 0x10000 -> 0x8000 -> 0x4000):
+    //    When a small 0x10000 hole remains in DirectMemory and no large arena shave exists, sub-1MB probes larger than 0x10000
+    //    must step down naturally to claim the real 0x10000 DirectMemory hole without straddle-shaving, and once 0 bytes of
+    //    DirectMemory remain, subsequent 0x4000 page allocations succeed via pure synthetic FlexibleMemory chunks:
+    sim_reset(0x20000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    release_early_gpu();
+    release_early_work();
+    g_mbuf_state = 1;
+    g_sim_flex_avail = 0x20000000u;
+    long fill_sg = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x20000000L, 0x1DFF0000u, 0x10000u, 3, &fill_sg) == 0);
+    ASSERT(dm_avail(0x4000u) == 0x10000u);
+    long sg_p = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x20000000L, 0x80000u, 0x4000u, 3, &sg_p) == (int32_t)0x80020023u);
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x20000000L, 0x40000u, 0x4000u, 3, &sg_p) == (int32_t)0x80020023u);
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x20000000L, 0x20000u, 0x4000u, 3, &sg_p) == (int32_t)0x80020023u);
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x20000000L, 0x10000u, 0x4000u, 3, &sg_p) == 0);
+    ASSERT(g_shave_n == 0);
+    ASSERT(dm_avail(0x4000u) == 0);
+    // Now DirectMemory is 0 bytes free; next 0x4000 page request is backed by synthetic FlexibleMemory:
+    long sg_syn = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x20000000L, 0x4000u, 0x4000u, 3, &sg_syn) == 0);
+    ASSERT(g_shave_n == 1 && g_shaves[0].real_len == 0 && g_shaves[0].orig_len == 0x4000u);
+    ASSERT(on_sub() == 0);
 }
 
 int main(void)

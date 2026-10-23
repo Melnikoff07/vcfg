@@ -465,6 +465,8 @@ entry:
   %son = icmp ne i32 %fsen, 0
   %fjit = and i32 %gfl, 128
   %jit = icmp ne i32 %fjit, 0
+  %fsw = and i32 %gfl, 512
+  %sw = icmp ne i32 %fsw, 0
   %ax = extractelement <4 x float> %ab, i32 0
   %ay = extractelement <4 x float> %ab, i32 1
   %bx_ = extractelement <4 x float> %ab, i32 2
@@ -498,8 +500,10 @@ entry:
   %G1 = call <4 x float> @ldG(<4 x i32> %vg, i32 %c1)
   %r1x = extractelement <4 x float> %G1, i32 0
   %r1y = extractelement <4 x float> %G1, i32 1
-  %g1x = call float @dec(float %r1x, float %ax, float %bx_)
-  %g1y = call float @dec(float %r1y, float %ay, float %by_)
+  %d1x = select i1 %sw, float %r1y, float %r1x
+  %d1y = select i1 %sw, float %r1x, float %r1y
+  %g1x = call float @dec(float %d1x, float %ax, float %bx_)
+  %g1y = call float @dec(float %d1y, float %ay, float %by_)
   %ok1 = call i1 @gok(float %r1x, float %r1y, float %g1x, float %g1y, i1 %son, i32 %sentx, i32 %senty)
   ; ---- fixed point: sample 2 at m - g1/2
   %hgx = fmul float %g1x, 0.5
@@ -514,10 +518,14 @@ entry:
   %r2y = extractelement <4 x float> %G2, i32 1
   %r2ox = extractelement <4 x float> %G2, i32 2
   %r2oy = extractelement <4 x float> %G2, i32 3
-  %g2x = call float @dec(float %r2x, float %ax, float %bx_)
-  %g2y = call float @dec(float %r2y, float %ay, float %by_)
-  %gox = call float @dec(float %r2ox, float %ax, float %bx_)
-  %goy = call float @dec(float %r2oy, float %ay, float %by_)
+  %d2x = select i1 %sw, float %r2y, float %r2x
+  %d2y = select i1 %sw, float %r2x, float %r2y
+  %d2ox = select i1 %sw, float %r2oy, float %r2ox
+  %d2oy = select i1 %sw, float %r2ox, float %r2oy
+  %g2x = call float @dec(float %d2x, float %ax, float %bx_)
+  %g2y = call float @dec(float %d2y, float %ay, float %by_)
+  %gox = call float @dec(float %d2ox, float %ax, float %bx_)
+  %goy = call float @dec(float %d2oy, float %ay, float %by_)
   %ok2 = call i1 @gok(float %r2x, float %r2y, float %g2x, float %g2y, i1 %son, i32 %sentx, i32 %senty)
   %oko = call i1 @gok(float %r2ox, float %r2oy, float %gox, float %goy, i1 %son, i32 %sentx, i32 %senty)
   ; ---- slots 3..11: centre value of the cell (ox, oy) in the 3x3 around q2 (4 px apart)
@@ -538,8 +546,10 @@ entry:
   %G3 = call <4 x float> @ldG(<4 x i32> %vg, i32 %c3)
   %r3x = extractelement <4 x float> %G3, i32 0
   %r3y = extractelement <4 x float> %G3, i32 1
-  %g3x = call float @dec(float %r3x, float %ax, float %bx_)
-  %g3y = call float @dec(float %r3y, float %ay, float %by_)
+  %d3x = select i1 %sw, float %r3y, float %r3x
+  %d3y = select i1 %sw, float %r3x, float %r3y
+  %g3x = call float @dec(float %d3x, float %ax, float %bx_)
+  %g3y = call float @dec(float %d3y, float %ay, float %by_)
   %ok3 = call i1 @gok(float %r3x, float %r3y, float %g3x, float %g3y, i1 %son, i32 %sentx, i32 %senty)
   ; ---- candidate of this lane
   %is0 = icmp eq i32 %sub, 0
@@ -560,17 +570,33 @@ entry:
   %vg12 = or i1 %v1, %v2
   %isg = or i1 %vg12, %v3
   %cval = or i1 %isg, %is0
-  ; ---- nearest depth among the valid 3x3 cells (slots 3..11)
+  ; ---- nearest & farthest depth among the valid 3x3 cells (slots 3..11)
   %zk0 = call i32 @zkey(<4 x i32> %vz, i32 %c3, i1 %rev)
+  %nrev = xor i1 %rev, true
+  %zkf0 = call i32 @zkey(<4 x i32> %vz, i32 %c3, i1 %nrev)
   %zk1 = and i32 %zk0, -16
   %zk2 = or i32 %zk1, %sub
+  %zkf1 = and i32 %zkf0, -16
   %v3d = and i1 %v3, %dep
   %zk = select i1 %v3d, i32 %zk2, i32 -1
+  %zkf = select i1 %v3d, i32 %zkf1, i32 -1
   %zm = call i32 @reduce(i32 %tid, i32 %zk, i32 %base, i32 16)
+  %zfm = call i32 @reduce(i32 %tid, i32 %zkf, i32 %base, i32 16)
   %zslot = and i32 %zm, 15
   %zany = icmp ne i32 %zm, -1
+  %zmc = and i32 %zm, -16
+  %zmi = xor i32 %zmc, -16
+  %zfmc = and i32 %zfm, -16
+  %zfmi = xor i32 %zfmc, -16
+  %zminb = select i1 %rev, i32 %zfmc, i32 %zmc
+  %zmaxb = select i1 %rev, i32 %zmi, i32 %zfmi
+  %zminf = bitcast i32 %zminb to float
+  %zmaxf = bitcast i32 %zmaxb to float
+  %zspan = fsub float %zmaxf, %zminf
+  %zedg0 = fcmp oge float %zspan, 0x3F60624DE0000000 ; 0.002
+  %zedg = and i1 %zany, %zedg0
   %isn0 = icmp eq i32 %sub, %zslot
-  %isnear = and i1 %isn0, %zany
+  %isnear = and i1 %isn0, %zedg
   ; ---- cost: bilateral L1 SAD at the rounded L1 candidate; texture lanes: self SAD of cur shifted by 2 L1 px
   %hx = fmul float %cvx, 0.5
   %hy = fmul float %cvy, 0.5
@@ -582,7 +608,12 @@ entry:
   %cy = select i1 %isty, i32 2, i32 %cy1
   %vimg = select i1 %istex, <4 x i32> %vc, <4 x i32> %vp
   %sad = call i32 @bsad(<4 x i32> %vimg, <4 x i32> %vc, i32 960, i32 540, i32 %X, i32 %Y, i32 %cx, i32 %cy)
-  %bg = select i1 %isg, i32 %biasg, i32 0
+  %sad0 = call i32 @bcast(i32 %tid, i32 %sad, i32 %base)
+  %sad0_tol = add i32 %sad0, 24
+  %sad_ok = icmp ule i32 %sad, %sad0_tol
+  %allow_bg = or i1 %zedg, %sad_ok
+  %isg_ok = and i1 %isg, %allow_bg
+  %bg = select i1 %isg_ok, i32 %biasg, i32 0
   %bz = select i1 %isnear, i32 %biasz, i32 0
   %agd = call float @dinf(float %g2x, float %g2y, float %fx, float %fy)
   %ag1 = fcmp ole float %agd, 1.0
@@ -640,8 +671,16 @@ st:
   %anc_keep0 = and i1 %has_anc, %far_anc
   %anc_keep = and i1 %anc_keep0, %fl_good
   %anc_allow = xor i1 %anc_keep, true
+  %fzx = fcmp oeq float %fx, 0.0
+  %fzy = fcmp oeq float %fy, 0.0
+  %fzero = and i1 %fzx, %fzy
+  %jitz = or i1 %jit, %fzero
+  %subpx = fcmp ole float %dfg, 1.0
+  %jkeep = and i1 %subpx, %jitz
+  %jallow = xor i1 %jkeep, true
   %doap0 = and i1 %apply, %won
-  %doap = and i1 %doap0, %anc_allow
+  %doap1 = and i1 %doap0, %anc_allow
+  %doap = and i1 %doap1, %jallow
   br i1 %doap, label %wf, label %snp
 wf:
   %o0 = insertelement <2 x float> undef, float %ofx, i32 0

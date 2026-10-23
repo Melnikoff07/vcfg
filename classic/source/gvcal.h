@@ -27,11 +27,18 @@ typedef struct {
 
 typedef struct {
     double n[2], sr[2], sf[2], srr[2], sff[2], srf[2];      // inlier sums per axis over all informative frames
+    double w_srr[2], w_sff[2], w_srf[2];                    // within-frame centered sums (TAA-jitter invariant)
     float  fmr[2][GVCAL_MAXF], fmf[2][GVCAL_MAXF], fa[2][GVCAL_MAXF];   // per frame: mean raw, mean flow, slope
     uint32_t nf[2];                                          // informative frames per axis (stored up to MAXF)
-    // DRS pixel-space hypothesis: raw pre-scaled by (ref_w / cur_w, ref_h / cur_h) when target resolution varies
+    // X/Y axis-swapped hypothesis: raw.y -> flow.x, raw.x -> flow.y
+    double sw_n[2], sw_sr[2], sw_sf[2], sw_srr[2], sw_sff[2], sw_srf[2];
+    double sw_w_srr[2], sw_w_sff[2], sw_w_srf[2];
+    float  sw_fmr[2][GVCAL_MAXF], sw_fmf[2][GVCAL_MAXF], sw_fa[2][GVCAL_MAXF];
+    uint32_t sw_nf[2];
+    // DRS pixel-space hypothesis: flow scaled by (cur_w / ref_w, cur_h / ref_h) when target resolution varies
     double drs_n[2], drs_sr[2], drs_sf[2], drs_srr[2], drs_sff[2], drs_srf[2];
-    float  drs_fmr[2][GVCAL_MAXF], drs_fa[2][GVCAL_MAXF];
+    double drs_w_srr[2], drs_w_sff[2], drs_w_srf[2];
+    float  drs_fmr[2][GVCAL_MAXF], drs_fmf[2][GVCAL_MAXF], drs_fa[2][GVCAL_MAXF];
     uint32_t ref_w, ref_h, cur_w, cur_h, drs_varied;
     uint32_t classes;                                        // motion classes seen (bit mask)
     uint32_t frames, informative, flat, stale_votes, const_frames;
@@ -44,13 +51,14 @@ typedef struct {
     int   state;            // 0 pending, 1 accepted, -1 rejected
     int   soft;             // rejection that may change with the scene (retry this candidate in a later scan)
     char  reason[80];
-    float ax, bx, ay, by;   // flow = a * raw + b (per axis)
+    float ax, bx, ay, by;   // flow = a * raw + b (per axis; if swap_xy, raw is (ry, rx))
     float r2x, r2y, jit_x, jit_y, slope_spread;
     int   sentinel; uint32_t sent_x, sent_y;   // raw bit pattern meaning "not written" (objects-only buffer)
     uint32_t frames, blocks, classes;
     char  units[48];
     uint32_t cal_w, cal_h;  // active target resolution at calibration (for pixel-space DRS scaling)
     int   drs_scale;        // 1 if velocity is in render-target pixels and scales with (cal_w / cur_w)
+    int   swap_xy;          // 1 if X and Y velocity channels are swapped in the game buffer
 } gvcal_result_t;
 
 // last frame's numbers, for the log

@@ -86,6 +86,19 @@ static const Supported k_sup[] = {
     { "CUSA17722", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
     { "CUSA32836", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
     { "CUSA01113", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00009", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00093", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00265", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA00362", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA01766", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA02703", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA02902", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA18824", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA24360", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA29008", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA33277", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA40994", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
+    { "CUSA42311", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },
 };
 #define NSUP (int)(sizeof(k_sup) / sizeof(k_sup[0]))
 static const char *k_files[] = { "vcfg16.prx", "vcfg_classic51.prx", "vcfg_alt_16.prx" };
@@ -99,7 +112,8 @@ static int auto_2buf(const char *id)
            vcfg_in_family(id, "CUSA15778") || vcfg_in_family(id, "CUSA00083") ||
            vcfg_in_family(id, "CUSA02299") || vcfg_in_family(id, "CUSA08344") ||
            vcfg_in_family(id, "CUSA10454") || vcfg_in_family(id, "CUSA11100") ||
-           vcfg_in_family(id, "CUSA15090") || vcfg_in_family(id, "CUSA18723");
+           vcfg_in_family(id, "CUSA15090") || vcfg_in_family(id, "CUSA18723") ||
+           vcfg_in_family(id, "CUSA00009") || vcfg_in_family(id, "CUSA42311");
 }
 static int auto_alt(const char *id)
 {
@@ -111,7 +125,7 @@ static const Supported *sup_for_title(const char *id)
     for (int i = 0; i < NSUP; i++) if (!strcmp(fam, k_sup[i].id)) return &k_sup[i];
     return NULL;
 }
-#define MAPMAX 512   // plugins.ini sections we manage: the verified table + regional aliases + every game in the list (App.games)
+#define MAPMAX 1024  // plugins.ini sections we manage: the verified table + regional aliases + every game in the list (App.games)
 #define ENGFILE CFGDIR "/vcfg_engines.ini"   // the player's engine choice per game: CUSAxxxxx=<SEL_*>, AUTO not written
 #define BUFFILE CFGDIR "/vcfg_buffers.ini"   // the player's buffer mode choice per game: CUSAxxxxx=<BUF_*>, AUTO not written
 static const char *prx_of(int engine)
@@ -1285,11 +1299,11 @@ static void summarize(Buf *r, const char *id, const char *which, const char *t)
     int gpu = strstr(t, "gpu_init: ok") || strstr(t, "A20_ALLOC");
     int post = strstr(t, "inject #") != NULL || strstr(t, "vout inject #") != NULL;
     int fg = strstr(t, "mode4 #") || strstr(t, "vout fg #") || strstr(t, "kind=1") ||
-             (post && !strstr(t, "inert:") && !strstr(t, "framegen=0") && strstr(t, "extra buffer(s)"));
+             (post && !strstr(t, "inert:") && !strstr(t, "INERT:") && !strstr(t, "framegen=0") && strstr(t, "extra buffer(s)"));
     int menu = strstr(t, "menu opened") || strstr(t, "A20_MENU open=1");
     bprintf(r, "%s, %s: %s | %s | first frame %s, GPU memory %s, FG frames %s, OSD/post injects %s, menu used %s\n", id, which, v, secs,
             frame ? "yes" : "NO", gpu ? "yes" : "no", fg ? "yes" : "no", post ? "yes" : "no", menu ? "yes" : "no");
-    static const char *keys[] = { "STALL SNAPSHOT", "inert", "FAIL", "fail", "stop", "NATIVE_ONLY", "refus", "no memory", "dcb_unreadable" };
+    static const char *keys[] = { "STALL SNAPSHOT", "INERT:", "inert", "FAIL", "fail", "stop", "NATIVE_ONLY", "refus", "no memory", "dcb_unreadable" };
     int shown = 0;
     for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]) && shown < 4; k++)
         if (find_line(t, keys[k], line, sizeof(line))) { bprintf(r, "    reason? %s\n", line); shown++; }
@@ -1786,9 +1800,10 @@ int main(void)
     int jrc = sys_sdk_jailbreak(&jb);           // fonts are loaded already: /app0 is not reachable while jailbroken
     vlog("jailbreak rc=%d\n", jrc);
     for (int i = 0; i < NSUP; i++) {
-        Game *g = &a->games[a->ngames++];
+        Game *g = &a->games[a->ngames++]; memset(g, 0, sizeof(*g));
         snprintf(g->id, sizeof(g->id), "%s", k_sup[i].id); g->engine = k_sup[i].engine; g->def_buf = auto_2buf(k_sup[i].id) ? BUF_2BUF : BUF_STD; g->testing = k_sup[i].testing;
         load_meta(g);
+        if (!g->installed) a->ngames--;
     }
     // Every other installed game is listed as experimental (switched off until the user turns it on).
     for (int r = 0; r < NROOT; r++) {

@@ -261,29 +261,36 @@ static int tsharp_is_surface_candidate(const uint32_t *t, uint64_t base, tgt_t *
     uint32_t base_lvl = (t[3] >> 12) & 0xFu, last_lvl = (t[3] >> 16) & 0xFu, tile = (t[3] >> 20) & 0x1Fu;
     if (base_lvl != 0u || last_lvl != 0u || tile == 8u) return 0;   // single-mip tiled 2D surface only
     if ((t[4] & 0x1FFFu) != 0u || (t[4] >> 27) != 0u || (t[5] & 0x1FFFFFu) != 0u) return 0;
-    uint32_t w = (t[2] & 0x3FFFu) + 1u, h = ((t[2] >> 14) & 0x3FFFu) + 1u;
+    uint32_t w = (t[2] & 0x3FFFu) + 1u, h_raw = ((t[2] >> 14) & 0x3FFFu) + 1u;
     uint32_t pitch = ((t[4] >> 13) & 0x3FFFu) + 1u;
+    uint32_t h = unpad_alloc_h(w, h_raw);
     if (w < 640u || w > 4096u || h < 360u || h > 2304u || pitch < w || pitch > 4096u || (pitch & 7u) != 0u) return 0;
-    // Aspect ratio: ~16:9 (within 10%) or half-width 8:9 checkerboard
+    // Aspect ratio: |w * 1080 - h * 1920| <= 16 * 1080, ~16:9 (within 10%), or half-width 8:9 checkerboard
+    int64_t ar_diff = (int64_t)w * 1080ll - (int64_t)h * 1920ll;
+    if (ar_diff < 0) ar_diff = -ar_diff;
     uint64_t lhs = (uint64_t)w * 9u, rhs = (uint64_t)h * 16u;
-    int ar_ok = (lhs * 100u >= rhs * 90u && lhs * 100u <= rhs * 110u) ||
+    int ar_ok = ((uint64_t)ar_diff <= 16ull * 1080ull) ||
+                (lhs * 100u >= rhs * 90u && lhs * 100u <= rhs * 110u) ||
                 (lhs * 200u >= rhs * 95u && lhs * 200u <= rhs * 105u);
     if (!ar_ok) return 0;
-    int is_vel = (dfmt == 5u || dfmt == 12u) && (nfmt == 7u || nfmt == 1u || nfmt == 0u);
-    int is_z32 = (dfmt == 4u && nfmt == 7u);
+    int is_vel = ((dfmt == 5u || dfmt == 12u) && (nfmt == 7u || nfmt == 1u || nfmt == 0u)) ||
+                 (dfmt == 3u && (nfmt == 0u || nfmt == 1u)) ||
+                 (dfmt == 11u && nfmt == 7u);
+    int is_z32 = ((dfmt == 4u || dfmt == 22u) && nfmt == 7u);
     int is_z24 = ((dfmt == 20u || dfmt == 21u) && nfmt == 0u);
-    if (!is_vel && !is_z32 && !is_z24) return 0;
+    int is_z16 = (dfmt == 2u && nfmt == 0u);
+    if (!is_vel && !is_z32 && !is_z24 && !is_z16) return 0;
     memset(out, 0, sizeof(*out));
     out->base = base;
-    out->d.depth = (is_z32 || is_z24) ? 1u : 0u;
-    out->d.fmt = is_z32 ? 3u : is_z24 ? 2u : dfmt;
-    out->d.num = is_z32 ? 7u : is_z24 ? 0u : nfmt;
+    out->d.depth = (is_z32 || is_z24 || is_z16) ? 1u : 0u;
+    out->d.fmt = is_z32 ? 3u : is_z24 ? 2u : is_z16 ? 1u : dfmt;
+    out->d.num = is_z32 ? 7u : (is_z24 || is_z16) ? 0u : nfmt;
     out->d.pitch = pitch;
-    out->d.alloc_h = (h + 7u) & ~7u;
+    out->d.alloc_h = (h_raw + 7u) & ~7u;
     out->d.tile = tile;
     out->w = w;
     out->h = h;
-    out->bpp = out->d.depth ? 4u : pm4_cb_bpp(dfmt);
+    out->bpp = out->d.depth ? (is_z16 ? 2u : 4u) : pm4_cb_bpp(dfmt);
     out->size = (uint64_t)out->d.pitch * out->d.alloc_h * out->bpp;
     out->slot = out->d.depth ? 8u : 0u;
     return 1;
@@ -308,9 +315,9 @@ static void tsharp_match(pm4_frame_t *f, const uint32_t *t, int cs)
         r->flags |= PM4RT_SAMPLED;
         // Refine active dimensions from the sampling T# when the draw scissors were left at full allocation size
         if (type == 9u) {
-            uint32_t tw = (t[2] & 0x3FFFu) + 1u, th = ((t[2] >> 14) & 0x3FFFu) + 1u;
+            uint32_t tw = (t[2] & 0x3FFFu) + 1u, th = unpad_alloc_h(tw, ((t[2] >> 14) & 0x3FFFu) + 1u);
             if (tw >= 320u && tw <= r->d.pitch && th >= 180u && th <= r->d.alloc_h &&
-                r->w == r->d.pitch && (tw < r->w || th < r->h)) {
+                (tw <= r->w && th <= r->h) && (tw < r->w || th < r->h)) {
                 r->w = tw; r->h = th;
             }
         }
@@ -359,8 +366,12 @@ static int tbl_seen(pm4_frame_t *f, uint64_t p)
 static uint32_t readable_table_dwords(pm4_frame_t *f, const uint32_t *tb)
 {
     if (!f->readable) return 0;
-    static const uint32_t probes[5] = { 128u, 64u, 32u, 16u, 8u };
-    for (int k = 0; k < 5; k++) {
+    if (f->readable(tb, 128u * 4u, f->user)) return 128u;
+    uint32_t dw_to_page = (uint32_t)((0x4000u - ((uintptr_t)tb & 0x3FFFu)) / 4u);
+    if (dw_to_page >= 8u && dw_to_page < 128u && f->readable(tb, (size_t)dw_to_page * 4u, f->user))
+        return dw_to_page;
+    static const uint32_t probes[4] = { 64u, 32u, 16u, 8u };
+    for (int k = 0; k < 4; k++) {
         if (f->readable(tb, (size_t)probes[k] * 4u, f->user)) return probes[k];
     }
     return 0;
@@ -417,7 +428,9 @@ static void on_draw(pm4_frame_t *f)
                 r->draws++;
                 if (zon) r->zdraws++;
                 r->last_draw = f->draws; r->last_pass = f->passes;
-                if (!r->w || (t[i].w >= 320u && t[i].h >= 180u)) {
+                if (!r->w || (t[i].w >= 320u && t[i].h >= 180u &&
+                              !((r->flags & PM4RT_SAMPLED) && r->w < t[i].w) &&
+                              !(r->w >= 640u && r->h >= 360u && r->w < r->d.pitch && t[i].w == r->d.pitch))) {
                     r->w = t[i].w; r->h = t[i].h;
                 }
                 r->slot_mask |= 1u << t[i].slot;
@@ -579,7 +592,13 @@ int pm4_walk_entry(pm4_frame_t *f, const uint32_t *dcb, uint32_t ndw, int32_t en
                 set_regs(f->sh, off, b + 1, nb - 1);
                 for (int i = 0; i < PM4_NCS; i++)
                     if (pm4_cs_reg_idx[i] >= off && pm4_cs_reg_idx[i] < off + nb - 1) f->cs_seen |= 1u << i;
-                if (f->pending_tsharp && (f->mode & PM4_FULL) && nb - 1 >= 8) tsharp_match(f, b + 1, off >= 0x200);
+                if ((f->mode & PM4_FULL) && nb - 1 >= 8) {
+                    if (f->pending_tsharp) tsharp_match(f, b + 1, off >= 0x200);
+                    else {
+                        for (uint32_t j = 0; j + 8u <= nb - 1u; j += 8u)
+                            tsharp_match(f, b + 1 + j, off >= 0x200);
+                    }
+                }
             }
             f->pending_tsharp = 0;
             break;
@@ -688,15 +707,33 @@ static int near_ratio(uint32_t a, uint32_t b, uint32_t num, uint32_t den)   // a
     return x * 100u >= t * 97u && x * 100u <= t * 103u;
 }
 
+static int ar_match(uint32_t w, uint32_t h, uint32_t sw, uint32_t sh)
+{
+    int64_t d = (int64_t)w * (int64_t)sh - (int64_t)h * (int64_t)sw;
+    if (d < 0) d = -d;
+    if ((uint64_t)d <= 16ull * (uint64_t)sh) return 1;
+    return near_ratio(w * 9u, h * 16u, 1, 1) || near_ratio(w * sh, h * sw, 1, 1);
+}
+
 void pm4_rank(pm4_frame_t *f, uint32_t sw, uint32_t sh)
 {
     uint32_t tot = f->draws ? f->draws : 1u;
+    uint32_t z_w = 0, z_h = 0, z_best_draws = 0;
+    for (uint32_t i = 0; i < f->nrt; i++) {
+        const pm4_rt_t *r = &f->rt[i];
+        if (r->d.depth && !(r->flags & PM4RT_MSAA) && r->w >= 640u && r->h >= 360u &&
+            ar_match(r->w, r->h, sw, sh) && r->draws >= z_best_draws) {
+            z_best_draws = r->draws;
+            z_w = r->w;
+            z_h = r->h;
+        }
+    }
     for (uint32_t i = 0; i < f->nrt; i++) {
         pm4_rt_t *r = &f->rt[i];
         int s = 0;
         int full = near_ratio(r->w, sw, 1, 1) && near_ratio(r->h, sh, 1, 1);
         int half = near_ratio(r->w, sw, 1, 2) && near_ratio(r->h, sh, 1, 2);
-        int ar16_9 = near_ratio(r->w * 9u, r->h * 16u, 1, 1) || near_ratio(r->w * sh, r->h * sw, 1, 1);
+        int ar16_9 = ar_match(r->w, r->h, sw, sh);
         // Dynamic resolution: 50%..100% of display resolution, 1280x720..3840x2160 16:9 (including PS4 Pro neo=1
         // supersampling or sub-4K DRS), or horizontal DRS / checkerboard (50%..100% width at full height).
         int dyn_hi = !full && !half && ar16_9 &&
@@ -707,7 +744,7 @@ void pm4_rank(pm4_frame_t *f, uint32_t sw, uint32_t sh)
                       (near_ratio(r->h, sh, 1, 1) && r->w * 2u >= sw && r->w <= sw));
         int dyn = dyn_hi || dyn_lo;
         if (r->d.depth) {
-            if (full) s += 40; else if (dyn) s += 25; else if (half) s += 5; else s -= 40;
+            if (full) s += 40; else if (dyn) s += 30; else if (half) s += 20; else s -= 40;
             if (r->d.fmt == 3) s += 10;
             else if (r->d.fmt == 2) s += 8;                             // Z24 depth buffer
             if (r->draws >= 50) s += 20; else if (r->draws >= 10) s += 10;
@@ -722,9 +759,12 @@ void pm4_rank(pm4_frame_t *f, uint32_t sw, uint32_t sh)
             else if (r->nch == 4 && r->bpp == 4) s -= 5;                // RGBA8 G-buffer (packed velocity: rare)
             if (r->d.num == 7 || r->d.num == 1) s += 10; else if (r->d.num == 0) s += 5;
             else if (r->d.num == 6) s -= 30; else s -= 5;
-            if (full) s += 25; else if (dyn_hi) s += 20; else if (half || dyn_lo) s += 15; else s -= 30;
-            if (r->draws >= 100) s += 15; else if (r->draws >= 20) s += 10; else if (r->draws <= 2) s -= 5;
+            if (full || dyn_hi) s += 25; else if (half || dyn_lo) s += 20; else s -= 30;
+            if (z_w && z_h && r->w == z_w && r->h == z_h && (r->zdraws * 2u >= r->draws || (r->flags & PM4RT_SAMPLED)))
+                s += 10;                                                // matches primary 3D scene depth resolution
+            if (r->draws >= 100) s += 15; else if (r->draws >= 20) s += 10; else if (r->draws <= 2) s -= 15;
             if (r->zdraws * 2u >= r->draws && r->draws) s += 15;         // rasterised geometry with depth test
+            else if (r->zdraws == 0 && r->draws < 15) s -= 20;          // 2D post-TAA / UI pass without depth test
             if (r->flags & PM4RT_WITHMRT) s += 5;
             if (r->flags & PM4RT_SAMPLED) s += 10;                       // read later (TAA / motion blur)
             if (r->first_draw * 2u < tot) s += 5;                        // written in the first half of the frame

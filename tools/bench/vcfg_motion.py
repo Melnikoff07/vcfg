@@ -465,8 +465,29 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# mf8: robust smoothness filter of the field
+# mf8: robust smoothness filter of the field + 8x8 Sub-Block Contour Refinement & Dual-Layer FG/BG Motion Field
 # ---------------------------------------------------------------------------------------------------------------
+def unpack_f_8x8(F):
+    """Unpack the 120x68 dual-layer float32 field F into the effective 240x136 8x8 sub-block motion field."""
+    nby, nbx = F.shape[:2]
+    bxi = F[..., 0].view(np.uint32)
+    byi = F[..., 1].view(np.uint32)
+    m = (bxi & np.uint32(0xF)).astype(np.int32)
+    cx2 = ((bxi.astype(np.int32) << 20) >> 24) * 2
+    cy2 = ((byi.astype(np.int32) << 24) >> 24) * 2
+    v1x = (bxi & np.uint32(0xFFFFF000)).view(np.float32)
+    v1y = (byi & np.uint32(0xFFFFFF00)).view(np.float32)
+    v1x = np.where(m != 0, np.where(np.abs(v1x) <= np.float32(0.0625), np.float32(0.0), v1x), F[..., 0])
+    v1y = np.where(m != 0, np.where(np.abs(v1y) <= np.float32(0.0625), np.float32(0.0), v1y), F[..., 1])
+    F8 = np.zeros((nby * 2, nbx * 2, 2), np.float32)
+    for qbit in range(4):
+        use2 = ((m >> qbit) & 1) != 0
+        qx, qy = qbit & 1, qbit >> 1
+        F8[qy::2, qx::2, 0] = np.where(use2, cx2.astype(np.float32), v1x)
+        F8[qy::2, qx::2, 1] = np.where(use2, cy2.astype(np.float32), v1y)
+    return F8
+
+
 def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None):
     mp = mp or {}
     nby, nbx = FT.shape[:2]
@@ -487,6 +508,8 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None):
     cap = np.where(nfgk, mp.get("cap", 32), 8)
     lsh = np.where(nfgk, mp.get("lsh", 2), 1)
     h1, w1 = L1c.shape
+    wm8, hm8 = w1 - 8, h1 - 8
+    r_idx = np.arange(8)[None, :]
 
     def ldT(ox, oy):
         x0 = bx + ox
@@ -496,35 +519,68 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None):
         return FT[y, x]
 
     nbrs = [ldT(ox, oy) for oy in (-1, 0, 1) for ox in (-1, 0, 1)]                # t0..t8 raster, t4 = own
+    outer_offs = [(0, -2), (0, 2), (-2, 0), (2, 0), (-1, -2), (1, 2)]             # sub 10..15: 2-hop outer contour ring
+    outer_nbrs = [ldT(ox, oy) for ox, oy in outer_offs]
     nbq = [(rnd(v[:, 0] * np.float32(0.5)), rnd(v[:, 1] * np.float32(0.5))) for v in nbrs]
     best = np.full(N, BIG, np.int64)
     winv = np.zeros((N, 2), np.float32)
-    for sub in range(10):
+    wincx = np.zeros(N, np.int64)
+    wincy = np.zeros(N, np.int64)
+    winq = np.zeros((N, 4), np.int64)
+    cand_cx, cand_cy, cand_q, cand_ap, cand_val = [], [], [], [], []
+    for sub in range(16):
         if sub == 0:
-            k = 4
+            cv = nbrs[4].copy()
         elif sub <= 8:
             k = sub - 1 if sub - 1 < 4 else sub                                    # skip the centre (k = 4)
+            cv = nbrs[k].copy()
+        elif sub == 9:
+            cv = np.where(notanc[:, None], np.array([gmx4, gmy4], np.float32)[None, :], nbrs[4])
         else:
-            k = 4
-        cv = nbrs[k].copy()
-        if sub == 9:
-            cv = np.where(notanc[:, None], np.array([gmx4, gmy4], np.float32)[None, :], cv)
+            cv = outer_nbrs[sub - 10].copy()
         cx, cy = rnd(cv[:, 0] * np.float32(0.5)), rnd(cv[:, 1] * np.float32(0.5))
         aoff = np.abs(cx - av[:, 0]) + np.abs(cy - av[:, 1])
         sc = np.abs(cx - gmx2) + np.abs(cy - gmy2)
         afar = (aoff > 3) & ((aoff > 16) | ((~still) & (sc * 2 <= aoff)))
         ap = isanc & afar
-        # Only shift to the CUR grid when evaluating an anchor escape candidate (so static heads reject sky escape);
-        # keep all valid moving objects, articulated limbs, and normal blocks on the MID grid matching me1.
-        scx = np.where(ap, cx >> 1, 0)
-        scy = np.where(ap, cy >> 1, 0)
-        Xu, Yu = X + scx, Y + scy
-        sad, _ = sad_bilateral(L1p, L1c, Xu, Yu, cx, cy)
         terms = [np.minimum(np.abs(cx - nx) + np.abs(cy - ny), cap) for nx, ny in nbq]
         sm0 = sum(terms[j] for j in (0, 1, 2, 3, 5, 6, 7, 8))
         sm = sm0 + np.where(nfgk, terms[4] * 3, 0)
         pen = sm << lsh
-        bias = np.where(hasfg, 96, 0) if sub == 0 else 0
+        # Outward disocclusion/occlusion shift: when evaluating a camera-aligned background candidate
+        # (sc <= 3) at a high-gradient motion boundary (sm0 >= 16), shift the bilateral SAD window
+        # up to 5 L1 px away from the higher-disagreement (foreground) neighbor so the occluded tap
+        # samples clean background instead of the foreground object's edge.
+        bg_c = (sc <= 3) & notanc & (sm0 >= 16)
+        shx_d = np.clip(((terms[3] - terms[5]) * 5) >> 3, -5, 5)
+        shy_d = np.clip(((terms[1] - terms[7]) * 5) >> 3, -5, 5)
+        # Only shift to the CUR grid when evaluating an anchor escape candidate (so static heads reject sky escape);
+        # keep all valid moving objects, articulated limbs, and normal blocks on the MID grid matching me1.
+        scx = np.where(ap, cx >> 1, np.where(bg_c, shx_d, 0))
+        scy = np.where(ap, cy >> 1, np.where(bg_c, shy_d, 0))
+        Xu, Yu = X + scx, Y + scy
+        dxc = np.clip(cx, -wm8, wm8)
+        dyc = np.clip(cy, -hm8, hm8)
+        xc = np.clip(Xu - (dxc >> 1), np.maximum(0, -dxc), np.minimum(wm8, wm8 - dxc))
+        xp = xc + dxc
+        ybc = np.clip(Yu - (dyc >> 1), np.maximum(0, -dyc), np.minimum(hm8, hm8 - dyc))
+        ybp = ybc + dyc
+        p_blk = _blocks(L1p, xp, ybp[:, None] + r_idx)
+        c_blk = _blocks(L1c, xc, ybc[:, None] + r_idx)
+        adiff = np.abs(p_blk - c_blk)
+        q00 = adiff[:, 0:4, 0:4].sum(axis=(1, 2))
+        q10 = adiff[:, 0:4, 4:8].sum(axis=(1, 2))
+        q01 = adiff[:, 4:8, 0:4].sum(axis=(1, 2))
+        q11 = adiff[:, 4:8, 4:8].sum(axis=(1, 2))
+        qs = np.stack([q00, q10, q01, q11], axis=-1)
+        raw_sad = q00 + q10 + q01 + q11
+        sad0 = _dc_adjust(raw_sad, p_blk.sum(axis=(1, 2)), c_blk.sum(axis=(1, 2)))
+        # Partial-occlusion trim: when 1+ quadrant has a clean match (qmin <= 88), discount up to 3/4 of excess SAD
+        qmin = qs.min(axis=-1)
+        qexc = np.maximum(sad0 - (qmin * 4 + 256), 0)
+        qtrim = qexc - (qexc >> 2)
+        sad = np.minimum(sad0 - np.where(qmin <= 88, qtrim, 0), 65535)
+        bias = np.where(hasfg & ((sc > 3) | (sm0 < 16)), 96, 0) if sub == 0 else 0
         apen = np.where(ap, 512, 0)
         xc_0 = Xu - (cx >> 1)
         xp_0 = xc_0 + cx
@@ -536,11 +592,76 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None):
         cost = sad + 256 + pen + apen + oob_p - bias
         key = (cost << 8) | sub
         if fade:
-            valid = np.full(N, sub == 0)
+            valid1 = np.full(N, sub == 0)
         else:
-            valid = np.ones(N, bool)                                               # sub < 10, filter on
-        key = np.where(valid, key, BIG)
+            valid1 = np.full(N, sub < 10)                                          # Pass 1 uses sub < 10
+        key = np.where(valid1, key, BIG)
         better = key < best
         best = np.where(better, key, best)
         winv = np.where(better[:, None], cv, winv)
-    return winv.reshape(nby, nbx, 2)
+        wincx = np.where(better, cx, wincx)
+        wincy = np.where(better, cy, wincy)
+        winq = np.where(better[:, None], qs, winq)
+        cand_cx.append(cx)
+        cand_cy.append(cy)
+        cand_q.append(qs)
+        cand_ap.append(ap)
+        cand_val.append(np.full(N, sub == 0) if fade else np.ones(N, bool))
+
+    # Pass 2: Dual-layer 8x8 quadrant contour refinement across all 16 lanes (sub = 0..15)
+    best2 = np.full(N, BIG, np.int64)
+    win_mask = np.zeros(N, np.int64)
+    win_cx2 = np.zeros(N, np.int64)
+    win_cy2 = np.zeros(N, np.int64)
+    sc1 = np.abs(wincx - gmx2) + np.abs(wincy - gmy2)
+    winq_max = winq.max(axis=-1)
+    for sub in range(16):
+        cx, cy = cand_cx[sub], cand_cy[sub]
+        qs = cand_q[sub]
+        d12 = np.abs(cx - wincx) + np.abs(cy - wincy)
+        sc = np.abs(cx - gmx2) + np.abs(cy - gmy2)
+        qmin = qs.min(axis=-1)
+        qmax = qs.max(axis=-1)
+        qmin_ok = (qmin <= 32) | ((winq_max >= 32) & (qmin <= 96)) | ((winq_max >= 384) & (qmin <= 148))
+        lock = (sc1 <= 3) & (sc > 4) & qmin_ok & (qmax >= 160) & ((qmax - qmin) >= 112)
+        q_direct = (qs + 24 < winq) & (qs <= 160) & ((sc[:, None] > 3) | (winq >= 160))
+        q_win = q_direct | (lock[:, None] & (qs <= 192) & (qs * 4 <= qmax[:, None] * 3))
+        mask = (q_win[:, 0].astype(np.int64) |
+                (q_win[:, 1].astype(np.int64) << 1) |
+                (q_win[:, 2].astype(np.int64) << 2) |
+                (q_win[:, 3].astype(np.int64) << 3))
+        ok = cand_val[sub] & (~cand_ap[sub]) & (d12 >= 3) & (mask > 0) & (mask < 15) & qmin_ok
+        c2 = qmin + 256
+        k2 = np.where(ok, (c2 << 8) | sub, BIG)
+        b2 = k2 < best2
+        best2 = np.where(b2, k2, best2)
+        win_mask = np.where(b2, mask, win_mask)
+        win_cx2 = np.where(b2, np.clip(cx, -128, 127), win_cx2)
+        win_cy2 = np.where(b2, np.clip(cy, -128, 127), win_cy2)
+
+    # Canonicalize dual layers on split blocks so v1 is always the background layer (closer to gm)
+    # and v2 (mask bit = 1) is always the foreground contour layer (farther from gm)
+    sc2_win = np.abs(win_cx2 - gmx2) + np.abs(win_cy2 - gmy2)
+    swap_l = (win_mask > 0) & (sc1 > sc2_win)
+    win_mask = np.where(swap_l, win_mask ^ 0xF, win_mask)
+    old_cx1 = np.clip(wincx, -128, 127)
+    old_cy1 = np.clip(wincy, -128, 127)
+    winv = np.where(swap_l[:, None], np.stack([win_cx2 * 2, win_cy2 * 2], axis=-1).astype(np.float32), winv)
+    win_cx2 = np.where(swap_l, old_cx1, win_cx2)
+    win_cy2 = np.where(swap_l, old_cy1, win_cy2)
+
+    vx = winv[:, 0].copy()
+    vy = winv[:, 1].copy()
+    has_split = win_mask > 0
+    vx = np.where(has_split & (np.abs(vx) < np.float32(0.0625)), np.float32(0.0625), vx)
+    vy = np.where(has_split & (np.abs(vy) < np.float32(0.0625)), np.float32(0.0625), vy)
+    bxi = vx.view(np.uint32)
+    byi = vy.view(np.uint32)
+    bxi_hom = bxi & np.uint32(0xFFFFFFF0)
+    bxi_spl = ((bxi & np.uint32(0xFFFFF000)) |
+               ((win_cx2.astype(np.uint32) & np.uint32(0xFF)) << np.uint32(4)) |
+               (win_mask.astype(np.uint32) & np.uint32(0xF)))
+    byi_spl = (byi & np.uint32(0xFFFFFF00)) | (win_cy2.astype(np.uint32) & np.uint32(0xFF))
+    vx_out = np.where(has_split, bxi_spl, bxi_hom).astype(np.uint32).view(np.float32)
+    vy_out = np.where(has_split, byi_spl, byi).astype(np.uint32).view(np.float32)
+    return np.stack([vx_out, vy_out], axis=-1).reshape(nby, nbx, 2)

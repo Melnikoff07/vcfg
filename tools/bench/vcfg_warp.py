@@ -75,20 +75,25 @@ def sum3(a):
     return a[..., 0] + a[..., 1] + a[..., 2]
 
 
-def side_lerp(a2, b2, sp, sc, e0, eac, ebp, t):
-    ga = diff3(a2, sp)
-    gb = diff3(b2, sc)
+def side_lerp(a2, b2, sp, sc, e0, eac, ebp, t, v_ex=0.0, w_occ=0.0, div_b=0.0):
+    ga = np.maximum(diff3(a2, sp), F32(0.0))
+    gb = np.maximum(diff3(b2, sc), F32(0.0))
     da = np.minimum(eac, ga)
     db = np.minimum(ebp, gb)
     d_lu = sum3(b2 - a2)
     d_min = da - db
-    adadb = np.abs(d_min)
     d_cr = eac - ebp
-    d_sf = ga - gb
+    d_sf0 = ga - gb
+    wsf = np.maximum(sat(F32(v_ex) * F32(0.125)), F32(1.0) - F32(w_occ))
+    d_sf = d_sf0 * wsf
+    adadb = np.maximum(np.abs(d_min), np.abs(F32(div_b)) * F32(3.0) * F32(w_occ))
     g_em = sat((e0 - F32(0.08)) * F32(6.0))
-    g_occ = sat((e0 - F32(0.50)) * F32(4.0))
-    b_hi = F32(0.07) + F32(0.35) * g_occ
-    raw = (d_min * F32(0.33) + d_cr * F32(0.07)) + (d_sf * F32(0.14) + d_lu * F32(0.05))
+    s01 = d_min * F32(0.33) + d_cr * F32(0.07)
+    s23 = d_sf * F32(0.14) + d_lu * F32(0.04)
+    raw0 = s01 + s23
+    o_sum = s01 * F32(1.625) + F32(div_b)
+    raw = raw0 + F32(w_occ) * o_sum
+    b_hi = F32(0.07) + F32(0.43) * F32(w_occ)
     dlt = np.clip(g_em * raw, -b_hi, b_hi)
     tab = sat(F32(t) + dlt)
     return a2 + (b2 - a2) * tab[..., None], adadb
@@ -129,15 +134,38 @@ def _taps(tp, tc, u, v, vx, vy, t, sp, sc, es, str_en, quad, csh=0.5, use_cr=Fal
     a2 = np.where(onlyp[..., None], b, a)
     b2 = np.where(onlyc[..., None], a, b)
     e0 = diff3(a2, b2)
-    if quad:
-        return a2, b2, e0
     eb = np.where(one, F32(0.02), e0)
+    if quad:
+        return a2, b2, eb
     both = ~oobp & ~oobc
     fastc = (np.abs(vx) + np.abs(vy)) > 16
     st_on = str_en & both & fastc
     eac, ebp = diff3(a2, sc), diff3(b2, sp)
     ed = np.maximum(np.minimum(eac, ebp) - es - F32(0.375), F32(0.0))
     return a2, b2, eb + np.where(st_on, ed, F32(0.0))
+
+
+def _eval_sub_corner(raw_x0y0, raw_x1y0, raw_x0y1, raw_x1y1, qx, qy):
+    """Unpack 8x8 sub-block corner (qx, qy) in {0, 1, 2, 3}^2 from the 2x2 loaded 16x16 blocks."""
+    use_x1 = (qx >= 2)[..., None]
+    use_y1 = (qy >= 2)[..., None]
+    r_top = np.where(use_x1, raw_x1y0, raw_x0y0)
+    r_bot = np.where(use_x1, raw_x1y1, raw_x0y1)
+    raw = np.where(use_y1, r_bot, r_top)
+    qbit = (qx & 1) | ((qy & 1) << 1)
+    bxi = raw[..., 0].view(np.uint32)
+    byi = raw[..., 1].view(np.uint32)
+    m = (bxi & np.uint32(0xF)).astype(np.int32)
+    use2 = ((m >> qbit) & 1) != 0
+    cx2 = ((bxi.astype(np.int32) << 20) >> 24) * 2
+    cy2 = ((byi.astype(np.int32) << 24) >> 24) * 2
+    v1x = (bxi & np.uint32(0xFFFFF000)).view(F32)
+    v1y = (byi & np.uint32(0xFFFFFF00)).view(F32)
+    v1x = np.where(m != 0, np.where(np.abs(v1x) <= F32(0.0625), F32(0.0), v1x), raw[..., 0])
+    v1y = np.where(m != 0, np.where(np.abs(v1y) <= F32(0.0625), F32(0.0), v1y), raw[..., 1])
+    vx = np.where(use2, cx2.astype(F32), v1x)
+    vy = np.where(use2, cy2.astype(F32), v1y)
+    return np.stack([vx, vy], axis=-1), m, use2
 
 
 def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut_thr=0, cut_emov=0.3, wp=None):
@@ -148,7 +176,7 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
     out = np.empty((H, W, 3), F32)
     xs = np.arange(W, dtype=F32)
     nby, nbx = F.shape[:2]
-    # PC experiment only: the production shader uses a 16-pixel grid.
+    # PC experiment only: the production shader uses a 16-pixel grid with 8x8 sub-block unpacking.
     block = int(wp.get("block", 16))
     if block not in (8, 16):
         raise ValueError("motion grid block must be 8 or 16")
@@ -176,14 +204,46 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         ixr, iyr = flx.astype(np.int64), fly.astype(np.int64)
         ix0, ix1 = np.clip(ixr, 0, nbx - 1), np.clip(ixr + 1, 0, nbx - 1)
         iy0, iy1 = np.clip(iyr, 0, nby - 1), np.clip(iyr + 1, 0, nby - 1)
-        f00, f10, f01, f11 = F[iy0, ix0], F[iy0, ix1], F[iy1, ix0], F[iy1, ix1]
+        raw00, raw10, raw01, raw11 = F[iy0, ix0], F[iy0, ix1], F[iy1, ix0], F[iy1, ix1]
+        if block == 16 and wp.get("sub8", True):
+            any_split = ((raw00[..., 0].view(np.uint32) | raw10[..., 0].view(np.uint32) |
+                          raw01[..., 0].view(np.uint32) | raw11[..., 0].view(np.uint32)) & np.uint32(0xF)) != 0
+            fx8 = wx * F32(2.0) + F32(0.5)
+            fy8 = wy * F32(2.0) + F32(0.5)
+            sx = np.floor(fx8).astype(np.int32)
+            sy = np.floor(fy8).astype(np.int32)
+            wx8 = fx8 - np.floor(fx8)
+            wy8 = fy8 - np.floor(fy8)
+            s00, _, u00 = _eval_sub_corner(raw00, raw10, raw01, raw11, sx, sy)
+            s10, _, u10 = _eval_sub_corner(raw00, raw10, raw01, raw11, sx + 1, sy)
+            s01, _, u01 = _eval_sub_corner(raw00, raw10, raw01, raw11, sx, sy + 1)
+            s11, _, u11 = _eval_sub_corner(raw00, raw10, raw01, raw11, sx + 1, sy + 1)
+            f00 = np.where(any_split[..., None], s00, raw00)
+            f10 = np.where(any_split[..., None], s10, raw10)
+            f01 = np.where(any_split[..., None], s01, raw01)
+            f11 = np.where(any_split[..., None], s11, raw11)
+            wx = np.where(any_split, wx8, wx)
+            wy = np.where(any_split, wy8, wy)
+        else:
+            f00, f10, f01, f11 = raw00, raw10, raw01, raw11
+            any_split = np.zeros(es.shape, bool)
+            u00 = u10 = u01 = u11 = np.zeros(es.shape, bool)
         lsum = [np.abs(f[..., 0]) + np.abs(f[..., 1]) for f in (f00, f10, f01, f11)]
         iwx, iwy = F32(1.0) - wx, F32(1.0) - wy
         w00, w10, w01, w11 = iwx * iwy, wx * iwy, iwx * wy, wx * wy
         mx = np.maximum(np.maximum(f00, f10), np.maximum(f01, f11))
         nn = np.minimum(np.minimum(f00, f10), np.minimum(f01, f11))
         spr = np.maximum(mx[..., 0] - nn[..., 0], mx[..., 1] - nn[..., 1])
-        coh = spr <= F32(wp.get("coh_thr", 1.0))
+        vm4 = np.maximum(np.abs(mx[..., 0]), np.abs(nn[..., 0])) + np.maximum(np.abs(mx[..., 1]), np.abs(nn[..., 1]))
+        coh_thr = ( np.maximum(vm4 * F32(0.125), F32(2.0))
+                    if "coh_thr" not in wp else F32(wp["coh_thr"]) )
+        coh = spr <= coh_thr
+        xh_r = wx < F32(0.5)
+        yh_b0 = wy < F32(0.5)
+        gbx = np.where(xh_r, ix0, ix1)
+        gby = np.where(yh_b0, iy0, iy1)
+        vmn = np.minimum(np.minimum(lsum[0], lsum[1]), np.minimum(lsum[2], lsum[3]))
+        vsp = (mx[..., 0] - nn[..., 0]) + (mx[..., 1] - nn[..., 1])
         mov = np.zeros((y1 - y0, W, 3), F32)
         emov = np.zeros((y1 - y0, W), F32)
         vmg = np.zeros((y1 - y0, W), F32)
@@ -202,43 +262,61 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
             a2, b2 = np.where(usebil, ab, a2), np.where(usebil, bb, b2)
             fe = np.where(usebil[..., 0], feb, fe)
         eac_f, ebp_f = diff3(a2, sc), diff3(b2, sp)
-        fm, _ = side_lerp(a2, b2, sp, sc, fe, eac_f, ebp_f, t)
+        fm, fad = side_lerp(a2, b2, sp, sc, fe, eac_f, ebp_f, t, vmb, F32(0.0), F32(0.0))
+        frel = np.minimum(fad * F32(0.10), fe * F32(0.60))
+        fe_rel = np.maximum(fe - frel, F32(0.0))
         fast_mov = np.where(zv[..., None], zm, fm)
-        fast_e = np.where(zv, es, fe)
+        fast_e = np.where(zv, es, fe_rel)
         mov = np.where(coh[..., None], fast_mov, mov)
         emov = np.where(coh, fast_e, emov)
         vmg = np.where(coh, vmb, vmg)
         # ---- non-coherent pixels: per-corner vectors, edge-weighted accumulation
         slow = ~coh
         if slow.any():
-            gk_s = GK[np.clip(yfs.astype(np.int64) >> 4, 0, gny - 1), np.clip(xfs.astype(np.int64) >> 4, 0, gnx - 1)]
+            gk_s = GK[np.clip(gby, 0, gny - 1), np.clip(gbx, 0, gnx - 1)]
             nsl = sum((l < 12).astype(np.int64) for l in lsum)
             str_en = (gk_s == 0) & ((flags & 2048) == 0) & (nsl >= 2) & (es < 0.1875)
+            w_occ_s = sat((vsp - F32(12.0)) * F32(0.5))
+            dxq = F32(0.5) * ((f10[..., 0] - f00[..., 0]) + (f11[..., 0] - f01[..., 0]))
+            dyq = F32(0.5) * ((f01[..., 1] - f00[..., 1]) + (f11[..., 1] - f10[..., 1]))
+            div = dxq + dyq
+            div_b_s = np.clip(div * F32(-0.09), F32(-0.55), F32(0.55))
             win = int(wp.get("e_win", 1))
             acc = np.zeros_like(sp)
             sw = np.zeros(es.shape, F32)
             em = None
             ranked = []
-            for fv, w in ((f00, w00), (f10, w10), (f01, w01), (f11, w11)):
+            for fv, w, u2 in ((f00, w00, u00), (f10, w10, u10), (f01, w01, u01), (f11, w11, u11)):
                 a2, b2, e_raw = _taps(tp, tc, u, v, fv[..., 0], fv[..., 1], t, sp, sc, es, str_en, False, csh=wp.get("csh", 0.5), use_cr=bool(wp.get("slow_cr", False)))
+                eb = diff3(a2, b2)
+                spen = e_raw - eb
+                vmag = np.abs(fv[..., 0]) + np.abs(fv[..., 1])
+                v_ex = np.maximum(vmag - vmn, F32(0.0))
+                dv_g = sat(F32(1.0) - v_ex * F32(0.25))
+                g_occ = w_occ_s * dv_g * sat((eb - F32(0.55)) * F32(4.0))
+                div_eff = div_b_s * dv_g
                 eac_s, ebp_s = diff3(a2, sc), diff3(b2, sp)
-                m_s, adadb = side_lerp(a2, b2, sp, sc, e_raw, eac_s, ebp_s, t)
-                g_occ = sat((e_raw - F32(0.55)) * F32(4.0))
-                e = np.maximum(e_raw - adadb * F32(0.10) * g_occ, F32(0.0))
+                m_s, adadb = side_lerp(a2, b2, sp, sc, eb, eac_s, ebp_s, t, v_ex, g_occ, div_eff)
+                rk = F32(0.10) + F32(0.75) * g_occ
+                rel = np.minimum(adadb * rk, eb * F32(0.82))
+                e = np.maximum(eb + spen - rel, F32(0.0))
                 if wp.get('slow_cr_max') is not None:
-                    ab, bb, eb = _taps(tp, tc, u, v, fv[..., 0], fv[..., 1], t, sp, sc, es, str_en, False)
+                    ab, bb, eb_b = _taps(tp, tc, u, v, fv[..., 0], fv[..., 1], t, sp, sc, es, str_en, False)
                     sharp = (np.abs(fv[..., 0]) + np.abs(fv[..., 1])) <= F32(wp['slow_cr_max'])
-                    a2, b2, e = np.where(sharp[..., None], a2, ab), np.where(sharp[..., None], b2, bb), np.where(sharp, e, eb)
+                    a2, b2, e = np.where(sharp[..., None], a2, ab), np.where(sharp[..., None], b2, bb), np.where(sharp, e, eb_b)
                 if win > 1:
                     e = boxf(e, win)
+                is_fg_sub = any_split & u2 & (e < F32(0.18))
+                w_eff = np.where(is_fg_sub, w * F32(4.0) + F32(0.16), w)
+                e_eff = np.where(is_fg_sub, np.maximum(e - F32(0.08), F32(0.0)), e)
                 if wp.get("slow_select"):
-                    ranked.append((e, m_s, w))
+                    ranked.append((e_eff, m_s, w_eff))
                 if em is None:
-                    em = e.copy()
-                em1 = np.minimum(em, e)
+                    em = e_eff.copy()
+                em1 = np.minimum(em, e_eff)
                 scl = np.exp2((em1 - em) * F32(wp.get("k", 8.0)))
-                x1 = np.exp2((em1 - e) * F32(wp.get("k", 8.0)))
-                om = (w + F32(wp.get("w_eps", 0.08))) * x1
+                x1 = np.exp2((em1 - e_eff) * F32(wp.get("k", 8.0)))
+                om = (w_eff + F32(wp.get("w_eps", 0.08))) * x1
                 acc = acc * scl[..., None] + m_s * om[..., None]
                 sw = sw * scl + om
                 em = em1
@@ -261,27 +339,46 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
             emov = np.where(slow, em, emov)
             vmg = np.where(slow, F32(0.0), vmg)
         # ---- merge: static / foreground logic
-        ws0 = sat((F32(0.006) - es) * F32(333.33334))
-        gk = GK[np.clip(yfs.astype(np.int64) >> 4, 0, gny - 1), np.clip(xfs.astype(np.int64) >> 4, 0, gnx - 1)]
+        stat = lerp4(sp, sc, t)
+        l_mov = sum3(mov)
+        l_stat = sum3(stat)
+        dl_s = l_stat - l_mov
+        w_occ_m = sat((spr - F32(12.0)) * F32(0.5)) * sat((es - F32(0.80)) * F32(4.0)) * sat((F32(0.31) - emov) * F32(4.0))
+        d_sm = stat - mov
+        mx_ch = np.maximum(np.maximum(d_sm[..., 0], d_sm[..., 1]), d_sm[..., 2])
+        pos_c = np.maximum(l_stat - F32(2.56), mx_ch * F32(3.0) - dl_s - F32(0.60))
+        ws0_raw = sat((F32(0.006) - es) * F32(333.33334))
+        dk_spot = (vmg > F32(2.0)) & (emov < F32(0.015)) & (dl_s < F32(-0.48))
+        ws0 = np.where(dk_spot, F32(0.0), ws0_raw)
+        gk = GK[np.clip(gby, 0, gny - 1), np.clip(gbx, 0, gnx - 1)]
         hasfg = gk >= (1 << 20)
-        fgkill = hasfg & (emov < 0.25) & ((flags & 16) == 0)
-        ws = np.where(fgkill, F32(0.0), ws0)
+        nfgk = ~hasfg
+        w_hv = sat((vmg + spr) * F32(2.0))
+        w_he = sat((F32(0.08) - es) * F32(32.0))
+        w_hc = sat(pos_c * F32(64.0))
+        w_nd = sat((dl_s - F32(0.05)) * F32(25.0))
+        w_hud = np.where(nfgk, w_hv * w_he * w_hc * w_nd, F32(0.0))
+        ws0_h = np.maximum(ws0, w_hud)
+        mov_obj = hasfg | (vmg > F32(8.0))
+        fgkill_ws = hasfg & (emov < 0.25) & ((flags & 16) == 0)
+        fgkill = mov_obj & (emov < 0.25) & ((flags & 16) == 0)
+        ws = np.where(fgkill_ws, F32(0.0), ws0_h)
         if flags & 4096:
             ws = ws * F32(0.0)
-        stat = lerp4(sp, sc, t)
         dmp = diff3(mov, sp)
         dmc = diff3(mov, sc)
         dmv = diff3(mov, stat)
         ddm = dmp - dmc
-        dtsc = np.clip(ddm * F32(0.45), F32(-0.30), F32(0.30))
+        k_ddm = F32(0.45) + F32(0.45) * w_occ_m
+        lim_hi = F32(0.30) + F32(0.20) * w_occ_m
+        dtsc = np.clip(ddm * k_ddm, -lim_hi, lim_hi)
         tsc = sat(F32(t) + dtsc)
         fillc = sp + (sc - sp) * tsc[..., None]
         cw2 = sat((emov - F32(wp.get("cw_bias", 0.5))) * F32(wp.get("cw_slope", 2.5))) * sat((F32(0.80) - es) * F32(4.0))
-        bg3 = (vmg > 8.0) & (es < 0.25) & ~hasfg & (emov > 0.25)
-        bgs = sat((dmv - es - F32(0.1225)) * F32(4.0))
+        bg3 = (vmg > 8.0) & (es < 0.25) & ~mov_obj & (emov > 0.25)
+        bgs = sat((dmv - es - F32(0.22)) * F32(4.0))
         bgw = np.where(bg3, bgs, F32(0.0))
-        dl_s = sum3(stat) - sum3(mov)
-        dsw = sat((dl_s - F32(0.40)) * F32(1.60)) * sat((emov - F32(0.12)) * F32(5.0)) * sat((F32(0.30) - es) * F32(4.0))
+        dsw = sat((dl_s - F32(0.18)) * F32(2.5)) * sat((emov - F32(0.22)) * F32(5.0)) * sat((F32(0.30) - es) * F32(4.0))
         cw_base = np.maximum(np.maximum(cw2, bgw), dsw)
         res_cw = mlp_cw(ddm, emov, es, dmv, dl_s, spr, vmg)
         dcw = sat((emov - F32(0.15)) * F32(10.0)) * res_cw

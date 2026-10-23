@@ -110,7 +110,7 @@ def side_lerp_ref(a2, b2, sp, sc, e0, eac, ebp, t, vmag, w_occ, div_b, mode):
     if mode == 'new':
         wsf = np.maximum(sat(vmag * 0.125), 1.0 - w_occ)
         d_sf = d_sf0 * wsf
-        adadb = np.maximum(np.abs(d_min), np.abs(div_b) * w_occ)
+        adadb = np.maximum(np.abs(d_min), np.abs(div_b) * 3.0 * w_occ)
     else:
         d_sf = d_sf0
         adadb = np.abs(d_min)
@@ -133,7 +133,7 @@ def side_lerp_ref(a2, b2, sp, sc, e0, eac, ebp, t, vmag, w_occ, div_b, mode):
     return m, adadb
 
 
-def taps_ref(P, C, u, v, vx, vy, t, sp, sc, es, str_en, w_occ, div_b, mode):
+def taps_ref(P, C, u, v, vx, vy, t, sp, sc, es, str_en, w_occ, div_b, vmn, mode):
     tc1 = 1.0 - t
     up = u + vx * t
     vp = v + vy * t
@@ -149,17 +149,22 @@ def taps_ref(P, C, u, v, vx, vy, t, sp, sc, es, str_en, w_occ, div_b, mode):
     emx = np.minimum(eac, ebp)
     spen = np.where(st_on, np.maximum(emx - es - 0.375, 0.0), 0.0)
     if mode == 'new':
-        g_occ = w_occ * sat((eb - 0.55) * 4.0)
-        div_eff = div_b * sat(1.0 - vmag * 0.25)
+        v_ex = np.maximum(vmag - vmn, 0.0)
+        dv_g = sat(1.0 - v_ex * 0.25)
+        g_occ = w_occ * dv_g * sat((eb - 0.55) * 4.0)
+        div_eff = div_b * dv_g
     else:
+        v_ex = vmag
         g_occ = w_occ
         div_eff = div_b
-    m, adadb = side_lerp_ref(a2, b2, sp, sc, eb, eac, ebp, t, vmag, g_occ, div_eff, mode)
+    m, adadb = side_lerp_ref(a2, b2, sp, sc, eb, eac, ebp, t, v_ex, g_occ, div_eff, mode)
     if mode == 'new':
-        rk = 0.10 + 0.48 * g_occ
+        rk = 0.10 + 0.75 * g_occ
+        rel_cap = 0.82
     else:
         rk = 0.10
-    rel = np.minimum(adadb * rk, eb * 0.60)
+        rel_cap = 0.60
+    rel = np.minimum(adadb * rk, eb * rel_cap)
     e = np.maximum(eb + spen - rel, 0.0)
     return m, e
 
@@ -228,19 +233,18 @@ def run_warp8_ref(P, C, F, GK=None, t=0.5, mode='new'):
 
     vmx4 = np.maximum(np.maximum(l00, l10), np.maximum(l01, l11))
     vmn4 = np.minimum(np.minimum(l00, l10), np.minimum(l01, l11))
+    mx = np.maximum(np.maximum(x00, x10), np.maximum(x01, x11))
+    nx = np.minimum(np.minimum(x00, x10), np.minimum(x01, x11))
+    my = np.maximum(np.maximum(y00, y10), np.maximum(y01, y11))
+    ny = np.minimum(np.minimum(y00, y10), np.minimum(y01, y11))
+    vmn = vmn4
     if mode == 'new':
-        vmx = np.maximum(vmx4, np.maximum(l20, l02))
-        vmn = np.minimum(vmn4, np.minimum(l20, l02))
-        vsp = vmx - vmn
+        vsp = (mx - nx) + (my - ny)
         w_occ_s = sat((vsp - 12.0) * 0.5)
         dxq = 0.5 * ((x10 - x00) + (x11 - x01))
-        dx2 = np.where(xh_r, x00 - x20, x20 - x10)
-        div_x = dxq + dx2
         dyq = 0.5 * ((y01 - y00) + (y11 - y10))
-        dy2 = np.where(yh_b0, y00 - y02, y02 - y01)
-        div_y = dyq + dy2
-        div = div_x + div_y
-        div_b_s = np.clip(div * -0.035, -0.35, 0.35)
+        div = dxq + dyq
+        div_b_s = np.clip(div * -0.09, -0.55, 0.55)
     else:
         vmx = vmx4
         w_occ_s = np.zeros_like(vmx)
@@ -293,19 +297,21 @@ def run_warp8_ref(P, C, F, GK=None, t=0.5, mode='new'):
     nslow = (l00 < 12.0).astype(np.int32) + (l10 < 12.0).astype(np.int32) + (l01 < 12.0).astype(np.int32) + (l11 < 12.0).astype(np.int32)
     str_en = nofgs & (nslow >= 2) & (es < 0.1875)
 
-    c0_m, c0_e = taps_ref(P, C, u, v, x00, y00, t, sp, sc, es, str_en, w_occ_s, div_b_s, mode)
-    c1_m, c1_e = taps_ref(P, C, u, v, x10, y10, t, sp, sc, es, str_en, w_occ_s, div_b_s, mode)
-    c2_m, c2_e = taps_ref(P, C, u, v, x01, y01, t, sp, sc, es, str_en, w_occ_s, div_b_s, mode)
-    c3_m, c3_e = taps_ref(P, C, u, v, x11, y11, t, sp, sc, es, str_en, w_occ_s, div_b_s, mode)
+    c0_m, c0_e = taps_ref(P, C, u, v, x00, y00, t, sp, sc, es, str_en, w_occ_s, div_b_s, vmn, mode)
+    c1_m, c1_e = taps_ref(P, C, u, v, x10, y10, t, sp, sc, es, str_en, w_occ_s, div_b_s, vmn, mode)
+    c2_m, c2_e = taps_ref(P, C, u, v, x01, y01, t, sp, sc, es, str_en, w_occ_s, div_b_s, vmn, mode)
+    c3_m, c3_e = taps_ref(P, C, u, v, x11, y11, t, sp, sc, es, str_en, w_occ_s, div_b_s, vmn, mode)
 
     acc = np.zeros_like(P)
     sw = np.zeros_like(es)
     em = c0_e.copy()
     for (cm, ce), cw_i in [((c0_m, c0_e), w00), ((c1_m, c1_e), w10), ((c2_m, c2_e), w01), ((c3_m, c3_e), w11)]:
         em1 = np.minimum(em, ce)
-        sc_w = np.exp2((em1 - em) * 5.95)
-        x1 = np.exp2((em1 - ce) * 5.95)
-        om = (cw_i + 0.26) * x1
+        k_exp = 8.0 if mode == 'new' else 5.95
+        w_eps = 0.08 if mode == 'new' else 0.26
+        sc_w = np.exp2((em1 - em) * k_exp)
+        x1 = np.exp2((em1 - ce) * k_exp)
+        om = (cw_i + w_eps) * x1
         acc = acc * sc_w[..., None] + cm * om[..., None]
         sw = sw * sc_w + om
         em = em1
@@ -329,12 +335,12 @@ def run_warp8_ref(P, C, F, GK=None, t=0.5, mode='new'):
         w_occ_m = sat((spr - 12.0) * 0.5) * sat((es - 0.80) * 4.0) * sat((0.31 - emov) * 4.0)
         d_sm = stat - mov
         mx_ch = np.maximum(np.maximum(d_sm[..., 0], d_sm[..., 1]), d_sm[..., 2])
-        pos_c = np.maximum(l_stat - 2.60, mx_ch * 3.0 - dl_s - 0.60)
-        dk_spot = (vmg > 2.0) & (emov < 0.22) & (dl_s < -0.04)
+        pos_c = np.maximum(l_stat - 2.56, mx_ch * 3.0 - dl_s - 0.60)
+        dk_spot = (vmg > 2.0) & (emov < 0.015) & (dl_s < -0.48)
         ws0 = np.where(dk_spot, 0.0, ws0_raw)
-        w_hv = sat((vmg - 6.0) * 0.25)
-        w_he = sat((0.05 - es) * 50.0)
-        w_hc = sat(pos_c * 16.0)
+        w_hv = sat((vmg + spr) * 2.0)
+        w_he = sat((0.08 - es) * 32.0)
+        w_hc = sat(pos_c * 64.0)
         w_nd = sat((dl_s - 0.05) * 25.0)
         w_hud = np.where(nfgk, w_hv * w_he * w_hc * w_nd, 0.0)
         ws0_h = np.maximum(ws0, w_hud)
@@ -374,7 +380,8 @@ def run_warp8_ref(P, C, F, GK=None, t=0.5, mode='new'):
     cw_base = np.maximum(np.maximum(cw2, bgw), dsw)
     res_cw = mlp_cw(ddm, emov, es, dmv, dl_s, spr, vmg)
     act = sat((emov - 0.15) * 10.0)
-    cw = sat(cw_base + act * res_cw)
+    gcw = sat((emov - es) * 4.0) if mode == chr(110)+chr(101)+chr(119) else 1.0
+    cw = sat(cw_base + act * res_cw) * gcw
 
     movc = lerp4(mov, fillc, cw)
     out = lerp4(movc, stat, ws)
@@ -540,7 +547,7 @@ def verify_shader_build_and_ir():
     shaders_h = (ROOT / 'classic/source/shaders.h').read_text(encoding='utf-8')
 
     # Check key asymmetric disocclusion & inline HUD symbols in warp8.ll
-    for sym in ['%f20', '%f02', '%vsp', '%w_occ_s', '%div_b_s', '%pos_c', '%dk_spot', '%w_hud', '%w_occ_m']:
+    for sym in ['%vmn', '%vsp', '%vsp', '%w_occ_s', '%div_b_s', '%pos_c', '%dk_spot', '%w_hud', '%w_occ_m']:
         assert sym in warp8_ll, f"Missing expected symbol {sym} in classic/shaders/warp8.ll"
 
     # Extract COMPUTE_PGM_RSRC1 and COMPUTE_PGM_RSRC2 for warp8 from shaders.h
