@@ -119,6 +119,12 @@ static int draw_header(Canvas *c, App *a)
         else draw_text(c, &f->mono, x, bottom - 6, tabs[i], th.ink, 1);
         x -= 44;
     }
+    if (a->turned_off) {
+        int by = bottom + 8, bh = 40, bw = c->w - 2 * M;
+        fill_round(c, M, by, bw, bh, 10, RED);
+        draw_button(c, BTN_CROSS, M + 26, by + bh / 2, 22, YEL);
+        draw_text(c, &f->mono, M + 52, by + 28, "VCFG IS TURNED OFF - PRESS CROSS ON 04 PLUGIN TO ENABLE", CREAM, 1);
+    }
     return bottom;
 }
 
@@ -234,27 +240,28 @@ static void draw_card(Canvas *c, App *a, Game *g, int idx, int x, int y, int w, 
     Theme th = theme_of(a);
     Fonts *f = a->f;
     uint32_t accent = k_card[idx % 3];
-    int active_fg = g->installed && !g->testing && (!g->experimental || g->s.fg);
+    int fg_on = !a->turned_off && g->installed && g->s.fg;
+    int active_fg = !a->turned_off && g->installed && !g->testing && (!g->experimental || g->s.fg);
     uint32_t bg, fg_ink, sub_ink, bar_col, num_col;
     if (a->dark_theme) {
         bg = active_fg ? (sel ? 0xFF1F2430u : th.panel) : th.card_off;
         fg_ink = th.ink;
         sub_ink = active_fg ? accent : th.dim;
-        bar_col = (g->installed && g->s.fg) ? accent : th.div;
-        num_col = (g->installed && g->s.fg) ? accent : RED;
+        bar_col = fg_on ? accent : th.div;
+        num_col = fg_on ? accent : RED;
         if (sel) { fill_round(c, x, y, w, h, 22, active_fg ? accent : YEL); fill_round(c, x + 7, y + 7, w - 14, h - 14, 16, bg); }
         else fill_round(c, x, y, w, h, 22, bg);
-        if (!sel && (g->testing || !g->installed || g->experimental)) dashed_rect(c, x, y, w, h, 4, 14, th.div);
+        if (!sel && (a->turned_off || g->testing || !g->installed || g->experimental)) dashed_rect(c, x, y, w, h, 4, 14, th.div);
     } else {
-        bg = g->testing ? CREAM : accent;
+        bg = (a->turned_off || g->testing) ? CREAM : accent;
         if (!g->installed || (g->experimental && !g->s.fg)) bg = CREAM;
         fg_ink = INK;
         sub_ink = INK;
         bar_col = INK;
-        num_col = (g->installed && g->s.fg) ? INK : RED;
+        num_col = fg_on ? INK : RED;
         if (sel) { fill_round(c, x, y, w, h, 22, INK); fill_round(c, x + 8, y + 8, w - 16, h - 16, 15, bg); }
         else fill_round(c, x, y, w, h, 22, bg);
-        if (!sel && (g->testing || !g->installed || g->experimental)) dashed_rect(c, x, y, w, h, 4, 14, INK);
+        if (!sel && (a->turned_off || g->testing || !g->installed || g->experimental)) dashed_rect(c, x, y, w, h, 4, 14, INK);
     }
     int p = 22, isz = w - 2 * p;
     if (g->icon) blit_scaled(c, g->icon, g->iw, g->ih, x + p, y + p, isz, isz, 11);
@@ -282,12 +289,13 @@ static void draw_card(Canvas *c, App *a, Game *g, int idx, int x, int y, int w, 
     fill_rect(c, x + p, ry, isz, 4, bar_col);
     char lab[48] = "";
     if (!g->installed) cat(lab, "NOT INSTALLED");
+    else if (a->turned_off) cat(lab, "VCFG TURNED OFF");
     else if (g->testing) cat(lab, "UNSTABLE, OFF");
     else if (g->experimental) cat(lab, g->s.fg ? "EXPERIMENTAL" : "EXPERIMENTAL, OFF");
     else if (!g->s.fg) cat(lab, "FG OFF");
     else cat(lab, mode_name(g->s.preset));
     draw_text(c, &f->mono, x + p, y + h - 30, lab, fg_ink, 1);
-    const char *num = (g->installed && g->s.fg) ? "60" : "30";
+    const char *num = fg_on ? "60" : "30";
     int nw = text_width(&f->num, num, -3);
     draw_text(c, &f->num, x + w - p - nw, y + h - 26, num, num_col, -3);
 }
@@ -411,9 +419,9 @@ static void draw_install(Canvas *c, App *a, int top)
     int y = top + 58, w = c->w - 2 * M, gap = 24;
     static const char *states[3] = { "NOT INSTALLED", "UP TO DATE", "NEEDS UPDATE" };
     int dw = 390, tw = 450, pw = w - dw - tw - 2 * gap;
-    fill_round(c, M, y, pw, 230, 22, a->plugin_state == 1 ? YEL : RED);
+    fill_round(c, M, y, pw, 230, 22, (!a->turned_off && a->plugin_state == 1) ? YEL : RED);
     draw_text(c, &f->mono, M + 30, y + 56, "PLUGIN ON THIS CONSOLE", INK, 1);
-    const char *st_txt = states[a->plugin_state % 3];
+    const char *st_txt = a->turned_off ? "TURNED OFF" : states[a->plugin_state % 3];
     Face *st_face = text_width(&f->big, st_txt, -6) <= pw - 50 ? &f->big : &f->logo;
     draw_text_clip(c, st_face, M + 30, y + 190, pw - 50, st_txt, INK, -6);
 
@@ -440,7 +448,7 @@ static void draw_install(Canvas *c, App *a, int top)
     draw_text(c, &f->title, M, ly, "The app installs and updates the plugin automatically on startup. Cross repeats that if needed.", th.ink, 0);
     draw_text(c, &f->title, M, ly + 50, "Triangle: toggle full boot/API debug log. L2: toggle automatic network crash report upload to VPS.", th.ink, 0);
     draw_text(c, &f->title, M, ly + 100, "Circle: save /data/vcfg_report.txt and upload it to VPS (shows a 6-character #ID on screen).", th.ink, 0);
-    draw_text(c, &f->title, M, ly + 150, "R2 twice: delete every VCFG file (plugins, settings, logs) from this console. Square: turn VCFG off.", th.ink, 0);
+    draw_text(c, &f->title, M, ly + 150, "R2 twice / Square: uninstall VCFG (plugins, settings; logs kept) from this console.", th.ink, 0);
     for (int i = 0; i < a->nlog; i++) draw_text(c, &f->mono, M, ly + 212 + i * 40, a->log[i], th.dim, 1);
     if (a->status[0]) draw_text(c, &f->mono, M, c->h - FOOT - 40, a->status, a->dark_theme ? YEL : INK, 1);
 }

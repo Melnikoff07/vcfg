@@ -82,7 +82,7 @@ int32_t sceVideoOutGetFlipStatus_hook(int32_t h, VoFlipStatus *s)
             __atomic_store_n(&g_tb_last_p, s->flipPendingNum, __ATOMIC_RELAXED);
             __atomic_store_n(&g_tb_last_g, s->gcQueueNum, __ATOMIC_RELAXED);
             if (vq_active()) {   // one queue entry per real frame: our generated frame is not the game's
-                int on_our_buf = (g_mbase > 0 && s->currentBuffer >= g_mbase);
+                int on_our_buf = (g_mbuf_state == 1 && g_mbase > 0 && s->currentBuffer >= g_mbase && s->currentBuffer < g_nbuf);
                 if (on_our_buf && s->flipPendingNum == 1 && s->gcQueueNum == 0) {
                     s->flipPendingNum = 0;
                 } else if (s->flipPendingNum > 0) {

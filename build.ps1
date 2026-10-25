@@ -33,7 +33,7 @@ $inc = @('-isysroot', $tc, '-isystem', "$tc\include", "-I$sdk\include", "-I$src\
 $def = @('-D_BSD_SOURCE=1', '-D__BSD_VISIBLE=1', '-D__PS4__=1', '-DOO=1', '-D__OPENORBIS__=1', '-D__OOPS4__=1', '-D__FINAL__=1', '-D__USE_PRINTF__')
 foreach ($d in $Defs) { $def += "-D$d" }
 $def += "-DVCFG_VER=$((Get-Content (Join-Path $root 'VERSION') -Raw).Trim())"   # shown in the trace / bug report
-$flags = @('--target=x86_64-pc-freebsd12-elf', '-fPIC', '-funwind-tables', '-Wno-c99-designator', '-Werror=format')
+$flags = @('--target=x86_64-pc-freebsd12-elf', '-fPIC', '-funwind-tables', "-ffile-prefix-map=$root=.", '-Wno-c99-designator', '-Werror=format')
 $objs = @()
 $srcs = @(Get-ChildItem "$src\common\*.c") + @(Get-ChildItem "$src\source\*.c")
 if ($Target -eq 'plugin') { $srcs += Get-Item (Join-Path $root 'overlay/vov.c') }   # in-game overlay renderer
@@ -47,8 +47,13 @@ $libs = @('-lSceLibcInternal', '-lSceGnmDriver', '-lSceVideoOut', '-lScePad', '-
 $elf = Join-Path $out "$Name.elf"
 & $ld '-m' 'elf_x86_64' '-pie' '-e' '_init' '--script' "$tc\link.x" '--eh-frame-hdr' '-L' "$tc\lib" '-L' $sdk "$sdk\build\crtprx.o" @objs @libs '-o' $elf
 if ($LASTEXITCODE -ne 0) { throw 'Link failed' }
-& "$tc\bin\windows\create-fself.exe" "-in=$elf" "-out=$out\$Name.oelf" "-lib=$out\$Name.prx" '--paid' '0x3800000000000011'
-if ($LASTEXITCODE -ne 0) { throw 'create-fself failed' }
+Push-Location $out
+try {
+    & "$tc\bin\windows\create-fself.exe" "-in=$Name.elf" "-out=$Name.oelf" "-lib=$Name.prx" '--paid' '0x3800000000000011'
+    if ($LASTEXITCODE -ne 0) { throw 'create-fself failed' }
+} finally {
+    Pop-Location
+}
 if ($Target -eq 'plugin') {
     # Shader arrays must be byte-identical to the headers (never text-edit machine arrays).
     & $cfg.python -I (Join-Path $root 'tools\elf_arrays.py') $elf (Join-Path $src 'source')

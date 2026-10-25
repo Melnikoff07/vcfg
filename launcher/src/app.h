@@ -129,6 +129,7 @@ typedef struct {
     char log[6][96]; int nlog;
     int dirty;
     int clean_armed;                                     // Install tab: R2 pressed once, a second R2 deletes every VCFG file
+    int turned_off;                                      // 1 while /data/bb_probe/vcfg_off exists (VCFG disabled until Cross on 04 PLUGIN)
     Fonts *f;
 } App;
 

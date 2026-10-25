@@ -55,6 +55,19 @@ static int fclose(FILE *f) { return 0; }
 static int rename(const char *a, const char *b) { return 0; }
 #define LOG_DIR "/unused"
 #define VCFG_BENCH_SOURCE_HASH "0000000000000000000000000000000000000000000000000000000000000000"
+#define BLOG(...) ((void)0)
+typedef long off_t;
+static void klog(const char *fmt, ...) {}
+static int sceKernelOpen(const char *p, int f, int m) { return -1; }
+static long sceKernelRead(int fd, void *b, size_t n) { return 0; }
+static int sceKernelClose(int fd) { return 0; }
+static size_t sceKernelGetDirectMemorySize(void) { return 0x100000000ull; }
+static int sceKernelAllocateDirectMemory(long s, long e, size_t l, size_t a, int t, long *p) { *p = 0; return -1; }
+static int sceKernelMapDirectMemory(void **a, size_t l, int p, int f, long ph, size_t al) { return -1; }
+static int sceKernelMapFlexibleMemory(void **a, size_t l, int p, int f) { return -1; }
+static int sceKernelAvailableDirectMemorySize(long s, long e, size_t a, long p, size_t z) { return 0; }
+static int sceKernelAvailableFlexibleMemorySize(size_t z) { return 0; }
+extern int sscanf(const char *, const char *, ...);
 static uint64_t sceKernelGetProcessTimeCounter(void) { return 123; }
 static int sceKernelMkdir(const char *p, int mode) { return 0; }
 static void lg(const char *fmt, ...) {}
@@ -71,6 +84,8 @@ static void gv_fill_table(uint32_t *p, uint32_t s, uint32_t k) {}
 static int gv_pass_active(void) { return 0; }
 static int gv_warp_active(void) { return 0; }
 static int gv_viz_active(void) { return 0; }
+static uint32_t cut_blocks8(void) { return 0; }
+static int post_mid_only(void) { return 1; }
 static unsigned waits, overlays;
 static int insert_wait_flip_done(uint32_t *p, uint32_t n, int32_t h, uint32_t i) { waits++; memset(p,0,28); return 0; }
 static void osd_build_slot(uint8_t *p, uint32_t *x, uint32_t *w, uint32_t flags) { overlays++; *w=1; }
@@ -79,7 +94,9 @@ static uint8_t surfaces[0x1000000];
 static uint8_t *g_gpu=gpu_mem, *g_work=work_mem, *g_dump_mem=raw_mem;
 static uint32_t mon[4], *g_mon=mon;
 static uint32_t g_hud_packed, g_sh8_off[17], g_dump_frame, g_flips;
-static int g_dump_req=1, g_fence_logged, g_fg_off=1;
+static uint64_t g_pyr_last_cur_base;
+static uint32_t g_pyr_last_w, g_pyr_last_h, g_pyr_parity;
+static int g_dump_req=1, g_fence_logged, g_fg_off=1, g_mem_tight=0;
 static int g_opt_phase, g_opt_marker, g_opt_nocf, g_opt_nofgk, g_opt_noanc, g_opt_notp, g_opt_nomf;
 static int g_opt_notex, g_opt_notpg, g_opt_sharp, g_opt_nostr;
 static int g_bench_enabled=1, g_bench_offscreen, g_gpu_state=1, g_sh8_ok=1;
@@ -109,7 +126,7 @@ static int test_submit(uint32_t count, void **d, uint32_t *z, void **c, uint32_t
 struct = re.search(r'typedef struct \{.*?\} fg_config_t;', text, re.S)[0]
 attr = re.search(r'typedef struct \{\s*uint32_t format,.*?\} VoAttr;', text, re.S)[0]
 pieces = [prefix, struct, attr, 'static fg_config_t g_cfg; static VoAttr g_attr;',
-          '#include "shaders.h"', '#include "bench_shaders.h"', '#include "fg8_table.h"',
+          '#include "shaders.h"', '#include "bench_shaders.h"', '#include "fg_res.h"', '#include "fg8_table.h"',
           'const uint8_t *vov_pal_ptr(void) {return NULL;} const uint8_t *vov_pix_ptr(void){return NULL;}']
 pieces += [define(n) for n in ['SLOT0', 'SLOT_SZ', 'STATS_OFF', 'WORK_SZ', 'DUMP_DONE_OFF', 'DCB8_OFF', 'DCB8_SZ',
                               'PKT3', 'TS_EOP', 'TS2', 'PASS_BARRIER', 'SET_PASS']]
@@ -165,7 +182,14 @@ int main(void) {
     if(frame(240,100000) || writes || g_bench_state!=BENCH_WRITE)return 12;
     reset(960,40,1,1);frame(240,100000);frame(241,116683);frame(242,133366);
     if(frame(841,10000000) || g_bench_state!=BENCH_STOP)return 13;
-    printf("capture host checks passed; max appended DCB %u / 8192 bytes\n",max_bytes);
+    memcpy(g_title_id,"CUSA03041",10);g_ema_frame_us=33366;g_osd_real_fps_x10=300;
+    reset(1920,40,1,0);
+    if(frame(240,100000) || g_bench_state!=BENCH_GT)return 14;
+    if(frame(241,133366) || g_bench_state!=BENCH_B)return 15;
+    if(frame(242,166732) || g_bench_state!=BENCH_WAIT)return 16;
+    *(uint64_t *)(g_gpu+DUMP_DONE_OFF)=g_bench_cookie;
+    bench_io_tick();if(writes!=5 || g_bench_state!=BENCH_DONE)return 17;
+    printf("capture host checks passed (60Hz + 30Hz); max appended DCB %u / 8192 bytes\n",max_bytes);
     return 0;
 }
 ''']

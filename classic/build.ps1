@@ -23,7 +23,7 @@ if ($Bench) {
 [IO.File]::WriteAllText("$PSScriptRoot/source/git_ver.h", "#define GIT_COMMIT `"vcfg`"`n#define GIT_VER `"vcfg`"`n#define GIT_NUM 0`n#define BUILD_DATE `"vcfg`"`n")
 if ($Bench) { Run $cfg.python @('-I', "$PSScriptRoot/bench/build_id.py", $out) }
 # Deliberately no optimization: optimized classic builds regressed CUSA00207.
-$flags = @('--target=x86_64-pc-freebsd12-elf', '-fPIC', '-funwind-tables', '-isysroot', $tc,
+$flags = @('--target=x86_64-pc-freebsd12-elf', '-fPIC', '-funwind-tables', "-ffile-prefix-map=$root=.", '-isysroot', $tc,
     '-isystem', "$tc/include", "-I$sdk/include", "-I$PSScriptRoot/source", "-I$root/overlay",
     '-Wno-c99-designator', '-D_BSD_SOURCE=1', '-D__BSD_VISIBLE=1', '-D__PS4__=1', '-DOO=1',
     '-D__OPENORBIS__=1', '-D__OOPS4__=1', '-D__FINAL__=1', '-D__USE_PRINTF__', "-DVCFG_VER=$ver", "-DVCFG_2BUF_TEST=$Test",
@@ -39,7 +39,12 @@ Run "$ll/ld.lld.exe" (@("$sdk/build/crtprx.o") + $objects + @('-o', "$out/vcfg_c
     '-pie', '-e', '_init', '--script', "$tc/link.x", '--eh-frame-hdr', "-L$tc/lib", "-L$sdk",
     '-lSceLibcInternal', '-lSceGnmDriver', '-lSceVideoOut', '-lScePad', '-lGoldHEN_Hook', '-lkernel',
     '-lSceSysmodule', '-lSceSystemService', '-lSceUserService'))
-Run "$tc/bin/windows/create-fself.exe" @("-in=$out/vcfg_classic.elf", "-out=$out/vcfg_classic.oelf", "-lib=$out/vcfg_classic.prx", '--paid', '0x3800000000000011')
+Push-Location $out
+try {
+    Run "$tc/bin/windows/create-fself.exe" @('-in=vcfg_classic.elf', '-out=vcfg_classic.oelf', '-lib=vcfg_classic.prx', '--paid', '0x3800000000000011')
+} finally {
+    Pop-Location
+}
 Get-Item "$out/vcfg_classic.prx" | Select-Object FullName, Length
 Write-Host "SHA256 $((Get-FileHash "$out/vcfg_classic.prx" -Algorithm SHA256).Hash)"
 if (-not $Bench -and $Test -eq 0) {

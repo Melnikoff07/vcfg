@@ -415,9 +415,99 @@ static int count_substr(const char *s, const char *needle)
     while ((p = strstr(p, needle)) != NULL) { c++; p += l; }
     return c;
 }
+static int last_reg_buf_num(const char *s)
+{
+    if (!s) return 0;
+    int last = 0;
+    const char *p = s;
+    while ((p = strstr(p, "num=")) != NULL) {
+        p += 4;
+        int v = atoi(p);
+        if (v > 0) last = v;
+    }
+    return last;
+}
+static const char *rec_shave_label(int m)
+{
+    return m == 2 ? "LATE (F120)" : (m == 1 ? "VALVE ONLY" : "EARLIEST");
+}
+static const char *rec_reg_label(int m, int long_form)
+{
+    return m == 2 ? (long_form ? "DEFERRED (F120)" : "DEFER REG") : (m == 1 ? "TOP GROUP" : "ALL BUFFERS");
+}
+static int is_tp_prx_name(const char *name)
+{
+    if (!name || !name[0]) return 0;
+    if (!strstr(name, ".prx")) return 0;
+    if (!strncmp(name, "libSce", 6) || !strncmp(name, "libkernel", 9) ||
+        !strcmp(name, "libc.prx") || !strncmp(name, "vcfg", 4) ||
+        !strncmp(name, "bb_probe", 8) || !strncmp(name, "GoldHEN", 7) ||
+        !strcmp(name, "eboot.bin") || !strcmp(name, "PS4Util.prx") ||
+        !strcmp(name, "Il2CppUserAssemblies.prx") || !strcmp(name, "MonoAssembliesPS4.prx") ||
+        !strcmp(name, "fullgame.prx") || !strcmp(name, "gnmscale_plugin.prx") ||
+        !strcmp(name, "gs_resident_plugin.prx") || !strcmp(name, "steamnetworkingsockets.prx") ||
+        !strcmp(name, "Party.prx") || !strcmp(name, "logiWheel.prx") ||
+        !strncmp(name, "EOSSDK", 6) || !strncmp(name, "libfmod", 7) || !strncmp(name, "libAk", 5))
+        return 0;
+    return 1;
+}
+static int extract_third_party_prx(const char *cs, char *out, size_t cap)
+{
+    out[0] = 0;
+    if (!cs || !*cs || cap < 2) return 0;
+    const char *m = strstr(cs, "THIRD_PARTY_PRX_FAULT:");
+    if (m) {
+        const char *q = strstr(m, "module='");
+        if (q) {
+            q += 8;
+            size_t i = 0;
+            while (q[i] && q[i] != '\'' && q[i] != '\r' && q[i] != '\n' && i + 1 < cap) {
+                out[i] = q[i];
+                i++;
+            }
+            out[i] = 0;
+            if (out[0] && strcmp(out, "unknown") != 0) return 1;
+            out[0] = 0;
+        }
+    }
+    const char *limit = strstr(cs, "LOADED MODULES");
+    const char *p = cs;
+    while ((p = strstr(p, ".prx")) != NULL) {
+        if (limit && p >= limit) break;
+        const char *end = p + 4;
+        if (*end == '+') {
+            const char *beg = p;
+            while (beg > cs) {
+                char c = beg[-1];
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')
+                    beg--;
+                else
+                    break;
+            }
+            size_t len = (size_t)(end - beg);
+            if (len > 4 && len < cap) {
+                char cand[64];
+                if (len < sizeof(cand)) {
+                    memcpy(cand, beg, len);
+                    cand[len] = 0;
+                    if (is_tp_prx_name(cand)) {
+                        snprintf(out, cap, "%s", cand);
+                        return 1;
+                    }
+                }
+            }
+        }
+        p = end;
+    }
+    if (m) {
+        snprintf(out, cap, "3rd-party.prx");
+        return 1;
+    }
+    return 0;
+}
 static void refresh_dev_status(Game *g)
 {
-    char path[96]; size_t n = 0, bn = 0, tn = 0;
+    char path[96]; size_t n = 0, an = 0, bn = 0, tn = 0;
     DevCfg *d = &g->dev;
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id);
     unsigned char *sb = read_all(path, &n);
@@ -427,7 +517,8 @@ static void refresh_dev_status(Game *g)
     d->safe_state = raw_safe > 0 ? raw_safe : d->had_watchdog;
 
     snprintf(path, sizeof(path), CFGDIR "/adapt-%s.ini", g->id);
-    d->has_adapt = file_exists(path);
+    unsigned char *ab = read_all(path, &an);
+    d->has_adapt = ab != NULL;
     snprintf(path, sizeof(path), CFGDIR "/crash-%s.txt", g->id);
     unsigned char *cb = read_all(path, &n);
     d->has_crash = cb != NULL;
@@ -472,6 +563,7 @@ static void refresh_dev_status(Game *g)
     snprintf(d->step2, sizeof(d->step2), "2. Press SQUARE to launch %s and test.", g->id);
     snprintf(d->step3, sizeof(d->step3), "3. If an issue occurs, return here and press R2.");
 
+    const char *as = ab ? (const char *)ab : "";
     const char *cs = cb ? (const char *)cb : "";
     const char *bs = bb ? (const char *)bb : "";
     const char *ts = tb ? (const char *)tb : "";
@@ -481,17 +573,37 @@ static void refresh_dev_status(Game *g)
     if (d->n_tail < 4 && bb) add_tail_lines(d, bs);
 
     // Deterministic log-based telemetry (never depends on live UI sliders so R2 is 100% idempotent):
-    int logged_shave   = kv_uint_after(bs, "shave_mode=", 0);
-    int logged_reg     = kv_uint_after(bs, "reg_mode=", 0);
-    int logged_pace    = kv_uint_after(bs, "pace_order=", 0);
-    int is_2b_log      = (strstr(bs, "num=2") != NULL || strstr(ts, "count=2") != NULL ||
-                          strstr(ts, "double-buffered game") != NULL || strstr(ts, "1x1_gv_fallback") != NULL ||
-                          strstr(bs, " 1x1 ") != NULL || auto_2buf(g->id));
+    int logged_shave   = kv_uint_after(cs, "shave_mode=", kv_uint_after(bs, "shave_mode=", 0));
+    int logged_reg     = kv_uint_after(cs, "reg_mode=", kv_uint_after(bs, "reg_mode=", 0));
+    int logged_pace    = kv_uint_after(cs, "pace_order=", kv_uint_after(bs, "pace_order=", 0));
+    int shave2_failed  = (ini_int(as, "shave2_failed", 0) > 0 ||
+                          (ab && ini_int(as, "shave_mode", 0) == 2 && ini_int(as, "adapt_ver", 0) < 234) ||
+                          strstr(cs, "shave2_failed=1") != NULL || strstr(bs, "shave2_failed=1") != NULL);
+    int no_shave2      = (logged_shave == 2 || shave2_failed);
+    int last_num_b     = last_reg_buf_num(bs);
+    int last_num_t     = last_reg_buf_num(ts);
+    int last_num_c     = kv_uint_after(cs, "ngame=", 0);
+    int has_3buf       = (last_num_b >= 3 || last_num_t >= 3 || last_num_c >= 3);
+    int is_2b_log      = auto_2buf(g->id) ||
+                         (!has_3buf && (last_num_b == 2 || last_num_t == 2 ||
+                                        strstr(bs, "(count=2)") != NULL || strstr(ts, "(count=2)") != NULL ||
+                                        strstr(ts, "double-buffered game") != NULL || strstr(ts, "1x1_gv_fallback") != NULL ||
+                                        strstr(bs, " 1x1 ") != NULL));
     int multi_reg      = count_substr(bs, "RegisterBuffers enter:") + count_substr(ts, "RegisterBuffers handle=");
-    int has_shave_log  = (strstr(bs, "arena shave OK") != NULL || strstr(bs, "shave=1") != NULL);
+    int has_shave_log  = (strstr(bs, "arena shave #") != NULL ||
+                          kv_uint_after(cs, "shave=", kv_uint_after(bs, "shave=", 0)) > 0);
     int has_vout_only  = (strstr(ts, "flips via sceVideoOutSubmitFlip") != NULL || strstr(ts, "vout_flip") != NULL);
-    int has_60fps_inert= (strstr(ts, "60FPS NATIVE") != NULL || strstr(ts, "detected_60fps=1") != NULL);
-    int has_hdr_inert  = (strstr(ts, "HDR/FMT") != NULL);
+    int has_60fps_inert= (strstr(ts, "60FPS NATIVE") != NULL || strstr(ts, "detected_60fps=1") != NULL || strstr(bs, "60FPS NATIVE") != NULL);
+    int has_hdr_inert  = (strstr(ts, "HDR/FMT") != NULL || strstr(bs, "HDR/FMT") != NULL);
+    int has_safe_mem   = (strstr(bs, "SAFE NO WORK MEM") != NULL || strstr(ts, "SAFE NO WORK MEM") != NULL ||
+                          strstr(bs, "refused (NO WORK MEM)") != NULL || strstr(ts, "NO WORK MEM") != NULL ||
+                          strstr(bs, "SAFE NO DISPLAY MEM") != NULL || strstr(ts, "SAFE NO DISPLAY MEM") != NULL ||
+                          strstr(bs, "refused (NO DISPLAY MEM)") != NULL || strstr(ts, "NO DISPLAY MEM") != NULL ||
+                          strstr(bs, "SAFE NO GPU MEM") != NULL || strstr(ts, "SAFE NO GPU MEM") != NULL ||
+                          strstr(bs, "refused (NO GPU MEM)") != NULL || strstr(ts, "NO GPU MEM") != NULL);
+    int has_inert_log  = (has_safe_mem || has_hdr_inert || has_60fps_inert ||
+                          strstr(bs, "INERT:") != NULL || strstr(ts, "INERT:") != NULL ||
+                          strstr(bs, "refused (") != NULL || strstr(ts, "safe mode: refused") != NULL);
     unsigned pace_to   = (unsigned)kv_uint_after(ts, "pace timeouts ", 0);
     unsigned missed_vb = (unsigned)kv_uint_after(ts, "missed ", 0);
     int fg_ran         = (strstr(ts, "mode4 #") != NULL || strstr(ts, "vout fg #") != NULL ||
@@ -504,57 +616,71 @@ static void refresh_dev_status(Game *g)
         unsigned flips = (unsigned)kv_uint_after(cs, "flips=", 0);
         int in_sub     = kv_uint_after(cs, "in_submit=", 0);
         int afail      = kv_uint_after(cs, "alloc_fail=", 0);
+        char tp_name[64];
+        int tp_prx     = extract_third_party_prx(cs, tp_name, sizeof(tp_name));
         int oom = afail > 0 || strstr(cs, "AllocateDirectMemory") || strstr(cs, "MapDirectMemory") ||
                   strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory") || strstr(bs, "[LOWMEM] valve=0");
-        if (oom) {
+        if (tp_prx) {
+            d->diag_kind  = DIAG_BOOT_EARLY;
+            d->rec_manual = 0;
+            snprintf(d->diag_cause, sizeof(d->diag_cause), "%s IN %s (3RD-PARTY PRX)", sig, tp_name);
+            snprintf(d->diag_stage, sizeof(d->diag_stage), "EXTERNAL GOLDHEN PLUGIN FAULT");
+            snprintf(d->diag_advice, sizeof(d->diag_advice), "CHECK / DISABLE %s IN PLUGINS.INI", tp_name);
+            snprintf(d->diag_detail, sizeof(d->diag_detail),
+                     "Crash (%s at flip %u) occurred inside third-party plugin %s, not inside VCFG.",
+                     sig, flips, tp_name);
+            snprintf(d->step1, sizeof(d->step1), "1. Fault address is inside %s.", tp_name);
+            snprintf(d->step2, sizeof(d->step2), "2. Update or disable %s for %s in plugins.ini.", tp_name, g->id);
+            snprintf(d->step3, sizeof(d->step3), "3. Press TRIANGLE to keep VCFG on AUTO.");
+        } else if (oom) {
             d->diag_kind      = DIAG_OOM_BOOT;
             d->rec_manual     = 1;
             d->rec_eng_sel    = (g->engine == ENGINE_NEW) ? SEL_NEW : SEL_ALT;
             d->rec_buf_sel    = is_2b_log ? BUF_2BUF : BUF_AUTO;
-            d->rec_shave_mode = (flips == 0 && logged_shave >= 1) ? 2 : (has_shave_log ? 1 : 2);
-            d->rec_reg_mode   = (flips == 0) ? 2 : 1;
+            d->rec_shave_mode = no_shave2 ? 0 : ((flips == 0 && logged_shave >= 1) ? 2 : (has_shave_log ? 1 : 2));
+            d->rec_reg_mode   = (flips == 0 && no_shave2) ? 0 : ((flips == 0) ? 2 : 1);
             d->rec_pace_order = is_2b_log ? 3 : 2;
             d->rec_post_mid   = 1;
             d->rec_row        = 2;
             snprintf(d->diag_cause, sizeof(d->diag_cause), "%s: GPU / DIRECT MEM OOM", sig);
             snprintf(d->diag_stage, sizeof(d->diag_stage), "VRAM EXHAUSTED AT FLIP %u", flips);
             snprintf(d->diag_advice, sizeof(d->diag_advice), "ALT + %s + %s (R2: APPLY ALL)",
-                     d->rec_shave_mode == 1 ? "VALVE ONLY" : "LATE (F120)",
-                     d->rec_reg_mode == 1 ? "TOP GROUP" : "DEFER REG");
+                     rec_shave_label(d->rec_shave_mode),
+                     rec_reg_label(d->rec_reg_mode, 0));
             snprintf(d->diag_detail, sizeof(d->diag_detail),
                      "DirectMemory conflict (%s at flip %u, alloc_fail=%d). Press R2 to apply ALT low-VRAM engine + %s + %s + MID ONLY.",
                      sig, flips, afail,
-                     d->rec_shave_mode == 1 ? "VALVE ONLY" : "LATE (F120)",
-                     d->rec_reg_mode == 1 ? "TOP GROUP" : "DEFERRED (F120)");
+                     rec_shave_label(d->rec_shave_mode),
+                     rec_reg_label(d->rec_reg_mode, 1));
             snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply the full Low-VRAM Advisor profile.");
             snprintf(d->step2, sizeof(d->step2), "2. Sets ALT Engine + %s + %s.",
-                     d->rec_shave_mode == 1 ? "VALVE ONLY" : "LATE (F120)",
-                     d->rec_reg_mode == 1 ? "TOP GROUP" : "DEFERRED");
+                     rec_shave_label(d->rec_shave_mode),
+                     rec_reg_label(d->rec_reg_mode, 1));
             snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to re-test the game.");
         } else if (flips == 0 || strstr(cs, "RegisterBuffers") || strstr(cs, "BatchMap")) {
             d->diag_kind      = DIAG_BOOT_EARLY;
             d->rec_manual     = 1;
             d->rec_eng_sel    = (g->engine == ENGINE_NEW) ? SEL_NEW : SEL_ALT;
             d->rec_buf_sel    = is_2b_log ? BUF_2BUF : BUF_AUTO;
-            d->rec_shave_mode = (strstr(cs, "RegisterBuffers") || strstr(bs, "BatchMap")) ? 1 : 2;
-            d->rec_reg_mode   = (logged_reg == 1) ? 2 : 1;
+            d->rec_shave_mode = no_shave2 ? 0 : ((strstr(cs, "RegisterBuffers") || strstr(bs, "BatchMap")) ? 1 : 2);
+            d->rec_reg_mode   = no_shave2 ? 0 : ((logged_reg == 1) ? 2 : 1);
             d->rec_pace_order = is_2b_log ? 3 : 2;
             d->rec_post_mid   = 1;
             d->rec_row        = (d->rec_shave_mode == 2) ? 2 : 3;
             snprintf(d->diag_cause, sizeof(d->diag_cause), "%s BEFORE FIRST FRAME", sig);
             snprintf(d->diag_stage, sizeof(d->diag_stage), "EARLY BOOT / BUFFER REG HOOK");
             snprintf(d->diag_advice, sizeof(d->diag_advice), "ALT + %s + %s (R2: APPLY ALL)",
-                     d->rec_shave_mode == 2 ? "LATE (F120)" : "VALVE ONLY",
-                     d->rec_reg_mode == 2 ? "DEFER (F120)" : "TOP GROUP");
+                     rec_shave_label(d->rec_shave_mode),
+                     rec_reg_label(d->rec_reg_mode, 0));
             snprintf(d->diag_detail, sizeof(d->diag_detail),
                      "Crash (%s) during engine init before frame 1. Press R2 to isolate display buffers in %s and use %s memory hook.",
                      sig,
-                     d->rec_reg_mode == 2 ? "DEFERRED (F120)" : "TOP GROUP (16-N)",
-                     d->rec_shave_mode == 2 ? "LATE (F120)" : "VALVE ONLY");
+                     rec_reg_label(d->rec_reg_mode, 1),
+                     rec_shave_label(d->rec_shave_mode));
             snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply the full Boot-Safe Advisor profile.");
             snprintf(d->step2, sizeof(d->step2), "2. Sets ALT + %s + %s.",
-                     d->rec_shave_mode == 2 ? "LATE (F120)" : "VALVE ONLY",
-                     d->rec_reg_mode == 2 ? "DEFERRED (F120)" : "TOP GROUP");
+                     rec_shave_label(d->rec_shave_mode),
+                     rec_reg_label(d->rec_reg_mode, 1));
             snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to test boot stability.");
         } else if (in_sub || strstr(cs, "SubmitAndFlip") || strstr(cs, "SubmitDone") ||
                    strstr(cs, "VideoOutSubmitFlip") || strstr(cs, "WaitOnAddress")) {
@@ -599,12 +725,12 @@ static void refresh_dev_status(Game *g)
                      d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
             snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to verify stability.");
         }
-    } else if (d->safe_state > 0) {
+    } else if (d->safe_state > 0 && !has_inert_log && !fg_ran) {
         d->diag_kind      = DIAG_BOOT_EARLY;
         d->rec_manual     = 1;
         d->rec_eng_sel    = (g->engine == ENGINE_NEW) ? SEL_NEW : SEL_ALT;
         d->rec_buf_sel    = is_2b_log ? BUF_2BUF : BUF_AUTO;
-        d->rec_shave_mode = (multi_reg >= 2) ? 1 : 2;
+        d->rec_shave_mode = no_shave2 ? 0 : ((multi_reg >= 2) ? 1 : 2);
         d->rec_reg_mode   = 1;
         d->rec_pace_order = is_2b_log ? 3 : 2;
         d->rec_post_mid   = 1;
@@ -614,15 +740,15 @@ static void refresh_dev_status(Game *g)
         snprintf(d->diag_stage, sizeof(d->diag_stage),
                  d->safe_state >= 2 ? "FG PAUSED BY SAFE WATCHDOG" : "AUTO-DEFERRED TO FRAME 120");
         snprintf(d->diag_advice, sizeof(d->diag_advice), "ALT + %s + TOP GROUP (R2: APPLY)",
-                 d->rec_shave_mode == 2 ? "LATE (F120)" : "VALVE ONLY");
+                 rec_shave_label(d->rec_shave_mode));
         snprintf(d->diag_detail, sizeof(d->diag_detail),
                  "Watchdog detected %s before frame 120 (safe_state=%d). Press R2 to apply the full Boot-Safe Advisor profile and clear watchdog.",
                  d->safe_state >= 2 ? "2+ incomplete boots" : "an incomplete boot", d->safe_state);
         snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply ALT + %s + TOP GROUP.",
-                 d->rec_shave_mode == 2 ? "LATE (F120)" : "VALVE ONLY");
+                 rec_shave_label(d->rec_shave_mode));
         snprintf(d->step2, sizeof(d->step2), "2. Or press TRIANGLE to restore AUTO (ALGORITHM).");
         snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch and test.");
-    } else if (strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory") || strstr(ts, "work memory: none") || strstr(bs, "alloc_dm FAIL")) {
+    } else if (has_safe_mem || strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory") || strstr(ts, "work memory: none") || strstr(bs, "alloc_dm FAIL")) {
         d->diag_kind      = DIAG_OOM_BOOT;
         d->rec_manual     = 1;
         d->rec_eng_sel    = SEL_ALT;
@@ -632,7 +758,8 @@ static void refresh_dev_status(Game *g)
         d->rec_pace_order = is_2b_log ? 3 : 2;
         d->rec_post_mid   = 1;
         d->rec_row        = 1;
-        snprintf(d->diag_cause, sizeof(d->diag_cause), "GPU WORK MEMORY ALLOC FAILED");
+        snprintf(d->diag_cause, sizeof(d->diag_cause),
+                 has_safe_mem ? "INERT: SAFE NO WORK / DISPLAY MEM" : "GPU WORK MEMORY ALLOC FAILED");
         snprintf(d->diag_stage, sizeof(d->diag_stage), "NOT ENOUGH FREE DIRECT MEMORY");
         snprintf(d->diag_advice, sizeof(d->diag_advice), "ALT ENGINE + VALVE+SHAVE + TOP GROUP (R2)");
         snprintf(d->diag_detail, sizeof(d->diag_detail),
@@ -799,7 +926,7 @@ static void refresh_dev_status(Game *g)
         }
     }
 
-    free(cb); free(bb); free(tb);
+    free(ab); free(cb); free(bb); free(tb);
 }
 static void load_settings(App *a)
 {
@@ -845,12 +972,22 @@ static void load_settings(App *a)
         Game *g = &a->games[i]; g->s = a->defaults; if (g->testing || g->experimental) g->s.fg = 0;
         memset(&g->dev, 0, sizeof(g->dev));
         if (g->eng_sel != SEL_AUTO || g->buf_sel != BUF_AUTO) g->dev.manual_mode = 1;
+        int shave2_failed = 0;
         snprintf(path, sizeof(path), CFGDIR "/adapt-%s.ini", g->id);
         unsigned char *ab = read_all(path, &n);
         if (ab) {
             const char *as = (const char *)ab;
-            g->dev.shave_mode = ini_int(as, "shave_mode", g->dev.shave_mode);
-            g->dev.reg_mode   = ini_int(as, "reg_mode", g->dev.reg_mode);
+            int sm_a = ini_int(as, "shave_mode", g->dev.shave_mode);
+            int rm_a = ini_int(as, "reg_mode", g->dev.reg_mode);
+            int av_a = ini_int(as, "adapt_ver", 0);
+            int s2f  = ini_int(as, "shave2_failed", 0);
+            if (s2f > 0 || (sm_a == 2 && av_a < 234)) shave2_failed = 1;
+            if (sm_a == 2 && shave2_failed) {
+                sm_a = 0;
+                rm_a = 0;
+            }
+            g->dev.shave_mode = sm_a;
+            g->dev.reg_mode   = rm_a;
             g->dev.pace_order = ini_int(as, "pace_order", g->dev.pace_order);
             free(ab);
         }
@@ -870,7 +1007,9 @@ static void load_settings(App *a)
                 int mm = ini_int(s, "manual_mode", 0);
                 if (mm > 0) g->dev.manual_mode = 1;
                 if (g->dev.manual_mode) {
-                    int sm = ini_int(s, "shave_mode", 0); if (sm > g->dev.shave_mode) g->dev.shave_mode = sm;
+                    int sm = ini_int(s, "shave_mode", 0);
+                    if (shave2_failed && sm == 2) sm = 0;
+                    if (sm > g->dev.shave_mode) g->dev.shave_mode = sm;
                     int rm = ini_int(s, "reg_mode", 0);   if (rm > g->dev.reg_mode)   g->dev.reg_mode   = rm;
                     int po = ini_int(s, "pace_order", 0); if (po > 0) g->dev.pace_order = po;
                     int pm = ini_int(s, "post_mid", 0);   if (pm > 0) g->dev.post_mid   = pm;
@@ -882,10 +1021,18 @@ static void load_settings(App *a)
         }
         refresh_dev_status(g);
     }
+    a->turned_off = file_exists(CFGDIR "/vcfg_off");
+    if (a->turned_off) snprintf(a->status, sizeof(a->status), "VCFG IS TURNED OFF - PRESS CROSS ON 04 PLUGIN TO ENABLE");
 }
 static void save_settings(App *a)
 {
     char buf[768], path[96];
+    if (file_exists(CFGDIR "/vcfg_off")) {
+        a->turned_off = 1;
+        snprintf(a->status, sizeof(a->status), "VCFG IS TURNED OFF - PRESS CROSS ON 04 PLUGIN TO ENABLE");
+        vlog("settings not saved: vcfg_off=1\n");
+        return;
+    }
     sceKernelMkdir(CFGDIR, 0777);
     const unsigned combo = menu_combo_sanitize(a->menu_combo);   // validated mask, written to every file the plugins read
     snprintf(buf, sizeof(buf),
@@ -955,6 +1102,12 @@ static void remap_if_changed(App *a);
 static void do_reset_dev(App *a)
 {
     if (!a->ngames) return;
+    if (file_exists(CFGDIR "/vcfg_off")) {
+        a->turned_off = 1;
+        snprintf(a->status, sizeof(a->status), "VCFG IS TURNED OFF - PRESS CROSS ON 04 PLUGIN TO ENABLE");
+        addlog(a, a->status);
+        return;
+    }
     Game *g = &a->games[a->sel];
     char path[96];
     g->eng_sel = SEL_AUTO;
@@ -974,11 +1127,17 @@ static void do_reset_dev(App *a)
 static void do_apply_advice(App *a)
 {
     if (!a->ngames) return;
+    if (file_exists(CFGDIR "/vcfg_off")) {
+        a->turned_off = 1;
+        snprintf(a->status, sizeof(a->status), "VCFG IS TURNED OFF - PRESS CROSS ON 04 PLUGIN TO ENABLE");
+        addlog(a, a->status);
+        return;
+    }
     Game *g = &a->games[a->sel];
     DevCfg *d = &g->dev;
     char path[96];
     refresh_dev_status(g);
-    if (d->rec_applied && g->s.fg) {
+    if (d->rec_applied && g->s.fg && !d->has_adapt) {
         snprintf(a->status, sizeof(a->status), "ADVISOR PROFILE ALREADY ACTIVE FOR %s (NO CHANGES)", g->id);
         addlog(a, a->status);
         return;
@@ -997,9 +1156,9 @@ static void do_apply_advice(App *a)
     if (focus_row >= 1 && focus_row <= 7) a->row = focus_row;
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id); remove(path);
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.boot", g->id);  remove(path);
+    snprintf(path, sizeof(path), CFGDIR "/adapt-%s.ini", g->id);  remove(path);
     if (!d->manual_mode) {
-        snprintf(path, sizeof(path), CFGDIR "/adapt-%s.ini", g->id); remove(path);
-        snprintf(path, sizeof(path), CFGDIR "/tile_%s", g->id);      remove(path);
+        snprintf(path, sizeof(path), CFGDIR "/tile_%s", g->id);   remove(path);
     }
     save_settings(a);
     remap_if_changed(a);
@@ -1071,7 +1230,7 @@ static void emit_new(Out *w, int t)
     if (g_map[t].prx) snprintf(b, sizeof(b), "[%s]\n" PLUG "%s\n", g_map[t].id, g_map[t].prx); else snprintf(b, sizeof(b), "[%s]\n", g_map[t].id);
     emit(w, b);
 }
-typedef struct { char hdr[512]; char body[8192]; size_t bn; int have, cur; } Section;
+typedef struct { char hdr[512]; char body[8192]; size_t bn; int have, cur, had_ours; } Section;
 static void sec_add(Section *s, const char *line)
 {
     size_t l = strlen(line); if (s->bn + l + 1 < sizeof(s->body)) { memcpy(s->body + s->bn, line, l); s->bn += l; s->body[s->bn++] = '\n'; }
@@ -1082,10 +1241,11 @@ static void sec_flush(Out *w, Section *s, int install, int *done)
     if (s->have) {
         int dup = s->cur >= 0 && done[s->cur];   // already written before [default]
         if (s->cur >= 0 && install && g_map[s->cur].prx && !dup) { char b[96]; snprintf(b, sizeof(b), PLUG "%s", g_map[s->cur].prx); sec_add(s, b); }
-        if (!(s->cur >= 0 && !s->bn && (dup || !g_map[s->cur].keep_empty))) { emit(w, s->hdr); emit(w, "\n"); s->body[s->bn] = 0; emit(w, s->body); }
+        int drop_empty = (s->cur >= 0) ? (!install || dup || !g_map[s->cur].keep_empty) : s->had_ours;
+        if (!(s->bn == 0 && drop_empty)) { emit(w, s->hdr); emit(w, "\n"); s->body[s->bn] = 0; emit(w, s->body); }
         if (s->cur >= 0) done[s->cur] = 1;
     }
-    s->have = 0; s->bn = 0; s->cur = -1;
+    s->have = 0; s->bn = 0; s->cur = -1; s->had_ours = 0;
 }
 static char *ini_update(const char *old, int install, size_t *outn)
 {
@@ -1107,7 +1267,7 @@ static char *ini_update(const char *old, int install, size_t *outn)
             snprintf(sec.hdr, sizeof(sec.hdr), "%s", line); sec.have = 1; sec.cur = map_of(s);
             continue;
         }
-        if (sec.cur >= 0 && ours(s)) continue;
+        if (ours(s)) { sec.had_ours = 1; continue; }
         if (!sec.have) { emit(&w, line); emit(&w, "\n"); continue; }
         sec_add(&sec, line);
     }
@@ -1160,6 +1320,8 @@ static uint64_t g_exp_written;
 static void do_install(App *a)
 {
     set_off(0);
+    a->turned_off = 0;
+    a->status[0] = 0;
     sceKernelMkdir("/data/GoldHEN/plugins", 0777); sceKernelMkdir(CFGDIR, 0777);
     for (int i = 0; i < (int)(sizeof(k_files) / sizeof(k_files[0])); i++) {
         char src[96], dst[96], m[96]; size_t n;
@@ -1189,7 +1351,20 @@ static void do_install(App *a)
     a->plugin_state = plugin_state();
 }
 
-// Delete every VCFG file: the plugins.ini mapping (backed up first), the plugin files, settings, traces and logs. The app stays off until Cross.
+// Delete every VCFG file except logs: the plugins.ini mapping, plugin binaries, settings, adapt/safe/tile/markers. The app stays off until Cross.
+static int is_vcfg_log_file(const char *name)
+{
+    if (!name || !name[0]) return 0;
+    size_t l = strlen(name);
+    if (l >= 4 && !strcmp(name + l - 4, ".log")) return 1;
+    if (!strncmp(name, "boot-", 5) && l >= 4 && !strcmp(name + l - 4, ".txt")) return 1;
+    if (!strncmp(name, "trace-", 6) && l >= 4 && !strcmp(name + l - 4, ".txt")) return 1;
+    if (!strncmp(name, "crash-", 6) && l >= 4 && !strcmp(name + l - 4, ".txt")) return 1;
+    if (!strncmp(name, "voutrace-", 9) && l >= 4 && !strcmp(name + l - 4, ".txt")) return 1;
+    if (!strncmp(name, "discovery", 9)) return 1;
+    if (!strcmp(name, "telemetry.ini")) return 1;
+    return 0;
+}
 static int clean_dir(const char *dir, const char *const *prefixes, int np, const char *suffix)
 {
     DIR *d = opendir(dir); if (!d) return 0; int n = 0; struct dirent *e;
@@ -1199,9 +1374,18 @@ static int clean_dir(const char *dir, const char *const *prefixes, int np, const
         for (int i = 0; i < np; i++) if (!strncmp(e->d_name, prefixes[i], strlen(prefixes[i]))) hit = 1;
         if (hit && suffix) { size_t l = strlen(e->d_name), q = strlen(suffix); if (l < q || strcmp(e->d_name + l - q, suffix)) hit = 0; }
         if (!hit) continue;
-        if (!strcmp(e->d_name, "telemetry.ini")) continue;
+        if (is_vcfg_log_file(e->d_name)) continue;
         char p[192]; snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
-        if (remove(p) == 0) n++;
+        if (remove(p) == 0) {
+            n++;
+        } else {
+            DIR *sub = opendir(p);
+            if (sub) {
+                closedir(sub);
+                n += clean_dir(p, NULL, 0, NULL);
+                rmdir(p);
+            }
+        }
     }
     closedir(d); return n;
 }
@@ -1210,11 +1394,13 @@ static void do_clean(App *a)
     do_ini(a, 0);
     static const char *const plug[] = { "vcfg", "bb_probe" };
     int np = clean_dir("/data/GoldHEN/plugins", plug, 2, ".prx");
-    static const char *const bak[] = { "plugins.ini.vcfg_backup_" };
-    clean_dir("/data/GoldHEN", bak, 1, NULL);
+    clean_dir("/data/GoldHEN/plugins", plug, 2, ".vcfg_tmp");
+    static const char *const bak[] = { "plugins.ini.vcfg_backup_", "plugins.ini.vcfg_tmp" };
+    clean_dir("/data/GoldHEN", bak, 2, NULL);
     int nc = clean_dir(CFGDIR, NULL, 0, NULL);
-    remove("/data/vcfg_report.txt");
     set_off(1);
+    a->turned_off = 1;
+    snprintf(a->status, sizeof(a->status), "VCFG IS TURNED OFF - PRESS CROSS ON 04 PLUGIN TO ENABLE");
     a->debug_log = 0;
     a->defaults = (Settings){ 1, 0, 40, 1, 0 };
     a->overlay_pos = 4;
@@ -1230,7 +1416,7 @@ static void do_clean(App *a)
         if (g->testing || g->experimental) g->s.fg = 0;
         refresh_dev_status(g);
     }
-    char m[96]; snprintf(m, sizeof(m), "WIPED %d PLUGINS + %d FILES & RESET RAM TO FACTORY ZERO.", np, nc); addlog(a, m);
+    char m[96]; snprintf(m, sizeof(m), "WIPED %d PLUGINS + %d FILES (LOGS KEPT) & RESET RAM.", np, nc); addlog(a, m);
     a->plugin_state = plugin_state();
 }
 
@@ -1860,8 +2046,11 @@ int main(void)
     a->debug_log = file_exists(CFGDIR "/debug_log");
     g_exp_written = exp_sig(a);
     a->plugin_state = plugin_state();
-    if (is_off()) addlog(a, "VCFG IS TURNED OFF. CROSS TURNS IT ON.");
-    else if (a->plugin_state != 1) {
+    a->turned_off = is_off();
+    if (a->turned_off) {
+        snprintf(a->status, sizeof(a->status), "VCFG IS TURNED OFF - PRESS CROSS ON 04 PLUGIN TO ENABLE");
+        addlog(a, "VCFG IS TURNED OFF. CROSS TURNS IT ON.");
+    } else if (a->plugin_state != 1) {
         addlog(a, a->plugin_state ? "UPDATING PLUGINS" : "INSTALLING PLUGINS");
         do_install(a);
         load_settings(a);
@@ -1890,8 +2079,7 @@ int main(void)
         if (edge) {
             int act = app_input(a, edge); redraw = 1;
             if (act == ACT_INSTALL) do_install(a);
-            else if (act == ACT_REMOVE) { do_ini(a, 0); set_off(1); a->plugin_state = plugin_state(); }
-            else if (act == ACT_CLEAN) do_clean(a);
+            else if (act == ACT_REMOVE || act == ACT_CLEAN) do_clean(a);
             else if (act == ACT_DEBUG) do_debug_toggle(a);
             else if (act == ACT_TELEMETRY_TOGGLE) do_telemetry_toggle(a);
             else if (act == ACT_REPORT) do_report(a);
@@ -1900,7 +2088,7 @@ int main(void)
             else if (act == ACT_SAVE) { save_settings(a); remap_if_changed(a); }
             else if (act == ACT_LAUNCH) do_launch_game(a, &c, back);
             else if (act == ACT_SAVE_EXIT) {
-                save_settings(a); remap_if_changed(a);
+                if (!is_off()) { save_settings(a); remap_if_changed(a); }
                 snprintf(a->status, sizeof(a->status), "SAVED. START A GAME, HOLD THE MENU HOTKEY FOR 3 S.");
                 app_draw(&c, a); present(back); sceKernelUsleep(900000); quit();
             }

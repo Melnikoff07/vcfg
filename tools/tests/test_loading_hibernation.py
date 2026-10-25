@@ -73,6 +73,7 @@ int32_t sceKernelMapDirectMemory2_hook(void **addr, size_t len, int type, int pr
 extern void *memset(void *, int, size_t);
 extern void *calloc(size_t, size_t);
 extern void free(void *);
+extern int strcmp(const char *, const char *);
 extern int printf(const char *, ...);
 extern void exit(int);
 
@@ -92,8 +93,10 @@ extern void exit(int);
 
 typedef struct {
     int shave_mode;
+    int audio_fix;
 } fg_config_t;
 
+static char g_title_id[16] = "CUSA00552";
 static fg_config_t g_cfg = { 0 };
 static int g_dm_hooks = 1;
 static volatile int g_own_alloc = 0;
@@ -199,7 +202,7 @@ static int g_sim_check_hibernating_in_sleep = 0;
 static int g_sim_render_saw_hibernating = 0;
 static int g_sim_work_still_mapped_on_first_sleep = 0;
 static uint32_t g_sim_done_val_at_work_release = 0;
-int on_sub(void);
+static int on_sub(void);
 
 static void sim_reset(size_t dm_total)
 {
@@ -701,6 +704,8 @@ static void test_scenario_c_shave_mode3_and_flex_recovery(void)
         g_pre_work_phys = pw;
         g_pre_work_sz = 0x200000u;
         g_work = (uint8_t *)vw;
+        g_pre_mem = (void *)0x550080000000ULL;
+        g_pre_size = 0x800000u;
         g_mbuf_state = 1;
         g_gpu_state = 1;
     }
@@ -769,6 +774,14 @@ def main() -> None:
         check=True,
     )
     subprocess.run([str(llvm / "lli.exe"), "--dlopen=msvcrt.dll", str(bitcode)], check=True)
+
+
+import unittest
+
+
+class TestLoadingHibernation(unittest.TestCase):
+    def test_all_loading_hibernation_scenarios(self) -> None:
+        main()
 
 
 if __name__ == "__main__":

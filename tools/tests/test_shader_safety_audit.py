@@ -121,10 +121,14 @@ class TestShaderSafetyAudit(unittest.TestCase):
             divisor = m.group(1)
             if divisor.lstrip("-").isdigit():
                 self.assertNotEqual(int(divisor), 0, f"Zero int divisor at {name}:{lineno}")
-            else:
-                self.assertEqual(name, "warp.ll", f"Dynamic int div in {name}:{lineno}: {stmt}")
+            elif name == "warp.ll":
                 self.assertEqual(divisor, "%bs")
                 self.assertIn("%bs = extractelement <4 x i32> %cn, i32 3", self.ll_texts["warp.ll"])
+            else:
+                self.assertIn(name, ("me1.ll", "mf8.ll"), f"Dynamic int div in {name}:{lineno}: {stmt}")
+                # Texture-normalized SAD divisor is smax(tex, 96) >= 96
+                self.assertIn("call i32 @llvm.smax.i32(", self.ll_texts[name])
+                self.assertIn(", i32 96)", self.ll_texts[name])
 
         # Verify all 4 sqrt sites have non-negative clamped/unsigned inputs:
         sqrt_files = [s[0] for s in sqrt_sites]
@@ -761,8 +765,8 @@ class TestShaderSafetyAudit(unittest.TestCase):
 
         end_off = 0x8000 + total_aligned
         dcb8_off = 0x1C000
-        self.assertEqual(total_aligned, 0x13700)
-        self.assertEqual(end_off, 0x1B700)
+        self.assertEqual(total_aligned, 0x13C00)
+        self.assertEqual(end_off, 0x1BC00)
         self.assertLessEqual(
             end_off,
             dcb8_off,
@@ -843,6 +847,438 @@ class TestShaderSafetyAudit(unittest.TestCase):
                 # Every descriptor offset must be 16-byte aligned (4 dwords) and in valid_fg8_slots
                 self.assertEqual(off % 16, 0, f"Unaligned %tbl offset {off} in {sname}")
                 self.assertIn(off, valid_fg8_slots, f"Unknown %tbl offset {off} (+0x{off:X}) in {sname}")
+
+    def test_4c_gcn_tsharp_dfmt_channel_count_vs_shader_dmask(self):
+        """
+        Verify GCN (gfx700 / Sea Islands) T# IMG_DATA_FORMAT (dfmt) hardware channel count
+        against shader image.store.2d dmask and image.load.2d / image.sample.lz.2d channel reads
+        in pcopy8.ll, warp8.ll, warp8g.ll, and pyr8.ll (prevents v2.33 dfmt=3 green strobe).
+        """
+        # Hardware channel count per GCN Sea Islands IMG_DATA_FORMAT (dfmt, T#[1][25:20]):
+        gcn_dfmt_channels = {
+            1: 1,   # IMG_DATA_FORMAT_8
+            2: 1,   # IMG_DATA_FORMAT_16
+            3: 2,   # IMG_DATA_FORMAT_8_8 (2 channels X,Y ONLY - drops channel Z!)
+            4: 1,   # IMG_DATA_FORMAT_32
+            5: 2,   # IMG_DATA_FORMAT_16_16
+            10: 4,  # IMG_DATA_FORMAT_8_8_8_8
+            12: 4,  # IMG_DATA_FORMAT_16_16_16_16
+            14: 4,  # IMG_DATA_FORMAT_32_32_32_32
+            16: 3,  # IMG_DATA_FORMAT_5_6_5 (3 channels X,Y,Z in 16 bpp)
+        }
+
+        # Extract make_t_ex() and make_t_pbuf() from classic/source/fg8_table.h
+        m_ex = re.search(
+            r"static\s+(?:inline\s+)?void\s+make_t_ex\s*\([^)]*\)\s*\{(.*?)\n\}",
+            self.fg8_table_h,
+            re.S,
+        )
+        m_fn = re.search(
+            r"static\s+(?:inline\s+)?void\s+make_t_pbuf\s*\([^)]*\)\s*\{(.*?)\n\}",
+            self.fg8_table_h,
+            re.S,
+        )
+        self.assertIsNotNone(m_ex, "make_t_ex not found in classic/source/fg8_table.h")
+        self.assertIsNotNone(m_fn, "make_t_pbuf not found in classic/source/fg8_table.h")
+        fn_body = m_fn.group(1)
+
+        # Parse dfmt in fmt == 1 (16-bit half-footprint t[1] in make_t_pbuf) and fmt == 0 (g_t_dfmt in make_t_ex)
+        m_fmt1 = re.search(r"t\[1\]\s*=[^;]*\(\s*(\d+)u\s*<<\s*20\s*\)", fn_body)
+        m_fmt0 = re.search(r"g_t_dfmt\s*=\s*(\d+)u?", self.fg8_table_h)
+        self.assertIsNotNone(m_fmt1, "Could not parse t[1] dfmt in make_t_pbuf(fmt=1)")
+        self.assertIsNotNone(m_fmt0, "Could not parse g_t_dfmt for make_t_ex(fmt=0)")
+        self.assertIn("(g_t_dfmt << 20)", m_ex.group(1))
+        dfmt_fmt1 = int(m_fmt1.group(1))
+        dfmt_fmt0 = int(m_fmt0.group(1))
+
+        self.assertIn(dfmt_fmt1, gcn_dfmt_channels, f"Unknown GCN dfmt={dfmt_fmt1} in make_t_pbuf(fmt=1)")
+        self.assertIn(dfmt_fmt0, gcn_dfmt_channels, f"Unknown GCN dfmt={dfmt_fmt0} in make_t_pbuf(fmt=0)")
+
+        # In pcopy8.ll (do_copy, mode==0), image.store.2d writes <4 x float> %c (R, G, B, A) with dmask=15 to %to (T#out).
+        # In warp8.ll / warp8g.ll, @taps / @cr samples <4 x float> (R, G, B, A) with dmask=15 from %tp (T#prev).
+        pcopy_ir = self.ll_texts["pcopy8.ll"]
+        self.assertIn(
+            "call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %c, i32 15, i32 %x, i32 %y, <8 x i32> %to, i32 0, i32 0)",
+            pcopy_ir,
+        )
+
+        for wname in ("warp8.ll", "warp8g.ll"):
+            wir = self.ll_texts[wname]
+            self.assertIn("call <4 x float> @llvm.amdgcn.image.sample.lz.2d.v4f32.f32(i32 15,", wir)
+
+        # CRITICAL INVARIANT: fmt==1 MUST have >= 3 hardware RGB channels (never dfmt=3 8_8 which has only 2 channels!)
+        self.assertNotEqual(
+            dfmt_fmt1,
+            3,
+            "REGRESSION: make_t_pbuf(fmt=1) uses dfmt=3 (8_8, 2 channels), dropping channel Z (Blue) -> 60 Hz color strobe!",
+        )
+        self.assertGreaterEqual(
+            gcn_dfmt_channels[dfmt_fmt1],
+            3,
+            f"make_t_pbuf(fmt=1) dfmt={dfmt_fmt1} has only {gcn_dfmt_channels[dfmt_fmt1]} channels, but RGB T#prev requires >= 3!",
+        )
+        self.assertEqual(dfmt_fmt1, 16, "Expected dfmt=16 (IMG_DATA_FORMAT_5_6_5, 3 channels, 16 bpp) for fmt==1")
+        self.assertGreaterEqual(gcn_dfmt_channels[dfmt_fmt0], 4)
+        self.assertEqual(dfmt_fmt0, 10, "Expected dfmt=10 (IMG_DATA_FORMAT_8_8_8_8, 4 channels, 32 bpp) for fmt==0")
+
+        # Simulate hardware IMG_DATA_FORMAT_5_6_5 (5-bit R, 6-bit G, 5-bit B UNORM) store & sample in pcopy8 -> warp8:
+        def q_unorm(v: float, bits: int) -> float:
+            mx = (1 << bits) - 1
+            q = int(math.floor(sat_f32(v) * mx + 0.5))
+            return f32(q / float(mx))
+
+        def sim_pcopy8_warp8_hw_format(rgb, dfmt: int):
+            nch = gcn_dfmt_channels[dfmt]
+            r0, g0, b0 = [c / 255.0 for c in rgb]
+            if dfmt == 16:  # 5_6_5 (3 channels: 5b R, 6b G, 5b B)
+                r_s, g_s, b_s = q_unorm(r0, 5), q_unorm(g0, 6), q_unorm(b0, 5)
+            elif dfmt == 3:  # 8_8 (2 channels: drops Z/Blue to 0.0!)
+                r_s, g_s, b_s = q_unorm(r0, 8), q_unorm(g0, 8), (0.0 if nch < 3 else q_unorm(b0, 8))
+            else:
+                r_s, g_s, b_s = q_unorm(r0, 8), q_unorm(g0, 8), q_unorm(b0, 8)
+            return (round(r_s * 255), round(g_s * 255), round(b_s * 255))
+
+        for rgb in ((255, 255, 255), (180, 180, 180), (96, 96, 96), (220, 50, 50), (50, 80, 220)):
+            r_out, g_out, b_out = sim_pcopy8_warp8_hw_format(rgb, dfmt_fmt1)
+            self.assertLessEqual(abs(r_out - rgb[0]), 8, f"R channel corrupted for {rgb}: got {(r_out, g_out, b_out)}")
+            self.assertLessEqual(abs(g_out - rgb[1]), 4, f"G channel corrupted for {rgb}: got {(r_out, g_out, b_out)}")
+            self.assertLessEqual(abs(b_out - rgb[2]), 8, f"B channel corrupted for {rgb}: got {(r_out, g_out, b_out)}")
+
+    def test_4d_compiled_me1_bit_exact_vs_python_port(self):
+        """
+        Compile classic/shaders/me1.ll directly with clang-22 and verify 100% bit-for-bit
+        float32 identity (0 / 16,320 word diffs in FT) against tools/bench/vcfg_motion.py::me1.
+        """
+        import shutil
+        import subprocess
+        import tempfile
+        import numpy as np
+
+        clang_bin = shutil.which("clang-22") or "/usr/bin/clang-22"
+        if not Path(clang_bin).exists() or sys.platform != "linux":
+            self.skipTest("clang-22 Linux host required for native LLVM IR shader execution")
+
+        sys.path.insert(0, str(REPO_ROOT / "tools" / "bench"))
+        import vcfg_motion as vm
+
+        c_wrapper = r"""
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef int32_t v2i32 __attribute__((vector_size(8)));
+typedef int32_t v3i32 __attribute__((vector_size(12)));
+typedef int32_t v4i32 __attribute__((vector_size(16)));
+typedef float   v2f32 __attribute__((vector_size(8)));
+
+#if defined(__aarch64__)
+typedef struct { uint64_t regs[22]; } fiber_ctx_t;
+__attribute__((noinline)) void fiber_switch(fiber_ctx_t *from, const fiber_ctx_t *to) {
+    __asm__ volatile(
+        "stp x19, x20, [%0, #0]\n\t"
+        "stp x21, x22, [%0, #16]\n\t"
+        "stp x23, x24, [%0, #32]\n\t"
+        "stp x25, x26, [%0, #48]\n\t"
+        "stp x27, x28, [%0, #64]\n\t"
+        "stp x29, x30, [%0, #80]\n\t"
+        "mov x9, sp\n\t"
+        "str x9, [%0, #96]\n\t"
+        "stp d8,  d9,  [%0, #104]\n\t"
+        "stp d10, d11, [%0, #120]\n\t"
+        "stp d12, d13, [%0, #136]\n\t"
+        "stp d14, d15, [%0, #152]\n\t"
+        "ldp x19, x20, [%1, #0]\n\t"
+        "ldp x21, x22, [%1, #16]\n\t"
+        "ldp x23, x24, [%1, #32]\n\t"
+        "ldp x25, x26, [%1, #48]\n\t"
+        "ldp x27, x28, [%1, #64]\n\t"
+        "ldp x29, x30, [%1, #80]\n\t"
+        "ldr x9, [%1, #96]\n\t"
+        "mov sp, x9\n\t"
+        "ldp d8,  d9,  [%1, #104]\n\t"
+        "ldp d10, d11, [%1, #120]\n\t"
+        "ldp d12, d13, [%1, #136]\n\t"
+        "ldp d14, d15, [%1, #152]\n\t"
+        : : "r"(from), "r"(to) : "x9", "memory"
+    );
+}
+#endif
+
+static fiber_ctx_t g_ctx[64];
+static fiber_ctx_t g_main_ctx;
+static uint8_t     g_stacks[64][16384] __attribute__((aligned(16)));
+static int         g_cur_tid = 0;
+static const uint8_t *g_cur_tbl = NULL;
+static int32_t     g_cur_gx = 0;
+static int32_t     g_cur_gy = 0;
+
+extern void shader_main(const uint8_t *tbl, int32_t gx, int32_t gy, int32_t tid);
+
+void sim_barrier(void) {
+    int prev = g_cur_tid;
+    int next = (prev + 1) & 63;
+    g_cur_tid = next;
+    fiber_switch(&g_ctx[prev], &g_ctx[next]);
+}
+
+static void lane_trampoline(void) {
+    int tid = g_cur_tid;
+    shader_main(g_cur_tbl, g_cur_gx, g_cur_gy, tid);
+    if (tid < 63) {
+        g_cur_tid = tid + 1;
+        fiber_switch(&g_ctx[tid], &g_ctx[tid + 1]);
+    } else {
+        fiber_switch(&g_ctx[63], &g_main_ctx);
+    }
+}
+
+static inline const uint8_t *vsharp_ptr(v4i32 v, int32_t off, int32_t soff, uint32_t *nbytes_out) {
+    uint64_t lo = (uint32_t)v[0];
+    uint64_t hi = (uint32_t)(v[1] & 0xFFFF);
+    uint64_t base = lo | (hi << 32);
+    *nbytes_out = (uint32_t)v[2];
+    int64_t tot = (int64_t)off + (int64_t)soff;
+    if (tot < 0 || (uint64_t)tot >= *nbytes_out) return NULL;
+    return (const uint8_t *)(uintptr_t)(base + (uint64_t)tot);
+}
+
+int32_t sim_load_i32(v4i32 v, int32_t off, int32_t soff, int32_t glc) {
+    uint32_t nb = 0;
+    const uint8_t *p = vsharp_ptr(v, off, soff, &nb);
+    if (!p) return 0;
+    int32_t out = 0;
+    memcpy(&out, p, 4);
+    return out;
+}
+
+v2i32 sim_load_v2i32(v4i32 v, int32_t off, int32_t soff, int32_t glc) {
+    uint32_t nb = 0;
+    const uint8_t *p = vsharp_ptr(v, off, soff, &nb);
+    v2i32 out = {0, 0};
+    if (p) memcpy(&out, p, 8);
+    return out;
+}
+
+v3i32 sim_load_v3i32(v4i32 v, int32_t off, int32_t soff, int32_t glc) {
+    uint32_t nb = 0;
+    const uint8_t *p = vsharp_ptr(v, off, soff, &nb);
+    int32_t tmp[3] = {0, 0, 0};
+    if (p) memcpy(tmp, p, 12);
+    v3i32 out = {tmp[0], tmp[1], tmp[2]};
+    return out;
+}
+
+v2f32 sim_load_v2f32(v4i32 v, int32_t off, int32_t soff, int32_t glc) {
+    uint32_t nb = 0;
+    const uint8_t *p = vsharp_ptr(v, off, soff, &nb);
+    v2f32 out = {0.0f, 0.0f};
+    if (p) memcpy(&out, p, 8);
+    return out;
+}
+
+void sim_store_i32(int32_t val, v4i32 v, int32_t off, int32_t soff, int32_t glc) {
+    uint32_t nb = 0;
+    uint8_t *p = (uint8_t *)vsharp_ptr(v, off, soff, &nb);
+    if (p) memcpy(p, &val, 4);
+}
+
+void sim_store_v2f32(v2f32 val, v4i32 v, int32_t off, int32_t soff, int32_t glc) {
+    uint32_t nb = 0;
+    uint8_t *p = (uint8_t *)vsharp_ptr(v, off, soff, &nb);
+    if (p) memcpy(p, &val, 8);
+}
+
+int32_t sim_atomic_add_i32(int32_t val, v4i32 v, int32_t off, int32_t soff, int32_t glc) {
+    uint32_t nb = 0;
+    int32_t *p = (int32_t *)vsharp_ptr(v, off, soff, &nb);
+    if (!p) return 0;
+    int32_t old = *p;
+    *p = old + val;
+    return old;
+}
+
+int32_t sim_alignbyte(int32_t hi, int32_t lo, int32_t sel) {
+    uint64_t comb = ((uint64_t)(uint32_t)hi << 32) | (uint64_t)(uint32_t)lo;
+    uint32_t sh = (uint32_t)(sel & 3) * 8u;
+    return (int32_t)(uint32_t)(comb >> sh);
+}
+
+int32_t sim_sad_u8(int32_t a, int32_t b, int32_t acc) {
+    uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
+    int32_t s = acc;
+    for (int i = 0; i < 4; i++) {
+        int da = (int)((ua >> (i * 8)) & 0xFFu);
+        int db = (int)((ub >> (i * 8)) & 0xFFu);
+        s += (da >= db) ? (da - db) : (db - da);
+    }
+    return s;
+}
+
+void run_dispatch(const uint8_t *tbl, int32_t ngx, int32_t ngy) {
+    g_cur_tbl = tbl;
+    for (int32_t gy = 0; gy < ngy; gy++) {
+        for (int32_t gx = 0; gx < ngx; gx++) {
+            g_cur_gx = gx;
+            g_cur_gy = gy;
+            for (int t = 0; t < 64; t++) {
+                memset(&g_ctx[t], 0, sizeof(g_ctx[t]));
+                uint64_t sp = (uint64_t)(uintptr_t)(&g_stacks[t][16384]) & ~15ULL;
+                g_ctx[t].regs[11] = (uint64_t)(uintptr_t)lane_trampoline;
+                g_ctx[t].regs[12] = sp;
+            }
+            g_cur_tid = 0;
+            fiber_switch(&g_main_ctx, &g_ctx[0]);
+        }
+    }
+}
+"""
+        def ll_to_host(ll_src: str) -> str:
+            s = re.sub(r'target triple = "amdgcn--"', "", ll_src)
+            s = s.replace("addrspace(3)", "").replace("addrspace(4)", "")
+            s = s.replace("define amdgpu_cs void @main(", "define void @shader_main(")
+            s = s.replace(" inreg ", " ")
+            s = s.replace('syncscope("workgroup") ', "")
+            s = s.replace("@llvm.amdgcn.s.barrier", "@sim_barrier")
+            s = s.replace("@llvm.amdgcn.raw.buffer.load.i32", "@sim_load_i32")
+            s = s.replace("@llvm.amdgcn.raw.buffer.load.v2i32", "@sim_load_v2i32")
+            s = s.replace("@llvm.amdgcn.raw.buffer.load.v3i32", "@sim_load_v3i32")
+            s = s.replace("@llvm.amdgcn.raw.buffer.load.v2f32", "@sim_load_v2f32")
+            s = s.replace("@llvm.amdgcn.raw.buffer.store.i32", "@sim_store_i32")
+            s = s.replace("@llvm.amdgcn.raw.buffer.store.v2f32", "@sim_store_v2f32")
+            s = s.replace("@llvm.amdgcn.raw.buffer.atomic.add.i32", "@sim_atomic_add_i32")
+            s = s.replace("@llvm.amdgcn.alignbyte", "@sim_alignbyte")
+            s = s.replace("@llvm.amdgcn.sad.u8", "@sim_sad_u8")
+            s = s.replace(" #0 {", " {")
+            s = re.sub(r"attributes #0 = \{[^}]*\}", "", s)
+            return s.replace("i32 immarg", "i32")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            (tmp / "wrapper.c").write_text(c_wrapper, encoding="utf-8")
+            me1_ll_str = (SHADERS_DIR / "me1.ll").read_text(encoding="utf-8")
+            mf8_ll_str = (SHADERS_DIR / "mf8.ll").read_text(encoding="utf-8")
+            (tmp / "me1_host.ll").write_text(ll_to_host(me1_ll_str), encoding="utf-8")
+            (tmp / "mf8_host.ll").write_text(ll_to_host(mf8_ll_str), encoding="utf-8")
+            so_path = tmp / "libme1_sim.so"
+            so_mf8_path = tmp / "libmf8_sim.so"
+            subprocess.run(
+                [clang_bin, "-O2", "-fPIC", "-shared", "-Wno-override-module",
+                 str(tmp / "wrapper.c"), str(tmp / "me1_host.ll"), "-o", str(so_path), "-lm"],
+                check=True,
+            )
+            subprocess.run(
+                [clang_bin, "-O2", "-fPIC", "-shared", "-Wno-override-module",
+                 str(tmp / "wrapper.c"), str(tmp / "mf8_host.ll"), "-o", str(so_mf8_path), "-lm"],
+                check=True,
+            )
+            lib = ctypes.CDLL(str(so_path))
+            lib.run_dispatch.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32]
+            lib.run_dispatch.restype = None
+            lib_mf8 = ctypes.CDLL(str(so_mf8_path))
+            lib_mf8.run_dispatch.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32]
+            lib_mf8.run_dispatch.restype = None
+
+            def set_v(tbl, dword_off, buf):
+                addr = buf.ctypes.data
+                tbl[dword_off + 0] = addr & 0xFFFFFFFF
+                tbl[dword_off + 1] = (addr >> 32) & 0xFFFF
+                tbl[dword_off + 2] = buf.nbytes
+                tbl[dword_off + 3] = 0
+
+            # Build test pairs: real console dump CUSA08519 #19 (if present) + synthetic textured scene
+            pairs = []
+            real_a = Path("/home/melnikoff/vcfg-pipeline/runtime/research/head-occlusion-20261023/bench_CUSA08519/bench_0019_a.rgba")
+            real_b = Path("/home/melnikoff/vcfg-pipeline/runtime/research/head-occlusion-20261023/bench_CUSA08519/bench_0019_b.rgba")
+            if real_a.exists() and real_b.exists():
+                def load_rgb(p):
+                    raw = np.fromfile(p, dtype="<u2").reshape(1080, 1920, 4)
+                    return raw[:, :, :3].astype(np.float32) * np.float32(1.0 / 65535.0)
+                pairs.append(("CUSA08519_19", load_rgb(real_a), load_rgb(real_b)))
+
+            rng = np.random.default_rng(42)
+            syn_p = rng.uniform(0.05, 0.95, (1080, 1920, 3)).astype(np.float32)
+            syn_c = np.roll(syn_p, shift=(-6, 12), axis=(0, 1))
+            pairs.append(("synthetic_textured", syn_p, syn_c))
+
+            for label, A, B in pairs:
+                L1p, L2p, L3p = vm.pyr8_shader(A)
+                L1c, L2c, L3c = vm.pyr8_shader(B)
+                V3, sum_c, sum_p = vm.me3_dual(L3p, L3c)
+                V2, S2 = vm.me2(L2p, L2c, V3)
+                gm = vm.gm8(V2, S2)
+                GK, _ = vm.fgs8(L2p, L2c, V2, S2, gm)
+                prevF_zero = np.zeros((68, 120, 2), dtype=np.float32)
+                FT_py, cutn_py, _ = vm.me1(L1p, L1c, V2, GK, gm, sum_c, sum_p, prevF=prevF_zero)
+
+                L1c_buf = np.zeros(960 * 540 + 16, dtype=np.uint8)
+                L1p_buf = np.zeros(960 * 540 + 16, dtype=np.uint8)
+                L1c_buf[:960 * 540] = L1c.astype(np.uint8).ravel()
+                L1p_buf[:960 * 540] = L1p.astype(np.uint8).ravel()
+                v2_x = (V2[:, :, 0].astype(np.int32) & 0xFFFF).astype(np.uint32)
+                v2_y = (V2[:, :, 1].astype(np.int32) & 0xFFFF).astype(np.uint32)
+                V2_buf = (v2_x | (v2_y << np.uint32(16))).ravel().copy()
+                GK_buf = GK.astype(np.uint32).ravel().copy()
+                Fprev_buf = np.zeros(120 * 68 * 2, dtype=np.float32)
+                misc_buf = np.zeros(8, dtype=np.int32)
+                misc_buf[2] = int(sum_c)
+                misc_buf[3] = int(sum_p)
+                misc_buf[4] = int(gm[0])
+                misc_buf[5] = int(gm[1])
+                misc_buf[6] = int(vm._LAST_FGCNT)
+                FT_sim = np.zeros(120 * 68 * 2, dtype=np.float32)
+
+                tbl = np.zeros(160, dtype=np.uint32)
+                tbl[28] = 0
+                tbl[30] = 0
+                tbl[140] = 960
+                tbl[141] = 540
+                set_v(tbl, 32, L1c_buf)
+                set_v(tbl, 36, L1p_buf)
+                set_v(tbl, 60, V2_buf)
+                set_v(tbl, 68, Fprev_buf)
+                set_v(tbl, 72, misc_buf)
+                set_v(tbl, 84, GK_buf)
+                set_v(tbl, 96, FT_sim)
+
+                lib.run_dispatch(tbl.ctypes.data, 30, 68)
+                ft_diffs = int((FT_sim.view(np.uint32) != FT_py.ravel().view(np.uint32)).sum())
+                self.assertEqual(
+                    ft_diffs,
+                    0,
+                    f"Compiled me1.ll differs from vcfg_motion.py::me1 on {label}: {ft_diffs}/16320 float32 words differ",
+                )
+                self.assertEqual(int(misc_buf[0]), int(cutn_py), f"cutn mismatch on {label}")
+
+                F_py = vm.mf8(L1p, L1c, FT_py, GK, V2, gm, bool(misc_buf[7]))
+                F_sim = np.zeros(120 * 68 * 2, dtype=np.float32)
+                set_v(tbl, 64, F_sim)
+                lib_mf8.run_dispatch(tbl.ctypes.data, 30, 68)
+                f_diffs = int((F_sim.view(np.uint32) != F_py.ravel().view(np.uint32)).sum())
+                self.assertEqual(
+                    f_diffs,
+                    0,
+                    f"Compiled mf8.ll differs from vcfg_motion.py::mf8 on {label}: {f_diffs}/16320 float32 words differ",
+                )
+
+    def test_4e_prx_reproducible_no_worktree_path(self):
+        """
+        Verify built vcfg_classic.prx and vcfg_classic.oelf do not embed absolute worktree paths
+        from create-fself -in=..., and build scripts invoke create-fself with relative -in= paths.
+        """
+        for rel in ("build/classic/vcfg_classic.prx", "build/classic/vcfg_classic.oelf"):
+            p = REPO_ROOT / rel
+            if p.exists():
+                raw = p.read_bytes()
+                self.assertEqual(
+                    raw.find(str(REPO_ROOT).encode("utf-8")),
+                    -1,
+                    f"{rel} embeds absolute worktree root path {REPO_ROOT}",
+                )
+        for script_rel in ("classic/build.ps1", "classic/build.sh", "build.ps1"):
+            stext = (REPO_ROOT / script_rel).read_text(encoding="utf-8")
+            self.assertNotIn("-in=$out", stext, f"{script_rel} passes absolute $out path to create-fself -in=")
+            self.assertNotIn('-in="$B/', stext, f"{script_rel} passes absolute $B path to create-fself -in=")
+            self.assertNotIn("-in=$elf", stext, f"{script_rel} passes absolute $elf path to create-fself -in=")
 
 
 if __name__ == "__main__":

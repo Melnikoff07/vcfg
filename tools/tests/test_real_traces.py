@@ -17,6 +17,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 cfg = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 MAIN_C = (ROOT / "classic" / "source" / "main.c").read_text(encoding="utf-8")
 HOOKS_H = (ROOT / "classic" / "source" / "debug_hooks.h").read_text(encoding="utf-8")
+TWO_BUF_H = (ROOT / "classic" / "source" / "two_buffer_test.h").read_text(encoding="utf-8")
+FG8_H = (ROOT / "classic" / "source" / "fg8_table.h").read_text(encoding="utf-8")
 FAMILIES_H = (ROOT / "overlay" / "title_families.h").read_text(encoding="utf-8")
 TRACES_PATH = ROOT / "tools" / "tests" / "real_traces.json"
 
@@ -29,6 +31,66 @@ def extract_between(src: str, start_marker: str, end_marker: str) -> str:
     return src[s:e]
 
 
+MAIN_MBASE_DECLS = extract_between(
+    MAIN_C,
+    "static int g_nmid = 3;",
+    "static void *g_pre_mem = NULL;",
+)
+ON_OUR_BUF_LINE = extract_between(
+    TWO_BUF_H,
+    "int on_our_buf =",
+    "\n",
+)
+FG8_RESOLVE_FN = extract_between(
+    FG8_H,
+    "static inline void fg8_resolve_2buf_history(",
+    "static inline void make_t_ex(",
+)
+FLIP_PCOPY_BLOCK = extract_between(
+    MAIN_C,
+    "int two_buf_now =",
+    "if (tb_fast) {",
+)
+REG_HOOK_SRC = extract_between(
+    MAIN_C,
+    "int32_t sceVideoOutRegisterBuffers_hook(",
+    "// ---- in-game L3+R3 (3s) menu",
+)
+REG_START0_RESET = extract_between(
+    REG_HOOK_SRC,
+    "if (startIndex == 0) {",
+    "if (!dfmt",
+)
+REG_FMT_BLOCK = extract_between(
+    REG_HOOK_SRC,
+    "uint32_t fam = attr->format >> 24",
+    "vov_set_hdr(",
+)
+LATENCY_FG_EXPR_M = re.search(
+    r"\(unsigned long long\)g_lat_n,\s*(.+?),\s*g_cfg\.preset,\s*pend_max\);",
+    MAIN_C,
+)
+assert LATENCY_FG_EXPR_M is not None, "Could not find LATENCY FG expression in classic/source/main.c"
+LATENCY_FG_EXPR = LATENCY_FG_EXPR_M.group(1)
+REG_BUF_LOOP = extract_between(
+    REG_HOOK_SRC,
+    "for (int i = 0; addresses && i < bufferNum && startIndex + i < 16; i++) {",
+    "if (g_safe_active && startIndex == 0",
+)
+PCOPY_AVAIL_BLOCK = extract_between(
+    REG_HOOK_SRC,
+    "g_pcopy_avail = (want_pcopy",
+    "if (g_cfg.reg_mode == 1",
+)
+REG_FALLBACK_BLOCK = (
+    extract_between(
+        REG_HOOK_SRC,
+        "if (g_mbuf_state != 1)",
+        'lg("mbufs: no extra display buffers',
+    )
+    + 'lg("mbufs: no extra display buffers (stride 0x%zx)\\n", one);\n'
+    + ("}" if "if (g_mbuf_state != 1) {" in REG_HOOK_SRC else "")
+)
 MAIN_ALLOC_PART1 = extract_between(
     MAIN_C,
     "#define FLEX_GPU_MAX 8",
@@ -39,6 +101,8 @@ MAIN_ALLOC_PART2 = extract_between(
     "static size_t dm_avail(size_t align)",
     "static void gpu_init(void)",
 )
+PCOPY_GATE_HAS_MAX_EXTRA = 1 if ("nm < 2 && max_extra >= 2" in MAIN_C or "nm < 2 && nm < max_extra" in MAIN_C) else 0
+HAS_CUSA10249_AUDIO_FIX = 1 if "cusa10249_audio_fix" in HOOKS_H else 0
 HOOKS_DECLS = extract_between(
     HOOKS_H,
     "#define SHAVE_MAX ",
@@ -87,15 +151,28 @@ extern void exit(int);
 #define INJECT_AFTER_FLIPS 120
 
 typedef struct {
+    int framegen;
     int shave_mode;
     int reg_mode;
     int pace_order;
+    int present_copy;
+    int two_buffer;
+    int audio_fix;
 } fg_config_t;
+
+typedef struct {
+    uint32_t format;
+    uint32_t tilingMode;
+    uint32_t aspectRatio;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitchInPixel;
+    uint64_t option;
+} VoAttr;
 
 static char g_title_id[16] = "UNKNOWN";
 static int g_known_game = 0;
-static int g_ngame = 0;
-static fg_config_t g_cfg = { 0, 0, 0 };
+static fg_config_t g_cfg = { 1, 0, 0, 0, 0, 0, 0 };
 static int g_dm_hooks = 1;
 static volatile int g_own_alloc = 0;
 static uint32_t g_dbg_allocs = 0;
@@ -105,11 +182,27 @@ static uint32_t g_flips = 0;
 static volatile uint32_t g_vo_submit_flips = 0;
 static int g_gpu_state = 0;
 static int g_mbuf_state = 0;
+static int g_nbuf = 0;
+static uint64_t g_buf[16];
+static uint32_t g_bw = 0, g_bh = 0, g_pitch = 0;
+static int g_fmt_supported = 1, g_safe_active = 0;
+static uint32_t g_t_dfmt = 10u;
+static VoAttr g_attr = { 0x80000000u, 0, 0, 1920, 1080, 1920, 0 };
+static VoAttr g_ext_attr = { 0x80000000u, 0, 0, 1920, 1080, 1920, 0 };
+static int g_ext_nm = 0;
+static uint32_t g_sim_rereg_ext_fmt = 0;
+static int g_sim_rereg_ext_cnt = 0;
+static char g_inert_reason[64] = "";
+static uint32_t g_prev_idx = 0xFFFFFFFFu, g_prev2_idx = 0xFFFFFFFFu;
+static int g_vq_on = 0, g_runtime_2buf = 0;
+static int g_t_prev_half16 = 0, g_pcopy_dst_half16 = 0;
+static uint64_t g_sub_t[16];
 static void *g_gpu = NULL, *g_mon = NULL;
 static int g_safe_never = 0, g_fg_off = 0;
 static long g_low_sub2mb_end = 0;
 static size_t g_gpu_sz = GPU_SZ_BASE;
 static int g_work_garlic = 0;
+__MAIN_MBASE_DECLS__
 
 static volatile uint32_t g_mem_hibernate_count = 0;
 static inline void pyr_cache_invalidate(void) {}
@@ -130,6 +223,7 @@ static void api_ring_push(const char *fmt, ...) { (void)fmt; }
 static void stage_nop(const char *fmt, ...) { (void)fmt; }
 #define STAGE(...) stage_nop(__VA_ARGS__)
 #define klog(...)  stage_nop(__VA_ARGS__)
+#define lg(...)    stage_nop(__VA_ARGS__)
 
 #define MAX_DM_BLOCKS 512
 typedef struct {
@@ -146,6 +240,7 @@ typedef struct {
     int prot;
     int flags;
     int in_use;
+    int is_flex;
 } SimFlexBlock;
 
 static uint8_t g_backing_buf[0x400000];
@@ -213,7 +308,24 @@ static void sim_reset(size_t dm_total)
     g_flips = 0;
     g_gpu_state = 0;
     g_mbuf_state = 0;
+    g_nbuf = 0;
+    memset(g_buf, 0, sizeof(g_buf));
+    g_bw = 0;
+    g_bh = 0;
+    g_pitch = 0;
+    g_fmt_supported = 1;
+    g_safe_active = 0;
+    g_prev_idx = 0xFFFFFFFFu;
+    g_prev2_idx = 0xFFFFFFFFu;
+    g_vq_on = 0;
+    g_runtime_2buf = 0;
+    g_nmid = 3;
+    g_pcopy_avail = 0;
+    g_pcopy_k = 2;
+    g_pcopy_on = 0;
+    g_mbase = __INIT_G_MBASE__;
     g_ngame = 0;
+    g_game_idx_hi = 0;
     g_low_sub2mb_end = 0;
     g_gpu_sz = GPU_SZ_BASE;
     g_work_garlic = 0;
@@ -412,13 +524,15 @@ static int32_t sceKernelMapFlexibleMemory(void **addr, size_t len, int prot, int
     } else if (g_own_alloc && len <= sizeof(g_backing_buf) - 0x100000u) {
         base = ((uintptr_t)g_backing_buf + 0xFFFFFu) & ~(uintptr_t)0xFFFFFu;
     } else {
-        g_sim_fake_va_cursor = (g_sim_fake_va_cursor + 0x3FFFu) & ~(uintptr_t)0x3FFFu;
+        uintptr_t mask = g_sim_force_misaligned_flex ? 0x3FFFu : 0xFFFFu;
+        g_sim_fake_va_cursor = (g_sim_fake_va_cursor + mask) & ~mask;
         base = g_sim_fake_va_cursor;
         g_sim_fake_va_cursor += len;
     }
     for (int i = 0; i < MAX_FLEX_BLOCKS; i++) {
         if (!g_sim_flex[i].in_use) {
             g_sim_flex[i].in_use = 1;
+            g_sim_flex[i].is_flex = 1;
             g_sim_flex[i].va = base;
             g_sim_flex[i].len = len;
             g_sim_flex[i].prot = prot;
@@ -426,6 +540,7 @@ static int32_t sceKernelMapFlexibleMemory(void **addr, size_t len, int prot, int
             break;
         }
     }
+    g_sim_flex_avail -= len;
     *addr = (void *)base;
     return 0;
 }
@@ -436,7 +551,9 @@ static int32_t sceKernelMunmap(void *addr, size_t len)
     if (!addr) return -1;
     for (int i = 0; i < MAX_FLEX_BLOCKS; i++) {
         if (g_sim_flex[i].in_use && g_sim_flex[i].va == (uintptr_t)addr) {
+            if (g_sim_flex[i].is_flex) g_sim_flex_avail += g_sim_flex[i].len;
             g_sim_flex[i].in_use = 0;
+            g_sim_flex[i].is_flex = 0;
             return 0;
         }
     }
@@ -464,6 +581,13 @@ int32_t sceKernelMapNamedDirectMemory_hook(void **addr, size_t len, int prot, in
 """
 
 REPLAY_HELPER_C = r"""
+#if !__HAS_CUSA10249_AUDIO_FIX__
+static int g_c10249_tail_pending = 0;
+static int g_c10249_first_reg_done = 0;
+static inline int cusa10249_audio_fix(void) { return 0; }
+static inline void cusa10249_apply_deferred_tail_if_needed(void) {}
+#endif
+
 static void reset_shave_state(void)
 {
     memset(g_shaves, 0, sizeof(g_shaves));
@@ -488,6 +612,13 @@ static void reset_shave_state(void)
     g_syn_phys_cursor = 0;
     g_flex_vmap_n = 0;
     memset(g_flex_gpu_slots, 0, sizeof(g_flex_gpu_slots));
+    g_pbuf = NULL;
+    g_pbuf_phys = 0;
+    g_pbuf_sz = 0;
+    g_pbuf_ycocg = 0;
+    g_pbuf_valid = 0;
+    g_c10249_tail_pending = 0;
+    g_c10249_first_reg_done = 0;
 }
 
 static void apply_title_defaults_sim(const char *tid)
@@ -495,11 +626,18 @@ static void apply_title_defaults_sim(const char *tid)
     for (int i = 0; i < 15; i++) g_title_id[i] = tid[i];
     g_title_id[15] = 0;
     g_known_game = vcfg_is_verified_family(g_title_id);
+    g_cfg.present_copy = 0;
+    g_cfg.two_buffer = 0;
     g_cfg.shave_mode = 0;
     g_cfg.reg_mode = 0;
     g_cfg.pace_order = 0;
+    g_cfg.audio_fix = (strcmp(g_title_id, "CUSA10249") == 0) ? 1 : 0;
     if (vcfg_in_family(g_title_id, "CUSA11456")) {
-        g_cfg.reg_mode = 1;
+        g_cfg.present_copy = 2;
+        g_cfg.two_buffer = 0;
+        g_cfg.shave_mode = 2;
+        g_cfg.reg_mode = 2;
+        g_cfg.pace_order = 3;
     } else if (vcfg_in_family(g_title_id, "CUSA08519")) {
         g_cfg.shave_mode = 1;
     } else if (vcfg_in_family(g_title_id, "CUSA16734") || vcfg_in_family(g_title_id, "CUSA02299")) {
@@ -529,8 +667,9 @@ static void setup_plugin_load_early(size_t dm_sz, long pre_occ)
         }
     }
     if (g_cfg.shave_mode == 2) return;
+    int skip_gpu_work = (__HAS_CUSA10249_AUDIO_FIX__ && strcmp(g_title_id, "CUSA10249") == 0 && (g_cfg.audio_fix == 1 || g_cfg.audio_fix == 2));
     long top_e = (long)(dm_sz & ~(size_t)0x1FFFFFu);
-    size_t want_pre = 0x2000000u;
+    size_t want_pre = skip_gpu_work ? 0x800000u : 0x2000000u;
     long top_s = top_e - (long)want_pre;
     g_own_alloc++;
     if (raw_sceKernelAllocateDirectMemory(top_s, top_e, want_pre, 0x200000u, 3, &g_pre_mem_phys) == 0) {
@@ -538,6 +677,7 @@ static void setup_plugin_load_early(size_t dm_sz, long pre_occ)
         g_pre_size = want_pre;
     }
     g_own_alloc--;
+    if (skip_gpu_work) return;
     if (g_low_sub2mb_end > 0) {
         g_pre_gpu = alloc_dm_range(0, g_low_sub2mb_end, g_gpu_sz, g_gpu_sz, 0, &g_pre_gpu_phys);
     }
@@ -548,44 +688,402 @@ static void setup_plugin_load_early(size_t dm_sz, long pre_occ)
     g_pre_work = alloc_work_early(WORK_SZ_8, 3);
 }
 
-static void replay_register_buffers(int start_idx, int num_buf, uint32_t bw, uint32_t bh, uint32_t pitch)
+typedef struct { int32_t currentBuffer; } SimFlipStatus;
+static int sim_on_our_buf(int32_t cur_buf)
 {
-    if (start_idx != 0 || num_buf < 2 || num_buf > 8 || g_cfg.reg_mode == 2) return;
-    g_ngame = num_buf;
-    size_t calc = (size_t)pitch * (size_t)((bh + 63u) & ~63u) * 4u;
-    size_t one = (calc + 0x7FFFFu) & ~(size_t)0x7FFFFu;
-    if (one < 0x100000u || one > 0x4000000u) return;
-    if (bw < 1280u || bh < 720u || bw > 3840u || bh > 2160u) return;
-    int want_pcopy = (g_ngame == 2);
-    int hi_res = (bw > 1920u || bh > 1080u);
-    int stream_3buf = (!want_pcopy &&
-                       ((!g_known_game && g_dbg_allocs >= 32u) ||
-                        vcfg_in_family(g_title_id, "CUSA09311") ||
-                        vcfg_in_family(g_title_id, "CUSA18534") ||
-                        vcfg_in_family(g_title_id, "CUSA10123")));
-    int cap_extra = want_pcopy
-        ? (vcfg_in_family(g_title_id, "CUSA11456") ? 1 : ((!g_known_game && g_dbg_allocs >= 32u) ? 2 : (hi_res ? 4 : 6)))
-        : (stream_3buf ? 1 : ((hi_res || !g_known_game) ? 2 : 3));
-    int max_extra = 16 - g_ngame;
-    if (max_extra > cap_extra) max_extra = cap_extra;
-    if (g_pre_mem) {
-        int nm = (int)(g_pre_size / one);
-        if (nm > max_extra) nm = max_extra;
-        if (nm >= 1) {
-            size_t used_pre = (one * (size_t)nm + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
-            if (used_pre < 0x800000u) used_pre = 0x800000u;
-            if (used_pre > 0 && used_pre < g_pre_size) {
-                shrink_early_mem_to_ex(used_pre, 0);
+    SimFlipStatus st = { cur_buf };
+    SimFlipStatus *s = &st;
+    __ON_OUR_BUF_LINE__
+    return on_our_buf;
+}
+
+__FG8_RESOLVE_FN__
+
+static void sim_step_2buf_frame(uint32_t seq, uint32_t index, uint32_t prev_idx,
+                                uint32_t *out_show_idx, uint32_t *out_copy_idx,
+                                uint64_t *out_P, uint64_t *out_copy_dst)
+{
+    int pcopy = g_pcopy_avail && g_cfg.present_copy != 2;
+    g_pcopy_on = pcopy;
+    int tb_fast = 0, two_mids = 0, third_flip = 0;
+    (void)two_mids; (void)third_flip;
+    uint32_t show_idx = index;
+    __FLIP_PCOPY_BLOCK__
+    uint64_t P = g_buf[prev_idx];
+    uint64_t C = g_buf[index];
+    uint64_t copy_dst = pcopy ? g_buf[ci] : 0ull;
+    uint32_t copy_idx = ci;
+    fg8_resolve_2buf_history(&P, C, &copy_dst, &copy_idx, seq);
+    if (out_show_idx) *out_show_idx = show_idx;
+    if (out_copy_idx) *out_copy_idx = copy_idx;
+    if (out_P) *out_P = P;
+    if (out_copy_dst) *out_copy_dst = copy_dst;
+}
+
+static void on_register_buffers_2buf(int count, size_t surf_sz)
+{
+    g_pbuf_valid = 0;
+    if (count == 2 || g_cfg.present_copy == 1 || g_cfg.two_buffer == 1) {
+        if (count == 2) g_runtime_2buf = 1;
+        if (g_cfg.present_copy != 2) {
+            if (count == 2 || g_cfg.two_buffer == 1) g_vq_on = 1;
+            if (!g_pcopy_avail || g_pcopy_k < 2) {
+                if (alloc_pbuf_history(surf_sz)) {
+                    g_pcopy_avail = 1;
+                }
             }
-            g_mbuf_state = 1;
         }
+    } else {
+        g_runtime_2buf = 0;
+        g_vq_on = 0;
+        if (g_pbuf) release_pbuf();
     }
 }
-"""
+
+static const char *sim_latency_fg_str(void)
+{
+    return __LATENCY_FG_EXPR__;
+}
+
+static void replay_register_buffers_fmt(int start_idx, int num_buf, uint32_t bw, uint32_t bh, uint32_t pitch, uint32_t fmt)
+{
+    int32_t startIndex = start_idx, bufferNum = num_buf;
+    (void)bufferNum;
+    VoAttr attr_val = { fmt, 0, 0, bw, bh, pitch, 0 };
+    const VoAttr *attr = &attr_val;
+    int need_rereg_ext_fmt = 0;
+    (void)need_rereg_ext_fmt;
+    if (attr && startIndex == 0) g_attr = *attr;
+    int is_aux_plane = (startIndex > 0 && g_bw > 0 && (bw != g_bw || bh != g_bh));
+    if (attr && !is_aux_plane) {
+        g_bw = attr->width; g_bh = attr->height; g_pitch = attr->pitchInPixel;
+        __REG_FMT_BLOCK__
+    }
+    if (need_rereg_ext_fmt) {
+        g_sim_rereg_ext_fmt = attr->format;
+        g_sim_rereg_ext_cnt++;
+    }
+}
+
+static void replay_register_buffers(int start_idx, int num_buf, uint32_t bw, uint32_t bh, uint32_t pitch)
+{
+    cusa10249_apply_deferred_tail_if_needed();
+    int32_t startIndex = start_idx, bufferNum = num_buf;
+    void *dummy_addrs[16];
+    for (int i = 0; i < 16; i++)
+        dummy_addrs[i] = (void *)(uintptr_t)(0x800000000ULL + (uint64_t)((startIndex + i) & 15) * 0x800000ULL);
+    void *const *addresses = dummy_addrs;
+    int is_aux_plane = (startIndex > 0 && g_bw > 0 && (bw != g_bw || bh != g_bh));
+    if (!is_aux_plane) {
+        g_bw = bw; g_bh = bh; g_pitch = pitch;
+        uint32_t seen_dfmt = 0;
+        (void)seen_dfmt;
+        __REG_START0_RESET__
+    }
+    if (addresses && bufferNum > 0 && !is_aux_plane) {
+        if (startIndex + bufferNum > g_game_idx_hi) g_game_idx_hi = startIndex + bufferNum;
+    }
+    __REG_BUF_LOOP__
+    if (start_idx != 0 || num_buf < 2 || num_buf > 8 || g_cfg.reg_mode == 2) return;
+    g_ngame = num_buf;
+    if (g_ngame == 2) g_vq_on = 1;
+    g_mbuf_state = -1;
+    size_t calc = (size_t)pitch * (size_t)((bh + 63u) & ~63u) * 4u;
+    size_t one = (calc + 0x7FFFFu) & ~(size_t)0x7FFFFu;
+    if (one >= 0x100000u && one <= 0x4000000u && bw >= 1280u && bh >= 720u && bw <= 3840u && bh <= 2160u) {
+        int want_pcopy = (g_ngame == 2);
+        int hi_res = (bw > 1920u || bh > 1080u);
+        int stream_3buf = (!want_pcopy &&
+                           ((!g_known_game && g_dbg_allocs >= 32u) ||
+                            vcfg_in_family(g_title_id, "CUSA09311") ||
+                            vcfg_in_family(g_title_id, "CUSA18534") ||
+                            vcfg_in_family(g_title_id, "CUSA10123")));
+        int cap_extra = want_pcopy
+            ? (vcfg_in_family(g_title_id, "CUSA11456") ? 1 : ((!g_known_game && g_dbg_allocs >= 32u) ? 2 : (hi_res ? 4 : 6)))
+            : (stream_3buf ? 1 : ((hi_res || !g_known_game) ? 2 : 3));
+        int max_extra = 16 - g_ngame;
+        if (max_extra > cap_extra) max_extra = cap_extra;
+        if (g_pre_mem) {
+            int nm = (int)(g_pre_size / one);
+            if (nm > max_extra) nm = max_extra;
+            g_nmid = nm > 0 ? nm : 1;
+            if (nm >= 1) {
+                size_t used_pre = (one * (size_t)nm + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
+                if (used_pre < 0x800000u) used_pre = 0x800000u;
+                if (used_pre > 0 && used_pre < g_pre_size) {
+                    shrink_early_mem_to_ex(used_pre, 0);
+                }
+                void *m2_va = NULL;
+                int nm2 = 0;
+                if (want_pcopy && nm < 2 && (__PCOPY_HAS_MAX_EXTRA__ ? (nm < max_extra) : 1) && one < 0x1000000u) {
+                    size_t need2 = (one * (size_t)(2 - nm) + 0x1FFFFFu) & ~(size_t)0x1FFFFFu;
+                    if (!g_mem_tight && dm_avail(0x200000u) >= need2 + 0x4000000u) {
+                        long m2_phys = 0;
+                        size_t range = sceKernelGetDirectMemorySize();
+                        long top_e = (long)(range & ~(size_t)0x1FFFFFu);
+                        long top_s = (top_e > (long)need2) ? (top_e - (long)need2) : 0L;
+                        g_own_alloc++;
+                        int r2 = (top_s > 0) ? sceKernelAllocateDirectMemory(top_s, top_e, need2, 0x200000u, 3, &m2_phys) : -1;
+                        if (r2 != 0) r2 = sceKernelAllocateDirectMemory(0, (long)range, need2, 0x200000u, 3, &m2_phys);
+                        if (r2 == 0) {
+                            sceKernelMapDirectMemory(&m2_va, need2, 0x33, 0, m2_phys, 0x200000u);
+                            if (m2_va) nm2 = 2 - nm;
+                        }
+                        g_own_alloc--;
+                    }
+                }
+                nm += nm2;
+                __PCOPY_AVAIL_BLOCK__
+                int base = (g_cfg.reg_mode == 1 && g_game_idx_hi > g_ngame && 16 - nm >= g_ngame) ? (16 - nm) : g_ngame;
+                g_mbase = base;
+                for (int i = 0; i < nm && base + i < 16; i++)
+                    g_buf[base + i] = 0x881200000ULL + (uint64_t)i * one;
+                g_nbuf = base + nm;
+                g_mbuf_state = 1;
+                on_register_buffers_2buf(g_ngame, calc);
+                return;
+            }
+        }
+        __REG_FALLBACK_BLOCK__
+    }
+}
+""".replace("__PCOPY_HAS_MAX_EXTRA__", str(PCOPY_GATE_HAS_MAX_EXTRA)).replace(
+    "__HAS_CUSA10249_AUDIO_FIX__", str(HAS_CUSA10249_AUDIO_FIX)
+)
 
 
 def generate_trace_c(traces: list[dict]) -> str:
-    lines: list[str] = ["int main(void) {", "    int passed = 0;"]
+    lines: list[str] = [
+        "int main(void) {",
+        "    int passed = 0;",
+        "    int fixA_failures = 0;",
+        """
+    /* Real trace: CUSA10249 (615a072258, 1440p re-registration after 1080p 2-buffer boot, audio_fix=0 pbuf release check) */
+    {
+        apply_title_defaults_sim("CUSA10249");
+        g_cfg.audio_fix = 0;
+        setup_plugin_load_early(0x15f200000ULL, 0x15c200000LL);
+        g_sim_flex_avail = 0xF00000u;
+        shrink_early_mem_to_ex(0x800000u, 1);
+        long p_fill = 0;
+        g_own_alloc++;
+        raw_sceKernelAllocateDirectMemory(0, 0x15ea00000LL, 0x2800000u, 0x200000u, 3, &p_fill);
+        g_own_alloc--;
+        replay_register_buffers(0, 2, 1920u, 1080u, 1920u);
+        ASSERT_MSG(g_mbuf_state == 1 && g_mbase == 2 && g_nbuf == 3 && IS_MID(2) && sim_on_our_buf(2), "CUSA10249_615a072258", 1, g_mbase);
+        ASSERT_MSG(g_runtime_2buf == 1 && g_vq_on == 1 && g_pbuf != NULL && g_pbuf_ycocg == 1, "CUSA10249_615a072258", 2, g_pbuf_sz);
+        {
+            long p = 0; void *va = NULL;
+            int32_t r = sceKernelAllocateDirectMemory(0LL, 0x15f200000LL, 0x600000ULL, 0x200000ULL, 0, &p);
+            ASSERT_MSG(r == 0, "CUSA10249_615a072258", 3, 0x600000ULL);
+            int32_t mr = sceKernelMapDirectMemory(&va, 0x600000ULL, 0x33, 0, p, 0x200000ULL);
+            ASSERT_MSG(mr == 0 && va != NULL, "CUSA10249_615a072258", 4, 0x600000ULL);
+        }
+        replay_register_buffers(0, 3, 2560u, 1440u, 2560u);
+        if (!(g_mbuf_state == -1 && g_mbase == 16 && g_nbuf == 3 && !IS_MID(2) && !sim_on_our_buf(2) && g_vq_on == 0 && g_runtime_2buf == 0 && g_pbuf == NULL)) {
+            printf("TRACE ASSERT FAILED [CUSA10249_615a072258 step 5]: mbuf_state=%d mbase=%d nbuf=%d IS_MID(2)=%d on_our_buf(2)=%d vq_on=%d runtime_2buf=%d pbuf=%p\\n",
+                   g_mbuf_state, g_mbase, g_nbuf, (int)IS_MID(2), sim_on_our_buf(2), g_vq_on, g_runtime_2buf, g_pbuf);
+            fixA_failures++;
+        }
+    }
+    /* Real trace: CUSA07410 (3b55484699, second group start=14 num=2 after start=0 num=3) */
+    {
+        apply_title_defaults_sim("CUSA07410");
+        setup_plugin_load_early(0x135210000ULL, 0xc2400000LL);
+        shrink_early_mem_to_ex(0x800000u, 1);
+        replay_register_buffers(0, 3, 1920u, 1080u, 1920u);
+        ASSERT_MSG(g_mbuf_state == 1 && g_mbase == 3 && g_nbuf == 4 && IS_MID(3) && sim_on_our_buf(3), "CUSA07410_3b55484699", 1, g_nbuf);
+        replay_register_buffers(14, 2, 1920u, 1080u, 1920u);
+        if (!(g_mbuf_state == 1 && g_mbase == 3 && g_nbuf == 4 && g_game_idx_hi == 16 && !IS_MID(14) && !IS_MID(15) && !sim_on_our_buf(14) && !sim_on_our_buf(15))) {
+            printf("TRACE ASSERT FAILED [CUSA07410_3b55484699 step 2]: mbuf_state=%d mbase=%d nbuf=%d idx_hi=%d IS_MID(14)=%d IS_MID(15)=%d on_our_buf(14)=%d on_our_buf(15)=%d\\n",
+                   g_mbuf_state, g_mbase, g_nbuf, g_game_idx_hi, (int)IS_MID(14), (int)IS_MID(15), sim_on_our_buf(14), sim_on_our_buf(15));
+            fixA_failures++;
+        }
+    }
+    if (fixA_failures > 0) exit(1);
+    int fixB_failures = 0;
+    /* Real trace: CUSA03468 (701e4d8e5f, 2-buffer 1080p pitch=1920 one=0x810000 pre_size=0x1a00000 -> nm=3) */
+    {
+        apply_title_defaults_sim("CUSA03468");
+        setup_plugin_load_early(0x128000000ULL, 0x810000LL);
+        shrink_early_mem_to_ex(0x1a00000u, 0);
+        replay_register_buffers(0, 2, 1920u, 1080u, 1920u);
+        uint32_t show_121 = 0, copy_121 = 0, show_122 = 0, copy_122 = 0;
+        uint64_t P_121 = 0, dst_121 = 0, P_122 = 0, dst_122 = 0;
+        sim_step_2buf_frame(121u, 0u, 1u, &show_121, &copy_121, &P_121, &dst_121);
+        sim_step_2buf_frame(122u, 1u, 0u, &show_122, &copy_122, &P_122, &dst_122);
+        if (!(dst_122 == 0ull || copy_122 == 0xFFFFu || copy_122 != show_121)) {
+            printf("TRACE ASSERT FAILED [CUSA03468_701e4d8e5f f:122 deadlock]: pcopy_k=%d nmid=%d show_121=%u copy_122=%u dst_122=0x%zx pbuf=%p\\n",
+                   g_pcopy_k, g_nmid, show_121, copy_122, (size_t)dst_122, g_pbuf);
+            fixB_failures++;
+        } else {
+            ASSERT_MSG(g_pbuf != NULL && P_122 == (uint64_t)(uintptr_t)g_pbuf && copy_122 == 0xFFFFu, "CUSA03468_701e4d8e5f", 2, copy_122);
+        }
+    }
+    /* Real trace: CUSA08809 (21c982659f, 2-buffer 1080p pitch=1920 one=0x800000 pre_size=0x1800000 -> nm=3, flex tight -> ycocg=1) */
+    {
+        apply_title_defaults_sim("CUSA08809");
+        setup_plugin_load_early(0x128000000ULL, 0x0LL);
+        g_sim_flex_avail = 0x1000000u;
+        shrink_early_mem_to_ex(0x1800000u, 1);
+        replay_register_buffers(0, 2, 1920u, 1080u, 1920u);
+        uint32_t show_121 = 0, copy_121 = 0, show_122 = 0, copy_122 = 0;
+        uint64_t P_121 = 0, dst_121 = 0, P_122 = 0, dst_122 = 0;
+        sim_step_2buf_frame(121u, 0u, 1u, &show_121, &copy_121, &P_121, &dst_121);
+        sim_step_2buf_frame(122u, 1u, 0u, &show_122, &copy_122, &P_122, &dst_122);
+        if (!(dst_122 == 0ull || copy_122 == 0xFFFFu || copy_122 != show_121)) {
+            printf("TRACE ASSERT FAILED [CUSA08809_21c982659f f:122 deadlock]: pcopy_k=%d nmid=%d show_121=%u copy_122=%u dst_122=0x%zx pbuf=%p\\n",
+                   g_pcopy_k, g_nmid, show_121, copy_122, (size_t)dst_122, g_pbuf);
+            fixB_failures++;
+        } else {
+            ASSERT_MSG(g_pbuf != NULL && g_pbuf_ycocg == 1 && P_122 == (uint64_t)(uintptr_t)g_pbuf && copy_122 == 0xFFFFu, "CUSA08809_21c982659f", 2, copy_122);
+        }
+    }
+    if (fixB_failures > 0) exit(1);
+    /* NEGATIVE HARDWARE EXAMPLE (owner-test-234b/boot-CUSA10249.prev.txt, saved in tools/tests/negative_cusa10249_arena2_preshave_sigbus_boot.txt):
+     * Pre-shaving CUSA10249 Arena 2 (len=0x15800000, type=0, phys=0x8e400000) by 0x600000 with an immediate FlexibleMemory tail (7afdb16)
+     * consumes 6 MB of FlexibleMemory at t=2.437s BEFORE the game's FlexibleMemory check at t=2.479s (eboot.bin+0x6a224b, right after Arena 4 map),
+     * causing the game's 86 MB FlexibleMemory mapping (va=0x1400000000) to fail with -15 (uc[19]=-15, [rsp+0x200]=0x600000) and abort via int $0x41 (SIGBUS sig=10 code=3).
+     * At audio_fix=0 (c87af66 compatibility), Arena 2 (0x15800000) is NOT pre-shaved (g_shave_n == 0 after Arenas 1..4). */
+    {
+        apply_title_defaults_sim("CUSA10249");
+        g_cfg.audio_fix = 0;
+        setup_plugin_load_early(0x137200000ULL, 0x200000LL);
+        g_sim_flex_avail = 0xE00000u;
+        long p1 = 0, p2 = 0, p3 = 0, p4 = 0;
+        void *va1 = (void *)(uintptr_t)0x1000000000ULL;
+        void *va2 = (void *)(uintptr_t)0x1100000000ULL;
+        void *va3 = (void *)(uintptr_t)0x1200000000ULL;
+        void *va4 = (void *)(uintptr_t)0x1300000000ULL;
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x8e200000ULL, 0x200000ULL, 0, &p1) == 0, "CUSA10249_neg_arena2_sigbus", 1, p1);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va1, 0x8e200000ULL, 0x33, 0x90, p1, 0x200000ULL) == 0, "CUSA10249_neg_arena2_sigbus", 1, (uintptr_t)va1);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x15800000ULL, 0x200000ULL, 0, &p2) == 0, "CUSA10249_neg_arena2_sigbus", 2, p2);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va2, 0x15800000ULL, 0x33, 0x90, p2, 0x200000ULL) == 0, "CUSA10249_neg_arena2_sigbus", 2, (uintptr_t)va2);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x68e00000ULL, 0x200000ULL, 3, &p3) == 0, "CUSA10249_neg_arena2_sigbus", 3, p3);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va3, 0x68e00000ULL, 0x33, 0x90, p3, 0x200000ULL) == 0, "CUSA10249_neg_arena2_sigbus", 3, (uintptr_t)va3);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x2a000000ULL, 0x200000ULL, 3, &p4) == 0, "CUSA10249_neg_arena2_sigbus", 4, p4);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va4, 0x2a000000ULL, 0x33, 0x90, p4, 0x200000ULL) == 0, "CUSA10249_neg_arena2_sigbus", 4, (uintptr_t)va4);
+        if (!(g_shave_n == 0 && p2 == 0x8e400000LL && p3 == 0xa3c00000LL && p4 == 0x10ca00000LL)) {
+            printf("TRACE ASSERT FAILED [CUSA10249_neg_arena2_sigbus]: Arena 2 must NOT be pre-shaved at audio_fix=0 (shave_n=%d p2=0x%zx p3=0x%zx p4=0x%zx)\\n",
+                   g_shave_n, (size_t)p2, (size_t)p3, (size_t)p4);
+            exit(1);
+        }
+    }
+    /* Real trace: owner-test-c87af66/boot-CUSA10249.txt under audio_fix=1 (Variant C, default for CUSA10249) and audio_fix=2 (Variant D):
+     * 1) Default for CUSA10249 is audio_fix=1.
+     * 2) 0 bytes of FlexibleMemory mapped BEFORE the first sceVideoOutRegisterBuffers (after Arenas 1..4 map, where eboot+0x6a224b checks Flex).
+     * 3) At audio_fix=1 (Variant C), the deferred 6 MB Flex tail of Arena 2 is mapped at the beginning of the FIRST sceVideoOutRegisterBuffers;
+     *    at audio_fix=2 (Variant D), Arena 4 is pre-shaved by 6 MB and its tail is unmapped (0 Flex calls).
+     * 4) In both audio_fix=1 and audio_fix=2, Alloc 5 (len=0x600000, align=0x200000, type=0 at 9.256s) receives 100% real DirectMemory (phys=0x136400000). */
+    for (int af_mode = 1; af_mode <= 2; af_mode++) {
+        apply_title_defaults_sim("CUSA10249");
+        if (af_mode == 1 && g_cfg.audio_fix != 1) {
+            printf("TRACE ASSERT FAILED [CUSA10249 default audio_fix]: expected 1, got %d\\n", g_cfg.audio_fix);
+            exit(1);
+        }
+        g_cfg.audio_fix = af_mode;
+        setup_plugin_load_early(0x137200000ULL, 0x200000LL);
+        g_sim_flex_avail = 0xE00000u;
+        long p1 = 0, p2 = 0, p3 = 0, p4 = 0, p_audio = 0;
+        void *va1 = (void *)(uintptr_t)0x1000000000ULL;
+        void *va2 = (void *)(uintptr_t)0x1100000000ULL;
+        void *va3 = (void *)(uintptr_t)0x1200000000ULL;
+        void *va4 = (void *)(uintptr_t)0x1300000000ULL;
+        void *va_audio = NULL;
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x8e200000ULL, 0x200000ULL, 0, &p1) == 0, "CUSA10249_audio_fix", 1, p1);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va1, 0x8e200000ULL, 0x33, 0x90, p1, 0x200000ULL) == 0, "CUSA10249_audio_fix", 1, (uintptr_t)va1);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x15800000ULL, 0x200000ULL, 0, &p2) == 0, "CUSA10249_audio_fix", 2, p2);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va2, 0x15800000ULL, 0x33, 0x90, p2, 0x200000ULL) == 0, "CUSA10249_audio_fix", 2, (uintptr_t)va2);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x68e00000ULL, 0x200000ULL, 3, &p3) == 0, "CUSA10249_audio_fix", 3, p3);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va3, 0x68e00000ULL, 0x33, 0x90, p3, 0x200000ULL) == 0, "CUSA10249_audio_fix", 3, (uintptr_t)va3);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x2a000000ULL, 0x200000ULL, 3, &p4) == 0, "CUSA10249_audio_fix", 4, p4);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va4, 0x2a000000ULL, 0x33, 0x90, p4, 0x200000ULL) == 0, "CUSA10249_audio_fix", 4, (uintptr_t)va4);
+        if (!(g_sim_map_flex_calls == 0 && g_sim_flex_avail == 0xE00000u)) {
+            printf("TRACE ASSERT FAILED [CUSA10249 audio_fix=%d pre-RegisterBuffers flex check]: map_flex_calls=%d flex_avail=0x%zx\\n",
+                   af_mode, g_sim_map_flex_calls, g_sim_flex_avail);
+            exit(1);
+        }
+        if (af_mode == 1) {
+            if (!(g_shave_n == 1 && g_shaves[0].orig_len == 0x15800000ULL && g_shaves[0].real_len == 0x15200000ULL &&
+                  p2 == 0x8e400000LL && p3 == 0xa3600000LL && p4 == 0x10c400000LL)) {
+                printf("TRACE ASSERT FAILED [CUSA10249 audio_fix=1 (C) arena2 shave]: shave_n=%d orig=0x%zx real=0x%zx p2=0x%zx p3=0x%zx p4=0x%zx\\n",
+                       g_shave_n, g_shave_n > 0 ? g_shaves[0].orig_len : 0, g_shave_n > 0 ? g_shaves[0].real_len : 0,
+                       (size_t)p2, (size_t)p3, (size_t)p4);
+                exit(1);
+            }
+        } else {
+            if (!(g_shave_n == 1 && g_shaves[0].orig_len == 0x2a000000ULL && g_shaves[0].real_len == 0x29a00000ULL &&
+                  p2 == 0x8e400000LL && p3 == 0xa3c00000LL && p4 == 0x10ca00000LL)) {
+                printf("TRACE ASSERT FAILED [CUSA10249 audio_fix=2 (D) arena4 shave]: shave_n=%d orig=0x%zx real=0x%zx p2=0x%zx p3=0x%zx p4=0x%zx\\n",
+                       g_shave_n, g_shave_n > 0 ? g_shaves[0].orig_len : 0, g_shave_n > 0 ? g_shaves[0].real_len : 0,
+                       (size_t)p2, (size_t)p3, (size_t)p4);
+                exit(1);
+            }
+        }
+        replay_register_buffers(0, 2, 1920u, 1080u, 1920u);
+        if (af_mode == 1) {
+            if (!(g_pbuf == NULL && g_sim_map_flex_calls == 1 && g_sim_flex_avail == 0x800000u)) {
+                printf("TRACE ASSERT FAILED [CUSA10249 audio_fix=1 (C) RegBuffers#1 deferred tail]: pbuf=%p map_flex_calls=%d flex_avail=0x%zx\\n",
+                       g_pbuf, g_sim_map_flex_calls, g_sim_flex_avail);
+                exit(1);
+            }
+        } else {
+            if (!(g_pbuf == NULL && g_sim_map_flex_calls == 0 && g_sim_flex_avail == 0xE00000u)) {
+                printf("TRACE ASSERT FAILED [CUSA10249 audio_fix=2 (D) RegBuffers#1 no flex]: pbuf=%p map_flex_calls=%d flex_avail=0x%zx\\n",
+                       g_pbuf, g_sim_map_flex_calls, g_sim_flex_avail);
+                exit(1);
+            }
+        }
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x600000ULL, 0x200000ULL, 0, &p_audio) == 0, "CUSA10249_audio_fix", 5, p_audio);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va_audio, 0x600000ULL, 0x33, 0, p_audio, 0x200000ULL) == 0 && va_audio != NULL, "CUSA10249_audio_fix", 5, (uintptr_t)va_audio);
+        if (!(p_audio == 0x136400000LL && sim_dm_is_allocated_range((uint64_t)p_audio, 0x600000ULL) &&
+              g_pre_mem != NULL && g_pre_size == 0x800000ULL && g_pre_mem_phys == 0x136a00000LL &&
+              g_shave_n == 1 && g_mbuf_state == 1 && g_mbase == 2 && g_nbuf == 3)) {
+            printf("TRACE ASSERT FAILED [CUSA10249 audio_fix=%d Alloc5 real DM]: p_audio=0x%zx in_dm=%d pre_mem_phys=0x%zx shave_n=%d mbuf_state=%d mbase=%d nbuf=%d\\n",
+                   af_mode, (size_t)p_audio, sim_dm_is_allocated_range((uint64_t)p_audio, 0x600000ULL), (size_t)g_pre_mem_phys,
+                   g_shave_n, g_mbuf_state, g_mbase, g_nbuf);
+            exit(1);
+        }
+    }
+    /* Real trace: owner-test-234/trace-CUSA13323.txt:192-195 (HDR10 format switch at start=2 num=2 fmt=0x88740000 + LATENCY FG off check) */
+    {
+        apply_title_defaults_sim("CUSA13323");
+        setup_plugin_load_early(0x13ca00000ULL, 0x18200000LL);
+        g_cfg.framegen = 1;
+        g_fg_off = 0;
+        g_inert_reason[0] = 0;
+        g_sim_rereg_ext_fmt = 0;
+        g_sim_rereg_ext_cnt = 0;
+        replay_register_buffers_fmt(0, 2, 1920u, 1080u, 1920u, 0x80000000u);
+        replay_register_buffers_fmt(2, 2, 1920u, 1080u, 1920u, 0x80000000u);
+        replay_register_buffers_fmt(4, 2, 1920u, 1080u, 1920u, 0x80000000u);
+        /* Late activation at f:120 registers our extra buffer at index 15 */
+        g_safe_active = 1;
+        g_mbuf_state = 1;
+        g_mbase = 15;
+        g_nbuf = 16;
+        g_ext_nm = 1;
+        /* At f:673, game switches scanout group start=2 num=2 to HDR10 (0x88740000, dfmt=9) */
+        replay_register_buffers_fmt(2, 2, 1920u, 1080u, 1920u, 0x88740000u);
+        if (!(g_fmt_supported == 1 && g_t_dfmt == 9u && g_attr.format == 0x88740000u && g_ext_attr.format == 0x88740000u && g_sim_rereg_ext_fmt == 0x88740000u && g_sim_rereg_ext_cnt == 1)) {
+            printf("TRACE ASSERT FAILED [CUSA13323_hdr10_format_switch]: fmt_supported=%d t_dfmt=%u attr_fmt=0x%x ext_attr_fmt=0x%x rereg_fmt=0x%x rereg_cnt=%d\\n",
+                   g_fmt_supported, g_t_dfmt, g_attr.format, g_ext_attr.format, g_sim_rereg_ext_fmt, g_sim_rereg_ext_cnt);
+            exit(1);
+        }
+        /* LATENCY FG status must report 'off' whenever g_fmt_supported == 0 (even if g_inert_reason[0] == 0) */
+        if (strcmp(sim_latency_fg_str(), "on") != 0) {
+            printf("TRACE ASSERT FAILED [LATENCY FG status when supported]: got %s\\n", sim_latency_fg_str());
+            exit(1);
+        }
+        g_fmt_supported = 0;
+        if (strcmp(sim_latency_fg_str(), "off") != 0) {
+            printf("TRACE ASSERT FAILED [LATENCY FG status when g_fmt_supported=0]: got %s\\n", sim_latency_fg_str());
+            exit(1);
+        }
+        g_fmt_supported = 1;
+        g_safe_active = 0;
+    }""",
+    ]
     for idx, tr in enumerate(traces):
         tkey = tr["trace_key"]
         tid = tr["title_id"]
@@ -594,7 +1092,15 @@ def generate_trace_c(traces: list[dict]) -> str:
         lines.append(f"    /* Trace {idx + 1}: {tkey} (v{tr['log_version']}) */")
         lines.append("    {")
         lines.append(f'        apply_title_defaults_sim("{tid}");')
+        if "shave_mode" in tr:
+            lines.append(f'        g_cfg.shave_mode = {int(tr["shave_mode"])};')
         lines.append(f"        setup_plugin_load_early({dm_sz}ULL, {pre_occ}LL);")
+        if tkey in ("CUSA13323_0x13ca00000", "CUSA11456_0x13ca00000"):
+            lines.append("        g_sim_flex_avail = 0x2C00000u;")
+        elif tkey == "CUSA10249_0x137200000":
+            lines.append("        g_sim_flex_avail = 0xE00000u;")
+        elif tkey == "CUSA13323_0x164a00000":
+            lines.append("        g_sim_flex_avail = 0x2000000u;")
         lines.append("        long id_phys[256]; size_t id_len[256];")
         lines.append("        memset(id_phys, 0, sizeof(id_phys)); memset(id_len, 0, sizeof(id_len));")
         for step_i, ev in enumerate(tr["events"]):
@@ -611,6 +1117,8 @@ def generate_trace_c(traces: list[dict]) -> str:
                 lines.append(
                     f"        replay_register_buffers({ev['start']}, {ev['num']}, {ev['w']}u, {ev['h']}u, {ev['pitch']}u);"
                 )
+                if tkey in ("CUSA13323_0x13ca00000", "CUSA11456_0x13ca00000") and ev["start"] == 0:
+                    lines.append("        g_sim_flex_avail = (g_pbuf != NULL && g_pbuf_phys < 0) ? 0x500000u : 0x1520000u;")
             elif op == "alloc":
                 s = ev["s"]
                 e = ev["e"]
@@ -640,13 +1148,104 @@ def generate_trace_c(traces: list[dict]) -> str:
                     )
                     lines.append(f"            if (r == 0) sceKernelReleaseDirectMemory(p, {elen}ULL);")
                     lines.append("        }")
-        if tid in ("CUSA07820", "CUSA10249", "CUSA00341", "CUSA07737"):
+        if tid in ("CUSA07820", "CUSA00341", "CUSA07737"):
             lines.append(
                 f'        for (int si = 0; si < g_shave_n; si++) ASSERT_MSG(g_shaves[si].real_len == 0, "{tkey}", 999, g_shaves[si].orig_len);'
             )
+        if tid in ("CUSA13323", "CUSA11456"):
+            lines.append(
+                f'        for (int si = 0; si < g_shave_n; si++) ASSERT_MSG(g_shaves[si].orig_len - g_shaves[si].real_len <= g_pre_size, "{tkey}", 998, g_shaves[si].orig_len - g_shaves[si].real_len);'
+            )
+        if tkey == "CUSA13323_0x13ca00000":
+            lines.append(f'        ASSERT_MSG(g_shave_n == 1 && g_pre_mem != NULL && g_pbuf == NULL, "{tkey}", 997, g_shave_n);')
+        if tkey == "CUSA11456_0x13ca00000":
+            lines.append(f'        ASSERT_MSG(g_pre_mem != NULL && g_pbuf == NULL && g_dbg_alloc_fail == 0, "{tkey}", 997, g_dbg_alloc_fail);')
+        if tkey == "CUSA10249_0x137200000":
+            lines.append(
+                f'        ASSERT_MSG(g_pbuf == NULL && g_pre_mem != NULL && g_pre_size == 0x800000ULL && g_shave_n == 1 && g_shaves[0].orig_len == 0x15800000ULL && g_shaves[0].real_len == 0x15200000ULL && id_phys[5] == 0x136400000LL && sim_dm_is_allocated_range((uint64_t)id_phys[5], 0x600000ULL), "{tkey}", 997, id_phys[5]);'
+            )
+        if tkey == "CUSA13323_0x164a00000":
+            lines.append(f'        ASSERT_MSG((g_pre_mem != NULL || dm_avail(0x200000u) >= 0x800000u) && g_pbuf == NULL && g_vq_on == 0 && g_dbg_alloc_fail == 0, "{tkey}", 997, g_dbg_alloc_fail);')
+        lines.append("        for (int bi = 0; bi < 16; bi++) {")
+        lines.append("            if (g_mbuf_state != 1) {")
+        lines.append(f'                ASSERT_MSG(!IS_MID(bi) && !sim_on_our_buf(bi), "{tkey}", 996, bi);')
+        lines.append("            } else if (bi < g_mbase || bi >= g_nbuf) {")
+        lines.append(f'                ASSERT_MSG(!IS_MID(bi) && !sim_on_our_buf(bi), "{tkey}", 996, bi);')
+        lines.append("            }")
+        lines.append("        }")
+        lines.append("        if (g_ngame == 2 && g_mbuf_state == 1) {")
+        lines.append("            uint32_t sh121 = 0, cp121 = 0, sh122 = 0, cp122 = 0;")
+        lines.append("            uint64_t p121 = 0, d121 = 0, p122 = 0, d122 = 0;")
+        lines.append("            sim_step_2buf_frame(121u, 0u, 1u, &sh121, &cp121, &p121, &d121);")
+        lines.append("            sim_step_2buf_frame(122u, 1u, 0u, &sh122, &cp122, &p122, &d122);")
+        lines.append(f'            ASSERT_MSG(d122 == 0ull || cp122 == 0xFFFFu || cp122 != sh121, "{tkey}", 995, cp122);')
+        lines.append("        }")
         lines.append(f'        ASSERT_MSG(on_sub() >= 0, "{tkey}", 1000, 0);')
         lines.append("        passed++;")
         lines.append("    }")
+        if tkey == "CUSA10249_0x137200000":
+            for extra_af in (2, 0):
+                lines.append("    {")
+                lines.append(f'        apply_title_defaults_sim("{tid}");')
+                lines.append(f"        g_cfg.audio_fix = {extra_af};")
+                lines.append(f"        setup_plugin_load_early({dm_sz}ULL, {pre_occ}LL);")
+                lines.append("        g_sim_flex_avail = 0xE00000u;")
+                lines.append("        long id_phys[256]; size_t id_len[256];")
+                lines.append("        memset(id_phys, 0, sizeof(id_phys)); memset(id_len, 0, sizeof(id_len));")
+                for step_i, ev in enumerate(tr["events"]):
+                    flips = ev.get("flips", 0)
+                    lines.append(f"        g_flips = {flips}u;")
+                    op = ev["op"]
+                    if op == "release_id":
+                        rid = ev["id"]
+                        if 0 < rid < 256:
+                            lines.append(
+                                f"        if (id_len[{rid}] > 0) {{ sceKernelReleaseDirectMemory(id_phys[{rid}], id_len[{rid}]); id_len[{rid}] = 0; }}"
+                            )
+                    elif op == "reg_buffers":
+                        lines.append(
+                            f"        replay_register_buffers({ev['start']}, {ev['num']}, {ev['w']}u, {ev['h']}u, {ev['pitch']}u);"
+                        )
+                    elif op == "alloc":
+                        s = ev["s"]
+                        e = ev["e"]
+                        elen = ev["len"]
+                        align = ev["align"]
+                        mtype = ev["type"]
+                        aid = ev.get("id", 0)
+                        if ev["orig_ret"] == "0x0":
+                            lines.append("        {")
+                            lines.append("            long p = 0; void *va = NULL;")
+                            lines.append(
+                                f"            int32_t r = sceKernelAllocateDirectMemory({s}LL, {e}LL, {elen}ULL, {align}ULL, {mtype}, &p);"
+                            )
+                            lines.append(f'            ASSERT_MSG(r == 0, "{tkey}_af{extra_af}", {step_i}, {elen}ULL);')
+                            lines.append(
+                                f"            int32_t mr = sceKernelMapDirectMemory(&va, {elen}ULL, 0x33, 0, p, {align}ULL);"
+                            )
+                            lines.append(f'            ASSERT_MSG(mr == 0 && va != NULL, "{tkey}_af{extra_af}", {step_i}, {elen}ULL);')
+                            if 0 < aid < 256:
+                                lines.append(f"            id_phys[{aid}] = p; id_len[{aid}] = {elen}ULL;")
+                            lines.append("        }")
+                        else:
+                            lines.append("        {")
+                            lines.append("            long p = 0;")
+                            lines.append(
+                                f"            int32_t r = sceKernelAllocateDirectMemory({s}LL, {e}LL, {elen}ULL, {align}ULL, {mtype}, &p);"
+                            )
+                            lines.append(f"            if (r == 0) sceKernelReleaseDirectMemory(p, {elen}ULL);")
+                            lines.append("        }")
+                if extra_af == 2:
+                    lines.append(
+                        f'        ASSERT_MSG(g_pbuf == NULL && g_pre_mem != NULL && g_pre_size == 0x800000ULL && g_shave_n == 1 && g_shaves[0].orig_len == 0x2a000000ULL && g_shaves[0].real_len == 0x29a00000ULL && id_phys[5] == 0x136400000LL && sim_dm_is_allocated_range((uint64_t)id_phys[5], 0x600000ULL) && g_sim_map_flex_calls == 0, "{tkey}_af2", 997, id_phys[5]);'
+                    )
+                else:
+                    lines.append(
+                        f'        for (int si = 0; si < g_shave_n; si++) ASSERT_MSG(g_shaves[si].real_len == 0, "{tkey}_af0", 999, g_shaves[si].orig_len);'
+                    )
+                    lines.append(f'        ASSERT_MSG(g_pbuf != NULL && g_pbuf_ycocg == 1 && g_shave_n == 1, "{tkey}_af0", 997, g_pbuf_sz);')
+                lines.append(f'        ASSERT_MSG(on_sub() >= 0, "{tkey}_af{extra_af}", 1000, 0);')
+                lines.append("    }")
     lines.append('    printf("real hardware traces replay: %d/%d CUSAxxxxx boot traces passed 100%%\\n", passed, passed);')
     lines.append("    return 0;")
     lines.append("}")
@@ -659,8 +1258,22 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     source = out / "test_real_traces.c"
     bitcode = out / "test_real_traces.bc"
+    init_mbase_m = re.search(r"static int g_mbase\s*=\s*(\d+);", MAIN_MBASE_DECLS)
+    init_mbase = init_mbase_m.group(1) if init_mbase_m else "3"
+    harness_c = HARNESS_C.replace("__MAIN_MBASE_DECLS__", MAIN_MBASE_DECLS).replace("__INIT_G_MBASE__", init_mbase)
+    replay_c = (
+        REPLAY_HELPER_C.replace("__ON_OUR_BUF_LINE__", ON_OUR_BUF_LINE)
+        .replace("__FG8_RESOLVE_FN__", FG8_RESOLVE_FN)
+        .replace("__FLIP_PCOPY_BLOCK__", FLIP_PCOPY_BLOCK)
+        .replace("__REG_START0_RESET__", REG_START0_RESET)
+        .replace("__REG_FMT_BLOCK__", REG_FMT_BLOCK)
+        .replace("__LATENCY_FG_EXPR__", LATENCY_FG_EXPR)
+        .replace("__REG_BUF_LOOP__", REG_BUF_LOOP)
+        .replace("__PCOPY_AVAIL_BLOCK__", PCOPY_AVAIL_BLOCK)
+        .replace("__REG_FALLBACK_BLOCK__", REG_FALLBACK_BLOCK)
+    )
     full_c = (
-        HARNESS_C
+        harness_c
         + "\n"
         + FAMILIES_BODY
         + "\n"
@@ -674,7 +1287,7 @@ def main() -> None:
         + "\n"
         + MAIN_ALLOC_PART2
         + "\n"
-        + REPLAY_HELPER_C
+        + replay_c
         + "\n"
         + generate_trace_c(traces)
     )

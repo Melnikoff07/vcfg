@@ -777,10 +777,10 @@ entry:
   %shy = call float @llvm.minnum.f32(float %shy1, float 16.0)
   %xfs0 = fadd float %xf1080, %shx
   %yfs0 = fadd float %yf1080, %shy
-  %xfs = fadd float %xfs0, %dqx
-  %yfs = fadd float %yfs0, %dqy
-  %u_q = fadd float %u, %dqx
-  %v_q = fadd float %v, %dqy
+  %xfs = fadd float %xfs0, 0.0
+  %yfs = fadd float %yfs0, 0.0
+  %u_q = fadd float %u, 0.0
+  %v_q = fadd float %v, 0.0
   ; ---- 4 nearest block centres (blocks of 16 px in 1080p space, centres at 16 i + 8)
   %fbx0 = fmul float %xfs, 0.0625
   %fbx = fsub float %fbx0, 0.46875
@@ -1241,8 +1241,7 @@ merge:
   %tc_w = fmul float %tc_w0, %tc_em
   %tc_dmp0 = fmul float %tc_w, 0x3FD3333340000000 ; 0.30
   %tc_dmp = fsub float 1.0, %tc_dmp0
-  %cw3_2 = fmul float %cw3_1, %tc_dmp
-  %cw3 = select i1 %fgkill, float 0.0, float %cw3_2
+  %cw3 = select i1 %fgkill, float 0.0, float %cw3_1
   %cw = select i1 %nocf, float 0.0, float %cw3
   %movc = call <4 x float> @lerp4(<4 x float> %mov, <4 x float> %fillc, float %cw)
   %out0 = call <4 x float> @lerp4(<4 x float> %movc, <4 x float> %stat, float %ws)

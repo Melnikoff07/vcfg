@@ -45,8 +45,13 @@ def metadata(data):
     if not isinstance(times, list) or len(times) != 3 or any(type(x) is not int for x in times):
         raise ValueError('invalid timestamps')
     dt = [times[1] - times[0], times[2] - times[1]]
-    if meta.get('timing_valid') is not True or not all(15000 <= d <= 18500 for d in dt) or abs(dt[0] - dt[1]) > 1500 or not 32000 <= sum(dt) <= 35000:
-        raise ValueError('not a uniform native-60 triplet')
+    is_30hz = meta.get('title') in ('CUSA03041', 'CUSA05571', 'CUSA08519')
+    if is_30hz:
+        if meta.get('timing_valid') is not True or not all(26000 <= d <= 48000 for d in dt) or abs(dt[0] - dt[1]) > 5000 or not 54000 <= sum(dt) <= 95000:
+            raise ValueError('not a uniform native-30 triplet')
+    else:
+        if meta.get('timing_valid') is not True or not all(15000 <= d <= 18500 for d in dt) or abs(dt[0] - dt[1]) > 1500 or not 32000 <= sum(dt) <= 35000:
+            raise ValueError('not a uniform native-60 triplet')
     if meta.get('generated_flipped') is not False or meta.get('phase_q16') != 32768:
         raise ValueError('not an offscreen midpoint capture')
     return meta

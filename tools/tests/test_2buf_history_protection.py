@@ -180,6 +180,7 @@ typedef struct {{
     int menu_opacity;
     int overlay;
     uint32_t menu_combo;
+    int audio_fix;
 }} fg_config_t;
 
 static fg_config_t g_cfg;
@@ -209,6 +210,7 @@ static uint32_t g_dbg_alloc_fail = 0;
 static uint32_t g_flips = 0;
 static volatile uint32_t g_vo_submit_flips = 0;
 static int g_gpu_state = 0;
+static volatile uint32_t g_mem_hibernate_count = 0;
 static int g_safe_never = 0;
 static long g_low_sub2mb_end = 0;
 static size_t g_gpu_sz = GPU_SZ_BASE;
@@ -512,7 +514,7 @@ static void simulate_gpu_pcopy8(uint32_t slot)
     uint64_t dst_va = ((uint64_t)tb3[16] << 8) | ((uint64_t)(tb3[17] & 0xFFu) << 40);
     uint32_t dst_dfmt = (tb3[17] >> 20) & 0x3Fu;
     if (!src_va || !dst_va) return;
-    if (dst_dfmt == 3u) {{
+    if (dst_dfmt == 16u) {{
         // 50%-footprint 16-bpp (2B/px) history surface: compress via YCoCg-R 4:2:0 16-bit
         ycocg420_compress_frame((const uint32_t *)(uintptr_t)src_va,
                                 (uint32_t *)(uintptr_t)dst_va, 64, 64, 64);
@@ -565,13 +567,15 @@ static void test_suite1_auto_2buf_detection(void)
     ASSERT(st.gcQueueNum == 1);
     ASSERT(st.currentBuffer == (int32_t)g_prev_idx);
 
-    // 1B: RegisterBuffers with count == 4 resets 2-buffer mode, then flipping a 2-buffer ring (0,1,0,1,0,1)
+    // 1B: RegisterBuffers with count == 4 resets 2-buffer mode (including g_vq_on from a 2-buffer splash screen,
+    //     e.g. CUSA10249 count=2 -> count=3 transition), then flipping a 2-buffer ring (0,1,0,1,0,1)
     //     dynamically detects the 2-buffer flip ring at runtime!
     g_ngame = 4;
-    g_vq_on = 0;
     g_pcopy_avail = 0;
     on_register_buffers_2buf(4, 0x800000u);
     ASSERT(g_runtime_2buf == 0);
+    ASSERT(g_vq_on == 0);
+    ASSERT(vq_active() == 0);
     ASSERT(g_pbuf == NULL);
 
     g_buf[0] = 0x210000000ULL;
@@ -732,7 +736,7 @@ static void test_suite3_prev_overwrite_protection_and_ycocg_psnr(void)
     uint32_t t_prev_dfmt = (tb_slot1[1] >> 20) & 0x3Fu;
     uint32_t t_prev_tidx = (tb_slot1[3] >> 20) & 0x1Fu;
     ASSERT(t_prev_va2 == (uint64_t)(uintptr_t)g_pbuf);
-    ASSERT(t_prev_dfmt == 3u); // 16-bpp (2 bytes/pixel = 50% footprint)
+    ASSERT(t_prev_dfmt == 16u); // 16-bpp 5_6_5 (2 bytes/pixel = 50% footprint, 3 RGB channels)
     ASSERT(t_prev_tidx == 8u); // Linear aligned
     uint32_t *tb3_slot1 = (uint32_t *)(g_gpu + SLOT0 + 1u * SLOT_SZ + OSD_SLOT_OFF);
     ASSERT(tb3_slot1[26] == 1920u * 1080u * 2u); // V#ycocg size = 4,147,200 bytes (4.15 MB)
@@ -808,6 +812,14 @@ def main() -> None:
         [str(llvm_bin / "lli.exe"), "--dlopen=msvcrt.dll", str(bc_path)],
         check=True,
     )
+
+
+import unittest
+
+
+class Test2BufHistoryProtection(unittest.TestCase):
+    def test_all_2buf_history_protection_suites(self) -> None:
+        main()
 
 
 if __name__ == "__main__":

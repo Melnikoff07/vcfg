@@ -37,7 +37,7 @@ extern char *strstr(const char *, const char *);
 extern size_t strlen(const char *);
 extern void *memcpy(void *, const void *, size_t);
 ''' + families_h + '''
-static int g_known_game, g_detected_60fps, g_tile_override = -1, g_tile_sweep, g_t6_bit_override = -1;
+static int g_known_game, g_detected_60fps, g_tile_override = -1, g_tile_sweep, g_t6_bit_override = -1, g_adapt_early_crashes = 0;
 static char g_title_id[16] = "CUSA00000";
 static char g_family_id[16] = "CUSA00000";
 static void tile_load(int idx) { (void)idx; }
@@ -77,7 +77,9 @@ int main(void) {
     if (c.two_buffer != 1) return 7;
     // Verify per-family defaults from telemetry logs:
     set_title("CUSA11456"); cfg_defaults(&c);
-    if (c.reg_mode != 1 || c.shave_mode != 0) return 8;
+    if (c.present_copy != 2 || c.two_buffer != 0 || c.shave_mode != 2 || c.reg_mode != 2 || c.pace_order != 3 || c.fps_lock != 30) return 8;
+    set_title("CUSA13323"); cfg_defaults(&c);
+    if (c.present_copy != 2 || c.two_buffer != 0 || c.shave_mode != 2 || c.reg_mode != 2 || c.pace_order != 3 || c.fps_lock != 30) return 8;
     set_title("CUSA16596"); cfg_defaults(&c);
     if (c.reg_mode != 1 || c.pace_order != 2) return 9;
     set_title("CUSA09311"); cfg_defaults(&c);
@@ -91,6 +93,15 @@ int main(void) {
     // Verify INI override still takes precedence over per-family default:
     input="game_vectors=1\\n"; parse_ini_file("title", &c, 0);
     if (c.game_vectors != 1) return 14;
+    // Verify audio_fix defaults to 1 on CUSA10249 and 0 on all other titles, and parses 0/1/2:
+    set_title("CUSA07408"); cfg_defaults(&c);
+    if (c.audio_fix != 0) return 15;
+    set_title("CUSA10249"); cfg_defaults(&c);
+    if (c.audio_fix != 1) return 16;
+    input="audio_fix = 2\\n"; parse_ini_file("title", &c, 0);
+    if (c.audio_fix != 2) return 17;
+    input="audio_fix=0\\n"; parse_ini_file("title", &c, 0);
+    if (c.audio_fix != 0) return 18;
     return 0;
 }
 ''', encoding='utf-8')

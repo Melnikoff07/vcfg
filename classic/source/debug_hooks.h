@@ -66,6 +66,23 @@ static volatile uint32_t *g_done = NULL;
 static volatile uint32_t g_last_seq = 0;
 static volatile uint32_t g_gpu_drain_waits = 0;
 
+// ---- CUSA10249 audio_fix deferred tail & helper state ----
+static int g_c10249_tail_pending = 0;
+static int g_c10249_first_reg_done = 0;
+static void *g_c10249_tail_va = NULL;
+static size_t g_c10249_tail_len = 0;
+static long g_c10249_tail_shave_cut = 0;
+static int g_c10249_tail_prot = 0;
+static int g_c10249_tail_type = 0;
+static uintptr_t g_c10249_arena_vs = 0;
+static uintptr_t g_c10249_arena_ve = 0;
+static long g_c10249_arena_phys = 0;
+
+static inline int cusa10249_audio_fix(void)
+{
+    return (strcmp(g_title_id, "CUSA10249") == 0 && (g_cfg.audio_fix == 1 || g_cfg.audio_fix == 2)) ? g_cfg.audio_fix : 0;
+}
+
 // ---- Lock-free API flight ring buffer (dumped on crash) ----
 #define API_RING_N 64
 static char g_api_ring[API_RING_N][224];
@@ -205,6 +222,37 @@ static void crash_load_modules(void)
             g_crash_mods[k].end1  = g_crash_mods[k].base1 + mi.segmentInfo[1].size;
         }
     }
+}
+
+static int is_third_party_prx_name(const char *name)
+{
+    if (!name || !name[0]) return 0;
+    if (!strstr(name, ".prx")) return 0;
+    if (!strncmp(name, "libSce", 6) || !strncmp(name, "libkernel", 9) ||
+        !strcmp(name, "libc.prx") || !strncmp(name, "vcfg", 4) ||
+        !strncmp(name, "bb_probe", 8) || !strncmp(name, "GoldHEN", 7) ||
+        !strcmp(name, "eboot.bin") || !strcmp(name, "PS4Util.prx") ||
+        !strcmp(name, "Il2CppUserAssemblies.prx") || !strcmp(name, "MonoAssembliesPS4.prx") ||
+        !strcmp(name, "fullgame.prx") || !strcmp(name, "gnmscale_plugin.prx") ||
+        !strcmp(name, "gs_resident_plugin.prx") || !strcmp(name, "steamnetworkingsockets.prx") ||
+        !strcmp(name, "Party.prx") || !strcmp(name, "logiWheel.prx") ||
+        !strncmp(name, "EOSSDK", 6) || !strncmp(name, "libfmod", 7) || !strncmp(name, "libAk", 5))
+        return 0;
+    return 1;
+}
+
+static int crash_resolve_third_party_mod(uintptr_t addr, char *mod_out, size_t mod_sz)
+{
+    if (addr < 0x10000u) return 0;
+    for (int i = 0; i < g_crash_nmods; i++) {
+        if (!is_third_party_prx_name(g_crash_mods[i].name)) continue;
+        if ((addr >= g_crash_mods[i].base0 && addr < g_crash_mods[i].end0) ||
+            (g_crash_mods[i].end1 > g_crash_mods[i].base1 && addr >= g_crash_mods[i].base1 && addr < g_crash_mods[i].end1)) {
+            if (mod_out && mod_sz > 0) snprintf(mod_out, mod_sz, "%s", g_crash_mods[i].name);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int crash_resolve_addr(uintptr_t addr, char *out, size_t out_sz)
@@ -410,26 +458,67 @@ static void crash_sig_handler(int sig, void *info, void *uctx)
         crash_write_both(fd_c, fd_b, "    %s\n", g_api_ring[i % API_RING_N]);
     }
     // Crash-driven self-adaptation: persist automatic workaround in adapt-<TITLE>.ini for the next start.
-    if (strncmp(g_title_id, "CUSA", 4) == 0) {
-        char apath[64], abuf[160];
+    // Never mutate adapt-<TITLE>.ini when the fault originated inside a third-party PRX plugin (e.g. game_patch.prx, OxagonLite_156.prx).
+    char tp_mod[64] = "";
+    uintptr_t rip_check = uctx ? (uintptr_t)((const uint64_t *)uctx)[28] : 0;
+    int is_tp_fault = crash_resolve_third_party_mod(rip_check, tp_mod, sizeof(tp_mod)) ||
+                      crash_resolve_third_party_mod(si_addr, tp_mod, sizeof(tp_mod));
+    if (is_tp_fault) {
+        crash_write_both(fd_c, fd_b,
+            "  THIRD_PARTY_PRX_FAULT: module='%s' (external plugin crash; SELF-ADAPT skipped)\n", tp_mod);
+    } else if (strncmp(g_title_id, "CUSA", 4) == 0) {
+        char apath[64], abuf[192];
         snprintf(apath, sizeof(apath), LOG_DIR "/adapt-%s.ini", g_title_id);
-        if ((g_flips < INJECT_AFTER_FLIPS && g_vo_submit_flips < INJECT_AFTER_FLIPS) ||
-            (g_dbg_alloc_fail > 0 && (g_cfg.shave_mode < 2 || g_cfg.reg_mode < 2))) {
+        if (vcfg_in_family(g_title_id, "CUSA11456") &&
+            ((g_flips < INJECT_AFTER_FLIPS + 600 && g_vo_submit_flips < INJECT_AFTER_FLIPS + 600) || g_dbg_alloc_fail > 0)) {
+            // CUSA13323 / CUSA11456 always crash at f:0 under shave_mode=0 (early 32 MB g_pre_mem starves BatchMap arenas).
+            // Never roll back to shave_mode=0; after 2 consecutive early crashes, disable FG (native mode) to avoid a loop.
+            int ec = g_adapt_early_crashes + 1;
+            g_adapt_early_crashes = ec;
+            int keep_vout = (g_cfg.vout_path > 0) ? 1 : 0;
+            int an = snprintf(abuf, sizeof(abuf),
+                              "; auto-generated on early crash\nadapt_ver = 234\nearly_crashes = %d\n%sshave_mode = 2\nreg_mode = 2\npace_order = 3\n%s",
+                              ec, (ec >= 2) ? "framegen = 0\n" : "",
+                              keep_vout ? "vout_path = 1\n" : "");
+            if (g_cfg.gv_conv >= 0 && an > 0 && an < (int)sizeof(abuf))
+                an += snprintf(abuf + an, sizeof(abuf) - (size_t)an, "gv_conv = %d\n", g_cfg.gv_conv);
+            int fd_a = sceKernelOpen(apath, 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0666);
+            if (fd_a >= 0 && an > 0) { sceKernelWrite(fd_a, abuf, (size_t)an); sceKernelClose(fd_a); }
+            char bmarker[64];
+            snprintf(bmarker, sizeof(bmarker), LOG_DIR "/safe-%s.boot", g_title_id);
+            sceKernelUnlink(bmarker);
+            if (ec >= 2) {
+                char spath[64];
+                snprintf(spath, sizeof(spath), LOG_DIR "/safe-%s.state", g_title_id);
+                int fd_s = sceKernelOpen(spath, 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0666);
+                if (fd_s >= 0) { sceKernelWrite(fd_s, "2\n", 2); sceKernelClose(fd_s); }
+            }
+            crash_write_both(fd_c, fd_b,
+                "  SELF-ADAPT: crash (flips=%u alloc_fail=%u early_crashes=%d) -> %s in %s for next start\n",
+                g_flips, g_dbg_alloc_fail, ec,
+                (ec >= 2) ? "disabled FG (native mode after 2 consecutive early crashes)" : "kept shave_mode=2 reg_mode=2",
+                apath);
+        } else if ((g_flips < INJECT_AFTER_FLIPS && g_vo_submit_flips < INJECT_AFTER_FLIPS) ||
+            (g_cfg.shave_mode == 2 && g_flips < INJECT_AFTER_FLIPS + 600 && g_vo_submit_flips < INJECT_AFTER_FLIPS + 600) ||
+            (g_dbg_alloc_fail > 0 && (g_cfg.shave_mode < 2 || g_cfg.reg_mode < 2 || g_cfg.shave_mode == 2))) {
             int next_shave = g_cfg.shave_mode;
             int next_reg = g_cfg.reg_mode;
-            if (g_cfg.shave_mode == 2 && g_shave_n == 0 && g_dbg_alloc_fail == 0 &&
-                g_flips < INJECT_AFTER_FLIPS && g_vo_submit_flips < INJECT_AFTER_FLIPS) {
-                next_shave = 1;
-                next_reg = 2;
-            } else if (g_cfg.shave_mode < 2 || g_cfg.reg_mode < 2) {
+            int rollback_shave2 = 0;
+            if (g_cfg.shave_mode == 2) {
+                next_shave = 0;
+                next_reg = 0;
+                rollback_shave2 = 1;
+                g_adapt_shave2_failed = 1;
+            } else if (!g_adapt_shave2_failed && (g_cfg.shave_mode < 2 || g_cfg.reg_mode < 2)) {
                 next_shave = 2;
                 next_reg = 2;
             }
-            if (next_shave != g_cfg.shave_mode || next_reg != g_cfg.reg_mode) {
-                int keep_2buf = (g_cfg.two_buffer > 0 || g_ngame == 2) ? 1 : 0;
+            if (next_shave != g_cfg.shave_mode || next_reg != g_cfg.reg_mode || rollback_shave2) {
+                int keep_2buf = (g_cfg.present_copy != 2 && (g_cfg.two_buffer > 0 || g_ngame == 2)) ? 1 : 0;
                 int keep_vout = (g_cfg.vout_path > 0) ? 1 : 0;
                 int an = snprintf(abuf, sizeof(abuf),
-                                  "; auto-generated on boot/alloc crash\nshave_mode = %d\nreg_mode = %d\npace_order = %d\n%s%s",
+                                  "; auto-generated on boot/alloc crash\nadapt_ver = 234\n%sshave_mode = %d\nreg_mode = %d\npace_order = %d\n%s%s",
+                                  rollback_shave2 ? "shave2_failed = 1\n" : "",
                                   next_shave, next_reg, g_cfg.pace_order,
                                   keep_2buf ? "two_buffer = 1\n" : "",
                                   keep_vout ? "vout_path = 1\n" : "");
@@ -437,21 +526,25 @@ static void crash_sig_handler(int sig, void *info, void *uctx)
                     an += snprintf(abuf + an, sizeof(abuf) - (size_t)an, "gv_conv = %d\n", g_cfg.gv_conv);
                 int fd_a = sceKernelOpen(apath, 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0666);
                 if (fd_a >= 0 && an > 0) { sceKernelWrite(fd_a, abuf, (size_t)an); sceKernelClose(fd_a); }
-                char bmarker[64];
-                snprintf(bmarker, sizeof(bmarker), LOG_DIR "/safe-%s.boot", g_title_id);
-                sceKernelUnlink(bmarker);
+                if (!rollback_shave2) {
+                    char bmarker[64];
+                    snprintf(bmarker, sizeof(bmarker), LOG_DIR "/safe-%s.boot", g_title_id);
+                    sceKernelUnlink(bmarker);
+                }
                 crash_write_both(fd_c, fd_b,
-                    "  SELF-ADAPT: crash (flips=%u alloc_fail=%u) -> wrote shave_mode=%d reg_mode=%d to %s for next start\n",
-                    g_flips, g_dbg_alloc_fail, next_shave, next_reg, apath);
+                    "  SELF-ADAPT: crash (flips=%u alloc_fail=%u) -> wrote shave_mode=%d reg_mode=%d%s to %s for next start\n",
+                    g_flips, g_dbg_alloc_fail, next_shave, next_reg,
+                    rollback_shave2 ? " (rollback shave2_failed=1)" : "", apath);
             }
         } else if ((g_flips >= INJECT_AFTER_FLIPS && g_flips < INJECT_AFTER_FLIPS + 600) ||
                    (g_vo_submit_flips >= INJECT_AFTER_FLIPS && g_vo_submit_flips < INJECT_AFTER_FLIPS + 600)) {
             int next_pace = (g_cfg.pace_order == 2) ? 3 : (g_last_pace_pre ? 2 : 1);
-            int keep_2buf = (g_cfg.two_buffer > 0 || g_ngame == 2) ? 1 : 0;
+            int keep_2buf = (g_cfg.present_copy != 2 && (g_cfg.two_buffer > 0 || g_ngame == 2)) ? 1 : 0;
             int keep_vout = (g_cfg.vout_path > 0) ? 1 : 0;
             int an = snprintf(abuf, sizeof(abuf),
-                              "; auto-generated on early FG crash (flips=%u)\nshave_mode = %d\nreg_mode = %d\npace_order = %d\n%s%s",
-                              g_flips, g_cfg.shave_mode, g_cfg.reg_mode, next_pace,
+                              "; auto-generated on early FG crash (flips=%u)\nadapt_ver = 234\n%sshave_mode = %d\nreg_mode = %d\npace_order = %d\n%s%s",
+                              g_flips, g_adapt_shave2_failed ? "shave2_failed = 1\n" : "",
+                              g_cfg.shave_mode, g_cfg.reg_mode, next_pace,
                               keep_2buf ? "two_buffer = 1\n" : "",
                               keep_vout ? "vout_path = 1\n" : "");
             if (g_cfg.gv_conv >= 0 && an > 0 && an < (int)sizeof(abuf))
@@ -509,6 +602,19 @@ static size_t dm_avail_range(long s, long e, size_t align, off_t *start_out)
     }
     if (start_out) *start_out = r == 0 ? start : 0;
     return r == 0 ? size : 0;
+}
+
+static void a10249_log_budget(const char *tag)
+{
+    if (strcmp(g_title_id, "CUSA10249") != 0) return;
+    size_t flex_av = 0;
+    ((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av);
+    size_t dm_sz = sceKernelGetDirectMemorySize();
+    size_t free_dm_2m = dm_avail_range(0, (long)dm_sz, 0x200000u, NULL);
+    size_t free_dm_64k = dm_avail_range(0, (long)dm_sz, 0x10000u, NULL);
+    STAGE("A10249 audio_fix=%d [%s]: flex_av=0x%zx free_dm_2m=0x%zx free_dm_64k=0x%zx pre_mem=%p(0x%zx@0x%lx) pre_gpu=%p(@0x%lx) pre_work=%p(0x%zx@0x%lx)",
+          g_cfg.audio_fix, tag, flex_av, free_dm_2m, free_dm_64k,
+          g_pre_mem, g_pre_size, g_pre_mem_phys, g_pre_gpu, g_pre_gpu_phys, g_pre_work, g_pre_work_sz, g_pre_work_phys);
 }
 
 int32_t sceVideoOutOpen_hook(int32_t u, int32_t bus, int32_t idx, const void *p)
@@ -763,16 +869,14 @@ static void claim_late_pre_mem_8mb(long s, long e)
     off_t av_start = 0;
     size_t av_sz = dm_avail_range(s, e, 0x200000u, &av_start);
     if (av_sz < keep) return;
-    long top_s = (long)av_start + (long)(av_sz - keep);
-    long top_e = (long)av_start + (long)av_sz;
+    long top_e = ((long)av_start + (long)av_sz) & ~0x1FFFFFL;
+    long top_s = top_e - (long)keep;
+    if (top_s < s || top_e > e) return;
     long phys = 0;
     void *va = NULL;
     g_own_alloc++;
     int ar = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                            top_s, top_e, keep, 0x200000u, 3 /*WC_GARLIC*/, &phys);
-    if (ar != 0)
-        ar = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
-                           s, e, keep, 0x200000u, 3 /*WC_GARLIC*/, &phys);
     int mr = (ar == 0) ? HOOK_CONTINUE(sceKernelMapDirectMemory, int32_t (*)(void **, size_t, int, int, long, size_t),
                                        &va, keep, 0x33, 0, phys, 0x200000u) : -1;
     g_own_alloc--;
@@ -851,17 +955,34 @@ static int32_t shave_game_alloc(long s, long e, size_t len, size_t align, int ty
         if (reserve && max_total_shave < (len - shave_av) + already_shaved)
             max_total_shave = (len - shave_av) + already_shaved;
     }
-    if ((g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) && max_total_shave < already_shaved + 0x2400000u)
-        max_total_shave = already_shaved + 0x2400000u;
+    if ((g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) && max_total_shave < 0x2400000u)
+        max_total_shave = 0x2400000u;
     if ((g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) && shave_av < len) {
         size_t flex_av = 0;
-        if (((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av) == 0 &&
-            flex_av >= (len - shave_av) + 0x400000u && max_total_shave < 0x4000000u) {
+        int fq = ((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av);
+        if (fq == 0 && already_shaved + (len - shave_av) > max_total_shave &&
+            flex_av < (len - shave_av) + 0x400000u && g_pbuf && g_pbuf_phys < 0 &&
+            flex_av + g_pbuf_sz >= (len - shave_av) + 0x400000u) {
+            release_pbuf();
+            fq = ((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av);
+        }
+        if (fq == 0 && flex_av >= (len - shave_av) + 0x400000u && max_total_shave < 0x4000000u) {
             max_total_shave = 0x4000000u;
         }
     }
     if (shave_av < len && (len - shave_av) <= 0x2400000u &&
         already_shaved + (len - shave_av) <= max_total_shave) {
+        size_t need_tail = len - shave_av;
+        size_t flex_av = 0;
+        int fq = ((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av);
+        if (fq == 0 && flex_av < need_tail && g_pbuf && g_pbuf_phys < 0 && flex_av + g_pbuf_sz >= need_tail) {
+            release_pbuf();
+            fq = ((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av);
+        }
+        int flex_ok = (fq != 0 || flex_av >= need_tail);
+        if (!flex_ok) {
+            return (int32_t)0x80020023u;
+        }
         if (shave_av >= 0x4000u && (len >= 0x100000u || has_large_arena_shave) &&
             !(is_desc_probe && len > 0x400000u && shave_av >= 0x40000u)) {
             int32_t sr = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
@@ -874,14 +995,11 @@ static int32_t shave_game_alloc(long s, long e, size_t len, size_t align, int ty
                       len, shave_av, *phys, len - shave_av, reserve);
                 return 0;
             }
-        } else if (shave_av == 0 && (g_pre_mem || g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) &&
+        } else if (shave_av == 0 && !cusa10249_audio_fix() && (g_pre_mem || g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) &&
                    ((g_pre_mem && len <= g_pre_size && already_shaved + len <= g_pre_size) ||
                     ((g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) && len <= 0x1000000u && already_shaved + len <= max_total_shave)) &&
                    (!is_desc_probe || len <= 0x400000u)) {
-            size_t flex_av = 0;
-            int flex_ok = (((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av) != 0 ||
-                           flex_av >= len);
-            if (flex_ok) {
+            {
                 // Exact final chunk (or runtime streaming chunk up to 16 MB) when 0 bytes of unallocated DirectMemory
                 // remain outside our scanout buffers, and not an intermediate step of a descending-size probe loop:
                 // synthesize a tail-only shave entry backed by FlexibleMemory on MapDirectMemory/BatchMap while keeping
@@ -914,13 +1032,54 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
 
     // In shave_mode=2 (LATE ALLOC), if this allocation would leave < 8 MB of 2MB-aligned DirectMemory in the pool,
     // claim our 8 MB g_pre_mem at the top of the free range first so Arena Shaving preserves 1 mid buffer.
+    // Never claim inside a constrained fixed subrange [s, e) when rng_av < len + 8 MB (e.g. CUSA08809 [0x40100000, 0x1275e0000)):
+    // only try claiming outside [s, e) so the game's exact subrange allocation is not starved.
     if (!g_own_alloc && !g_safe_never && !g_fg_off && !g_pre_mem && g_cfg.shave_mode == 2 &&
         g_gpu_state == 0 && g_mbuf_state <= 0 &&
         len >= 0x400000u && total_shaved_bytes() < 0x800000u) {
-        size_t pool_av2 = dm_avail_range(0, (long)sceKernelGetDirectMemorySize(), 0x200000u, NULL);
+        size_t dm_sz = sceKernelGetDirectMemorySize();
+        size_t pool_av2 = dm_avail_range(0, (long)dm_sz, 0x200000u, NULL);
         size_t rng_av = dm_avail_range(s, e, eff_align, NULL);
         if (rng_av >= len && pool_av2 >= 0x800000u && pool_av2 < len + 0x800000u) {
-            claim_late_pre_mem_8mb(s, e);
+            if ((s > 0 || (size_t)e < dm_sz) && rng_av < len + 0x800000u) {
+                if ((size_t)e < dm_sz) claim_late_pre_mem_8mb(e, (long)dm_sz);
+                if (!g_pre_mem && s > 0) claim_late_pre_mem_8mb(0, s);
+            } else {
+                claim_late_pre_mem_8mb(s, e);
+            }
+        }
+    }
+
+    // CUSA10249 audio_fix=1 (Variant C) & audio_fix=2 (Variant D):
+    // Pre-shave Arena 2 (0x15800000 -> 0x15200000, type==0, Variant C) or Arena 4 (0x2a000000 -> 0x29a00000, type==3, Variant D)
+    // by 0x600000 so 6 MB of real DirectMemory (0x136400000..0x136a00000) remains free for Alloc 5 (audio engine 0x600000, type==0).
+    if (!g_own_alloc && !g_safe_never && !g_fg_off &&
+        g_cfg.shave_mode != 1 && g_cfg.shave_mode != 3 &&
+        g_flips == 0 && g_gpu_state == 0 && g_shave_n == 0 &&
+        cusa10249_audio_fix() != 0 &&
+        ((cusa10249_audio_fix() == 1 && len == 0x15800000u && type == 0) ||
+         (cusa10249_audio_fix() == 2 && len == 0x2a000000u && type == 3)) &&
+        e > s && (size_t)(e - s) >= len) {
+        size_t need_tail = 0x600000u;
+        size_t real_len = len - need_tail;
+        if (g_pre_mem && g_pre_size > 0x800000u)
+            shrink_early_mem_to(0x800000u);
+        int32_t sr = HOOK_CONTINUE(sceKernelAllocateDirectMemory,
+                                   int32_t (*)(long, long, size_t, size_t, int, long *),
+                                   s, e, real_len, align, type, phys);
+        if (sr == 0 && phys) {
+            record_shave_entry(*phys, real_len, len, type);
+            g_mem_tight = 1;
+            uint32_t acnt = __atomic_add_fetch(&g_dbg_allocs, 1u, __ATOMIC_RELAXED);
+            (void)acnt;
+            void *caller = __builtin_return_address(0);
+            api_ring_push("AllocDM(pre-shave-af%d len=0x%zx real=0x%zx al=0x%zx ty=%d) = 0 phys=0x%lx c=%p",
+                          g_cfg.audio_fix, len, real_len, align, type, *phys, caller);
+            STAGE("A10249 audio_fix=%d (%s) arena pre-shave #1 OK: game asked len=0x%zx, allocated 0x%zx at phys=0x%lx (shaved 0x%zx for audio DirectMemory)",
+                  g_cfg.audio_fix, (g_cfg.audio_fix == 1) ? "C" : "D", len, real_len, *phys, need_tail);
+            STAGE("game AllocateDirectMemory(len=0x%zx align=0x%zx type=%d range=0x%lx..0x%lx) = 0x00000000 phys=0x%lx caller=%p",
+                  len, align, type, s, e, *phys, caller);
+            return 0;
         }
     }
 
@@ -1015,9 +1174,10 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
             if ((uint32_t)r == 0x80020023u)
                 r = shave_game_alloc(s, e, len, align, type, phys, boot_phase, is_desc_probe);
         }
+        int is_exact_fixed_range = (s > 0 && e > s && (size_t)(e - s) < len + 0x800000u);
         if ((uint32_t)r == 0x80020023u && g_pre_mem &&
             (g_mbuf_state <= 0 || (!boot_phase && (g_cfg.shave_mode == 1 || g_cfg.shave_mode == 3))) &&
-            !(non_2mb_giant_bundle && g_cfg.shave_mode == 2) && total_shaved_bytes() < g_pre_size) {
+            !(non_2mb_giant_bundle && g_cfg.shave_mode == 2 && !is_exact_fixed_range) && total_shaved_bytes() < g_pre_size) {
             size_t cur_av = dm_avail_range(s, e, eff_align, NULL);
             if (cur_av + g_pre_size >= len || (boot_phase && len >= 0x4000000u)) {
                 if (!boot_phase) {
@@ -1074,6 +1234,20 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
         if (r != 0 || (early_boot && (len >= 0x100000u || acnt <= 48u)))
             STAGE("game AllocateDirectMemory(len=0x%zx align=0x%zx type=%d range=0x%lx..0x%lx) = 0x%08x phys=0x%lx caller=%p",
                   len, align, type, s, e, (unsigned)r, (r == 0 && phys) ? *phys : 0L, caller);
+        if (strcmp(g_title_id, "CUSA10249") == 0 && len == 0x600000u && type == 0) {
+            long got_phys = (r == 0 && phys) ? *phys : 0L;
+            int is_syn = 0;
+            for (int si = 0; si < g_shave_n; si++) {
+                if (g_shaves[si].orig_len > 0 && g_shaves[si].real_len == 0 &&
+                    got_phys >= g_shaves[si].phys && got_phys < g_shaves[si].phys + (long)g_shaves[si].orig_len) {
+                    is_syn = 1;
+                    break;
+                }
+            }
+            STAGE("A10249 Alloc 5 result (audio_fix=%d): r=0x%08x phys=0x%lx kind=%s caller=%p",
+                  g_cfg.audio_fix, (unsigned)r, got_phys, (r == 0) ? (is_syn ? "synthetic" : "real") : "failed", caller);
+            a10249_log_budget("alloc5");
+        }
     }
     return r;
 }
@@ -1182,34 +1356,36 @@ static int32_t map_shaved_flex_tail(void *want_va, size_t tail_part, long shave_
 {
     g_own_alloc++;
     int32_t rf = map_flex_at_va(want_va, tail_part, prot);
+    if (rf != 0 && g_pbuf) {
+        release_pbuf();
+        rf = map_flex_at_va(want_va, tail_part, prot);
+    }
+    g_own_alloc--;
     if (rf == 0) {
-        g_own_alloc--;
         record_flex_vmap_ex(want_va, tail_part, shave_cut, prot, type, arena_vs, arena_ve, arena_phys);
         return 0;
     }
-    if (tail_part >= 0x10000u) {
-        // Partial FlexibleMemory fallback when the process has < tail_part of free FlexibleMemory
-        // (e.g. CUSA17722 / CUSA13323 0x8002000c, or sub-2MB tails like CUSA50688 0x12c000):
-        // map the final sentinel page first (so end-of-arena heap footer writes never fault),
-        // then map as much of the prefix as fits.
-        size_t sent_sz = (tail_part >= 0x200000u) ? 0x100000u : 0x10000u;
-        size_t step_sz = (tail_part >= 0x200000u) ? 0x200000u : 0x10000u;
-        void *sent_want = (uint8_t *)want_va + tail_part - sent_sz;
-        if (map_flex_at_va(sent_want, sent_sz, prot) == 0) {
-            record_flex_vmap_ex(sent_want, sent_sz, shave_cut + (long)(tail_part - sent_sz), prot, type,
-                                arena_vs, arena_ve, arena_phys);
-        }
-        for (size_t try_flex = (tail_part - sent_sz) & ~(step_sz - 1u);
-             try_flex >= step_sz; try_flex -= step_sz) {
-            if (map_flex_at_va(want_va, try_flex, prot) == 0) {
-                record_flex_vmap_ex(want_va, try_flex, shave_cut, prot, type, arena_vs, arena_ve, arena_phys);
-                rf = (try_flex + sent_sz >= tail_part) ? 0 : 1; // 1 = partial/sentinel
-                break;
-            }
-        }
+    return rf ? rf : (int32_t)0x8002000cu;
+}
+
+static void cusa10249_apply_deferred_tail_if_needed(void) __attribute__((unused));
+static void cusa10249_apply_deferred_tail_if_needed(void)
+{
+    if (strcmp(g_title_id, "CUSA10249") != 0) return;
+    g_c10249_first_reg_done = 1;
+    if (!g_c10249_tail_pending) return;
+    g_c10249_tail_pending = 0;
+    int32_t rf = map_shaved_flex_tail(g_c10249_tail_va, g_c10249_tail_len, g_c10249_tail_shave_cut,
+                                      g_c10249_tail_prot, g_c10249_tail_type,
+                                      g_c10249_arena_vs, g_c10249_arena_ve, g_c10249_arena_phys);
+    if (rf == 0) {
+        g_shave_tail_mapped = 1;
+        STAGE("audio_fix C tail mapped OK on RegisterBuffers #1: va=%p len=0x%zx prot=0x%x shave_cut=0x%lx",
+              g_c10249_tail_va, g_c10249_tail_len, g_c10249_tail_prot, g_c10249_tail_shave_cut);
+    } else {
+        STAGE("audio_fix C tail FAILED: va=%p len=0x%zx prot=0x%x shave_cut=0x%lx rf=0x%08x",
+              g_c10249_tail_va, g_c10249_tail_len, g_c10249_tail_prot, g_c10249_tail_shave_cut, (unsigned)rf);
     }
-    g_own_alloc--;
-    return rf;
 }
 
 static int32_t map_flex_aligned(void **addr, void *orig_addr_in, size_t len, int prot, int flags, size_t align)
@@ -1290,17 +1466,49 @@ static int32_t handle_game_map_inner(void **addr, size_t len, int type, int prot
                 size_t tail_part = len - real_part;
                 int32_t r = call_orig_map(addr, real_part, type, prot, flags, dmStart, maxPageSize, name, map_kind);
                 if (r == 0 && addr && *addr) {
-                    g_shave_tail_mapped = 1;
                     void *want_va = (uint8_t *)(*addr) + real_part;
+                    if (cusa10249_audio_fix() == 1 && !g_c10249_first_reg_done) {
+                        g_c10249_tail_va = want_va;
+                        g_c10249_tail_len = tail_part;
+                        g_c10249_tail_shave_cut = shave_cut;
+                        g_c10249_tail_prot = prot;
+                        g_c10249_tail_type = se->type;
+                        g_c10249_arena_vs = (uintptr_t)(*addr);
+                        g_c10249_arena_ve = (uintptr_t)(*addr) + len;
+                        g_c10249_arena_phys = dmStart;
+                        g_c10249_tail_pending = 1;
+                        api_ring_push("%s(shave-defer-C phys=0x%lx len=0x%zx real=0x%zx) = 0 va=%p c=%p",
+                                      mname, dmStart, len, real_part, *addr, caller);
+                        STAGE("A10249 audio_fix=1 (C) arena shave map OK (tail deferred until RegisterBuffers #1): va=%p real=0x%zx deferred_tail=0x%zx tail_va=%p prot=0x%x",
+                              *addr, real_part, tail_part, want_va, prot);
+                        STAGE("game %s(phys=0x%lx len=0x%zx prot=0x%x flags=0x%x align=0x%zx in=%p) = 0x00000000 va=%p (shaved-defer-C) caller=%p",
+                              mname, dmStart, len, prot, flags, maxPageSize, orig_addr_in, *addr, caller);
+                        return 0;
+                    }
+                    if (cusa10249_audio_fix() == 2) {
+                        api_ring_push("%s(shave-unmapped-D phys=0x%lx len=0x%zx real=0x%zx) = 0 va=%p c=%p",
+                                      mname, dmStart, len, real_part, *addr, caller);
+                        STAGE("A10249 audio_fix=2 (D) arena shave map OK (tail unmapped, 0 flex bytes): va=%p real=0x%zx unmapped_tail=0x%zx",
+                              *addr, real_part, tail_part);
+                        STAGE("game %s(phys=0x%lx len=0x%zx prot=0x%x flags=0x%x align=0x%zx in=%p) = 0x00000000 va=%p (shaved-D) caller=%p",
+                              mname, dmStart, len, prot, flags, maxPageSize, orig_addr_in, *addr, caller);
+                        if (len == 0x2a000000u)
+                            a10249_log_budget("after_arenas");
+                        return 0;
+                    }
                     int32_t rf = map_shaved_flex_tail(want_va, tail_part, shave_cut, prot, se->type,
                                                       (uintptr_t)(*addr), (uintptr_t)(*addr) + len, dmStart);
-                    api_ring_push("%s(shave-straddle phys=0x%lx len=0x%zx) = 0 va=%p rf=0x%x c=%p",
-                                  mname, dmStart, len, *addr, (unsigned)rf, caller);
-                    STAGE("arena shave map OK: va=%p real=0x%zx shaved_tail=0x%zx flex_tail=%s (rf=0x%08x)",
-                          *addr, real_part, tail_part, (rf == 0) ? "mapped" : "partial/sentinel", (unsigned)rf);
-                    STAGE("game %s(phys=0x%lx len=0x%zx prot=0x%x flags=0x%x align=0x%zx in=%p) = 0x00000000 va=%p (shaved) caller=%p",
-                          mname, dmStart, len, prot, flags, maxPageSize, orig_addr_in, *addr, caller);
-                    return 0;
+                    if (rf == 0) {
+                        g_shave_tail_mapped = 1;
+                        api_ring_push("%s(shave-straddle phys=0x%lx len=0x%zx) = 0 va=%p rf=0x%x c=%p",
+                                      mname, dmStart, len, *addr, (unsigned)rf, caller);
+                        STAGE("arena shave map OK: va=%p real=0x%zx shaved_tail=0x%zx flex_tail=mapped (rf=0x%08x)",
+                              *addr, real_part, tail_part, (unsigned)rf);
+                        STAGE("game %s(phys=0x%lx len=0x%zx prot=0x%x flags=0x%x align=0x%zx in=%p) = 0x00000000 va=%p (shaved) caller=%p",
+                              mname, dmStart, len, prot, flags, maxPageSize, orig_addr_in, *addr, caller);
+                        return 0;
+                    }
+                    sceKernelMunmap(*addr, real_part);
                 }
                 if (addr) *addr = orig_addr_in;
                 if (dmStart == se->phys && g_flips == 0 && g_gpu_state == 0 && g_mbuf_state <= 0) {
@@ -1399,6 +1607,8 @@ static int32_t handle_game_map_inner(void **addr, size_t len, int type, int prot
         if (r != 0 || (early_boot && (len >= 0x100000u || mcnt <= 48u)))
             STAGE("game %s(phys=0x%lx len=0x%zx prot=0x%x flags=0x%x align=0x%zx in=%p) = 0x%08x va=%p caller=%p",
                   mname, dmStart, len, prot, flags, maxPageSize, orig_addr_in, (unsigned)r, (void *)va_out, caller);
+        if (strcmp(g_title_id, "CUSA10249") == 0 && len == 0x2a000000u)
+            a10249_log_budget("after_arenas");
     }
     return r;
 }
@@ -1456,6 +1666,30 @@ static void unmap_shave_flex_vmaps(long phys_s, long phys_e)
             g_own_alloc++;
             sceKernelMunmap(va, vlen);
             g_own_alloc--;
+        } else if (vp_s < phys_s && phys_s < vp_e && phys_e >= vp_e) {
+            size_t keep_len = (size_t)(phys_s - vp_s);
+            size_t trim_len = (size_t)(vp_e - phys_s);
+            void *trim_va = (void *)(g_flex_vmap[i].va_start + keep_len);
+            g_flex_vmap[i].va_end = g_flex_vmap[i].va_start + keep_len;
+            if (g_flex_vmap[i].arena_va_end > g_flex_vmap[i].va_end) {
+                g_flex_vmap[i].arena_va_end = g_flex_vmap[i].va_end;
+            }
+            g_own_alloc++;
+            sceKernelMunmap(trim_va, trim_len);
+            g_own_alloc--;
+        } else if (phys_s <= vp_s && phys_e > vp_s && phys_e < vp_e) {
+            size_t trim_len = (size_t)(phys_e - vp_s);
+            void *trim_va = (void *)g_flex_vmap[i].va_start;
+            g_flex_vmap[i].va_start += trim_len;
+            g_flex_vmap[i].phys_start = phys_e;
+            if (g_flex_vmap[i].arena_va_start < g_flex_vmap[i].va_start &&
+                g_flex_vmap[i].arena_phys_start >= phys_s) {
+                g_flex_vmap[i].arena_va_start = g_flex_vmap[i].va_start;
+                g_flex_vmap[i].arena_phys_start = phys_e;
+            }
+            g_own_alloc++;
+            sceKernelMunmap(trim_va, trim_len);
+            g_own_alloc--;
         }
     }
 }
@@ -1476,6 +1710,7 @@ int32_t sceKernelReleaseDirectMemory_hook(off_t start, size_t len)
             if (rel_s <= se->phys && rel_e >= se_end) {
                 size_t real_len = se->real_len;
                 long real_phys = se->phys;
+                if (se->orig_len == 0x15800000u) g_c10249_tail_pending = 0;
                 unmap_shave_flex_vmaps(shave_cut, se_end);
                 se->orig_len = 0;
                 se->real_len = 0;
@@ -1492,7 +1727,7 @@ int32_t sceKernelReleaseDirectMemory_hook(off_t start, size_t len)
             }
             // Case B: Sub-range release completely inside the shaved tail [shave_cut, se_end)
             // (e.g. CUSA10213 / CUSA11260 / CUSA12607 releasing tail pages): never pass to kernel!
-            if (rel_s >= shave_cut && rel_e <= se_end) {
+            if (!cusa10249_audio_fix() && rel_s >= shave_cut && rel_e <= se_end) {
                 unmap_shave_flex_vmaps(rel_s, rel_e);
                 if (rel_e == se_end) {
                     se->orig_len = (size_t)(rel_s - se->phys);
@@ -1765,13 +2000,12 @@ int32_t sceKernelVirtualQuery_hook(const void *addr, int flags, OrbisKernelVirtu
                               addr, flags, info, infoSize);
     if (r == 0 && !g_in_crash && !g_own_alloc && info && infoSize >= sizeof(OrbisKernelVirtualQueryInfo)) {
         uintptr_t q_va = (uintptr_t)addr;
-        uintptr_t start_va = (uintptr_t)info->unk01;
         uint32_t fn = __atomic_load_n(&g_flex_vmap_n, __ATOMIC_ACQUIRE);
         for (uint32_t i = 0; i < fn && i < FLEX_VMAP_MAX; i++) {
             if (g_flex_vmap[i].phys_start < 0) continue; // skip internal alloc_flex_gpu buffers
             uintptr_t avs = g_flex_vmap[i].arena_va_start;
             uintptr_t ave = g_flex_vmap[i].arena_va_end;
-            if ((q_va >= avs && q_va < ave) || (start_va >= avs && start_va < ave)) {
+            if (q_va >= avs && q_va < ave) {
                 info->unk01 = (void *)avs;
                 info->unk02 = (void *)ave;
                 info->offset = (off_t)g_flex_vmap[i].arena_phys_start;

@@ -29,10 +29,15 @@ static void bench_stop(const char *reason)
     if (g_flips > 0) lg("BENCH STOP %s; native flips continue, allocations retained\n", reason);  // lg() opens stdio files: only once the game runs
 }
 
+static int bench_is_30hz_title(void)
+{
+    return !strcmp(g_title_id, "CUSA03041") || !strcmp(g_title_id, "CUSA05571") || !strcmp(g_title_id, "CUSA08519");
+}
+
 static int bench_bootstrap(void)
 {
-    if (strcmp(g_title_id, "CUSA00557") && strcmp(g_title_id, "CUSA09171")) {
-        klog("[bb_probe] BENCH inert: title not on the native-60 capture allowlist\n");
+    if (strcmp(g_title_id, "CUSA00557") && strcmp(g_title_id, "CUSA09171") && !bench_is_30hz_title()) {
+        klog("[bb_probe] BENCH inert: title not on the capture allowlist\n");
         return 0;
     }
     // raw kernel I/O (like read_mode_raw): stdio inside plugin_load crashes the game
@@ -90,6 +95,8 @@ static void bench_allocate(void)
 {
     bench_mem_report("before capture allocations");
     g_bench_surfaces = (uint8_t *)bench_alloc(2u * BENCH_SURFACE, 0x200000, 3);
+    if (!g_bench_surfaces) g_bench_surfaces = (uint8_t *)bench_alloc(2u * BENCH_SURFACE, 0x200000, 0);
+    if (!g_bench_surfaces) g_bench_surfaces = (uint8_t *)bench_alloc_flex(2u * BENCH_SURFACE);
     bench_mem_report("after surfaces");
     if (!g_bench_surfaces) { bench_stop("offscreen allocation failed"); return; }
     // the game leaves little direct memory free (33 MB for 960 wide failed with 0x80020023 on CUSA00557): narrower crops
@@ -229,8 +236,10 @@ static int32_t bench_flip(uint32_t count, void **dcb, uint32_t *sizes, void **cc
         if (state == BENCH_IDLE) goto native;  // between triplets a odd flip (menu, loading, other mode) only postpones the next sample
         bench_stop("unsupported/reconfigured scanout mid-triplet"); goto native;
     }
-    if (state == BENCH_IDLE && (g_flips < g_bench_next || g_ema_frame_us > 18500u ||
-        g_osd_real_fps_x10 < 550u || g_osd_real_fps_x10 > 620u)) goto native;
+    int is_30hz = bench_is_30hz_title();
+    if (state == BENCH_IDLE && (g_flips < g_bench_next ||
+        (is_30hz ? (g_ema_frame_us < 26000u || g_ema_frame_us > 48000u || g_osd_real_fps_x10 < 210u || g_osd_real_fps_x10 > 350u)
+                 : (g_ema_frame_us > 18500u || g_osd_real_fps_x10 < 550u || g_osd_real_fps_x10 > 620u)))) goto native;
     if (!count || count > 6 || !dcb || !sizes) { bench_stop("unsupported submission shape"); goto native; }
     for (uint32_t i = 0; i < count; i++) {
         if (!dcb[i] || !sizes[i] || (sizes[i] & 3u) || sizes[i] > (16u << 20) || !dcb_mem_ok((uintptr_t)dcb[i], sizes[i])) {
@@ -260,11 +269,13 @@ static int32_t bench_flip(uint32_t count, void **dcb, uint32_t *sizes, void **cc
         g_bench_attr = g_attr; g_bench_hud = g_hud_packed;
     }
     g_bench_frames[stage] = g_flips; g_bench_indices[stage] = index; g_bench_times[stage] = now;
-    if (stage && (g_flips != g_bench_first + stage || now - g_bench_times[stage - 1u] < 15000u ||
-                  now - g_bench_times[stage - 1u] > 18500u)) g_bench_timing = 0;
+    uint64_t dt_min = is_30hz ? 26000u : 15000u, dt_max = is_30hz ? 48000u : 18500u;
+    if (stage && (g_flips != g_bench_first + stage || now - g_bench_times[stage - 1u] < dt_min ||
+                  now - g_bench_times[stage - 1u] > dt_max)) g_bench_timing = 0;
     if (stage == 2) {
         uint64_t d1 = g_bench_times[1] - g_bench_times[0], d2 = now - g_bench_times[1];
-        if ((d1 > d2 ? d1 - d2 : d2 - d1) > 1500u || d1 + d2 < 32000u || d1 + d2 > 35000u) g_bench_timing = 0;
+        uint64_t diff_max = is_30hz ? 5000u : 1500u, sum_min = is_30hz ? 54000u : 32000u, sum_max = is_30hz ? 95000u : 35000u;
+        if ((d1 > d2 ? d1 - d2 : d2 - d1) > diff_max || d1 + d2 < sum_min || d1 + d2 > sum_max) g_bench_timing = 0;
     }
     // Same cache flush sequence as the normal appended mode8 DCB.
     *p++ = PKT3(0x46, 1, 0); *p++ = 0x0000002E;
@@ -274,6 +285,7 @@ static int32_t bench_flip(uint32_t count, void **dcb, uint32_t *sizes, void **cc
     p = bench_pack(p, current, stage, tidx);
     if (!stage) {
         uint32_t *tb = g_bench_tables + 128;
+        memset(tb, 0, 32u * sizeof(uint32_t));
         make_t(tb + 8, current, 1920, 1080, 1920, tidx);
         make_t(tb + 16, saved_a, 1920, 1080, 1920, tidx);
         p = bench_pass(p, tb, g_sh8_off[16], PCOPY8_RSRC1, PCOPY8_RSRC2, 240, 135);

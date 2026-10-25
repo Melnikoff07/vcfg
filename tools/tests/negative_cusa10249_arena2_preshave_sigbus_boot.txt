@@ -1,0 +1,82 @@
+# DOCUMENTED NEGATIVE EXAMPLE (owner-test-234b/boot-CUSA10249.prev.txt on commit 7afdb16 / bb22d56):
+# Pre-shaving CUSA10249 Arena 2 (len=0x15800000, type=0, phys=0x8e400000) by 0x600000 (real_len=0x15200000 + flex_tail=0x600000)
+# passes synthetic boot trace replay, but on real PS4 hardware triggers CRASH SIGBUS (sig=10 code=3) 45 ms later (t=2.479s, flips=0)
+# at eboot.bin+0x6a224b (<cd 41>, int $0x41 engine abort) because the engine sub-maps physical DirectMemory offsets across Arenas 1..3.
+# Reverted in git revert 7afdb16.
+    2.122 [t:101819 f:0] plugin_load enter: title=CUSA10249 (family=CUSA04529) version=2.34 engine=classic neo=0 dm=0x137200000 shave_mode=0 reg_mode=0 pace_order=0 post_mid=0
+    2.124 [t:101819 f:0] debug hooks + crash signal handlers installed (always-on logger + Allocate/Available/Map/Release/BatchMap/VQuery trace, main_dm=1 map2=1 rel=1 bm=1/1 vq=1)
+    2.124 [t:101819 f:0] status hook installed (two_buffer=0, test=0)
+    2.125 [t:101819 f:0] safe mode: title CUSA10249 in state=0 -> universal early pipeline active (boot marker armed until frame 120)
+    2.135 [t:101819 f:0] early display memory try 1 (top): len=0x2000000 align=0x200000 type=3 range=0x135200000..0x137200000 r=0x00000000 phys=0x135200000 ok
+    2.135 [t:101819 f:0] alloc gpu sz=0x20000 (mode 8)
+    2.135 [t:101819 f:0] alloc_dm ok: len=0x20000 align=0x20000 type=0 range=0x0..0x200000 phys=0x20000 va=881120000
+    2.136 [t:101819 f:0] alloc gpu -> 881120000 (phys=0x20000)
+    2.136 [t:101819 f:0] alloc work sz=0x190000 garlic
+    2.136 [t:101819 f:0] alloc_dm ok: len=0x190000 align=0x10000 type=3 range=0x40000..0x200000 phys=0x40000 va=883200000
+    2.136 [t:101819 f:0] alloc work -> 883200000 (phys=0x40000) garlic=1
+    2.136 [t:101819 f:0] hooking
+    2.137 [t:101819 f:0] hooks installed
+    2.432 [t:101819 f:0] game AllocateDirectMemory(len=0x8e200000 align=0x200000 type=0 range=0x0..0x137200000) = 0x00000000 phys=0x200000 caller=1f43483
+    2.434 [t:101819 f:0] game MapDirectMemory(phys=0x200000 len=0x8e200000 prot=0x33 flags=0x90 align=0x200000 in=1000000000) = 0x00000000 va=1000000000 caller=1f434ec
+    2.434 [t:101819 f:0] arena pre-shave #1 OK: game asked len=0x15800000, allocated 0x15200000 at phys=0x8e400000 (shaved 0x600000)
+    2.434 [t:101819 f:0] game AllocateDirectMemory(len=0x15800000 align=0x200000 type=0 range=0x0..0x137200000) = 0x00000000 phys=0x8e400000 caller=1f43483
+    2.437 [t:101819 f:0] arena shave map OK: va=1100000000 real=0x15200000 shaved_tail=0x600000 flex_tail=mapped (rf=0x00000000)
+    2.437 [t:101819 f:0] game MapDirectMemory(phys=0x8e400000 len=0x15800000 prot=0x33 flags=0x90 align=0x200000 in=1100000000) = 0x00000000 va=1100000000 (shaved) caller=1f434ec
+    2.437 [t:101819 f:0] game AllocateDirectMemory(len=0x68e00000 align=0x200000 type=3 range=0x0..0x137200000) = 0x00000000 phys=0xa3600000 caller=1f43483
+    2.438 [t:101819 f:0] game MapDirectMemory(phys=0xa3600000 len=0x68e00000 prot=0x33 flags=0x90 align=0x200000 in=1200000000) = 0x00000000 va=1200000000 caller=1f434ec
+    2.438 [t:101819 f:0] memory valve: shrunk display 0x2000000 -> 0x800000 (released phys=0x135200000..0x136a00000, kept phys=0x136a00000 va=881200000)
+    2.438 [t:101819 f:0] game AllocateDirectMemory(len=0x2a000000 align=0x200000 type=3 range=0x0..0x137200000) = 0x00000000 phys=0x10c400000 caller=1f43483
+    2.439 [t:101819 f:0] game MapDirectMemory(phys=0x10c400000 len=0x2a000000 prot=0x33 flags=0x90 align=0x200000 in=1300000000) = 0x00000000 va=1300000000 caller=1f434ec
+
+=== CRASH SIGBUS (sig=10 code=3) at 2.479s | flips=0 vo_flips=0 in_submit=0 alloc_fail=0 shave=1 tight=1 | tid=101819 'eboot.bin' ===
+  FAULT_ADDR: si_addr=0x0000000000aa224b (eboot.bin+0x6a224b)
+  VM_QUERY(si_addr): va=0x400000..0x31f4000 prot=0x5 is_flex=1 is_dm=0 name='executable'
+  VM_QUERY(RIP):     va=0x400000..0x31f4000 prot=0x5 is_flex=1 is_dm=0 name='executable'
+  MEM_STATE: dm_total=0x137200000 free_2mb=0x600000 free_16kb=0x600000 | pre_mem=881200000(phys=0x136a00000 sz=0x800000) pre_work=883200000(phys=0x40000 sz=0x190000) pre_gpu=881120000(phys=0x20000 sz=0x20000)
+  API_COUNTS: allocs=4(fail=0) maps=3 releases=0 batch_maps=0(fail=0) shaves=1(shaved_bytes=0x600000)
+  FG_STATE: res=0x0 pitch=0 fmt=0x0(sup=1) ngame=3 nmid=3 mbase=16 nbuf=0 mbuf_state=0 gpu_state=0 pcopy=0/0 safe=0/0
+  CFG_STATE: fg=1 mode=8 preset=0 shave_mode=0 reg_mode=0 pace_order=0 pcopy_cfg=0  BYTES[si_addr-32..-17]: 8d 35 1a 7c 3a 02 48 8d 15 fc 5c 42 02 41 b8 b8
+  BYTES[si_addr-16.. +7]: 01 00 00 45 31 c9 e8 0a 16 d1 01 e8 25 03 96 ff | <cd 41 80 3d d4 24 09 03>
+  UCONTEXT QWORDS (0..35):
+    uc[ 9] (+0x048) = 0x00000008001d6e68
+    uc[12] (+0x060) = 0x00000000034002a8  -> eboot.bin[seg1]+0x2a8
+    uc[13] (+0x068) = 0x000000000000a4a0
+    uc[14] (+0x070) = 0xff00fffffffffff8
+    uc[15] (+0x078) = 0x0000000880f4c540
+    uc[16] (+0x080) = 0x0000001400000000  -> game_arena_va(0x1400000000)
+    uc[17] (+0x088) = 0x00000007eeffaa70
+    uc[18] (+0x090) = 0x0000000880005a50
+    uc[19] (+0x098) = 0xfffffffffffffff1
+    uc[20] (+0x0a0) = 0x000000000b600000
+    uc[21] (+0x0a8) = 0xffffffff00000000
+    uc[22] (+0x0b0) = 0x0000000005600000
+    uc[23] (+0x0b8) = 0x0000000017400000
+    uc[24] (+0x0c0) = 0x001b001300000009
+    uc[26] (+0x0d0) = 0x003b003b00000001
+    uc[27] (+0x0d8) = 0x000000000000020a
+    uc[28] (+0x0e0) = 0x0000000000aa224b  -> eboot.bin+0x6a224b
+    uc[29] (+0x0e8) = 0x0000000000000043
+    uc[30] (+0x0f0) = 0x0000000000010202
+    uc[31] (+0x0f8) = 0x00000007eeffa780
+    uc[32] (+0x100) = 0x000000000000003b
+    uc[33] (+0x108) = 0x0000000000000480
+    uc[34] (+0x110) = 0x0000000000010002
+    uc[35] (+0x118) = 0x0000000000020001
+  STACK BACKTRACE (from RSP=0x7eeffa780):
+    [rsp+0x200] 0x0000000000600000 (eboot.bin+0x200000)
+    [rsp+0x2f8] 0x0000000000aa28d8 (eboot.bin+0x6a28d8)
+  LOADED MODULES (3):
+    [ 0] eboot.bin                    seg0=0x400000..0x31f4000 seg1=0x3400000..0x4b88000
+    [ 1] libSceFios2.prx              seg0=0x80000000..0x80060000 seg1=0x80064000..0x80190000
+    [ 2] libc.prx                     seg0=0x80190000..0x802a8000 seg1=0x802ac000..0x802b4000
+  LAST API CALLS (8 total):
+    #1 2.432 [t:101819 f:0] AllocDM(len=0x8e200000 al=0x200000 ty=0) = 0x00000000 phys=0x200000 c=1f43483
+    #2 2.434 [t:101819 f:0] MapDirectMemory(phys=0x200000 len=0x8e200000 prot=0x33 fl=0x90 in=1000000000) = 0x00000000 va=0x1000000000 c=1f434ec
+    #3 2.434 [t:101819 f:0] AllocDM(len=0x15800000 al=0x200000 ty=0) = 0x00000000 phys=0x8e400000 c=1f43483
+    #4 2.437 [t:101819 f:0] MapDirectMemory(shave-straddle phys=0x8e400000 len=0x15800000) = 0 va=1100000000 rf=0x0 c=1f434ec
+    #5 2.437 [t:101819 f:0] AllocDM(len=0x68e00000 al=0x200000 ty=3) = 0x00000000 phys=0xa3600000 c=1f43483
+    #6 2.438 [t:101819 f:0] MapDirectMemory(phys=0xa3600000 len=0x68e00000 prot=0x33 fl=0x90 in=1200000000) = 0x00000000 va=0x1200000000 c=1f434ec
+    #7 2.438 [t:101819 f:0] AllocDM(len=0x2a000000 al=0x200000 ty=3) = 0x00000000 phys=0x10c400000 c=1f43483
+    #8 2.439 [t:101819 f:0] MapDirectMemory(phys=0x10c400000 len=0x2a000000 prot=0x33 fl=0x90 in=1300000000) = 0x00000000 va=0x1300000000 c=1f434ec
+  SELF-ADAPT: crash (flips=0 alloc_fail=0) -> wrote shave_mode=2 reg_mode=2 to /data/bb_probe/adapt-CUSA10249.ini for next start
+=== END CRASH REPORT ===

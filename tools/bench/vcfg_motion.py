@@ -54,9 +54,36 @@ def sad_cur_grid(prev, cur, X, Y, dx, dy, dc_comp=False):
     return raw_sad
 
 
+def _block_tex_8x8(blk):
+    """8x8 horizontal + vertical adjacent-pixel absolute gradient sum (56 + 56 = 112 pairs)."""
+    gx = np.abs(blk[:, :, 1:] - blk[:, :, :-1]).sum(axis=(1, 2))
+    gy = np.abs(blk[:, 1:, :] - blk[:, :-1, :]).sum(axis=(1, 2))
+    return gx + gy
+
+
+def _norm_sad(sad_in, avg_sum, t_avg, t_min, ztex, zsum):
+    """3_no_dc_tex texture-confidence normalization + smooth-escape penalty."""
+    num = np.maximum(ztex, 96)
+    den = np.maximum(t_avg, 96)
+    infl_num = np.clip((num * 16) // den, 16, 64)
+    sad_i = (sad_in * infl_num) >> 4
+    tex_loss = np.maximum(ztex - t_avg - 48, 0)
+    luma_jump = np.maximum(np.abs(avg_sum - zsum) - 384, 0) >> 2
+    smooth_sky = np.clip(128 - t_min, 0, 128)
+    esc_pen = ((tex_loss + luma_jump) * smooth_sky) >> 7
+    return np.minimum(sad_i + esc_pen, 65535)
+
+
 def sad_bilateral(prev, cur, X, Y, dx, dy, dc_comp=True):
     """me1 bsad: prev block at X + ceil(d/2), cur block at X - floor(d/2) with displacement-preserving border clamp.
     Returns (dc_compensated_sad, (sum_prev + sum_cur) >> 1)."""
+    sad, sum_avg, _, _ = sad_bilateral_tex(prev, cur, X, Y, dx, dy, dc_comp=dc_comp)
+    return sad, sum_avg
+
+
+def sad_bilateral_tex(prev, cur, X, Y, dx, dy, dc_comp=True):
+    """me1 bsad with bilateral 8x8 gradient texture energy (tex_p + tex_c) >> 1 and min(tex_p, tex_c).
+    Returns (dc_compensated_sad, (sum_prev + sum_cur) >> 1, (tex_prev + tex_cur) >> 1, min(tex_prev, tex_cur))."""
     h, w = cur.shape
     r = np.arange(8)[None, :]
     X, Y, dx, dy = (np.asarray(a, np.int64) for a in (X, Y, dx, dy))
@@ -76,11 +103,19 @@ def sad_bilateral(prev, cur, X, Y, dx, dy, dc_comp=True):
     raw_sad = np.abs(p - c).sum(axis=(1, 2))
     sum_p = p.sum(axis=(1, 2))
     sum_c = c.sum(axis=(1, 2))
+    tex_p = _block_tex_8x8(p)
+    tex_c = _block_tex_8x8(c)
     if dc_comp:
         sad = _dc_adjust(raw_sad, sum_p, sum_c)
     else:
         sad = raw_sad
-    return np.minimum(sad, 65535), (sum_p + sum_c) >> 1
+    return np.minimum(sad, 65535), (sum_p + sum_c) >> 1, (tex_p + tex_c) >> 1, np.minimum(tex_p, tex_c)
+
+
+def rnd_floor(f):
+    """LLVM @rnd in me1/mf8: fptosi(clamp(floor(f + 0.5), -4096.0, 4096.0))."""
+    f = np.asarray(f, np.float32)
+    return np.clip(np.floor(f + np.float32(0.5)), np.float32(-4096.0), np.float32(4096.0)).astype(np.int64)
 
 
 def rnd(f):
@@ -268,6 +303,9 @@ def _isqrt(q):
     return np.floor(np.sqrt(np.maximum(q, 0).astype(np.float32))).astype(np.int64)
 
 
+_LAST_FGCNT = 0
+
+
 def fgs8(L2p, L2c, V2, S2, gm, anchor_hist=None):
     """returns GK (68, 120) uint32 splat keys (prio << 20 | closeness << 12 | L2 block) and the new anchor history"""
     nby2, nbx2 = V2.shape[:2]
@@ -318,6 +356,8 @@ def fgs8(L2p, L2c, V2, S2, gm, anchor_hist=None):
         nbk = nb0 | nb1 | nb2 | nb3
         nb_cnt = nb0.astype(np.int64) + nb1.astype(np.int64) + nb2.astype(np.int64) + nb3.astype(np.int64)
     isfg, isa0 = fg0 & nbk, an0 & nbk
+    global _LAST_FGCNT
+    _LAST_FGCNT = int(isfg.sum())
     h = np.zeros(N, np.int64) if anchor_hist is None else anchor_hist.astype(np.int64)
     hn = np.where(isa0, np.minimum(h + 1, 255), 0)
     strong_an = (~stl) & (nb_cnt >= 2) & (gdif >= 160)
@@ -352,7 +392,7 @@ def _equi(m, c, p):
     return np.clip(o, -0.5, 0.5).astype(np.float32)
 
 
-def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
+def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None, fgcnt=None):
     mp = mp or {}
     """raw field FT (68, 120, 2) float32 (full-res px, mid grid), the unmatched-block count and the fade flag"""
     h, w = L1c.shape
@@ -363,58 +403,33 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
     n2y, n2x = V2.shape[:2]
     gmx, gmy = gm
     gmx2, gmy2 = gmx * 2, gmy * 2
-    still = np.bool_((gmx | gmy) == 0)
-    ix0 = np.clip((bx * 4 - 2) >> 3, 0, max(n2x - 2, 0))
+    if fgcnt is None:
+        fgcnt = _LAST_FGCNT
+    fg_still = np.bool_(int(fgcnt) <= 32)
+    still0 = np.bool_((gmx | gmy) == 0)
+    still = still0 & fg_still
+    nstl = ~still0
+    ix0r = (bx * 4 - 2) >> 3
+    iy0r = (by * 4 - 2) >> 3
+    ix0 = np.clip(ix0r, 0, max(n2x - 2, 0))
     ix1 = np.minimum(ix0 + 1, n2x - 1)
-    iy0 = np.clip((by * 4 - 2) >> 3, 0, max(n2y - 2, 0))
+    iy0 = np.clip(iy0r, 0, max(n2y - 2, 0))
     iy1 = np.minimum(iy0 + 1, n2y - 1)
     nbi = [(iy0, ix0), (iy0, ix1), (iy1, ix0), (iy1, ix1)]
     nbv = [V2[a, b].astype(np.int64) * 2 for a, b in nbi]                      # (N, 2) in L1 px
-    ixm1 = np.maximum(ix0 - 1, 0)
+    ixm1 = np.maximum(ix0r, 1) - 1
     ixp1 = np.minimum(ix1 + 1, n2x - 1)
-    iym1 = np.maximum(iy0 - 1, 0)
+    iym1 = np.maximum(iy0r, 1) - 1
     iyp1 = np.minimum(iy1 + 1, n2y - 1)
     out_nbi = [(iy0, ixm1), (iy0, ixp1), (iym1, ix0), (iyp1, ix0)]
     out_nbv = [V2[a, b].astype(np.int64) * 2 for a, b in out_nbi]              # outer L2 ring for lanes 12..15
     zero = np.zeros(N, np.int64)
 
-    if prevF is not None:
-        tv0x, tv0y = prevF[by, bx, 0], prevF[by, bx, 1]
-        upx, upy = rnd(tv0x * np.float32(0.0625)), rnd(tv0y * np.float32(0.0625))
-        up_nz = (upx != 0) | (upy != 0)
-        txu, tyu = np.clip(bx + upx, 0, 119), np.clip(by + upy, 0, 67)
-        tvux, tvuy = prevF[tyu, txu, 0], prevF[tyu, txu, 1]
-
-        def td_nb(tox, toy):
-            tx1, ty1 = np.clip(bx + tox, 0, 119), np.clip(by + toy, 0, 67)
-            v1x, v1y = prevF[ty1, tx1, 0], prevF[ty1, tx1, 1]
-            low = (np.abs(v1x) + np.abs(v1y)) < np.float32(8.0)
-            tx2, ty2 = np.clip(bx + 2 * tox, 0, 119), np.clip(by + 2 * toy, 0, 67)
-            v2x, v2y = prevF[ty2, tx2, 0], prevF[ty2, tx2, 1]
-            return np.where(low, v2x, v1x), np.where(low, v2y, v1y)
-
-        nb5x, nb5y = td_nb(1, 0)
-        nb6x, nb6y = td_nb(0, 1)
-        nb10x, nb10y = td_nb(-1, 0)
-        nb11x, nb11y = td_nb(0, -1)
-
-        fwx, fwy = tv0x * np.float32(2.0) - tvux, tv0y * np.float32(2.0) - tvuy
-        acx, acy = tvux * np.float32(2.0) - tv0x, tvuy * np.float32(2.0) - tv0y
-        midx = tvux + nbv[2][:, 0].astype(np.float32)
-        midy = tvuy + nbv[2][:, 1].astype(np.float32)
-
-        t4 = (rnd(tv0x * np.float32(0.5)), rnd(tv0y * np.float32(0.5)))
-        t5 = (rnd(np.where(up_nz, fwx, nb5x) * np.float32(0.5)),
-              rnd(np.where(up_nz, fwy, nb5y) * np.float32(0.5)))
-        sc6 = np.where(up_nz, np.float32(0.25), np.float32(0.5))
-        t6 = (rnd(np.where(up_nz, midx, nb6x) * sc6),
-              rnd(np.where(up_nz, midy, nb6y) * sc6))
-        t10 = (rnd(np.where(up_nz, tvux, nb10x) * np.float32(0.5)),
-               rnd(np.where(up_nz, tvuy, nb10y) * np.float32(0.5)))
-        t11 = (rnd(np.where(up_nz, acx, nb11x) * np.float32(0.5)),
-               rnd(np.where(up_nz, acy, nb11y) * np.float32(0.5)))
-    else:
-        t4 = t5 = t6 = t10 = t11 = (zero, zero)
+    def tdv(ex, ey):
+        if prevF is None:
+            return zero, zero
+        tx, ty = np.clip(bx + ex, 0, 119), np.clip(by + ey, 0, 67)
+        return (rnd_floor(prevF[ty, tx, 0] * np.float32(0.5)), rnd_floor(prevF[ty, tx, 1] * np.float32(0.5)))
 
     gk = GK[by, bx]
     hasfg = gk != 0
@@ -423,29 +438,33 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
     gv = V2.reshape(-1, 2)[gk & 4095].astype(np.int64) * 2
     gdx, gdy = gv[:, 0], gv[:, 1]
     cand = [(nbv[k][:, 0], nbv[k][:, 1]) for k in range(4)]                    # slots 0..3: inner 2x2 L2
-    cand += [t4, t5, t6]                                                        # slots 4..6: temporal / forward / mid
+    cand += [tdv(0, 0), tdv(1, 0), tdv(0, 1)]                                  # slots 4..6: temporal (0, +x, +y)
     cand += [(zero, zero), (gdx, gdy), (np.full(N, gmx2), np.full(N, gmy2))]   # slots 7, 8, 9: zero, GK, camera
-    cand += [t10, t11]                                                          # slots 10..11: advected / accel temporal
+    cand += [tdv(-1, 0), tdv(0, -1)]                                           # slots 10..11: symmetric temporal (-x, -y)
     cand += [(out_nbv[k][:, 0], out_nbv[k][:, 1]) for k in range(4)]           # slots 12..15: outer cardinal L2 ring
 
     def nbdist(a, b, cdx, cdy):
         v = V2[a, b].astype(np.int64) * 2
         return np.abs(cdx - v[:, 0]) + np.abs(cdy - v[:, 1])
 
-    zs, zsum = sad_bilateral(L1p, L1c, X, Y, zero, zero)                        # lane 7 publishes (sad, mean sum)
+    zs, zsum, ztex, _ = sad_bilateral_tex(L1p, L1c, X, Y, zero, zero)          # lane 7 publishes (sad, mean sum, mean tex)
     best = np.full(N, BIG, np.int64)
     cx1, cy1 = zero.copy(), zero.copy()
     for sub, (cdx, cdy) in enumerate(cand):
-        sad1, sum1 = sad_bilateral(L1p, L1c, X, Y, cdx, cdy)
+        sad1_0, sum1, tex1, tmin1 = sad_bilateral_tex(L1p, L1c, X, Y, cdx, cdy)
+        sad1 = _norm_sad(sad1_0, sum1, tex1, tmin1, ztex, zsum)
         ist = (4 <= sub <= 6) or (10 <= sub <= 11)
         isout = 12 <= sub <= 15
+        isl2 = (sub < 4) or isout
+        ist811 = (8 <= sub <= 11)
         bias = np.zeros(N, np.int64)
         if ist:
             bias += mp.get("tbias", 16)
         if sub == 7:
             bias = np.where(still, 48, 0).astype(np.int64)
         if sub == 9:
-            bias += 32
+            cam_bonus = np.where((ztex > 160) & (tex1 * 2 < ztex), 0, 32)
+            bias += cam_bonus
         if sub == 8:
             bias = np.where(isfgk, 96, 64).astype(np.int64)
         if isout:
@@ -454,11 +473,12 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
         sc = np.abs(cdx - gmx2) + np.abs(cdy - gmy2)
         # Camera-escape guard: penalize jumping onto the camera pan gm2 (sc * 2 <= aad) or distant sky (aad > 16),
         # while allowing articulated limb motion (3 < aad <= 16 away from gm2) around an anchor torso.
-        afar = (aad > 3) & ((aad > 16) | ((~still) & (sc * 2 <= aad)))
+        afar = (aad > 3) & ((aad > 16) | (nstl & (sc * 2 <= aad)))
         ap1 = isanc & afar & (sub != 8)
         apen = np.where(ap1, 512, 0)
         p1f = (np.abs(cdx) + np.abs(cdy)) > 8
-        p1gate = (~isfgk) & (ap1 | ((~still) & (sc <= 6)))
+        smooth_jump = (ztex > 140) & (tex1 < 96)
+        p1gate = (~isfgk) & (smooth_jump | ((not ist811) & ((not isl2) | (sc > 16))))
         p1p = np.where(p1f & p1gate, np.maximum((np.abs(sum1 - zsum) >> 1) - zs, 0), 0)
         sm03 = np.minimum.reduce([nbdist(a, b, cdx, cdy) for a, b in nbi])
         sm03c = np.minimum(sm03, sc)
@@ -489,12 +509,11 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
     for k in range(9):
         ox, oy = k % 3 - 1, k // 3 - 1
         d2x, d2y = cx1 + ox, cy1 + oy
-        sad2, sum2 = sad_bilateral(L1p, L1c, X, Y, d2x, d2y)
+        sad2_0, sum2, tex2, tmin2 = sad_bilateral_tex(L1p, L1c, X, Y, d2x, d2y)
+        sad2 = _norm_sad(sad2_0, sum2, tex2, tmin2, ztex, zsum)
         p2f = (np.abs(d2x) + np.abs(d2y)) > 8
-        aad2 = np.abs(d2x - gdx) + np.abs(d2y - gdy)
         sc2 = np.abs(d2x - gmx2) + np.abs(d2y - gmy2)
-        ap2 = isanc & (aad2 > 3) & ((aad2 > 16) | ((~still) & (sc2 * 2 <= aad2)))
-        p2gate = (~isfgk) & (ap2 | ((~still) & (sc2 <= 6)))
+        p2gate = (~isfgk) & (isanc | (nstl & (sc2 <= 6)))
         p2p = np.where(p2f & p2gate, np.maximum((np.abs(sum2 - zsum) >> 1) - zs, 0), 0)
         key = ((sad2 + 256 + p2p + mp.get("lam1", 4) * (abs(ox) + abs(oy))) << 8) | k
         better = key < best2
@@ -515,11 +534,11 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None):
     fsc, fsp = np.float32(lumasum_cur), np.float32(lumasum_prev)
     fad = np.abs(fsc - fsp)
     fade0 = fad > fsp * np.float32(0.02)
-    fade = bool(fade0 and max(abs(gmx), abs(gmy)) <= 1)
+    fade = bool(fade0 and (max(abs(gmx), abs(gmy)) <= 1) and fg_still)
     zero_all = zero0 | fade
     FT = np.stack([np.where(zero_all, 0, vx), np.where(zero_all, 0, vy)], -1).astype(np.float32).reshape(nby, nbx, 2)
-    cthr = fad * np.float32(0.0019753087) + np.float32(256.0)
-    cutn = int((np.minimum(r0, r5).astype(np.float32) > cthr).sum())
+    cthr = fad * np.float32(0.0019753087) + np.float32(384.0)
+    cutn = int(((np.minimum(r0, r5).astype(np.float32) > cthr) & ((r0 * 2) > r5)).sum())
     return FT, cutn, fade
 
 
@@ -572,6 +591,12 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
     wm8, hm8 = w1 - 8, h1 - 8
     r_idx = np.arange(8)[None, :]
 
+    # Midpoint (0, 0) block texture and luma sum (clamped to [0, wm8] x [0, hm8] matching @mid_zinfo / @bsad)
+    p0_blk = _blocks(L1p, np.clip(X, 0, wm8), np.clip(Y, 0, hm8)[:, None] + r_idx)
+    c0_blk = _blocks(L1c, np.clip(X, 0, wm8), np.clip(Y, 0, hm8)[:, None] + r_idx)
+    ztex = (_block_tex_8x8(p0_blk) + _block_tex_8x8(c0_blk)) >> 1
+    zsum = (p0_blk.sum(axis=(1, 2)) + c0_blk.sum(axis=(1, 2))) >> 1
+
     def ldT(ox, oy):
         x0 = bx + ox
         y0 = by + oy
@@ -582,19 +607,7 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
     nbrs = [ldT(ox, oy) for oy in (-1, 0, 1) for ox in (-1, 0, 1)]                # t0..t8 raster, t4 = own
     outer_offs = [(0, -2), (0, 2), (-2, 0), (2, 0), (-1, -2), (1, 2)]             # sub 10..15: 2-hop outer contour ring
     outer_nbrs = [ldT(ox, oy) for ox, oy in outer_offs]
-    nbq = [(rnd(v[:, 0] * np.float32(0.5)), rnd(v[:, 1] * np.float32(0.5))) for v in nbrs]
-    if prevF is not None:
-        fp0x, fp0y = prevF[by, bx, 0], prevF[by, bx, 1]
-        upx, upy = rnd(fp0x * np.float32(0.0625)), rnd(fp0y * np.float32(0.0625))
-        up_nz = (upx != 0) | (upy != 0)
-        ubx, uby = np.clip(bx + upx, 0, 119), np.clip(by + upy, 0, 67)
-        fpux, fpuy = prevF[uby, ubx, 0], prevF[uby, ubx, 1]
-        tpx_u, tpy_u = rnd(fpux * np.float32(0.5)), rnd(fpuy * np.float32(0.5))
-        tpx_a = rnd((fpux * np.float32(2.0) - fp0x) * np.float32(0.5))
-        tpy_a = rnd((fpuy * np.float32(2.0) - fp0y) * np.float32(0.5))
-    else:
-        up_nz = np.zeros(N, bool)
-        tpx_u = tpy_u = tpx_a = tpy_a = np.zeros(N, np.int64)
+    nbq = [(rnd_floor(v[:, 0] * np.float32(0.5)), rnd_floor(v[:, 1] * np.float32(0.5))) for v in nbrs]
     best = np.full(N, BIG, np.int64)
     winv = np.zeros((N, 2), np.float32)
     wincx = np.zeros(N, np.int64)
@@ -611,7 +624,7 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
             cv = np.where(notanc[:, None], np.array([gmx4, gmy4], np.float32)[None, :], nbrs[4])
         else:
             cv = outer_nbrs[sub - 10].copy()
-        cx, cy = rnd(cv[:, 0] * np.float32(0.5)), rnd(cv[:, 1] * np.float32(0.5))
+        cx, cy = rnd_floor(cv[:, 0] * np.float32(0.5)), rnd_floor(cv[:, 1] * np.float32(0.5))
         aoff = np.abs(cx - av[:, 0]) + np.abs(cy - av[:, 1])
         sc = np.abs(cx - gmx2) + np.abs(cy - gmy2)
         afar = (aoff > 3) & ((aoff > 16) | ((~still) & (sc * 2 <= aoff)))
@@ -621,10 +634,9 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
         sm = sm0 + np.where(nfgk, terms[4] * 3, 0)
         pen = sm << lsh
         # Outward disocclusion/occlusion shift: when evaluating a camera-aligned background candidate
-        # (sc <= 3) at a high-gradient motion boundary (sm0 >= 16), shift the bilateral SAD window
-        # up to 5 L1 px away from the higher-disagreement (foreground) neighbor so the occluded tap
-        # samples clean background instead of the foreground object's edge.
-        bg_c = (sc <= 3) & notanc & (sm0 >= 16)
+        # (sc <= 3) at a high-gradient motion boundary (sm0 >= 16) and midpoint is not textured (ztex <= 160),
+        # shift the bilateral SAD window up to 5 L1 px away from the higher-disagreement (foreground) neighbor.
+        bg_c = (sc <= 3) & notanc & (sm0 >= 16) & (ztex <= 160)
         shx_d = np.clip(((terms[3] - terms[5]) * 5) >> 3, -5, 5)
         shy_d = np.clip(((terms[1] - terms[7]) * 5) >> 3, -5, 5)
         # Only shift to the CUR grid when evaluating an anchor escape candidate (so static heads reject sky escape);
@@ -647,16 +659,23 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
         q11 = adiff[:, 4:8, 4:8].sum(axis=(1, 2))
         qs = np.stack([q00, q10, q01, q11], axis=-1)
         raw_sad = q00 + q10 + q01 + q11
-        sad0 = _dc_adjust(raw_sad, p_blk.sum(axis=(1, 2)), c_blk.sum(axis=(1, 2)))
-        # Partial-occlusion trim: when 1+ quadrant has a clean match (qmin <= 88), discount up to 3/4 of excess SAD
+        sum_p = p_blk.sum(axis=(1, 2))
+        sum_c = c_blk.sum(axis=(1, 2))
+        avg_sum = (sum_p + sum_c) >> 1
+        tex_p = _block_tex_8x8(p_blk)
+        tex_c = _block_tex_8x8(c_blk)
+        tex_avg = (tex_p + tex_c) >> 1
+        tex_min = np.minimum(tex_p, tex_c)
+        sad0 = _dc_adjust(raw_sad, sum_p, sum_c)
+        # Partial-occlusion trim: when 1+ quadrant has a clean match (qmin <= 88) and not a smooth-sky escape,
+        # discount up to 3/4 of excess SAD
         qmin = qs.min(axis=-1)
         qexc = np.maximum(sad0 - (qmin * 4 + 256), 0)
         qtrim = qexc - (qexc >> 2)
-        sad = np.minimum(sad0 - np.where(qmin <= 88, qtrim, 0), 65535)
-        dtu = np.abs(cx - tpx_u) + np.abs(cy - tpy_u)
-        dta = np.abs(cx - tpx_a) + np.abs(cy - tpy_a)
-        tbias = np.where(up_nz & (np.minimum(dtu, dta) <= 2), 16, 0)
-        bias = (np.where(hasfg & ((sc > 3) | (sm0 < 16)), 96, 0) if sub == 0 else 0) + tbias
+        allow_qtrim = (qmin <= 88) & ~((ztex > 140) & (tex_min < 96))
+        sad_t = np.minimum(sad0 - np.where(allow_qtrim, qtrim, 0), 65535)
+        sad = _norm_sad(sad_t, avg_sum, tex_avg, tex_min, ztex, zsum)
+        bias = np.where(hasfg & ((sc > 3) | (sm0 < 16)), 96, 0) if sub == 0 else 0
         apen = np.where(ap, 512, 0)
         xc_0 = Xu - (cx >> 1)
         xp_0 = xc_0 + cx

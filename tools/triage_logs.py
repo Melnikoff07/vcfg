@@ -150,6 +150,45 @@ RE_CRASH = re.compile(
     r"===\s*CRASH\s+([A-Z0-9_]+)\s*\(sig=(\d+)\s+code=(-?\d+)\)\s*at\s*([\d.]+)s\s*\|\s*flips=(\d+)"
 )
 RE_CRASH_TAG = re.compile(r"\[CRASH\](?:\s*([A-Z0-9_]+))?|\bCRASH:\s*([A-Z0-9_]+)|\bCRASH\s+(SIG[A-Z0-9]+)\b")
+RE_THIRD_PARTY_FAULT = re.compile(
+    r"(?:THIRD_PARTY_PRX_FAULT:\s*module='([^']+)'|"
+    r"(?:FAULT_ADDR:.*?|uc\[28\]\s*\(\+0x0e0\)\s*=\s*0x[0-9a-fA-F]+\s*->\s*)([A-Za-z0-9_.-]+\.prx)(?:\[seg\d+\])?\+0x[0-9a-fA-F]+)"
+)
+
+
+def detect_third_party_prx_crash(text: str) -> str | None:
+    """Return the third-party .prx module name if FAULT_ADDR or RIP (uc[28]) points inside an external plugin."""
+    for m in RE_THIRD_PARTY_FAULT.finditer(text):
+        mod = m.group(1) or m.group(2)
+        if not mod:
+            continue
+        low = mod.lower()
+        if (
+            low.startswith("libsce")
+            or low.startswith("libkernel")
+            or low == "libc.prx"
+            or low.startswith("vcfg")
+            or low.startswith("bb_probe")
+            or low.startswith("goldhen")
+            or low == "eboot.bin"
+            or low in (
+                "ps4util.prx",
+                "il2cppuserassemblies.prx",
+                "monoassembliesps4.prx",
+                "fullgame.prx",
+                "gnmscale_plugin.prx",
+                "gs_resident_plugin.prx",
+                "steamnetworkingsockets.prx",
+                "party.prx",
+                "logiwheel.prx",
+            )
+            or low.startswith("eossdk")
+            or low.startswith("libfmod")
+            or low.startswith("libak")
+        ):
+            continue
+        return mod
+    return None
 RE_PLUGIN_LOAD = re.compile(
     r"plugin_load enter:\s*title=(CUSA\d{5}).*?version=v?(\d+\.\d+)(?:.*?dm=0x([0-9a-fA-F]+))?"
 )
@@ -616,6 +655,10 @@ def analyze_report_text(
         sig = "NONE"
         has_crash = False
 
+    third_party_prx = detect_third_party_prx_crash(text) if has_crash else None
+    if third_party_prx:
+        sig = f"{sig} ({third_party_prx})"
+
     l2_shave = bool(
         re.search(
             r"L2\s*\(?LOWMEM\)?|LOWMEM|arena shave|memory valve:\s*(?:shrunk|relocated|trimmed)|shave=[1-9]|shaves=[1-9]",
@@ -746,6 +789,7 @@ def analyze_report_text(
         "verified": is_verified,
         "version": ver,
         "crash": sig,
+        "third_party_prx": third_party_prx,
         "flips": flips,
         "mids_shown": mids_shown,
         "real_fps": avg_real_fps,

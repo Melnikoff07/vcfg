@@ -24,7 +24,7 @@
 static uint32_t g_t_dfmt = 10u;
 static int g_t_is_neo = 0;
 static int g_t6_bit_override = -1; // optional INI override (0..31); -1 = default bit 24 (GNM_T6_ALT_TILE_MODE_NEO)
-static int g_t_prev_half16 = 0;      // 1: T#prev is a 50%-footprint 16-bpp (2 bytes/px) linear history surface (dfmt=3, tidx=8)
+static int g_t_prev_half16 = 0;      // 1: T#prev is a 50%-footprint 16-bpp (2 bytes/px) linear history surface (dfmt=16 5_6_5, tidx=8)
 static int g_pcopy_dst_half16 = 0;   // 1: pcopy8 T#out is a 50%-footprint 16-bpp (2 bytes/px) linear history surface
 static int g_pcopy_ycocg_mode = 0;   // pcopy8 mode: 0 = direct copy, 1 = YCoCg-R 4:2:0 16b encode, 2 = YCoCg-R 4:2:0 16b decode
 
@@ -93,9 +93,9 @@ static inline void make_t_pbuf(uint32_t *t, uint64_t a, uint32_t w, uint32_t h, 
         return;
     }
     t[0] = (uint32_t)(a >> 8);
-    t[1] = (uint32_t)((a >> 40) & 0xFFu) | (3u << 20);
+    t[1] = (uint32_t)((a >> 40) & 0xFFu) | (16u << 20);
     t[2] = (w - 1u) | ((h - 1u) << 14);
-    t[3] = 4u | (5u << 3) | (6u << 6) | (7u << 9) | (8u << 20) | (9u << 28);
+    t[3] = 4u | (5u << 3) | (6u << 6) | (1u << 9) | (8u << 20) | (9u << 28);
     t[4] = (pitch - 1u) << 13;
     t[5] = 0;
     t[6] = 0;
