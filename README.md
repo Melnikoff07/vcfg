@@ -65,7 +65,7 @@ regenerates `classic/source/shaders.h` on every build.
    GoldHEN Package Installer (e.g. from `/data/pkg`).
 2. Enable **GoldHEN → Settings → Plugins**. Start **VCFG** from the home screen. On start it copies the plugins to
    `/data/GoldHEN/plugins/`, backs up `plugins.ini` and maps eligible games (your other plugins are kept).
-3. Pick a game (cross toggles FG, triangle opens its settings, square saves and exits). Other games appear as
+3. Pick a game (cross toggles FG, triangle opens its settings, square launches it). Other games appear as
    EXPERIMENTAL and are off until you switch them on.
 4. Start the game, wait ~20 s, hold **L3+R3 for 3 s** for the in-game menu (the buttons can be changed in the app: OVERLAY tab, "Menu hotkey"; takes effect at the next game start).
 
