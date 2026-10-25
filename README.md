@@ -1,5 +1,7 @@
 # VCFG
 
+**Current release: [v2.34](https://github.com/Melnikoff07/vcfg/releases/tag/v2.34) (25 October 2026).** For install and update details, use the release notes for the PKG you actually installed.
+
 VCFG (vibe coded frame generator): optical-flow frame generation for games on PS4 consoles running the
 GoldHEN homebrew enabler, as a GoldHEN plugin. The plugin hooks the game's frame
 submission, builds a motion field between the previous and the current game frame on the GPU, synthesises an
@@ -49,7 +51,7 @@ AMDGPU target for shaders.
 copy config.example.json config.json                                   # paths and console IP
 powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1          # new engine -> build/vcfg/vcfg.prx
 sh classic/build.sh                                                    # classic engine -> build/classic/vcfg_classic.prx
-powershell -NoProfile -ExecutionPolicy Bypass -File launcher/build_pkg.ps1 -Version 2.11   # -> build/launcher/VCFG_v2.11.pkg
+powershell -NoProfile -ExecutionPolicy Bypass -File launcher/build_pkg.ps1 -Version 2.34   # -> build/launcher/VCFG_v2.34.pkg
 python -I overlay/preview.py build/preview/vov                         # overlay preview PNGs (after building the DLL, see the script)
 ```
 
@@ -61,13 +63,17 @@ regenerates `classic/source/shaders.h` on every build.
 
 1. Download `VCFG_vX.pkg` from [Releases](https://github.com/Melnikoff07/vcfg/releases) and install it with the
    GoldHEN Package Installer (e.g. from `/data/pkg`).
-2. Start **VCFG** from the home screen. On start it copies the plugins to `/data/GoldHEN/plugins/`, backs up
-   `plugins.ini` and maps the verified games (your other plugins are kept).
+2. Enable **GoldHEN → Settings → Plugins**. Start **VCFG** from the home screen. On start it copies the plugins to
+   `/data/GoldHEN/plugins/`, backs up `plugins.ini` and maps eligible games (your other plugins are kept).
 3. Pick a game (cross toggles FG, triangle opens its settings, square saves and exits). Other games appear as
    EXPERIMENTAL and are off until you switch them on.
 4. Start the game, wait ~20 s, hold **L3+R3 for 3 s** for the in-game menu (the buttons can be changed in the app: OVERLAY tab, "Menu hotkey"; takes effect at the next game start).
 
-Turn off: tab **04 PLUGIN** → square (removes VCFG from `plugins.ini`; files stay).
+**Disable / clean reset (v2.34):** in **04 PLUGIN**, Square (**TURN OFF**) and R2 twice (**WIPE ALL**) both remove
+VCFG plugin files, VCFG `plugins.ini` entries/backups, and VCFG settings, adaptation and profiles. They keep logs in
+`/data/bb_probe/` and leave third-party plugins alone. A red **VCFG IS TURNED OFF** banner remains until you press
+Cross (**INSTALL**) in **04 PLUGIN**. Fully restart the game after changing plugin state. Save a report before cleaning
+if you need a single file to share.
 
 ## Install and test (developers)
 

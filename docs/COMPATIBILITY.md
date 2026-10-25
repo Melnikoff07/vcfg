@@ -1,5 +1,12 @@
 # Compatibility
 
+> **Current release: [v2.34](https://github.com/Melnikoff07/vcfg/releases/tag/v2.34).** The table below is a
+> historical log snapshot, not a live support list. The v2.34 release notes describe a built-in FG profile and
+> HDR10 handling for CUSA13323/CUSA11456, an audio fix for CUSA10249, and targeted memory/present fixes for
+> CUSA08809/CUSA03468. These changes do not prove that every update, console or output mode works. For a useful
+> new report, include exact VCFG version, CUSA/update, console/output mode, settings, result in gameplay, and
+> `vcfg_report.txt` when something fails.
+
 > Offline audit, 2026-10-20: [LOCAL_TRACE_REPORT.md](LOCAL_TRACE_REPORT.md) lists saved v2.14 evidence separately
 > by start. Those files cover different internal builds/settings without exact build attribution.
 > The older runtime table below is historical; the local experiments in [NIGHT_REPORT.md](NIGHT_REPORT.md)
