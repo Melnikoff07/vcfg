@@ -1076,17 +1076,6 @@ merge:
   %vmg = phi float [ %vmb, %fastzero ], [ %vmb, %fastside ], [ 0.0, %slow ]
   %hl_mov = extractelement <4 x float> %mov, i32 3
   %is_wire_fol = fcmp oge float %hl_mov, 4.0
-  %wom0 = fsub float %spr, 12.0
-  %wom1 = fmul float %wom0, 0.5
-  %w_om_s = call float @sat(float %wom1)
-  %wom_es0 = fsub float %es, 0x3FE99999A0000000 ; 0.80
-  %wom_es1 = fmul float %wom_es0, 4.0
-  %w_om_es = call float @sat(float %wom_es1)
-  %wom_em0 = fsub float 0x3FD3D70A40000000, %emov ; 0.31
-  %wom_em1 = fmul float %wom_em0, 4.0
-  %w_om_em = call float @sat(float %wom_em1)
-  %w_om01 = fmul float %w_om_s, %w_om_es
-  %w_occ_m = fmul float %w_om01, %w_om_em
   %stat = call <4 x float> @lerp4(<4 x float> %sp, <4 x float> %sc, float %t)
   %l_mov = call float @sum3(<4 x float> %mov)
   %l_stat = call float @sum3(<4 x float> %stat)
@@ -1168,6 +1157,31 @@ merge:
   %fl0b = extractelement <4 x i32> %cn0, i32 2
   %nocfb = and i32 %fl0b, 8
   %nocf = icmp ne i32 %nocfb, 0
+  ; fill weight: cw is exactly 0 when emov <= 0.025 (residual and every base term off), when emov <= es
+  ; (gcw = 0), on hl_act, under the full foreground kill (ws_keep = 0) or with the no-fill flag; then movc = mov
+  ; and the wave skips the fill block
+  %cwa = fcmp ogt float %emov, 0x3F999999A0000000 ; 0.025
+  %cwg = fcmp ogt float %emov, %es
+  %cwl0 = and i1 %cwa, %cwg
+  %nhlact = xor i1 %hl_act, true
+  %wsk_pos = fcmp ogt float %ws_keep, 0.0
+  %nfgkill = and i1 %nhlact, %wsk_pos
+  %nnocf = xor i1 %nocf, true
+  %cwl1 = and i1 %cwl0, %nfgkill
+  %cw_live = and i1 %cwl1, %nnocf
+  br i1 %cw_live, label %fill, label %fdone
+fill:
+  %wom0 = fsub float %spr, 12.0
+  %wom1 = fmul float %wom0, 0.5
+  %w_om_s = call float @sat(float %wom1)
+  %wom_es0 = fsub float %es, 0x3FE99999A0000000 ; 0.80
+  %wom_es1 = fmul float %wom_es0, 4.0
+  %w_om_es = call float @sat(float %wom_es1)
+  %wom_em0 = fsub float 0x3FD3D70A40000000, %emov ; 0.31
+  %wom_em1 = fmul float %wom_em0, 4.0
+  %w_om_em = call float @sat(float %wom_em1)
+  %w_om01 = fmul float %w_om_s, %w_om_es
+  %w_occ_m = fmul float %w_om01, %w_om_em
   %dmp = call float @diff3_k(<4 x float> %mov, <4 x float> %sp)
   %dmc = call float @diff3_k(<4 x float> %mov, <4 x float> %sc)
   %dmv = call float @diff3_k(<4 x float> %mov, <4 x float> %stat)
@@ -1272,7 +1286,10 @@ merge:
   %cw3_s = fmul float %cw3_1, %ws_keep
   %cw3 = select i1 %hl_act, float 0.0, float %cw3_s
   %cw = select i1 %nocf, float 0.0, float %cw3
-  %movc = call <4 x float> @lerp4(<4 x float> %mov, <4 x float> %fillc, float %cw)
+  %movf = call <4 x float> @lerp4(<4 x float> %mov, <4 x float> %fillc, float %cw)
+  br label %fdone
+fdone:
+  %movc = phi <4 x float> [ %mov, %merge ], [ %movf, %fill ]
   %out0 = call <4 x float> @lerp4(<4 x float> %movc, <4 x float> %stat, float %ws)
   ; scene change: > 68 % unmatched blocks -> per-pixel fallback only where both motion and static samples disagree
   ; per-title scene-change threshold: consts flags bits 16..31 = blocks / 8 (0 = default 5600 of 8160)

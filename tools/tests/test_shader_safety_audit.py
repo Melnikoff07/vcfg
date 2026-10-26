@@ -765,8 +765,8 @@ class TestShaderSafetyAudit(unittest.TestCase):
 
         end_off = 0x8000 + total_aligned
         dcb8_off = 0x1C000
-        self.assertEqual(total_aligned, 0x13E00)
-        self.assertEqual(end_off, 0x1BE00)
+        self.assertEqual(total_aligned, 0x13F00)
+        self.assertEqual(end_off, 0x1BF00)
         self.assertLessEqual(
             end_off,
             dcb8_off,
