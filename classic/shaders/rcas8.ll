@@ -574,5 +574,5 @@ done:
   ret void
 }
 
-attributes #0 = { "amdgpu-flat-work-group-size"="64,64" }
+attributes #0 = { "amdgpu-flat-work-group-size"="64,64" "denormal-fp-math-f32"="preserve-sign,preserve-sign" }
 !0 = !{}

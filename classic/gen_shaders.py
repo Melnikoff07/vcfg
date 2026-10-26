@@ -90,8 +90,9 @@ def resources(nv,ns,nuser,lds,scratch,y):
         raise ValueError('baseline SGPR margin exceeds gfx700 register limit')
     vgprs=(nv-1)//4
     sgprs=(ns+7)//8  # Preserve the baseline's deliberate extra SGPR granule.
-    # Preserve baseline FLOAT_MODE=0xc0 / DX10_CLAMP, even though LLVM default
-    # FloatMode may differ. Changing denormal modes requires hardware tests.
+    # Preserve baseline FLOAT_MODE=0xc0 / DX10_CLAMP. fp32 denormals are flushed, so the shaders declare
+    # "denormal-fp-math-f32"="preserve-sign,preserve-sign" (tools/tests/test_denormal_mode_attribute.py).
+    # Changing denormal modes requires hardware tests.
     return vgprs|(sgprs<<6)|(0xc0<<12)|(1<<21), (nuser<<1)|(1<<7)|(int(y)<<8)|(((lds+511)//512)<<15)
 
 
