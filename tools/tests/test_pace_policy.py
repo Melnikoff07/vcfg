@@ -300,5 +300,77 @@ class TestFgOffTimings(unittest.TestCase):
         self.assertIn("g_rel_t = sceKernelGetProcessTime();\n                    return rc0;", fn[n0:n0 + 900])
 
 
+def extract_block(src: str, marker: str) -> str:
+    start = src.index(marker)
+    pos = src.index("{", start)
+    end, depth = pos + 1, 1
+    while depth:
+        depth += (src[end] == "{") - (src[end] == "}")
+        end += 1
+    return src[pos:end]
+
+
+TICK = extract_function(MAIN_C, "static void tick(")
+RATE_BLOCK = extract_block(TICK, "{   // Track frame rate class transitions")
+_fn = extract_function(MAIN_C, "static int32_t flip_inner_ex(")
+WANT_FG = _fn[_fn.index("int want_fg = ") + len("int want_fg = "):]
+WANT_FG = WANT_FG[:WANT_FG.index(";")]
+
+REENABLE_HARNESS = r"""
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include "pace_policy.h"
+#define INJECT_AFTER_FLIPS 120
+static struct { int framegen, fps_lock; } g_cfg;
+static int g_detected_60fps, g_known_game = 1, g_menu_open, g_fg_off, g_inject_on = 8, g_ab_x_flag;
+static uint32_t g_last_disk_hash, g_bw = 1920, g_bh = 1080;
+static char g_inert_reason[32];
+static void gv_start(int on) { (void)on; }
+static int fg_res_supported(uint32_t w, uint32_t h) { (void)w; (void)h; return 1; }
+#define lg(...) ((void)0)
+static void window(uint32_t n, uint32_t sm_rfps)
+{
+    double rfps = sm_rfps / 10.0;
+    (void)rfps;
+    __BLOCK__
+}
+int main(void)
+{
+    const int locks[4] = { 0, 20, 30, 60 };
+    for (int k = 0; k < 4; k++) {
+        /* the run2 sequence: framegen=1 in the file, 60 fps in the warm-up, then the 30 fps class for good */
+        g_cfg.framegen = 1; g_cfg.fps_lock = locks[k]; g_fg_off = 0; g_last_disk_hash = 7;
+        uint32_t n = 60;
+        for (int i = 0; i < 4; i++, n += 30) window(n, 600);
+        g_detected_60fps = 1;
+        snprintf(g_inert_reason, sizeof(g_inert_reason), "60FPS NATIVE (FG OFF)");
+        int want_before = __WANT_FG__;
+        for (int i = 0; i < 10; i++, n += 15) window(n, 340);
+        printf("lock%d before %d after %d framegen %d detected %d inert %s\n", locks[k], want_before, __WANT_FG__,
+               g_cfg.framegen, g_detected_60fps, g_inert_reason[0] ? "set" : "clear");
+    }
+    return 0;
+}
+"""
+
+
+class TestFpsLock60(unittest.TestCase):
+    """The auto re-enable block of tick() and the want_fg expression, both taken from main.c and executed."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        src = REENABLE_HARNESS.replace("__BLOCK__", RATE_BLOCK).replace("__WANT_FG__", WANT_FG)
+        cls.r = rows(compile_and_run(src))
+
+    def test_fps_lock_60_is_kept_after_the_drop(self) -> None:
+        self.assertEqual(self.r["lock60"], "before 0 after 0 framegen 1 detected 1 inert set")
+
+    def test_other_values_keep_todays_behaviour(self) -> None:
+        self.assertEqual(self.r["lock0"], "before 0 after 1 framegen 1 detected 0 inert clear")
+        self.assertEqual(self.r["lock20"], "before 0 after 1 framegen 1 detected 0 inert clear")
+        self.assertEqual(self.r["lock30"], "before 1 after 1 framegen 1 detected 0 inert clear")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3223,13 +3223,19 @@ static void tick(uint32_t n, uint32_t handle, uint32_t index, uint32_t mode)
                 if (rate_class) lg("rate change: %d -> %d fps class at flip %u (%.1f fps, detected_60=%d)\n", rate_class, cls, n, rfps, g_detected_60fps);
                 rate_class = cls;
             }
+            static int lock60_logged;
             if (g_detected_60fps && n > INJECT_AFTER_FLIPS && low_fps_wins >= 2) {
-                g_detected_60fps = 0;
-                g_inert_reason[0] = 0;
-                if (g_known_game && !g_menu_open) { g_cfg.framegen = 1; g_fg_off = 0; }
-                g_last_disk_hash = 0;
-                gv_start(g_inject_on == 8 && fg_res_supported(g_bw, g_bh));
-                lg("auto-detect: game dropped to %.1f fps (30 fps class) -> FrameGen auto-enabled\n", rfps);
+                if (fg_auto_reenable_allowed(g_cfg.fps_lock)) {
+                    g_detected_60fps = 0;
+                    g_inert_reason[0] = 0;
+                    if (g_known_game && !g_menu_open) { g_cfg.framegen = 1; g_fg_off = 0; }
+                    g_last_disk_hash = 0;
+                    gv_start(g_inject_on == 8 && fg_res_supported(g_bw, g_bh));
+                    lg("auto-detect: game dropped to %.1f fps (30 fps class) -> FrameGen auto-enabled\n", rfps);
+                } else if (!lock60_logged) {   // fps_lock = 60: the player wants the game free, without frame generation
+                    lock60_logged = 1;
+                    lg("auto-detect: game dropped to %.1f fps (30 fps class), fps_lock=60 -> FrameGen stays off, game free up to 60 fps\n", rfps);
+                }
             }
         }
         g_fps_win_t = now;

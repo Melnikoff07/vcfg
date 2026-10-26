@@ -93,3 +93,11 @@ static inline uint32_t ft_format(char *out, size_t cap, const uint32_t (*rec)[3]
     out[pos] = 0;
     return done;
 }
+
+// ---- 60 fps detection ----
+// A game detected at 60 fps in the warm-up that later drops to the 30 fps class gets frame generation back on its own.
+// An explicit fps_lock = 60 is the player's choice of a free-running game without frame generation: it is kept.
+static inline int fg_auto_reenable_allowed(int fps_lock)
+{
+    return fps_lock != 60;
+}
