@@ -6,6 +6,10 @@ classic/shaders/rcas8.ll and the con == 0 fast path.
 2. con == 0: the RCAS weight is +-0 for every pixel, so the RCAS apply returns base_c bit for bit. rcas8.ll skips the
    weight block and the apply under a uniform branch on the con bits; the reference mirrors it and must equal the
    forced full apply exactly.
+3. Static-pixel skip: the real frames are shown raw (post-process target = generated frames only), so AA only in the
+   generated frame alternates at 30 Hz wherever the picture is static (HUD, still scenery). warp8 writes the mid's
+   alpha as a flag (1.0 where P == C in RGB, es == 0; 254/255 elsewhere), main.c sets rcas flag bit 4 only when warp8
+   (not warp8g) wrote the mid, and rcas8 sends flagged pixels down the rcas_only path on the mid pass only.
 """
 import pathlib
 import re
@@ -21,6 +25,8 @@ sys.path.insert(0, str(ROOT / "tools" / "bench"))
 import vcfg_warp as vw  # noqa: E402
 
 RCAS8 = (ROOT / "classic" / "shaders" / "rcas8.ll").read_text(encoding="utf-8")
+WARP8 = (ROOT / "classic" / "shaders" / "warp8.ll").read_text(encoding="utf-8")
+MAIN_C = (ROOT / "classic" / "source" / "main.c").read_text(encoding="utf-8")
 F32 = np.float32
 
 
@@ -63,12 +69,55 @@ class Rcas8AaLight(unittest.TestCase):
         self.assertRegex(RCAS8, r"%w_rcas = phi float \[ %w_rcas0, %rcas_w \], \[ 0\.0, %ld_sync \]")
         self.assertIn("br i1 %sharp, label %rcas_full, label %aa_out", RCAS8)
         aa_out = RCAS8.split("aa_out:\n", 1)[1].split("\n\n", 1)[0]
-        self.assertIn("insertelement <4 x float> %base_c, float %alpha, i32 3", aa_out)
+        self.assertIn("insertelement <4 x float> %base_c, float %aM, i32 3", aa_out)
         self.assertIn("ret <4 x float> %out_aa", aa_out)
         # the weight block holds every reciprocal of the RCAS lobe, none of them stays on the con == 0 path
         rcas_w = RCAS8.split("rcas_w:\n", 1)[1].split("rcas_w_done:\n", 1)[0]
         for v in ("%hmin", "%hmax", "%w_karis", "%nz1"):
             self.assertIn(v + " = fdiv", rcas_w)
+
+    def test_static_skip_reference(self):
+        rng = np.random.default_rng(7)
+        for seed in range(3):
+            img = scene(seed)
+            skip = rng.random(img.shape[:2]) < 0.4
+            skip[10:40, :30] = True                                   # part of the staircase is static
+            c8 = np.floor(np.clip(img, 0, 1) * F32(255.0) + F32(0.5)) * vw.RCP255
+            for con in (0.0, vw.rcas_con(35)):
+                out = vw.rcas8(img, con, 1, skip=skip)
+                ref_aa = vw.rcas8(img, con, 1)
+                ref_off = vw.rcas8(img, con, 0) if con else c8
+                self.assertTrue(np.array_equal(out[~skip], ref_aa[~skip]), "non-static pixels must be unchanged")
+                self.assertTrue(np.array_equal(out[skip], ref_off[skip]), "static pixels take the rcas_only path")
+
+    def test_static_px_is_warp8_es_zero(self):
+        a = scene(1)
+        b = a.copy()
+        b[5:9, 5:9, 1] += F32(1.0 / 255.0)
+        st = vw.static_px(a, b)
+        self.assertFalse(st[5:9, 5:9].any())
+        self.assertTrue(st[20:, 20:].all())
+        self.assertTrue(np.array_equal(st, vw.diff3_k(a, b) == 0))
+
+    def test_ir_static_flag_path(self):
+        self.assertRegex(WARP8, r"%st_px = fcmp oeq float %es, 0\.0\n\s*%alpha = select i1 %st_px, float 1\.0, float (0x[0-9A-F]+)")
+        lo = hexf(re.search(r"%alpha = select i1 %st_px, float 1\.0, float (0x[0-9A-F]+)", WARP8).group(1))
+        self.assertEqual(int(np.floor(lo * F32(255.0) + F32(0.5))), 254)
+        thr = hexf(re.search(r"%st_c = fcmp ogt float %aM, (0x[0-9A-F]+)", RCAS8).group(1))
+        self.assertTrue(F32(254.0) * vw.RCP255 < thr < F32(255.0) * vw.RCP255)
+        self.assertRegex(RCAS8, r"%stb = and i32 %rfl, 16\n\s*%use_st = icmp ne i32 %stb, 0")
+        self.assertRegex(RCAS8, r"%om = call <4 x float> @eval_tile\([^)]*i1 %sharp, i1 %use_st\)")
+        self.assertRegex(RCAS8, r"%oc = call <4 x float> @eval_tile\([^)]*i1 %sharp, i1 false\)")
+        self.assertIn("%doaa = and i1 %has_enh, %nst", RCAS8)
+        self.assertIn("br i1 %doaa, label %do_aa, label %rcas_only", RCAS8)
+
+    def test_main_sets_static_bit_only_for_warp8_mids(self):
+        self.assertRegex(MAIN_C, r"return \(rcas_flags & 1u\) && !gv_warp_active\(\) \? \(rcas_flags \| 16u\) : rcas_flags;")
+        self.assertIn("rcas_flags1 = rcas_static_flag(rcas_flags1);", MAIN_C)
+        self.assertIn("rcas_flags2 = rcas_static_flag(rcas_flags2);", MAIN_C)
+        self.assertEqual(MAIN_C.count("rcas_static_flag("), 3)       # definition + the two mid tables
+        post8 = MAIN_C.split("static uint32_t build_dcb_post8(", 1)[1].split("\n}\n", 1)[0]
+        self.assertNotIn("rcas_static_flag", post8)                   # real-frame-only pass never honours it
 
 
 if __name__ == "__main__":

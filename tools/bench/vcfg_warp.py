@@ -601,11 +601,17 @@ def rcas_weight(lM, lN, lS, lW, lE, mn5, mx5, rng5, tex_gate, s4l, con):
     return w_sharp + w_shim
 
 
-def rcas8(mid, con, emode, force_apply=False):
+def static_px(tp, tc):
+    """warp8's static-pixel flag, written to the mid's alpha (1.0 / 254/255): P == C in RGB at the pixel (es == 0)"""
+    return diff3_k(tp.astype(F32), tc.astype(F32)) == F32(0.0)
+
+
+def rcas8(mid, con, emode, force_apply=False, skip=None):
     """mid (H, W, 3) float32 (already quantised like the T# store). Neighbour colours come from the 8-bit LDS copy,
     luma from the full precision value. con == 0 (Sharpness 0) skips the RCAS weight and the RCAS apply, as rcas8.ll
     does: the weight is +-0 there, so the apply returns base_c bit for bit. force_apply runs the full apply anyway
-    (tests prove the identity with it)."""
+    (tests prove the identity with it). skip (H, W) bool: warp8's static flag (rcas flag bit 4, mid pass); those
+    pixels take the rcas_only path (no AA, RCAS as with Enhance off)."""
     H, W = mid.shape[:2]
     c = mid.astype(F32)
     luma = c[..., 1] * F32(0.5) + (c[..., 0] + c[..., 2]) * F32(0.25)
@@ -706,6 +712,9 @@ def rcas8(mid, con, emode, force_apply=False):
         wAA = edge_ramp * wClp * r_gate
         base_c = M + (rgbTarget - M) * wAA[..., None]
         w_eff = w_rcas * (F32(1.0) - edge_ramp)
+        if skip is not None:
+            base_c = np.where(skip[..., None], M, base_c)
+            w_eff = np.where(skip, w_rcas, w_eff)
     else:
         base_c, w_eff = M, w_rcas
     if not sharp and not force_apply:

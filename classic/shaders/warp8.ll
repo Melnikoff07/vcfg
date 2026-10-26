@@ -1317,6 +1317,11 @@ fdone:
   %mk1 = icmp ult i32 %mxy, 32
   %mk = and i1 %mk0, %mk1
   %hudw = extractelement <4 x i32> %cn, i32 3
+  ; HUD rectangle (hud file): uniform skip of the per-lane rectangle test when no rectangle is set (hudw == 0)
+  %hnz = icmp ne i32 %hudw, 0
+  br i1 %hnz, label %hud_rect, label %hud_done
+
+hud_rect:
   %hb0 = and i32 %hudw, 255
   %hb1a = lshr i32 %hudw, 8
   %hb1 = and i32 %hb1a, 255
@@ -1345,11 +1350,16 @@ fdone:
   %cin = icmp ule i32 %cd2, %crr
   %iscirc = icmp eq i32 %hy1, 0
   %hcsel = select i1 %iscirc, i1 %cin, i1 %hcx
-  %hnz = icmp ne i32 %hudw, 0
-  %inhud = and i1 %hcsel, %hnz
+  br label %hud_done
+
+hud_done:
+  %inhud = phi i1 [ %hcsel, %hud_rect ], [ false, %fdone ]
   %out1h = select i1 %inhud, <4 x float> %sc, <4 x float> %out1
   %out2 = select i1 %mk, <4 x float> <float 1.0, float 0.0, float 1.0, float 1.0>, <4 x float> %out1h
-  %alpha = extractelement <4 x float> %sc, i32 3
+  ; alpha = static-pixel flag for rcas8 (P == C in RGB at this pixel, es == 0): 1.0 static, 254/255 otherwise.
+  ; Only the scanout and osd8 (pass-through) see the mid's alpha; rcas8 skips the AA where the flag is set.
+  %st_px = fcmp oeq float %es, 0.0
+  %alpha = select i1 %st_px, float 1.0, float 0x3FEFDFDFE0000000 ; 254/255
   %out = insertelement <4 x float> %out2, float %alpha, i32 3
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %out, i32 15, i32 %x, i32 %y, <8 x i32> %to, i32 0, i32 0)
   ret void

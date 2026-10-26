@@ -6,7 +6,8 @@
 ; packed RGBA8 + float luma = 1152 B of LDS) and barrier-synchronising the wave before any computation or store.
 ; Supports dynamic screen resolutions (reads width-1 and height-1 directly from T# dword 2).
 ; table: +0x20 T#cur (real frame), +0x40 T#out (generated mid frame),
-;        +0x220 {rcas_con (float bits), rcas_flags (bit 0 = mid, bit 1 = cur, bits 2..3 = enhance mode 0/1/2)}.
+;        +0x220 {rcas_con (float bits), rcas_flags (bit 0 = mid, bit 1 = cur, bits 2..3 = enhance mode 0/1/2,
+;        bit 4 = the mid's alpha carries warp8's static-pixel flag, honoured on the mid pass only)}.
 target triple = "amdgcn--"
 declare <4 x float> @llvm.amdgcn.image.load.2d.v4f32.i32(i32 immarg, i32, i32, <8 x i32>, i32 immarg, i32 immarg)
 declare void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float>, i32 immarg, i32, i32, <8 x i32>, i32 immarg, i32 immarg)
@@ -134,7 +135,7 @@ define internal <4 x float> @rd_c(i32 %idx) alwaysinline {
   ret <4 x float> %c
 }
 
-define internal <4 x float> @eval_tile(<8 x i32> %t, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp) alwaysinline {
+define internal <4 x float> @eval_tile(<8 x i32> %t, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st) alwaysinline {
 entry:
   %t2 = extractelement <8 x i32> %t, i32 2
   %wm1 = and i32 %t2, 16383
@@ -270,7 +271,14 @@ rcas_w:
 rcas_w_done:
   %w_rcas = phi float [ %w_rcas0, %rcas_w ], [ 0.0, %ld_sync ]
   %has_enh = icmp ugt i32 %emode, 0
-  br i1 %has_enh, label %do_aa, label %rcas_only
+  ; static pixel (warp8 alpha flag 1.0 = P == C here): the real frames show it raw, so AA only in the mid would
+  ; alternate at 30 Hz; take the rcas_only path for it (waves with every lane static skip the AA block)
+  %aM = extractelement <4 x float> %M, i32 3
+  %st_c = fcmp ogt float %aM, 0x3FEFF7CEE0000000 ; 0.999
+  %st_skip = and i1 %use_st, %st_c
+  %nst = xor i1 %st_skip, true
+  %doaa = and i1 %has_enh, %nst
+  br i1 %doaa, label %do_aa, label %rcas_only
 
 do_aa:
   %NW = call <4 x float> @rd_c(i32 %iNW)
@@ -471,11 +479,10 @@ rcas_only:
 rcas_apply:
   %base_c = phi <4 x float> [ %aa_rgb, %do_aa ], [ %M, %rcas_only ]
   %w_eff  = phi float [ %w_eff_aa, %do_aa ], [ %w_rcas, %rcas_only ]
-  %alpha = extractelement <4 x float> %M, i32 3
   br i1 %sharp, label %rcas_full, label %aa_out
 
 aa_out:
-  %out_aa = insertelement <4 x float> %base_c, float %alpha, i32 3
+  %out_aa = insertelement <4 x float> %base_c, float %aM, i32 3
   ret <4 x float> %out_aa
 
 rcas_full:
@@ -510,7 +517,7 @@ rcas_full:
   %c_mx5 = call <4 x float> @llvm.maxnum.v4f32(<4 x float> %c_mx4, <4 x float> %base_c)
   %cl0 = call <4 x float> @llvm.maxnum.v4f32(<4 x float> %res0, <4 x float> %c_mn5)
   %cl1 = call <4 x float> @llvm.minnum.v4f32(<4 x float> %cl0, <4 x float> %c_mx5)
-  %out = insertelement <4 x float> %cl1, float %alpha, i32 3
+  %out = insertelement <4 x float> %cl1, float %aM, i32 3
   ret <4 x float> %out
 }
 
@@ -531,6 +538,9 @@ entry:
   %do_mid = icmp ne i32 %do_mid0, 0
   %em0 = lshr i32 %rfl, 2
   %emode = and i32 %em0, 3
+  ; bit 4: the mid's alpha carries warp8's static-pixel flag (set by main.c only when warp8 wrote the mid)
+  %stb = and i32 %rfl, 16
+  %use_st = icmp ne i32 %stb, 0
   ; con == 0 (Sharpness 0): the RCAS weight is +-0 everywhere, so rcas_apply returns base_c bit for bit; skip it
   %conabs = and i32 %conb, 2147483647
   %sharp = icmp ne i32 %conabs, 0
@@ -538,7 +548,7 @@ entry:
 pass_mid:
   %pto = getelementptr i8, ptr addrspace(4) %tbl, i64 64
   %to = load <8 x i32>, ptr addrspace(4) %pto, align 32, !invariant.load !0
-  %om = call <4 x float> @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp)
+  %om = call <4 x float> @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st)
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %om, i32 15, i32 %x, i32 %y, <8 x i32> %to, i32 0, i32 0)
   call void @bar()
   br label %check_cur
@@ -549,7 +559,7 @@ check_cur:
 pass_cur:
   %ptc = getelementptr i8, ptr addrspace(4) %tbl, i64 32
   %tc = load <8 x i32>, ptr addrspace(4) %ptc, align 32, !invariant.load !0
-  %oc = call <4 x float> @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp)
+  %oc = call <4 x float> @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 false)
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %oc, i32 15, i32 %x, i32 %y, <8 x i32> %tc, i32 0, i32 0)
   br label %done
 done:
