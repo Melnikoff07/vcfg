@@ -1245,7 +1245,7 @@ static void calc_rcas_params(uint32_t target_mask, uint32_t *con_bits_out, uint3
 // (sharpening the real frame in place was measured worse, see post_mid_only); Enhance AA off or post_mid = 1 / 2 in a
 // manual profile turn it off or override it. P must be the game's own 8-bit buffer (the 3-buffer ring without the
 // history copy, or a full-size copy): with the 16-bpp history copy the write-back test of bit 5 cannot match, so it
-// stays mid-only. Game vectors (warp8g) keep the game's alpha, so rcas_static_flag() cannot set bits 4 and 5 and the
+// stays mid-only. Game vectors (warp8g) keep the game's alpha, so the static bits 4 and 5 below are never set and the
 // real frame would get the AA on its static pixels too (offline: HUD -1.9 dB, still areas -3.2 dB): mid-only there.
 static int real_aa_default(void)
 {
