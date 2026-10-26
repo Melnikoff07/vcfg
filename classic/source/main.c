@@ -90,6 +90,7 @@ static char g_inert_reason[32] = "";
 static volatile int g_detected_60fps = 0;
 static volatile int g_fmt_supported = 1;
 static volatile uint32_t g_last_gpu_ms_x100 = 0, g_last_hz_x10 = 600;
+static volatile uint32_t g_vb_win_q8 = 0;   // refresh period measured over the last ~2 s of vblanks, Q24.8 us (0 = none yet)
 static volatile uint32_t g_osd_real_fps_x10 = 300, g_osd_out_fps_x10 = 600, g_osd_frame_ms_x10 = 333;
 static volatile uint32_t g_cur_pending_flips = 0, g_cur_gcq = 0;
 // Latency of real frames: time the game handed frame <buffer> to the flip hook -> time it was on screen.
@@ -428,6 +429,7 @@ static size_t g_pre_size = 0, g_pre_work_sz = 0;
 static long g_pre_gpu_phys = 0, g_pre_work_phys = 0, g_pre_mem_phys = 0, g_dump_phys = 0;
 
 #include "two_buffer_test.h"
+#include "pace_policy.h"
 #include "bench_state.h"
 #include "boot_stage.h"
 
@@ -2418,10 +2420,17 @@ static void safe_try_activate(uint32_t handle)
 }
 
 static uint64_t g_pace_next = 0;
+// Refresh period for the pacers: the measured one (exact), or the rounded rate until the first window is measured.
+static uint32_t refresh_period_q8(void)
+{
+    uint32_t q = __atomic_load_n(&g_vb_win_q8, __ATOMIC_ACQUIRE);
+    return q ? q : vb_period_q8_from_hz10(g_last_hz_x10);
+}
 static void pace_hz(uint32_t hz)
 {
     if (!hz || !g_freq) return;
-    uint64_t period = g_freq / hz;
+    uint32_t vb_q8 = refresh_period_q8();
+    uint64_t period = vb_ticks(g_freq, vb_q8, vb_per_frame(hz, vb_q8));   // whole refreshes: 60 -> 1, 30 -> 2, 20 -> 3
     uint64_t now = sceKernelGetProcessTimeCounter();
     if (g_pace_next == 0 || now > g_pace_next + period * 4) { g_pace_next = now + period; return; }
     if (now < g_pace_next) {
@@ -2754,6 +2763,10 @@ static void *mon_thread(void *arg)
         if (vs.processTime > win_t + 2000000) {
             double hz = (double)(vs.count - win_vb) * 1e6 / (double)(vs.processTime - win_t);
             g_last_hz_x10 = (uint32_t)(hz * 10.0 + 0.5);
+            {
+                uint32_t wq8 = vb_period_q8_from_window(vs.count - win_vb, vs.processTime - win_t);
+                if (wq8) __atomic_store_n(&g_vb_win_q8, wq8, __ATOMIC_RELEASE);
+            }
             uint32_t cn_ = __atomic_exchange_n(&g_cpu_n, 0u, __ATOMIC_ACQ_REL);
             uint32_t csum_ = __atomic_exchange_n(&g_cpu_sum_us, 0u, __ATOMIC_ACQ_REL);
             uint32_t cmax_ = __atomic_exchange_n(&g_cpu_max_us, 0u, __ATOMIC_ACQ_REL);
@@ -2844,8 +2857,7 @@ static uint32_t vblank_period_us(void)
     if (p_q8 >= (10000u << 8) && p_q8 <= (25000u << 8)) {
         return (p_q8 + 128u) >> 8;
     }
-    uint32_t hz10 = (g_last_hz_x10 > 400u && g_last_hz_x10 < 800u) ? g_last_hz_x10 : 599u;
-    uint32_t vb_us = (10000000u + (hz10 >> 1)) / hz10;
+    uint32_t vb_us = (refresh_period_q8() + 128u) >> 8;
     return (vb_us >= 10000u && vb_us <= 25000u) ? vb_us : 16683u;
 }
 
@@ -3035,7 +3047,8 @@ static void pace_vblank(int prev2_real, int prev_real, int cur_real)
 }
 
 // VCFG timer pacing for FG pairs, per title (LOG_DIR/pace_timer_<TITLE> exists): releases the game once per pair
-// period (2 refreshes at the measured rate) from the previous release, instead of waiting until its previous real
+// period (2 refreshes at the measured period, exact to ~0.01 us: the rounded 59.9 Hz drifted 22 us per pair and made
+// the latency a 1.3 ms / 2 s sawtooth) from the previous release, instead of waiting until its previous real
 // frame is on screen (pace_vblank). CUSA05571 needs 25 ms per frame but waited ~13 ms more in pace_vblank behind a
 // 4-deep flip queue and ran at 24-25 fps. +2 ms on the next release while 3+ flips are pending (drift).
 static int g_pace_timer = -1;
@@ -3043,8 +3056,7 @@ static uint64_t g_pair_next;
 static void pace_pair_ex(int32_t handle, uint64_t dt_enter_us, int pace_pre)
 {
     if (!g_freq) return;
-    uint32_t hz10 = g_last_hz_x10 > 400u && g_last_hz_x10 < 800u ? g_last_hz_x10 : 599u;
-    uint64_t period = g_freq * 20ull / hz10;                  // 2 refreshes
+    uint64_t period = vb_ticks(g_freq, refresh_period_q8(), 2u);   // 2 refreshes at the measured period
     uint64_t now = sceKernelGetProcessTimeCounter();
     if (!g_pair_next || now > g_pair_next + period * 3) { g_pair_next = now + period; g_rel_t = sceKernelGetProcessTime(); return; }
     if (now < g_pair_next) {

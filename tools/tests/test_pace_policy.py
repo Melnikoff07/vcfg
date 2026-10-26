@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Pacing policy of the classic plugin: classic/source/pace_policy.h compiled and executed on the host, plus the call
+sites in classic/source/main.c that must use it.
+
+Compiler: config.json llvm_bin (clang.exe + lli.exe, as the other harnesses) when present, otherwise the host clang/cc
+building a native binary.
+"""
+import json
+import pathlib
+import re
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+MAIN_C = (ROOT / "classic" / "source" / "main.c").read_text(encoding="utf-8", errors="replace")
+
+REFRESH_US = 1e6 / 59.939      # the TV of the CUSA18723 runs (CADENCE "refresh 59.939 Hz")
+
+
+def extract_function(src: str, signature: str) -> str:
+    start = src.index(signature)
+    pos = src.index("{", src.index(")", start))
+    end, depth = pos + 1, 1
+    while depth:
+        depth += (src[end] == "{") - (src[end] == "}")
+        end += 1
+    return src[start:end]
+
+
+def compile_and_run(src: str) -> str:
+    inc = ["-I" + str(ROOT / "classic" / "source")]
+    flags = ["-O0", "-Wall", "-Wno-unused-variable", "-Wno-unused-function", "-Wno-unused-but-set-variable"]
+    with tempfile.TemporaryDirectory() as td:
+        c = pathlib.Path(td) / "pace_policy_test.c"
+        c.write_text(src, encoding="utf-8")
+        cfg_path = ROOT / "config.json"
+        llvm = pathlib.Path(json.loads(cfg_path.read_text(encoding="utf-8"))["llvm_bin"]) if cfg_path.exists() else None
+        if llvm is not None and (llvm / "clang.exe").exists() and (llvm / "lli.exe").exists():
+            bc = pathlib.Path(td) / "pace_policy_test.bc"
+            subprocess.run([str(llvm / "clang.exe"), "--target=x86_64-pc-windows-msvc", *flags, *inc,
+                            "-emit-llvm", "-c", str(c), "-o", str(bc)], check=True)
+            cmd = [str(llvm / "lli.exe"), "--dlopen=msvcrt.dll", str(bc)]
+        else:
+            cc = shutil.which("clang") or shutil.which("cc")
+            if cc is None:
+                raise unittest.SkipTest("no C compiler (config.json llvm_bin or host clang/cc)")
+            exe = pathlib.Path(td) / "pace_policy_test"
+            subprocess.run([cc, *flags, *inc, str(c), "-o", str(exe)], check=True)
+            cmd = [str(exe)]
+        return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+
+
+def rows(out: str) -> dict:
+    d = {}
+    for line in out.splitlines():
+        k, _, v = line.partition(" ")
+        d[k] = v
+    return d
+
+
+PERIOD_HARNESS = r"""
+#include <stdio.h>
+#include "pace_policy.h"
+int main(void)
+{
+    const double vb = %(vb).6f;
+    const uint64_t freq = 1600000000ull;           /* any counter rate; the drift is relative */
+    /* one 2-s window of the monitor: 120 vblanks, timestamps in whole us */
+    uint64_t dt = (uint64_t)(120.0 * vb + 0.5);
+    uint32_t q8 = vb_period_q8_from_window(120, dt);
+    printf("q8_us %%.4f\n", q8 / 256.0);
+    printf("bad_window %%u %%u %%u\n", vb_period_q8_from_window(0, dt), vb_period_q8_from_window(10, dt),
+           vb_period_q8_from_window(120, 120ull * 40000ull));
+    printf("hz10_fallback_us %%.3f\n", vb_period_q8_from_hz10(599) / 256.0);
+    /* pair releases every 2 refreshes for 60 s: offset of release k from the true vblank grid */
+    uint64_t pair = vb_ticks(freq, q8, 2), pair_old = freq * 20ull / 599ull;
+    double worst = 0, worst_old = 0;
+    for (uint64_t k = 1; k <= 1800; k++) {
+        double t = (double)(k * pair) * 1e6 / (double)freq, t_old = (double)(k * pair_old) * 1e6 / (double)freq;
+        double e = t - 2.0 * vb * (double)k, e_old = t_old - 2.0 * vb * (double)k;
+        if (e < 0) e = -e;
+        if (e_old < 0) e_old = -e_old;
+        if (e > worst) worst = e;
+        if (k <= 60 && e_old > worst_old) worst_old = e_old;
+    }
+    printf("drift_60s_us %%.2f\n", worst);
+    printf("drift_old_2s_us %%.2f\n", worst_old);
+    printf("per_frame %%u %%u %%u %%u\n", vb_per_frame(60, q8), vb_per_frame(30, q8), vb_per_frame(20, q8), vb_per_frame(0, q8));
+    return 0;
+}
+""" % {"vb": REFRESH_US}
+
+
+class TestRefreshPeriod(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.r = rows(compile_and_run(PERIOD_HARNESS))
+
+    def test_window_measures_the_exact_period(self) -> None:
+        self.assertAlmostEqual(float(self.r["q8_us"]), REFRESH_US, delta=0.01)
+        self.assertEqual(self.r["bad_window"], "0 0 0", "too few vblanks or an out-of-range period must be rejected")
+        self.assertAlmostEqual(float(self.r["hz10_fallback_us"]), 1e7 / 599, delta=0.01)
+
+    def test_pair_releases_stay_on_the_vblank_grid(self) -> None:
+        # 1800 pairs = 60 s: below 1/10 of the 1.55 ms latch margin, so no vblank slip in a session
+        self.assertLess(float(self.r["drift_60s_us"]), 150.0)
+        # the rounded 59.9 Hz drifted 1.3 ms every 2 s (the console sawtooth); keeps the discriminator honest
+        self.assertGreater(float(self.r["drift_old_2s_us"]), 1000.0)
+
+    def test_frame_caps_are_whole_refreshes(self) -> None:
+        self.assertEqual(self.r["per_frame"], "1 2 3 1")
+
+    def test_main_c_pacers_use_the_measured_period(self) -> None:
+        for sig in ("static void pace_pair_ex(", "static void pace_hz(", "static uint32_t vblank_period_us("):
+            body = extract_function(MAIN_C, sig)
+            self.assertNotIn("g_last_hz_x10", body, f"{sig} must not use the 0.1 Hz rounded rate")
+            self.assertIn("refresh_period_q8()", body, f"{sig} must use the measured refresh period")
+        mon = extract_function(MAIN_C, "static void *mon_thread(")
+        self.assertIn("vb_period_q8_from_window(vs.count - win_vb, vs.processTime - win_t)", mon)
+        self.assertRegex(extract_function(MAIN_C, "static void pace_pair_ex("),
+                         r"vb_ticks\(g_freq, refresh_period_q8\(\), 2u\)")
+
+
+if __name__ == "__main__":
+    unittest.main()
