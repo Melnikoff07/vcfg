@@ -281,15 +281,6 @@ rcas_w_done:
   %st_c = fcmp ogt float %aM, 0x3FEFF7CEE0000000 ; 0.999
   %st_skip = and i1 %use_st, %st_c
   %nst = xor i1 %st_skip, true
-  %doaa = and i1 %has_enh, %nst
-  br i1 %doaa, label %do_aa, label %rcas_only
-
-do_aa:
-  %NW = call <4 x float> @rd_c(i32 %iNW)
-  %NE = call <4 x float> @rd_c(i32 %iNE)
-  %SW = call <4 x float> @rd_c(i32 %iSW)
-  %SE = call <4 x float> @rd_c(i32 %iSE)
-
   %is_str = icmp uge i32 %emode, 2
   %thr_abs = select i1 %is_str, float 0.015625, float 0.0234375 ; 4/256 vs 6/256
   %thr_rel = select i1 %is_str, float 0.0625, float 0.09375     ; 4/64 vs 6/64
@@ -298,6 +289,19 @@ do_aa:
   %er0 = fsub float %rng9, %ethr
   %er1 = fmul float %er0, 32.0
   %edge_ramp = call float @sat(float %er1)
+  ; edge_ramp == 0 makes wAA == 0 and w_eff == w_rcas: the AA block returns M bit for bit, so those lanes take the
+  ; rcas_only path too (waves with no edge lane skip the AA block)
+  %has_edge = fcmp ogt float %edge_ramp, 0.0
+  %doaa0 = and i1 %has_enh, %nst
+  %doaa = and i1 %doaa0, %has_edge
+  br i1 %doaa, label %do_aa, label %rcas_only
+
+do_aa:
+  %NW = call <4 x float> @rd_c(i32 %iNW)
+  %NE = call <4 x float> @rd_c(i32 %iNE)
+  %SW = call <4 x float> @rd_c(i32 %iSW)
+  %SE = call <4 x float> @rd_c(i32 %iSE)
+
 
   ; directional AA Sobel orientation: horizontal vs vertical
   %lW2 = fmul float %lW, 2.0

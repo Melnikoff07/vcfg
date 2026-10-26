@@ -606,12 +606,13 @@ def static_px(tp, tc):
     return diff3_k(tp.astype(F32), tc.astype(F32)) == F32(0.0)
 
 
-def rcas8(mid, con, emode, force_apply=False, skip=None):
+def rcas8(mid, con, emode, force_apply=False, skip=None, dbg=None):
     """mid (H, W, 3) float32 (already quantised like the T# store). Neighbour colours come from the 8-bit LDS copy,
     luma from the full precision value. con == 0 (Sharpness 0) skips the RCAS weight and the RCAS apply, as rcas8.ll
     does: the weight is +-0 there, so the apply returns base_c bit for bit. force_apply runs the full apply anyway
     (tests prove the identity with it). skip (H, W) bool: warp8's static flag (rcas flag bit 4, mid pass); those
-    pixels take the rcas_only path (no AA, RCAS as with Enhance off)."""
+    pixels take the rcas_only path (no AA, RCAS as with Enhance off). Lanes with edge_ramp == 0 take that path in
+    rcas8.ll too, which is the identity here (wAA == 0, w_eff == w_rcas). dbg: dict, receives edge_ramp."""
     H, W = mid.shape[:2]
     c = mid.astype(F32)
     luma = c[..., 1] * F32(0.5) + (c[..., 0] + c[..., 2]) * F32(0.25)
@@ -650,6 +651,8 @@ def rcas8(mid, con, emode, force_apply=False, skip=None):
         thr_abs, thr_rel = (F32(0.015625), F32(0.0625)) if is_str else (F32(0.0234375), F32(0.09375))
         ethr = np.maximum(thr_abs, mx9 * thr_rel)
         edge_ramp = sat((rng9 - ethr) * F32(32.0))
+        if dbg is not None:
+            dbg['edge_ramp'] = edge_ramp
         edgeH = np.abs(lNW + lSW - lW * 2) + np.abs(lN + lS - lM * 2) * 2 + np.abs(lNE + lSE - lE * 2)
         edgeV = np.abs(lNW + lNE - lN * 2) + np.abs(lW + lE - lM * 2) * 2 + np.abs(lSW + lSE - lS * 2)
         horz = edgeH >= edgeV
