@@ -287,6 +287,14 @@ void lg(const char *fmt, ...)
     lg_write(buf);
 }
 
+// File only (no klog, no trace copy): bulk debug lines such as FTRACE.
+static void lg_file_only(const char *buf)
+{
+    while (__atomic_exchange_n(&g_lgw_lock, 1u, __ATOMIC_ACQUIRE)) sceKernelUsleep(50);
+    if (g_log) { fputs(buf, g_log); fflush(g_log); }
+    __atomic_store_n(&g_lgw_lock, 0u, __ATOMIC_RELEASE);
+}
+
 static void lg_drain(void)
 {
     char buf[384];
@@ -430,6 +438,13 @@ static long g_pre_gpu_phys = 0, g_pre_work_phys = 0, g_pre_mem_phys = 0, g_dump_
 
 #include "two_buffer_test.h"
 #include "pace_policy.h"
+
+// FTRACE (pace_policy.h): one 3 x 32-bit record per real frame, only while the debug log is on. The hook writes the
+// hand-over / submit / own time, the monitor adds the time on screen and the vblanks held, the io thread prints them.
+static uint32_t g_ft[FT_N][3];
+static volatile uint32_t g_ft_w;          // records started by the hook
+static volatile uint32_t g_ft_slot[16];   // per display buffer: record index + 1 of the real frame flipped to it
+static uint32_t g_ft_r, g_ft_prev_h;      // io thread: next record to print, hand-over time of the last one printed
 #include "bench_state.h"
 #include "boot_stage.h"
 
@@ -2633,6 +2648,19 @@ static void *io_thread(void *arg)
     for (;;) {
         sceKernelUsleep(2000);
         if (g_lgq_r != g_lgq_w) lg_drain();
+        if (g_log) {   // FTRACE: 15 records per line, each at least 6 real frames old (the monitor has completed it)
+            uint32_t w = __atomic_load_n(&g_ft_w, __ATOMIC_ACQUIRE);
+            if (w - g_ft_r > FT_N - 8u) { g_ft_r = w - (FT_N - 8u); g_ft_prev_h = 0; }   // fell behind: skip, restart dh
+            if (w - g_ft_r >= 6u + 15u) {
+                uint32_t rec[15][3];
+                for (uint32_t i = 0; i < 15u; i++)
+                    for (int j = 0; j < 3; j++) rec[i][j] = __atomic_load_n(&g_ft[(g_ft_r + i) % FT_N][j], __ATOMIC_RELAXED);
+                char fb[512];
+                uint32_t nd = ft_format(fb, sizeof(fb), (const uint32_t (*)[3])rec, 15u, g_ft_prev_h);
+                if (nd) { g_ft_prev_h = rec[nd - 1][0]; g_ft_r += nd; lg_file_only(fb); }
+                else g_ft_r += 15u;
+            }
+        }
         bench_io_tick();
         if (__atomic_exchange_n(&g_cfg_save_req, 0, __ATOMIC_ACQ_REL)) cfg_save_game_ini();
         if (g_inject_on == 8) gv_io_tick();
@@ -2688,6 +2716,7 @@ static void *mon_thread(void *arg)
     VoVblankStatus vs;
     uint64_t last_count = 0, last_t = 0, win_t = 0, win_vb = 0, osd_t = 0, osd_fcnt = 0;
     int last_buf = -1, pend_max = 0, gcq_max = 0;
+    uint32_t ft_mid_nv = 0, ft_real_rec = 0;   // FTRACE: hold of the last generated frame, record of the real on screen
     for (;;) {
         sceKernelUsleep(500);
         if (g_handle < 0) continue;
@@ -2713,6 +2742,12 @@ static void *mon_thread(void *arg)
                     if (nv < 1) nv = 1;
                     if (nv > 4) nv = 4;
                     g_hist[IS_MID(last_buf) ? 0 : 1][nv - 1]++;
+                    if (IS_MID(last_buf)) ft_mid_nv = nv;
+                    else if (ft_real_rec && g_log && __atomic_load_n(&g_ft_w, __ATOMIC_ACQUIRE) - (ft_real_rec - 1u) < FT_N) {
+                        uint32_t *fr = &g_ft[(ft_real_rec - 1u) % FT_N][2];
+                        __atomic_store_n(fr, ft_with_real_vb(__atomic_load_n(fr, __ATOMIC_RELAXED), nv), __ATOMIC_RELAXED);
+                        ft_real_rec = 0;
+                    }
                     if (!IS_MID(last_buf) && g_mon) {
                         static uint32_t ema_dt = 16683u;
                         uint32_t dtu = dt > 66732u ? 66732u : (uint32_t)dt;
@@ -2741,6 +2776,18 @@ static void *mon_thread(void *arg)
                 if (t0 && fs.processTime > t0 && fs.processTime - t0 < 500000ull) {
                     uint64_t l = fs.processTime - t0; g_lat_sum += l; g_lat_n++; if (l > g_lat_max) g_lat_max = l;
                 }
+                uint32_t fs_slot = __atomic_exchange_n(&g_ft_slot[fs.currentBuffer], 0u, __ATOMIC_ACQ_REL);
+                ft_real_rec = 0;
+                if (fs_slot && g_log && __atomic_load_n(&g_ft_w, __ATOMIC_ACQUIRE) - (fs_slot - 1u) < FT_N) {
+                    uint32_t *fr = &g_ft[(fs_slot - 1u) % FT_N][2];
+                    uint32_t fv = __atomic_load_n(fr, __ATOMIC_RELAXED);
+                    uint64_t h0 = __atomic_load_n(&g_ft[(fs_slot - 1u) % FT_N][0], __ATOMIC_RELAXED);
+                    uint64_t dscr = (uint32_t)fs.processTime - (uint32_t)h0;   // both are process time in us (low 32 bits)
+                    fv = ft_with_mid_vb(ft_with_screen(fv, dscr), ft_mid_nv);
+                    __atomic_store_n(fr, fv, __ATOMIC_RELAXED);
+                    ft_real_rec = fs_slot;
+                }
+                ft_mid_nv = 0;
             }
             if (fs.currentBuffer >= 0 && !IS_MID(fs.currentBuffer)) g_last_real_buf = fs.currentBuffer;
             last_count = fs.count;
@@ -3304,8 +3351,10 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
         lg("CLASSIC_BUILD version=%s test=%d target=%d two_buffer=%d status_hook=%d\n", VCFG_TRACE_VERSION, VCFG_2BUF_TEST, tb_title(),
            g_vq_on, g_status_hooked);
     }
+    uint64_t ft_own_us = 0;
     if (g_rel_t) {
         uint64_t us = sceKernelGetProcessTime() - g_rel_t;
+        ft_own_us = us;
         g_rel_t = 0;
         if (us < 1000000) { g_cpu_n++; g_cpu_sum_us += (uint32_t)us; if (us > g_cpu_max_us) g_cpu_max_us = (uint32_t)us;
                             g_cpu_ema_us = g_cpu_ema_us ? (g_cpu_ema_us * 7u + (uint32_t)us) / 8u : (uint32_t)us; }
@@ -3746,6 +3795,14 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     pll_commit_frame_vblank((int32_t)handle, t_s1, hold_mid_us);
                 }
                 g_last_submit_enter_t = t_s1;
+                if (g_log && show_idx < 16u) {   // FTRACE record of this real frame (debug log only)
+                    uint32_t fw = __atomic_load_n(&g_ft_w, __ATOMIC_RELAXED), fi = fw % FT_N;
+                    __atomic_store_n(&g_ft[fi][0], (uint32_t)t_hook_in, __ATOMIC_RELAXED);
+                    __atomic_store_n(&g_ft[fi][1], ft_pack_sub(t_s1 - t_hook_in, ft_own_us), __ATOMIC_RELAXED);
+                    __atomic_store_n(&g_ft[fi][2], 0u, __ATOMIC_RELAXED);
+                    __atomic_store_n(&g_ft_slot[show_idx], fw + 1u, __ATOMIC_RELEASE);
+                    __atomic_store_n(&g_ft_w, fw + 1u, __ATOMIC_RELEASE);
+                }
                 __atomic_store_n(&g_done, (volatile uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0x900), __ATOMIC_RELEASE);
                 __atomic_store_n(&g_last_seq, g_flips, __ATOMIC_RELEASE);
                 g_injects++;

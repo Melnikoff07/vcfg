@@ -54,3 +54,42 @@ static inline int shq_step(ShallowQueue *s, uint32_t cpu_ema_us)
     else if (cpu_ema_us > SHQ_EXIT_US) s->on = 0;
     return (int)s->on;
 }
+
+// ---- FTRACE: one record of 3 x 32 bits per real frame ----
+//  [0] hand-over time (hook entry), low 32 bits of the process time in us
+//  [1] submit - hand-over in us (bits 0..15, saturated) | the game's own time release -> hand-over in us (bits 16..31)
+//  [2] on screen - hand-over in us (bits 0..23, 0 = not seen yet) | vblanks the real stayed (24..27) | vblanks the
+//      generated frame before it stayed (28..31)
+#define FT_N 128u
+static inline uint32_t ft_sat16(uint64_t v) { return v > 0xFFFFu ? 0xFFFFu : (uint32_t)v; }
+static inline uint32_t ft_pack_sub(uint64_t dsub_us, uint64_t own_us) { return ft_sat16(dsub_us) | (ft_sat16(own_us) << 16); }
+static inline uint32_t ft_with_screen(uint32_t w, uint64_t dscr_us)
+{
+    uint32_t v = dscr_us > 0xFFFFFFu ? 0xFFFFFFu : (uint32_t)dscr_us;
+    return (w & 0xFF000000u) | (v ? v : 1u);
+}
+static inline uint32_t ft_with_real_vb(uint32_t w, uint32_t nv) { return (w & ~0x0F000000u) | ((nv > 15u ? 15u : nv) << 24); }
+static inline uint32_t ft_with_mid_vb(uint32_t w, uint32_t nv) { return (w & ~0xF0000000u) | ((nv > 15u ? 15u : nv) << 28); }
+// Formats records [0, n) as "FTRACE <base_us> | dh,dsub,dscr,rv/mv,own;..." where dh is the hand-over interval to the
+// record before (the first one uses prev_handover_us). Returns the number of records written (stops before overflow).
+static inline uint32_t ft_format(char *out, size_t cap, const uint32_t (*rec)[3], uint32_t n, uint32_t prev_handover_us)
+{
+    if (!cap) return 0;
+    int k = snprintf(out, cap, "FTRACE %u |", n ? rec[0][0] : 0u);
+    if (k < 0 || (size_t)k >= cap) { out[0] = 0; return 0; }
+    size_t pos = (size_t)k;
+    uint32_t prev = prev_handover_us, done = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t h = rec[i][0], s = rec[i][1], c = rec[i][2];
+        char item[64];
+        int m = snprintf(item, sizeof(item), " %u,%u,%u,%u/%u,%u;", prev ? h - prev : 0u, s & 0xFFFFu, c & 0xFFFFFFu,
+                         (c >> 24) & 15u, c >> 28, s >> 16);
+        if (m < 0 || pos + (size_t)m + 2u > cap) break;
+        for (int j = 0; j < m; j++) out[pos++] = item[j];
+        prev = h;
+        done++;
+    }
+    out[pos++] = '\n';
+    out[pos] = 0;
+    return done;
+}

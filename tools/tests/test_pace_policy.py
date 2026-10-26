@@ -185,5 +185,87 @@ class TestShallowQueue(unittest.TestCase):
         self.assertIn("sceKernelGetProcessTime() - t_shq0 > 40000ull", fn, "bounded wait")
 
 
+FTRACE_HARNESS = r"""
+#include <stdio.h>
+#include "pace_policy.h"
+int main(void)
+{
+    uint32_t rec[20][3];
+    uint32_t h = 4294900000u;                      /* hand-over clock wraps past 2^32 inside the trace */
+    for (int i = 0; i < 20; i++) {
+        h += 33367u + (i & 1);
+        rec[i][0] = h;
+        rec[i][1] = ft_pack_sub(120u + i, i == 3 ? 900000u : 24600u + i);     /* own time saturates at 65535 */
+        uint32_t c = 0;
+        if (i != 5) c = ft_with_screen(c, 50040u + i);                         /* record 5: never seen on screen */
+        c = ft_with_mid_vb(c, 1);
+        c = ft_with_real_vb(c, i == 7 ? 20u : 1u);                             /* clamps at 15 */
+        rec[i][2] = c;
+    }
+    char buf[512];
+    uint32_t n = ft_format(buf, sizeof(buf), (const uint32_t (*)[3])rec, 15, rec[0][0] - 33367u);
+    printf("n %u\n", n);
+    printf("line %s", buf);
+    char small[120];
+    printf("small %u\n", ft_format(small, sizeof(small), (const uint32_t (*)[3])rec, 15, 0));
+    printf("small_line %s", small);
+    printf("sizeof_ring %u\n", (unsigned)(FT_N * 3u * sizeof(uint32_t)));
+    return 0;
+}
+"""
+
+
+class TestFtrace(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.r = rows(compile_and_run(FTRACE_HARNESS))
+
+    def parse(self, line: str):
+        head, _, body = line.partition("|")
+        self.assertTrue(head.startswith("FTRACE "))
+        out = []
+        for item in body.strip().split(";"):
+            if not item.strip():
+                continue
+            dh, dsub, dscr, vb, own = item.strip().split(",")
+            rv, mv = vb.split("/")
+            out.append((int(dh), int(dsub), int(dscr), int(rv), int(mv), int(own)))
+        return int(head.split()[1]), out
+
+    def test_fields_round_trip(self) -> None:
+        self.assertEqual(self.r["n"], "15")
+        base, recs = self.parse(self.r["line"])
+        self.assertEqual(len(recs), 15)
+        self.assertEqual(recs[0][0], 33367, "first dh uses the previous line's last hand-over")
+        self.assertEqual([x[0] for x in recs[1:4]], [33368, 33367, 33368], "dh across the 2^32 wrap")
+        self.assertEqual(recs[2][1], 122)
+        self.assertEqual(recs[2][2], 50042)
+        self.assertEqual(recs[5][2], 0, "not seen on screen stays 0")
+        self.assertEqual(recs[3][5], 65535, "own time saturates")
+        self.assertEqual((recs[7][3], recs[7][4]), (15, 1), "vblank counts clamp at 15")
+        self.assertEqual(recs[0][5], 24600)
+
+    def test_line_never_overflows(self) -> None:
+        n = int(self.r["small"])
+        self.assertGreater(n, 0)
+        self.assertLess(n, 15)
+        self.assertEqual(len(self.parse(self.r["small_line"])[1]), n)
+        self.assertLess(len("small_line " + self.r["small_line"]), 120 + 12)
+
+    def test_ring_is_small(self) -> None:
+        self.assertLessEqual(int(self.r["sizeof_ring"]), 2048)
+
+    def test_main_c_traces_only_with_the_debug_log(self) -> None:
+        fn = extract_function(MAIN_C, "static int32_t flip_inner_ex(")
+        self.assertIn("if (g_log && show_idx < 16u) {   // FTRACE record", fn)
+        io = extract_function(MAIN_C, "static void *io_thread(")
+        self.assertIn("ft_format(fb, sizeof(fb)", io)
+        self.assertIn("lg_file_only(fb)", io)
+        mon = extract_function(MAIN_C, "static void *mon_thread(")
+        self.assertIn("ft_with_screen(fv, dscr)", mon)
+        self.assertIn("ft_with_real_vb(", mon)
+        self.assertIn("static uint32_t g_ft[FT_N][3];", MAIN_C)
+
+
 if __name__ == "__main__":
     unittest.main()
