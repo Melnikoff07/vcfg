@@ -494,6 +494,11 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
             cw3_1 = cw3_1 * (F32(1.0) - F32(0.30) * tc_w)
         cw3 = np.where(fgkill, F32(0.0), cw3_1)
         cw = np.where(np.bool_((flags & 8) != 0), F32(0.0), cw3)
+        # warp8.ll runs the fill block only for waves with a lane where cw can be nonzero: cw is exactly 0 when
+        # emov <= 0.025 (residual and base terms off), emov <= es (gcw = 0), under fgkill or the no-fill flag
+        cw_live = (emov > CW_ACT_THR) & (emov > es) & ~fgkill & np.bool_((flags & 8) == 0)
+        cw_pre = cw
+        cw = np.where(cw_live, cw, F32(0.0))
         if wp.get("vis_fill"):   # cloud-report idea: fill from the visible side (the real frame that matches the warp) instead of a blend
             dmsc, dmsp = diff3(mov, sc), diff3(mov, sp)
             fillc = np.where((dmsc < dmsp)[..., None], sc, sp)
@@ -517,7 +522,7 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         crop = slice(core0 - y0, core1 - y0)
         out[core0:core1] = out0[crop]
         if dbg is not None:
-            for k, val in (("coh", coh), ("es", es), ("ws", ws), ("cw", cw), ("bg3", bg3), ("mov", mov), ("stat", stat), ("emov", emov)):
+            for k, val in (("coh", coh), ("es", es), ("ws", ws), ("cw", cw), ("cw_pre", cw_pre), ("cw_live", cw_live), ("bg3", bg3), ("mov", mov), ("stat", stat), ("emov", emov)):
                 dbg.setdefault(k, []).append(val[crop])
     return out
 
