@@ -72,10 +72,10 @@ class Rcas8StoreSkip(unittest.TestCase):
                     self.assertFalse(same[aa].all(), "no AA lane changed: the scene does not discriminate")
 
     def test_ir_reports_changed_lanes(self):
-        self.assertIn("define internal { <4 x float>, i1 } @eval_tile(", RCAS8)
+        self.assertIn("define internal { <4 x float>, i1, i1 } @eval_tile(", RCAS8)
         self.assertIn("%chg = phi i1 [ true, %do_aa ], [ false, %rcas_only ]", RCAS8)
-        self.assertRegex(RCAS8, r"%ra1 = insertvalue \{ <4 x float>, i1 \} %ra0, i1 %chg, 1")
-        self.assertRegex(RCAS8, r"%rf1 = insertvalue \{ <4 x float>, i1 \} %rf0, i1 true, 1")   # sharpening path
+        self.assertRegex(RCAS8, r"%ra1 = insertvalue \{ <4 x float>, i1, i1 \} %ra0, i1 %chg, 1")
+        self.assertRegex(RCAS8, r"%rf1 = insertvalue \{ <4 x float>, i1, i1 \} %rf0, i1 true, 1")   # sharpening path
 
     def test_ir_guards_both_stores(self):
         self.assertRegex(RCAS8, r"%pdf = getelementptr i8, ptr addrspace\(4\) %tbl, i64 32\n"
@@ -85,8 +85,8 @@ class Rcas8StoreSkip(unittest.TestCase):
                                 r"\s*%is8888 = icmp eq i32 %dfmt, 10\n\s*%keep_all = xor i1 %is8888, true")
         main = RCAS8.split("define amdgpu_cs void @main", 1)[1]
         self.assertEqual(main.count("@llvm.amdgcn.image.store"), 2)
-        for tag, v in (("mid", "om"), ("cur", "oc")):
-            self.assertRegex(main, rf"%{v}_st = or i1 %{v}c, %keep_all\n\s*br i1 %{v}_st, label %st_{tag}, label %")
+        for tag, v, lbl in (("mid", "om", "st_mid"), ("cur", "oc", "wb_sel")):   # cur: bit 5 write-back test first
+            self.assertRegex(main, rf"%{v}_st = or i1 %{v}c, %keep_all\n\s*br i1 %{v}_st, label %{lbl}, label %")
             blk = main.split(f"st_{tag}:", 1)[1].split("br label", 1)[0]
             self.assertIn(f"image.store.2d.v4f32.i32(<4 x float> %{v},", blk)
         join = main.split("mid_join:", 1)[1].split("br label %check_cur", 1)[0]

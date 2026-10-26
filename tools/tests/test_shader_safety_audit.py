@@ -766,10 +766,10 @@ class TestShaderSafetyAudit(unittest.TestCase):
         end_off = 0x8000 + total_aligned
         dcb8_off = 0x1C000
         # layout snapshot of the current shaders.h (fp32 preserve-sign denormal attribute: mad/mac fusion shrank
-        # warp8 by 512 B and rcas8 by 256 B; rcas8's guarded stores of unchanged lanes added 256 B back); the budget
-        # is the assertLessEqual against DCB8_OFF below
-        self.assertEqual(total_aligned, 0x13D00)
-        self.assertEqual(end_off, 0x1BD00)
+        # warp8 by 512 B and rcas8 by 256 B; rcas8's guarded stores of unchanged lanes added 256 B back, its bit-5
+        # real-frame static handling another 256 B); the budget is the assertLessEqual against DCB8_OFF below
+        self.assertEqual(total_aligned, 0x13E00)
+        self.assertEqual(end_off, 0x1BE00)
         self.assertLessEqual(
             end_off,
             dcb8_off,

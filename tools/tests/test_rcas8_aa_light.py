@@ -70,7 +70,7 @@ class Rcas8AaLight(unittest.TestCase):
         self.assertIn("br i1 %sharp, label %rcas_full, label %aa_out", RCAS8)
         aa_out = RCAS8.split("aa_out:\n", 1)[1].split("\n\n", 1)[0]
         self.assertIn("insertelement <4 x float> %base_c, float %aM, i32 3", aa_out)
-        self.assertIn("insertvalue { <4 x float>, i1 } undef, <4 x float> %out_aa, 0", aa_out)   # returned with the changed flag
+        self.assertIn("insertvalue { <4 x float>, i1, i1 } undef, <4 x float> %out_aa, 0", aa_out)   # returned with the changed flag
         # the weight block holds every reciprocal of the RCAS lobe, none of them stays on the con == 0 path
         rcas_w = RCAS8.split("rcas_w:\n", 1)[1].split("rcas_w_done:\n", 1)[0]
         for v in ("%hmin", "%hmax", "%w_karis", "%nz1"):
@@ -106,13 +106,17 @@ class Rcas8AaLight(unittest.TestCase):
         thr = hexf(re.search(r"%st_c = fcmp ogt float %aM, (0x[0-9A-F]+)", RCAS8).group(1))
         self.assertTrue(F32(254.0) * vw.RCP255 < thr < F32(255.0) * vw.RCP255)
         self.assertRegex(RCAS8, r"%stb = and i32 %rfl, 16\n\s*%use_st = icmp ne i32 %stb, 0")
-        self.assertRegex(RCAS8, r"%omr = call \{ <4 x float>, i1 \} @eval_tile\([^)]*i1 %sharp, i1 %use_st\)")
-        self.assertRegex(RCAS8, r"%ocr = call \{ <4 x float>, i1 \} @eval_tile\([^)]*i1 %sharp, i1 false\)")
+        self.assertRegex(RCAS8, r"%omr = call \{ <4 x float>, i1, i1 \} @eval_tile\([^)]*i1 %sharp, i1 %use_st, i1 false\)")
+        self.assertRegex(RCAS8, r"%ocr = call \{ <4 x float>, i1, i1 \} @eval_tile\([^)]*i1 %sharp, i1 false, i1 %cur_st\)")
         self.assertIn("%doaa0 = and i1 %has_enh, %nst", RCAS8)
         self.assertIn("br i1 %doaa, label %do_aa, label %rcas_only", RCAS8)
 
     def test_main_sets_static_bit_only_for_warp8_mids(self):
-        self.assertRegex(MAIN_C, r"return \(rcas_flags & 3u\) == 1u && !gv_warp_active\(\) \? \(rcas_flags \| 16u\) : rcas_flags;")
+        fn = MAIN_C.split("static uint32_t rcas_static_flag(uint32_t rcas_flags)", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("if (gv_warp_active()) return rcas_flags;", fn)
+        self.assertIn("if ((rcas_flags & 3u) == 1u) return rcas_flags | 16u;", fn)
+        # flags 3 get bits 4 + 5 only under real_aa_default() (test_rcas8_real_s1 runs every case)
+        self.assertIn("if ((rcas_flags & 3u) == 3u && real_aa_default()) return rcas_flags | 48u;", fn)
         self.assertIn("rcas_flags1 = rcas_static_flag(rcas_flags1);", MAIN_C)
         self.assertIn("rcas_flags2 = rcas_static_flag(rcas_flags2);", MAIN_C)
         self.assertEqual(MAIN_C.count("rcas_static_flag("), 3)       # definition + the two mid tables

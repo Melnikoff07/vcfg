@@ -7,7 +7,10 @@
 ; Supports dynamic screen resolutions (reads width-1 and height-1 directly from T# dword 2).
 ; table: +0x20 T#cur (real frame), +0x40 T#out (generated mid frame),
 ;        +0x220 {rcas_con (float bits), rcas_flags (bit 0 = mid, bit 1 = cur, bits 2..3 = enhance mode 0/1/2,
-;        bit 4 = the mid's alpha carries warp8's static-pixel flag, honoured on the mid pass only)}.
+;        bit 4 = the mid's alpha carries warp8's static-pixel flag, honoured on the mid pass,
+;        bit 5 = with bits 0, 1 and 4: the real frame (processed in place, the next pair's P) skips the AA where the
+;        mid pass of the same lane found the static flag, and is written back raw where its AA result equals the
+;        texel of T#prev (+0x00): static, but P holds last frame's AA of it)}.
 target triple = "amdgcn--"
 declare <4 x float> @llvm.amdgcn.image.load.2d.v4f32.i32(i32 immarg, i32, i32, <8 x i32>, i32 immarg, i32 immarg)
 declare void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float>, i32 immarg, i32, i32, <8 x i32>, i32 immarg, i32 immarg)
@@ -139,7 +142,7 @@ define internal <4 x float> @rd_c(i32 %idx) alwaysinline {
   ret <4 x float> %c
 }
 
-define internal { <4 x float>, i1 } @eval_tile(<8 x i32> %t, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st) alwaysinline {
+define internal { <4 x float>, i1, i1 } @eval_tile(<8 x i32> %t, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st, i1 %st_ext) alwaysinline {
 entry:
   %t2 = extractelement <8 x i32> %t, i32 2
   %wm1 = and i32 %t2, 16383
@@ -279,7 +282,9 @@ rcas_w_done:
   ; alternate at 30 Hz; take the rcas_only path for it (waves with every lane static skip the AA block)
   %aM = extractelement <4 x float> %M, i32 3
   %st_c = fcmp ogt float %aM, 0x3FEFF7CEE0000000 ; 0.999
-  %st_skip = and i1 %use_st, %st_c
+  %st_skip0 = and i1 %use_st, %st_c
+  ; st_ext: the cur pass (bit 5) takes the static flag the mid pass read for this lane
+  %st_skip = or i1 %st_skip0, %st_ext
   %nst = xor i1 %st_skip, true
   %is_str = icmp uge i32 %emode, 2
   %thr_abs = select i1 %is_str, float 0.015625, float 0.0234375 ; 4/256 vs 6/256
@@ -494,9 +499,10 @@ rcas_apply:
 
 aa_out:
   %out_aa = insertelement <4 x float> %base_c, float %aM, i32 3
-  %ra0 = insertvalue { <4 x float>, i1 } undef, <4 x float> %out_aa, 0
-  %ra1 = insertvalue { <4 x float>, i1 } %ra0, i1 %chg, 1
-  ret { <4 x float>, i1 } %ra1
+  %ra0 = insertvalue { <4 x float>, i1, i1 } undef, <4 x float> %out_aa, 0
+  %ra1 = insertvalue { <4 x float>, i1, i1 } %ra0, i1 %chg, 1
+  %ra2 = insertvalue { <4 x float>, i1, i1 } %ra1, i1 %st_skip, 2
+  ret { <4 x float>, i1, i1 } %ra2
 
 rcas_full:
 
@@ -531,9 +537,10 @@ rcas_full:
   %cl0 = call <4 x float> @llvm.maxnum.v4f32(<4 x float> %res0, <4 x float> %c_mn5)
   %cl1 = call <4 x float> @llvm.minnum.v4f32(<4 x float> %cl0, <4 x float> %c_mx5)
   %out = insertelement <4 x float> %cl1, float %aM, i32 3
-  %rf0 = insertvalue { <4 x float>, i1 } undef, <4 x float> %out, 0
-  %rf1 = insertvalue { <4 x float>, i1 } %rf0, i1 true, 1
-  ret { <4 x float>, i1 } %rf1
+  %rf0 = insertvalue { <4 x float>, i1, i1 } undef, <4 x float> %out, 0
+  %rf1 = insertvalue { <4 x float>, i1, i1 } %rf0, i1 true, 1
+  %rf2 = insertvalue { <4 x float>, i1, i1 } %rf1, i1 %st_skip, 2
+  ret { <4 x float>, i1, i1 } %rf2
 }
 
 define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 inreg %gy, i32 %tid) #0 {
@@ -556,6 +563,8 @@ entry:
   ; bit 4: the mid's alpha carries warp8's static-pixel flag (set by main.c only when warp8 wrote the mid)
   %stb = and i32 %rfl, 16
   %use_st = icmp ne i32 %stb, 0
+  %rsb = and i32 %rfl, 32
+  %real_s1 = icmp ne i32 %rsb, 0
   ; con == 0 (Sharpness 0): the RCAS weight is +-0 everywhere, so rcas_apply returns base_c bit for bit; skip it
   %conabs = and i32 %conb, 2147483647
   %sharp = icmp ne i32 %conabs, 0
@@ -574,9 +583,10 @@ entry:
 pass_mid:
   %pto = getelementptr i8, ptr addrspace(4) %tbl, i64 64
   %to = load <8 x i32>, ptr addrspace(4) %pto, align 32, !invariant.load !0
-  %omr = call { <4 x float>, i1 } @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st)
-  %om = extractvalue { <4 x float>, i1 } %omr, 0
-  %omc = extractvalue { <4 x float>, i1 } %omr, 1
+  %omr = call { <4 x float>, i1, i1 } @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st, i1 false)
+  %om = extractvalue { <4 x float>, i1, i1 } %omr, 0
+  %omc = extractvalue { <4 x float>, i1, i1 } %omr, 1
+  %oms = extractvalue { <4 x float>, i1, i1 } %omr, 2
   %om_st = or i1 %omc, %keep_all
   br i1 %om_st, label %st_mid, label %mid_join
 st_mid:
@@ -586,17 +596,33 @@ mid_join:
   call void @bar()
   br label %check_cur
 check_cur:
+  %mid_st = phi i1 [ %oms, %mid_join ], [ false, %entry ]
+  %cur_st = and i1 %mid_st, %real_s1
   %do_cur0 = and i32 %rfl, 2
   %do_cur = icmp ne i32 %do_cur0, 0
   br i1 %do_cur, label %pass_cur, label %done
 pass_cur:
   %ptc = getelementptr i8, ptr addrspace(4) %tbl, i64 32
   %tc = load <8 x i32>, ptr addrspace(4) %ptc, align 32, !invariant.load !0
-  %ocr = call { <4 x float>, i1 } @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 false)
-  %oc = extractvalue { <4 x float>, i1 } %ocr, 0
-  %occ = extractvalue { <4 x float>, i1 } %ocr, 1
+  %ocr = call { <4 x float>, i1, i1 } @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 false, i1 %cur_st)
+  %oc = extractvalue { <4 x float>, i1, i1 } %ocr, 0
+  %occ = extractvalue { <4 x float>, i1, i1 } %ocr, 1
   %oc_st = or i1 %occ, %keep_all
-  br i1 %oc_st, label %st_cur, label %done
+  br i1 %oc_st, label %wb_sel, label %done
+wb_sel:
+  %wb_try = and i1 %real_s1, %occ
+  br i1 %wb_try, label %wb_chk, label %st_cur
+wb_chk:
+  ; bit 5 write-back: the AA result equals P's stored code here, so P is last frame's AA of a static pixel; skip the
+  ; store (the real frame keeps its raw texel) so that the pixel compares static again from the next pair on
+  %tp = load <8 x i32>, ptr addrspace(4) %tbl, align 32, !invariant.load !0   ; T#prev (+0x00)
+  %pv = call <4 x float> @llvm.amdgcn.image.load.2d.v4f32.i32(i32 15, i32 %x, i32 %y, <8 x i32> %tp, i32 0, i32 0)
+  %pk_p = call i32 @pack_rgba(<4 x float> %pv)
+  %pk_o = call i32 @pack_rgba(<4 x float> %oc)
+  %pk_x = xor i32 %pk_p, %pk_o
+  %pk_rgb = and i32 %pk_x, 16777215
+  %wb_same = icmp eq i32 %pk_rgb, 0
+  br i1 %wb_same, label %done, label %st_cur
 st_cur:
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %oc, i32 15, i32 %x, i32 %y, <8 x i32> %tc, i32 0, i32 0)
   br label %done

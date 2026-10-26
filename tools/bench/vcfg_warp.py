@@ -618,6 +618,19 @@ def static_px(tp, tc):
     return diff3_k(tp.astype(F32), tc.astype(F32)) == F32(0.0)
 
 
+def rcas8_real(cur, prev, con, emode, dbg=None):
+    """rcas8 cur pass with rcas flag bit 5 (real frame post-processed in place, the next pair's P): no AA where warp8
+    flagged the pixel static (static_px(prev, cur), carried over from the mid pass of the same workgroup), and the
+    lane is written back raw (store skipped) where its AA result already equals prev's stored code: the pixel is
+    static but P holds last frame's AA of it, so it would never compare static again. Returns the stored frame."""
+    cur = cur.astype(F32)
+    st = static_px(prev, cur)
+    out = rcas8(cur, con, emode, skip=st, dbg=dbg)
+    q = lambda x: np.rint(np.clip(x, 0, 1) * F32(255.0))
+    same = (q(out) == q(prev.astype(F32))).all(-1)
+    return np.where(same[..., None], cur, out).astype(F32)
+
+
 def rcas8(mid, con, emode, force_apply=False, skip=None, dbg=None):
     """mid (H, W, 3) float32 (already quantised like the T# store). Neighbour colours come from the 8-bit LDS copy,
     luma from the full precision value. con == 0 (Sharpness 0) skips the RCAS weight and the RCAS apply, as rcas8.ll

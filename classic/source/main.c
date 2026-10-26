@@ -1239,14 +1239,35 @@ static void calc_rcas_params(uint32_t target_mask, uint32_t *con_bits_out, uint3
     *flags_out = rcas_flags;
 }
 
+// Per-title default (post_mid = 0, CUSA18723 only): with Enhance AA on and Sharpness 0, the real frame gets the same
+// AA as the generated one (rcas8 flags 3 in one dispatch, plus the static handling of bit 5 below), so edges are
+// smoothed the same way in both frames. Sharpness > 0 keeps the generated-frame-only post-process (sharpening the real
+// frame in place was measured worse, see post_mid_only); Enhance AA off or post_mid = 1 / 2 in a manual profile turn
+// it off or override it. P must be the game's own 8-bit buffer (the 3-buffer ring without the history copy, or a
+// full-size copy): with the 16-bpp history copy the write-back test of bit 5 cannot match, so it stays mid-only.
+static int real_aa_default(void)
+{
+    return g_cfg.post_mid == 0 && g_cfg.upscale > 0 && g_cfg.sharpness == 0 && !g_t_prev_half16 &&
+           vcfg_in_family(g_title_id, "CUSA18723");
+}
+
 // rcas8 flag bit 4: warp8 writes the mid's alpha as a static-pixel flag (1.0 where P == C in RGB, 254/255 elsewhere)
 // and rcas8 skips the AA there on the mid pass: the real frames show those pixels raw, so AA only in the generated
 // frame alternates at 30 Hz (HUD, still scenery). warp8g keeps the game's alpha, so the bit is set only for warp8, and
 // only when the real frame is not post-processed in the same dispatch (bit 1, post_mid = 2): then both frames get the
 // AA and a static pixel must get it in the mid too.
+//
+// Bit 5 (with bits 0, 1 and 4, real_aa_default() only): the real frame gets the AA too, in place, and it is the next
+// pair's P. AA on the static pixels of P made warp8 stop seeing them as static (offline: HUD -1.9 dB, still areas
+// -3.2 dB, HUD flicker +18 % against the mid-only AA), so the cur pass skips the AA where the mid pass found the static
+// flag, and writes the pixel back raw where its AA result equals P's stored code (static, but P holds last frame's AA
+// of it; without that, every edge that once moved stays AA'd in P and never compares static again).
 static uint32_t rcas_static_flag(uint32_t rcas_flags)
 {
-    return (rcas_flags & 3u) == 1u && !gv_warp_active() ? (rcas_flags | 16u) : rcas_flags;
+    if (gv_warp_active()) return rcas_flags;
+    if ((rcas_flags & 3u) == 1u) return rcas_flags | 16u;
+    if ((rcas_flags & 3u) == 3u && real_aa_default()) return rcas_flags | 48u;
+    return rcas_flags;
 }
 
 // 1.4: Native post-processing pass on T#cur only (when FrameGen is OFF or inert due to resolution / 60fps / no mbuf).
@@ -1338,6 +1359,7 @@ static int post_mid_only(void)
 {
     if (g_cfg.post_mid == 1) return 1;
     if (g_cfg.post_mid == 2) return 0;
+    if (real_aa_default()) return 0;
     if (g_mid_only < 0) {
         g_mid_only = 1;
         lg("post-process target: generated frames only (default, keeps real C/P unmodified)\n");
