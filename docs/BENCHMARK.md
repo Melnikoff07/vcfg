@@ -191,3 +191,7 @@ records the raw-real / out-of-place mid-post test with command/IR checks.
 The next [split-AA/raw-history test](POSTSPLIT_EXPERIMENT_20261020.md) follows
 the owner's report of persistent flicker. It includes the raw-GT detail-loss
 tradeoff, separate raw color history, and the corresponding isolated build.
+
+The [occlusion research](OCCLUSION_RESEARCH_20261026.md) traces the two failing
+disocclusion tests to `mf8` vector assignment next to moving objects and records
+two `mf8` candidates that pass those tests but were rejected on held-out clips.
