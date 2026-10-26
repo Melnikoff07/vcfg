@@ -109,7 +109,7 @@ def sum3(a):
     return a[..., 0] + a[..., 1] + a[..., 2]
 
 
-def side_lerp(a2, b2, sp, sc, e0, eac, ebp, t, v_ex=0.0, w_occ=0.0, div_b=0.0):
+def side_lerp(a2, b2, sp, sc, e0, eac, ebp, t, v_ex=0.0, w_occ=0.0, div_b=0.0, gem0=0.02, mob=None):
     ga = np.maximum(diff3(a2, sp), F32(0.0))
     gb = np.maximum(diff3(b2, sc), F32(0.0))
     da = np.minimum(eac, ga)
@@ -121,7 +121,7 @@ def side_lerp(a2, b2, sp, sc, e0, eac, ebp, t, v_ex=0.0, w_occ=0.0, div_b=0.0):
     wsf = np.maximum(sat(F32(v_ex) * F32(0.125)), F32(1.0) - F32(w_occ))
     d_sf = d_sf0 * wsf
     adadb = np.maximum(np.abs(d_min), np.abs(F32(div_b)) * F32(3.0) * F32(w_occ))
-    g_em = sat((e0 - F32(0.08)) * F32(6.0))
+    g_em = sat((e0 - F32(gem0)) * F32(6.0))
     s01 = d_min * F32(0.33) + d_cr * F32(0.07)
     s23 = d_sf * F32(0.14) + d_lu * F32(0.04)
     raw0 = s01 + s23
@@ -130,6 +130,10 @@ def side_lerp(a2, b2, sp, sc, e0, eac, ebp, t, v_ex=0.0, w_occ=0.0, div_b=0.0):
     b_hi = F32(0.07) + F32(0.43) * F32(w_occ)
     dlt = np.clip(g_em * raw, -b_hi, b_hi)
     tab = sat(F32(t) + dlt)
+    if mob is not None:   # experiment (Mob-FGSR blend rule): one side where the two warps agree, ramped
+        agree = sat((F32(mob[0]) - e0) * F32(mob[1]))
+        side = np.where(dlt >= 0, F32(1.0), F32(0.0))
+        tab = tab + (side - tab) * agree
     return a2 + (b2 - a2) * tab[..., None], adadb
 
 
@@ -365,7 +369,7 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
             fe = np.where(usebil[..., 0], feb, fe)
             hl_tag = np.where(usebil[..., 0], F32(0.0), hl_tag)
         eac_f, ebp_f = diff3_k(a2, sc), diff3_k(b2, sp)
-        fm, fad = side_lerp(a2, b2, sp, sc, fe, eac_f, ebp_f, t, vmb, F32(0.0), F32(0.0))
+        fm, fad = side_lerp(a2, b2, sp, sc, fe, eac_f, ebp_f, t, vmb, F32(0.0), F32(0.0), gem0=wp.get('gem0', 0.02), mob=wp.get('mob'))
         frel = np.minimum(fad * F32(0.10), fe * F32(0.60))
         fe_rel = np.maximum(fe - frel, F32(0.0))
         fast_mov = np.where(zv[..., None], zm, fm)
@@ -399,7 +403,7 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
                 g_occ = w_occ_s * dv_g * sat((eb - F32(0.55)) * F32(4.0))
                 div_eff = div_b_s * dv_g
                 eac_s, ebp_s = diff3(a2, sc), diff3(b2, sp)
-                m_s, adadb = side_lerp(a2, b2, sp, sc, eb, eac_s, ebp_s, t, v_ex, g_occ, div_eff)
+                m_s, adadb = side_lerp(a2, b2, sp, sc, eb, eac_s, ebp_s, t, v_ex, g_occ, div_eff, gem0=wp.get('gem0', 0.02), mob=wp.get('mob'))
                 rk = F32(0.10) + F32(0.75) * g_occ
                 rel = np.minimum(adadb * rk, eb * F32(0.82))
                 e = np.maximum(eb + spen - rel, F32(0.0))
@@ -481,8 +485,8 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         dmc = diff3_k(mov, sc)
         dmv = diff3_k(mov, stat)
         ddm = dmp - dmc
-        k_ddm = F32(0.45) + F32(0.45) * w_occ_m
-        lim_hi = F32(0.30) + F32(0.20) * w_occ_m
+        k_ddm = F32(wp.get("k_ddm0", 0.45)) + F32(wp.get("k_ddm1", 0.45)) * w_occ_m
+        lim_hi = F32(wp.get("lim0", 0.30)) + F32(wp.get("lim1", 0.20)) * w_occ_m
         dtsc = np.clip(ddm * k_ddm, -lim_hi, lim_hi)
         tsc = sat(F32(t) + dtsc)
         fillc = sp + (sc - sp) * tsc[..., None]
@@ -497,7 +501,9 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         cw3_0 = sat(cw_base + dcw)
         gcw = sat((emov - es) * F32(4.0))
         cw3_1 = cw3_0 * gcw
-        if prevF is not None:
+        # NOTE: warp8.ll computes this temporal damping (%tc_dmp) but does not apply it; wp={"tc_dmp": False} gives
+        # the shader behaviour (round 2: |dPSNR| <= 0.00004 dB per frame on the corpus either way)
+        if prevF is not None and wp.get("tc_dmp", True):
             gbx_m, gby_m = gbx, gby
             fg_cx, fg_cy = F[gby_m, gbx_m, 0], F[gby_m, gbx_m, 1]
             fg_bx = np.clip(gbx_m + (fg_cx * F32(1.0 / block)).astype(np.int64), 0, nbx - 1)
@@ -505,8 +511,10 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
             fg_px, fg_py = prevF[fg_by, fg_bx, 0], prevF[fg_by, fg_bx, 1]
             tc_err = np.abs(fg_cx - fg_px) + np.abs(fg_cy - fg_py)
             tc_pm = np.abs(fg_px) + np.abs(fg_py)
+            if wp.get("tc_src") == "q":   # experiment: reuse the trajectory sample of the quadratic offset
+                tc_err, tc_pm = am_q, vm_p
             tc_w = sat(tc_pm - F32(2.0)) * sat((F32(2.0) - tc_err) * F32(0.5)) * sat((F32(0.35) - emov) * F32(4.0))
-            cw3_1 = cw3_1 * (F32(1.0) - F32(0.30) * tc_w)
+            cw3_1 = cw3_1 * (F32(1.0) - F32(wp.get("tc_k", 0.30)) * tc_w)
         cw3_s = cw3_1 * ws_keep
         cw3 = np.where(hl_act, F32(0.0), cw3_s)
         cw = np.where(np.bool_((flags & 8) != 0), F32(0.0), cw3)
@@ -529,8 +537,25 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
                 cutpx = (sc if t >= 0.5 else sp)
                 m = (emov > F32(cut_emov))[..., None]
                 out0 = np.where(m, cutpx, out0)
-        elif cutn > cut_thr:
-            out0 = (sc if t >= 0.5 else sp).copy()
+        elif wp.get("cut_rule") is not None:   # experiment: compare the scene-change rules on one grid scale
+            rule = wp["cut_rule"]
+            frac = float(nby * nbx) / F32(8160.0)
+            thr = (wp.get("cut_thr_full", 8160 if rule == "none" else (5600 if rule == "shader" else 3264))) * frac
+            if rule != "none" and cutn > thr:
+                cutpx = (sc if t >= 0.5 else sp)
+                if rule == "shader":
+                    m = ((emov > F32(0.35)) & (es > F32(0.30)))[..., None]
+                    out0 = np.where(m, cutpx, out0)
+                else:
+                    out0 = cutpx.copy()
+        elif wp.get("cut_full"):              # experiment: the pre-2.x rule, whole frame replaced above 3264 blocks
+            if cutn > (flags_cut_thr if flags_cut_thr else 3264):
+                out0 = (sc if t >= 0.5 else sp).copy()
+        elif cutn > (flags_cut_thr if flags_cut_thr else 5600):
+            # warp8.ll: above the threshold (default 5600 of 8160 blocks), only pixels where both the motion and the
+            # static samples disagree take the real frame
+            m = ((emov > F32(0.35)) & (es > F32(0.30)))[..., None]
+            out0 = np.where(m, sc if t >= 0.5 else sp, out0)
         fbt = wp.get("fb_emov")
         if fbt is not None:   # experiment: low-confidence pixels (the two compensated samples disagree) fall back to a real frame
             fbp = sc if wp.get("fb", "cur") == "cur" else (stat if wp.get("fb") == "stat" else (sc * F32(0.5) + sp * F32(0.5)))
