@@ -33,3 +33,24 @@ static inline uint32_t vb_per_frame(uint32_t hz, uint32_t period_q8)
     return n ? n : 1u;
 }
 
+
+// ---- shallow flip queue ----
+// With frame generation the game is handed back while up to 3-4 flips are pending (WAIT_EXIT: 3 raw at exit). When its
+// own time per frame (release -> submit, g_cpu_ema_us) stays below SHQ_ENTER_US for SHQ_DWELL real frames in a row
+// (about 4 s), the hook waits before the submit until at most SHQ_MAX_PENDING flip is pending; it goes back to the old
+// queue as soon as the EMA passes SHQ_EXIT_US. The dwell keeps a game that swings between 30 and 40 fps on the old queue:
+// there the shallow queue would cost repeats (q-pacing simulator, scenarios osc_30_40_1s and sine_30_40_4s).
+#define SHQ_ENTER_US    30000u
+#define SHQ_EXIT_US     32000u
+#define SHQ_DWELL       120u
+#define SHQ_MAX_PENDING 1
+typedef struct { uint32_t on, below; } ShallowQueue;
+static inline int shq_step(ShallowQueue *s, uint32_t cpu_ema_us)
+{
+    if (!cpu_ema_us) { s->on = 0; s->below = 0; return 0; }
+    if (cpu_ema_us < SHQ_ENTER_US) { if (s->below < 0xFFFFu) s->below++; }
+    else s->below = 0;
+    if (!s->on) s->on = s->below > SHQ_DWELL;
+    else if (cpu_ema_us > SHQ_EXIT_US) s->on = 0;
+    return (int)s->on;
+}

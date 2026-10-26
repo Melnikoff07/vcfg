@@ -123,5 +123,67 @@ class TestRefreshPeriod(unittest.TestCase):
                          r"vb_ticks\(g_freq, refresh_period_q8\(\), 2u\)")
 
 
+SHQ_HARNESS = r"""
+#include <stdio.h>
+#include "pace_policy.h"
+static void run(const char *name, const uint32_t *ema, int n)
+{
+    ShallowQueue q = {0, 0};
+    printf("%s ", name);
+    for (int i = 0; i < n; i++) putchar(shq_step(&q, ema[i]) ? '1' : '0');
+    putchar('\n');
+}
+int main(void)
+{
+    static uint32_t a[400], b[400], c[400], d[400];
+    for (int i = 0; i < 400; i++) {
+        a[i] = 25000u;                                              /* steady 40 fps game: own 25 ms */
+        b[i] = i < 200 ? 25000u : (i < 300 ? 31500u : 32500u);     /* creeps up to 31.5 ms, then past 32 ms */
+        c[i] = ((i / 30) & 1) ? 33300u : 25000u;                   /* 30 <-> 40 fps every second */
+        d[i] = i == 250 ? 0u : 25000u;                             /* eligibility lost for one frame */
+    }
+    run("steady", a, 400);
+    run("creep", b, 400);
+    run("swing", c, 400);
+    run("reset", d, 400);
+    return 0;
+}
+"""
+
+
+class TestShallowQueue(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.r = rows(compile_and_run(SHQ_HARNESS))
+
+    def test_enters_after_the_dwell_only(self) -> None:
+        s = self.r["steady"]
+        self.assertEqual(s.index("1"), 120, "on at the 121st frame below 30 ms (about 4 s)")
+        self.assertNotIn("0", s[120:])
+
+    def test_hysteresis_keeps_it_on_until_32_ms(self) -> None:
+        s = self.r["creep"]
+        self.assertEqual(s[120:300], "1" * 180, "31.5 ms is inside the hysteresis band: stays on")
+        self.assertEqual(s[300:], "0" * 100, "above 32 ms: off at once and no re-entry")
+
+    def test_a_game_swinging_between_30_and_40_fps_keeps_the_old_queue(self) -> None:
+        self.assertNotIn("1", self.r["swing"])
+
+    def test_losing_eligibility_restarts_the_dwell(self) -> None:
+        s = self.r["reset"]
+        self.assertEqual(s[250], "0")
+        self.assertEqual(s.index("1", 251), 251 + 120)
+
+    def test_main_c_gates_the_submit_on_the_raw_queue(self) -> None:
+        fn = extract_function(MAIN_C, "static int32_t flip_inner_ex(")
+        gate = fn.index("int shq_on = shq_step(&s_shq, shq_ok ? g_cpu_ema_us : 0u);")
+        self.assertIn("int shq_ok = g_inject_on == 8 && second_flip && !third_flip && g_cfg.fps_lock != 20 && pace_timer_on();", fn)
+        wait = fn.index("qs.flipPendingNum <= SHQ_MAX_PENDING", gate)
+        self.assertIn("read_flip_status((int32_t)handle, &qs)", fn[gate:wait])   # raw status, not the virtual queue
+        self.assertLess(wait, fn.index("pace_pair_ex((int32_t)handle, dt_enter_us, 1)"), "before the pre-submit pacer")
+        self.assertLess(wait, fn.index("gnm_submit_and_flip_raw(has_wl, workload, ncount, d2, s2"), "before the submit")
+        self.assertIn("sceKernelGetProcessTime() - t_shq0 > 40000ull", fn, "bounded wait")
+
+
 if __name__ == "__main__":
     unittest.main()

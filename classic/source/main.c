@@ -3694,6 +3694,29 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         if (to_vb + 1500u < hold_mid_us) { hold_mid_us = to_vb + 1500u; g_pll_shortened++; }
                     }
                 }
+                // Shallow flip queue (pace_policy.h): FG pairs on the timer pacer, the game's own time well below 2 refreshes
+                // for ~4 s -> the frame enters the queue only when at most one flip is still pending (raw status, not the
+                // virtual one the game sees). Before the pre-submit pacer, or before the submit with post-submit pacing.
+                static ShallowQueue s_shq;
+                static uint32_t s_shq_frames, s_shq_on_frames, s_shq_timeouts;
+                static uint64_t s_shq_wait_sum, s_shq_wait_max;
+                int shq_ok = g_inject_on == 8 && second_flip && !third_flip && g_cfg.fps_lock != 20 && pace_timer_on();
+                int shq_on = shq_step(&s_shq, shq_ok ? g_cpu_ema_us : 0u);
+                uint64_t t_shq0 = sceKernelGetProcessTime();
+                if (shq_on) {
+                    for (;;) {
+                        VoFlipStatus qs;
+                        memset(&qs, 0, sizeof(qs));
+                        if (read_flip_status((int32_t)handle, &qs) != 0 || qs.flipPendingNum <= SHQ_MAX_PENDING) break;
+                        if (sceKernelGetProcessTime() - t_shq0 > 40000ull) { s_shq_timeouts++; break; }
+                        sceKernelUsleep(200);
+                    }
+                }
+                uint64_t shq_wait = sceKernelGetProcessTime() - t_shq0;
+                if (shq_ok) {
+                    s_shq_frames++;
+                    if (shq_on) { s_shq_on_frames++; s_shq_wait_sum += shq_wait; if (shq_wait > s_shq_wait_max) s_shq_wait_max = shq_wait; }
+                }
                 uint64_t t_p0 = sceKernelGetProcessTime(), t_p1 = t_p0;
                 if (pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
@@ -3767,7 +3790,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 if (second_flip) {   // where the game's thread spends its time inside this hook (FG frames)
                     static uint64_t a_build, a_sub, a_hold, a_flip2, a_pace, a_n;
                     uint64_t t_end = sceKernelGetProcessTime();
-                    a_build += t_p0 - t_hook_in; a_sub += t_s1e - t_s1; a_hold += t_hold - t_s1e; a_flip2 += t_s2e - t_hold;
+                    a_build += t_p0 - t_hook_in - shq_wait; a_sub += t_s1e - t_s1; a_hold += t_hold - t_s1e; a_flip2 += t_s2e - t_hold;
                     a_pace += pace_pre ? (t_p1 - t_p0) : (t_end - t_s2e); a_n++;
                     if (a_n >= 60) {
                         double k = 1.0 / 1000.0 / (double)a_n;
@@ -3775,6 +3798,12 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                            a_build * k, a_sub * k, a_hold * k, a_flip2 * k, a_pace * k, (a_build + a_sub + a_hold + a_flip2 + a_pace) * k,
                            g_cpu_ema_us / 1000.0, __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE), g_pll_shortened);
                         a_build = a_sub = a_hold = a_flip2 = a_pace = a_n = 0;
+                        if (s_shq_frames)   // separate line: parsers of "HOOK ms per FG frame" stay valid
+                            lg("QUEUE shallow %s: on in %u of %u frames, wait avg %.2f max %.2f ms, timeouts %u (on below %.1f ms own for %u frames, off above %.1f)\n",
+                               shq_on ? "on" : "off", s_shq_on_frames, s_shq_frames,
+                               s_shq_on_frames ? (double)s_shq_wait_sum / 1000.0 / s_shq_on_frames : 0.0, (double)s_shq_wait_max / 1000.0,
+                               s_shq_timeouts, SHQ_ENTER_US / 1000.0, SHQ_DWELL, SHQ_EXIT_US / 1000.0);
+                        s_shq_frames = s_shq_on_frames = s_shq_timeouts = 0; s_shq_wait_sum = s_shq_wait_max = 0;
                     }
                 }
                 return rc;
