@@ -134,7 +134,7 @@ define internal <4 x float> @rd_c(i32 %idx) alwaysinline {
   ret <4 x float> %c
 }
 
-define internal <4 x float> @eval_tile(<8 x i32> %t, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode) alwaysinline {
+define internal <4 x float> @eval_tile(<8 x i32> %t, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp) alwaysinline {
 entry:
   %t2 = extractelement <8 x i32> %t, i32 2
   %wm1 = and i32 %t2, 16383
@@ -219,7 +219,12 @@ ld_sync:
   %tg0 = fdiv arcp afn float %gDir, %rng9e
   %tg1 = fmul float %tg0, 1.5
   %tex_gate = call float @sat(float %tg1)
+  %s_nw = fadd float %lN, %lW
+  %s_es = fadd float %lE, %lS
+  %s4l = fadd float %s_nw, %s_es
+  br i1 %sharp, label %rcas_w, label %rcas_w_done
 
+rcas_w:
   ; RCAS adaptive lobe weight (5-tap extrema + Karis highlight compression)
   %mx5e = fadd float %mx5, 0x3F10000000000000 ; 2^-14
   %den0 = fmul float %mx5e, 4.0
@@ -238,9 +243,6 @@ ld_sync:
   %w_karis = fdiv arcp afn float 1.0, %k_den
   %w0 = fmul float %w0_raw, %w_karis
 
-  %s_nw = fadd float %lN, %lW
-  %s_es = fadd float %lE, %lS
-  %s4l = fadd float %s_nw, %s_es
   %avg4 = fmul float %s4l, 0.25
   %nz0 = fsub float %avg4, %lM
   %anz = call float @llvm.fabs.f32(float %nz0)
@@ -262,8 +264,11 @@ ld_sync:
   %w_sh1 = fmul float %w_sh0, 0x3FB99999A0000000 ; 0.10
   %w_sh2 = fmul float %w_sh1, %w_karis
   %w_shim = fmul float %w_sh2, %con_g
-  %w_rcas = fadd float %w_sharp, %w_shim
+  %w_rcas0 = fadd float %w_sharp, %w_shim
+  br label %rcas_w_done
 
+rcas_w_done:
+  %w_rcas = phi float [ %w_rcas0, %rcas_w ], [ 0.0, %ld_sync ]
   %has_enh = icmp ugt i32 %emode, 0
   br i1 %has_enh, label %do_aa, label %rcas_only
 
@@ -466,6 +471,14 @@ rcas_only:
 rcas_apply:
   %base_c = phi <4 x float> [ %aa_rgb, %do_aa ], [ %M, %rcas_only ]
   %w_eff  = phi float [ %w_eff_aa, %do_aa ], [ %w_rcas, %rcas_only ]
+  %alpha = extractelement <4 x float> %M, i32 3
+  br i1 %sharp, label %rcas_full, label %aa_out
+
+aa_out:
+  %out_aa = insertelement <4 x float> %base_c, float %alpha, i32 3
+  ret <4 x float> %out_aa
+
+rcas_full:
 
   %dSum_c0 = fadd float %dNS, %dWE
   %dSum_c = fadd float %dSum_c0, 0x3F10000000000000 ; 2^-14
@@ -497,7 +510,6 @@ rcas_apply:
   %c_mx5 = call <4 x float> @llvm.maxnum.v4f32(<4 x float> %c_mx4, <4 x float> %base_c)
   %cl0 = call <4 x float> @llvm.maxnum.v4f32(<4 x float> %res0, <4 x float> %c_mn5)
   %cl1 = call <4 x float> @llvm.minnum.v4f32(<4 x float> %cl0, <4 x float> %c_mx5)
-  %alpha = extractelement <4 x float> %M, i32 3
   %out = insertelement <4 x float> %cl1, float %alpha, i32 3
   ret <4 x float> %out
 }
@@ -519,11 +531,14 @@ entry:
   %do_mid = icmp ne i32 %do_mid0, 0
   %em0 = lshr i32 %rfl, 2
   %emode = and i32 %em0, 3
+  ; con == 0 (Sharpness 0): the RCAS weight is +-0 everywhere, so rcas_apply returns base_c bit for bit; skip it
+  %conabs = and i32 %conb, 2147483647
+  %sharp = icmp ne i32 %conabs, 0
   br i1 %do_mid, label %pass_mid, label %check_cur
 pass_mid:
   %pto = getelementptr i8, ptr addrspace(4) %tbl, i64 64
   %to = load <8 x i32>, ptr addrspace(4) %pto, align 32, !invariant.load !0
-  %om = call <4 x float> @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode)
+  %om = call <4 x float> @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp)
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %om, i32 15, i32 %x, i32 %y, <8 x i32> %to, i32 0, i32 0)
   call void @bar()
   br label %check_cur
@@ -534,7 +549,7 @@ check_cur:
 pass_cur:
   %ptc = getelementptr i8, ptr addrspace(4) %tbl, i64 32
   %tc = load <8 x i32>, ptr addrspace(4) %ptc, align 32, !invariant.load !0
-  %oc = call <4 x float> @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode)
+  %oc = call <4 x float> @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp)
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %oc, i32 15, i32 %x, i32 %y, <8 x i32> %tc, i32 0, i32 0)
   br label %done
 done:

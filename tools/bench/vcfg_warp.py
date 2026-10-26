@@ -583,13 +583,34 @@ def rcas_con(sharp_pct):
     return F32(con)
 
 
-def rcas8(mid, con, emode):
+RCP255 = F32(1.0) / F32(255.0)   # 0x3F70101020000000 in rcas8.ll unpack_rgb
+
+
+def rcas_weight(lM, lN, lS, lW, lE, mn5, mx5, rng5, tex_gate, s4l, con):
+    """RCAS adaptive lobe weight of rcas8 (block rcas_w of rcas8.ll; only run when con != 0)"""
+    eps = F32(2.0 ** -14)
+    hmin = mn5 / ((mx5 + eps) * F32(4.0))
+    hmax = (F32(1.0) - mx5) / ((mn5 - F32(1.0)) * F32(4.0) - eps)
+    lobe = np.maximum(np.maximum(-hmin, hmax), -F32(con))
+    w_karis = F32(1.0) / (F32(1.0) + mx5)
+    w0 = np.minimum(lobe, F32(0.0)) * w_karis
+    nz = sat(np.abs(s4l * F32(0.25) - lM) / (rng5 + eps))
+    dn = sat(F32(1.0) - nz * F32(0.85)) * tex_gate
+    w_sharp = w0 * dn
+    w_shim = (F32(1.0) - tex_gate) * sat((nz - F32(0.45)) * F32(2.0)) * F32(0.10) * w_karis * sat(F32(con) * F32(8.0))
+    return w_sharp + w_shim
+
+
+def rcas8(mid, con, emode, force_apply=False):
     """mid (H, W, 3) float32 (already quantised like the T# store). Neighbour colours come from the 8-bit LDS copy,
-    luma from the full precision value."""
+    luma from the full precision value. con == 0 (Sharpness 0) skips the RCAS weight and the RCAS apply, as rcas8.ll
+    does: the weight is +-0 there, so the apply returns base_c bit for bit. force_apply runs the full apply anyway
+    (tests prove the identity with it)."""
     H, W = mid.shape[:2]
     c = mid.astype(F32)
     luma = c[..., 1] * F32(0.5) + (c[..., 0] + c[..., 2]) * F32(0.25)
-    c8 = np.floor(np.clip(c, 0, 1) * F32(255.0) + F32(0.5)) / F32(255.0)
+    # LDS unpack of rcas8.ll: v_cvt_f32_ubyte * 1/255 (float constant), not a division (126 of 256 codes differ by 1 ulp)
+    c8 = np.floor(np.clip(c, 0, 1) * F32(255.0) + F32(0.5)) * RCP255
     Lp = np.pad(luma, 2, mode='edge')
     Cp = np.pad(c8, ((2, 2), (2, 2), (0, 0)), mode='edge')
 
@@ -615,17 +636,9 @@ def rcas8(mid, con, emode):
     dCard = np.maximum(dNS, dWE)
     dDiag = np.maximum(np.abs(lNE - lSW), np.abs(lNW - lSE)) * F32(0.5)
     tex_gate = sat((dCard + dDiag) / rng9e * F32(1.5))
-    hmin = mn5 / ((mx5 + eps) * F32(4.0))
-    hmax = (F32(1.0) - mx5) / ((mn5 - F32(1.0)) * F32(4.0) - eps)
-    lobe = np.maximum(np.maximum(-hmin, hmax), -F32(con))
-    w_karis = F32(1.0) / (F32(1.0) + mx5)
-    w0 = np.minimum(lobe, F32(0.0)) * w_karis
+    sharp = F32(con) != F32(0.0)
     s4l = (lN + lW) + (lE + lS)
-    nz = sat(np.abs(s4l * F32(0.25) - lM) / (rng5 + eps))
-    dn = sat(F32(1.0) - nz * F32(0.85)) * tex_gate
-    w_sharp = w0 * dn
-    w_shim = (F32(1.0) - tex_gate) * sat((nz - F32(0.45)) * F32(2.0)) * F32(0.10) * w_karis * sat(F32(con) * F32(8.0))
-    w_rcas = w_sharp + w_shim
+    w_rcas = rcas_weight(lM, lN, lS, lW, lE, mn5, mx5, rng5, tex_gate, s4l, con) if sharp else np.zeros_like(lM)
     if emode > 0:
         is_str = emode >= 2
         thr_abs, thr_rel = (F32(0.015625), F32(0.0625)) if is_str else (F32(0.0234375), F32(0.09375))
@@ -695,6 +708,8 @@ def rcas8(mid, con, emode):
         w_eff = w_rcas * (F32(1.0) - edge_ramp)
     else:
         base_c, w_eff = M, w_rcas
+    if not sharp and not force_apply:
+        return base_c.astype(F32)
     a_ns0 = (dNS * F32(2.0)) / (dNS + dWE + eps)
     a_we0 = F32(2.0) - a_ns0
     is_sh = w_eff < F32(0.0)
