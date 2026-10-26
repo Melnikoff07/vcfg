@@ -11,10 +11,11 @@ Without b), every edge that once moved stays AA'd in P and never compares static
    AA'd forever with a) alone; moving edges still get the AA.
 2. IR (classic/shaders/rcas8.ll): bit 5 parse, the mid's static flag carried to the cur pass, the write-back test
    against T#prev (+0x00) on the packed RGB codes, the store skipped when it matches.
-3. main.c, compiled and executed: real_aa_default(), post_mid_only() and rcas_static_flag() extracted literally; only
+3. main.c, compiled and executed: real_aa_default(), post_mid_only() and rcas_static_flag() extracted literally;
    any title (the CUSA18723 family and an unrelated CUSA00001) with post_mid 0, Enhance > 0, Sharpness 0, warp8 and P
-   in the game's buffer gets flags 3 + 48; Sharpness > 0, Enhance off, post_mid 1 / 2, game vectors and the 16-bpp
-   history keep the generated-frame-only flags, whatever the title.
+   in the game's buffer gets flags 3 + 48; Sharpness > 0, Enhance off, post_mid 1, game vectors (warp8g, no static
+   flag) and the 16-bpp history keep the generated-frame-only post-process, and post_mid 2 keeps its explicit
+   both-frames AA without bit 5, whatever the title.
 """
 import json
 import pathlib
@@ -195,8 +196,8 @@ class MainRealS1(unittest.TestCase):
             self.assertEqual(self.r[pre + "pm1"], {"mid_only": "1", "f1": "21", "f3": "7"}, pre + "pm1")
             # explicit post_mid 2: no bit 5
             self.assertEqual(self.r[pre + "pm2"], {"mid_only": "0", "f1": "21", "f3": "7"}, pre + "pm2")
-            # warp8g keeps the game's alpha
-            self.assertEqual(self.r[pre + "gv"], {"mid_only": "0", "f1": "5", "f3": "7"}, pre + "gv")
+            # warp8g keeps the game's alpha: no static flag, so no real-frame AA (mid-only, as before 2.38)
+            self.assertEqual(self.r[pre + "gv"], {"mid_only": "1", "f1": "5", "f3": "7"}, pre + "gv")
             self.assertEqual(self.r[pre + "half16"], {"mid_only": "1", "f1": "21", "f3": "7"}, pre + "half16")
 
 
