@@ -112,6 +112,7 @@ DEFINES = "\n".join(
 
 FN_SAFE_STRIDE = extract_function(MAIN_C, "safe_surface_stride")
 FN_CALC_RCAS = extract_function(MAIN_C, "calc_rcas_params")
+FN_RCAS_STATIC = extract_function(MAIN_C, "rcas_static_flag")
 FN_BUILD_FLOW8 = extract_function(MAIN_C, "build_dcb_flow8")
 
 HARNESS_C = f"""
@@ -503,6 +504,7 @@ static int vcfg_in_family(const char *t, const char *f) {{ return strcmp(t, f) =
 {FN_SAFE_STRIDE}
 {MAIN_2BUF_HELPERS}
 {FN_CALC_RCAS}
+{FN_RCAS_STATIC}
 {FN_BUILD_FLOW8}
 
 // Simulate GPU pcopy8 execution on the descriptor table built at slotb + OSD_SLOT_OFF
