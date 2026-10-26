@@ -1,8 +1,8 @@
 """The NumPy reference of warp8 (tools/bench/vcfg_warp.py) uses the same fill-weight constants as warp8.ll.
 
 Checks, without a GPU: every @mlp_cw constant of the IR, in order, equals the reference's MLP table bit for bit,
-and the residual activation threshold of the merge stage is the reference's CW_ACT_THR. The side_lerp gate and the
-scene-change rule also follow warp8.ll.
+and the residual activation threshold of the merge stage is the reference's CW_ACT_THR. The side_lerp gate, the
+scene-change rule and the slow-path mix weight (foreground sub-block error not lowered) also follow warp8.ll.
 """
 import inspect
 import pathlib
@@ -66,6 +66,22 @@ class Warp8ReferenceConformanceTest(unittest.TestCase):
         self.assertTrue(bad.any() and (~bad).any())
         np.testing.assert_array_equal(cut[bad], b[bad])
         np.testing.assert_array_equal(cut[~bad], keep[~bad])
+
+    def test_slow_mix_weight_matches_ir(self):
+        body = IR[IR.index("define internal { <4 x float>, float, float } @accum"):IR.index("define internal float @diff3(")]
+        self.assertIn("%w_b1 = fadd float %w_b0, 0x3FC47AE140000000", body)   # boosted weight w * 4 + 0.16 stays
+        self.assertIn("%e = fadd float %e0, -0.0", body)                       # the error is not lowered any more
+        self.assertNotIn("%e_s0", body)
+        sys.path.insert(0, str(ROOT / "tools" / "tests"))
+        import vcfg_ref as vref
+        from test_disocclusion_and_hud import build_opposite_motion_scene
+        P, C, GT, F, GK, _, _ = build_opposite_motion_scene()
+        st = vref.motion(P[..., :3], C[..., :3], dict(vref.PARAMS, prev_luma_sum=None))
+        args = (P[..., :3], C[..., :3], st["F"], st["GK"], st["cutn"])
+        cur = vw.warp8(*args, t=0.5)
+        np.testing.assert_array_equal(cur, vw.warp8(*args, t=0.5, wp={"fg_boost": "w"}))
+        old = vw.warp8(*args, t=0.5, wp={"fg_boost": True})
+        self.assertGreater(float(np.abs(cur - old).max()), 0.0)   # the scene exercises the removed error offset
 
 
 if __name__ == "__main__":

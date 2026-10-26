@@ -413,9 +413,21 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
                     a2, b2, e = np.where(sharp[..., None], a2, ab), np.where(sharp[..., None], b2, bb), np.where(sharp, e, eb_b)
                 if win > 1:
                     e = boxf(e, win)
-                is_fg_sub = any_split & u2 & (e < F32(0.18))
-                w_eff = np.where(is_fg_sub, w * F32(4.0) + F32(0.16), w)
-                e_eff = np.where(is_fg_sub, np.maximum(e - F32(0.08), F32(0.0)), e)
+                # warp8.ll @accum: weight (w_eff + 0.08) * exp2(8 * (emin - e)); a clean foreground sub-block (e < 0.18)
+                # gets w * 4 + 0.16. Its error was also lowered by 0.08 before round 2, which pulled the mix and emov
+                # towards the foreground at motion boundaries (wp={"fg_boost": True}; False = no boost at all).
+                w_eff, e_eff = w, e
+                fgb = wp.get("fg_boost", "w")
+                if fgb:
+                    is_fg_sub = any_split & u2 & (e < F32(0.18))
+                    if fgb in (True, "w"):
+                        w_eff = np.where(is_fg_sub, w * F32(4.0) + F32(0.16), w)
+                    if fgb in (True, "e"):
+                        e_eff = np.where(is_fg_sub, np.maximum(e - F32(0.08), F32(0.0)), e)
+                if wp.get("acc") == "err":   # experiment: error-only weight, no distance weight
+                    w_eff = None
+                if dbg is not None and wp.get("dump4"):   # analysis only: per-corner colour, error, weight
+                    dbg.setdefault("_c4", []).append((core0, slow, m_s, e_eff, w_eff, eb, w, e))
                 if wp.get("slow_select"):
                     ranked.append((e_eff, m_s, w_eff))
                 if em is None:
@@ -423,7 +435,7 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
                 em1 = np.minimum(em, e_eff)
                 scl = np.exp2((em1 - em) * F32(wp.get("k", 8.0)))
                 x1 = np.exp2((em1 - e_eff) * F32(wp.get("k", 8.0)))
-                om = (w_eff + F32(wp.get("w_eps", 0.08))) * x1
+                om = x1 if w_eff is None else (w_eff + F32(wp.get("w_eps", 0.08))) * x1
                 acc = acc * scl[..., None] + m_s * om[..., None]
                 sw = sw * scl + om
                 em = em1

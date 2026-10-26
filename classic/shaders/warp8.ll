@@ -380,6 +380,9 @@ define internal { float, float, i1 } @sub_corner(<2 x float> %r00, <2 x float> %
   ret { float, float, i1 } %o2
 }
 
+; slow-path mix of the 4 corner candidates: weight (w_eff + 0.08) * exp2(8 * (emin - e)). A clean foreground sub-block
+; (e < 0.18) gets w * 4 + 0.16; its error e is no longer lowered by 0.08, which pulled the mix and emov towards the
+; foreground at motion boundaries (round 2 of the CUSA18723 image work)
 define internal { <4 x float>, float, float } @accum({ <4 x float>, float, float } %st,
         { <4 x float>, float } %c, float %w) alwaysinline {
   %acc = extractvalue { <4 x float>, float, float } %st, 0
@@ -395,9 +398,7 @@ define internal { <4 x float>, float, float } @accum({ <4 x float>, float, float
   %w_b0 = fmul float %w_raw, 4.0
   %w_b1 = fadd float %w_b0, 0x3FC47AE140000000 ; 0.16
   %w_eff = select i1 %fg_bst, float %w_b1, float %w_raw
-  %e_s0 = fsub float %e0, 0x3FB47AE140000000 ; 0.08
-  %e_s1 = call float @llvm.maxnum.f32(float %e_s0, float 0.0)
-  %e = select i1 %fg_bst, float %e_s1, float %e0
+  %e = fadd float %e0, -0.0 ; the candidate's own error, also for a boosted foreground sub-block
   %em1 = call float @llvm.minnum.f32(float %em, float %e)
   %d0 = fsub float %em1, %em
   %k0 = fmul float %d0, 8.0
