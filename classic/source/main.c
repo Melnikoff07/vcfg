@@ -1312,6 +1312,12 @@ static uint32_t build_dcb_post8(uint32_t *p0, uint64_t C, uint32_t w, uint32_t h
     fill_table8_ext(tb, g_gpu, slotb, rcas_con_bits, rcas_flags, osd_xy, osd_wh);
     *(volatile uint64_t *)(slotb + 0x900) = 0;
     *(volatile uint64_t *)(slotb + 0x908) = 0;
+    // GPU time with FG off: this slot's timestamps are written here too (the reader took stale FG-on values of all four
+    // slots and divided them by the CPU time: "GPU time ... 400 ms"); pyramid / motion / fence are 0, warp/post = the
+    // post pass. No frame statistics (no motion search): marked absent for the FRAMES line.
+    for (int i = 0; i < 5; i++) *(volatile uint64_t *)(slotb + 0x910 + i * 8) = 0;
+    for (int i = 0; i < 8; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
+    for (int i = 0; i < 8; i++) ((volatile uint32_t *)(slotb + STATS_OFF))[i] = 0xFFFFFFFFu;
 
     uint32_t *p = p0;
     *p++ = PKT3(0x46, 1, 0); *p++ = 0x0000002E;
@@ -1322,6 +1328,7 @@ static uint32_t build_dcb_post8(uint32_t *p0, uint64_t C, uint32_t w, uint32_t h
     *p++ = PKT3(0x58, 6, 0); *p++ = 0x80C40000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
     *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
 
+    TS_EOP(0); TS_EOP(1); TS_EOP(2); TS_EOP(3);
     *p++ = PKT3(0x76, 4, 1); *p++ = 0x207; *p++ = 64; *p++ = 1; *p++ = 1;
     *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl; *p++ = (uint32_t)(tbl >> 32);
 
@@ -1335,6 +1342,7 @@ static uint32_t build_dcb_post8(uint32_t *p0, uint64_t C, uint32_t w, uint32_t h
         *p++ = PKT3(0x15, 4, 1); *p++ = (osd_wh & 0xFFu) * 2u; *p++ = ((osd_wh >> 8) & 0xFFu) * 2u; *p++ = 1; *p++ = 1;
         PASS_BARRIER();
     }
+    TS_EOP(4);
 
     *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)lbl; *p++ = 0x40000000u | ((uint32_t)(lbl >> 32) & 0xFFFFu); *p++ = seq; *p++ = 0;
     *p++ = PKT3(0x3C, 6, 0); *p++ = 0x13; *p++ = (uint32_t)lbl; *p++ = (uint32_t)(lbl >> 32); *p++ = seq; *p++ = 0xFFFFFFFFu; *p++ = 0x0A;
@@ -3519,6 +3527,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                 lg("GPU time of our passes: total %.2f ms = luma %.2f + search %.2f + refine %.2f + warp %.2f\n", tot, ms[0], ms[1], ms[2], ms[3]);
                             g_ts_n = 0; g_ts_first = 0; for (int i = 0; i < 4; i++) g_ts_pass[i] = 0;
                         }
+                        ts[0] = 0;   // consumed: a slot no DCB rewrites (nothing injected) is not read again as new
                     }
                     g_slot_cpu[slot] = cpu;
                 }
@@ -3685,6 +3694,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     int32_t rc0 = gnm_submit_and_flip_raw(has_wl, workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 30 && !g_detected_60fps && want_fg) pace_hz(30);
+                    g_rel_t = sceKernelGetProcessTime();
                     return rc0;
                 }
 
@@ -3844,6 +3854,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 } else if (second_flip) {
                     g_rel_t = t_s2e;
                 }
+                if (!second_flip) g_rel_t = sceKernelGetProcessTime();   // FG off: release -> submit is measured too
                 if (second_flip) {   // where the game's thread spends its time inside this hook (FG frames)
                     static uint64_t a_build, a_sub, a_hold, a_flip2, a_pace, a_n;
                     uint64_t t_end = sceKernelGetProcessTime();

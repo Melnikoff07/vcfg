@@ -267,5 +267,38 @@ class TestFtrace(unittest.TestCase):
         self.assertIn("static uint32_t g_ft[FT_N][3];", MAIN_C)
 
 
+class TestFgOffTimings(unittest.TestCase):
+    """GPU time and CPU release -> submit with frame generation off (post-only path, build_dcb_post8)."""
+
+    def test_post8_writes_fresh_timestamps(self) -> None:
+        fn = extract_function(MAIN_C, "static uint32_t build_dcb_post8(")
+        early = fn.index("if (!rcas_flags && !osd_wh) return 0;")
+        clear = fn.index("*(volatile uint64_t *)(slotb + 0x910 + i * 8) = 0;")
+        self.assertGreater(clear, early)
+        self.assertIn("((volatile uint32_t *)(slotb + STATS_OFF))[i] = 0xFFFFFFFFu;", fn, "no stale FRAMES statistics")
+        ts0 = fn.index("TS_EOP(0); TS_EOP(1); TS_EOP(2); TS_EOP(3);")
+        first_pass = fn.index("SET_PASS(")
+        last_dispatch = fn.rindex("PKT3(0x15, 4, 1)")
+        ts4 = fn.index("TS_EOP(4);")
+        final_label = fn.rindex("PKT3(0x47, 5, 0)")
+        self.assertLess(clear, ts0)
+        self.assertLess(ts0, first_pass, "pyramid / motion / fence stamps before the post pass (they read 0 ms)")
+        self.assertLess(last_dispatch, ts4)
+        self.assertLess(ts4, final_label, "end stamp before the completion label")
+
+    def test_reader_consumes_each_sample_once(self) -> None:
+        fn = extract_function(MAIN_C, "static int32_t flip_inner_ex(")
+        seen = fn.index("if (ts[0] && ts[4] > ts[0] && g_ts_slot_seen != ts[0]) {")
+        clear = fn.index("ts[0] = 0;   // consumed", seen)
+        self.assertLess(clear, fn.index("g_slot_cpu[slot] = cpu;", seen), "cleared inside the consuming block")
+        self.assertGreater(clear, fn.index("g_ts_n++;", seen))
+
+    def test_release_time_is_set_without_a_second_flip(self) -> None:
+        fn = extract_function(MAIN_C, "static int32_t flip_inner_ex(")
+        self.assertIn("if (!second_flip) g_rel_t = sceKernelGetProcessTime();", fn)
+        n0 = fn.index("if (n == 0) {")
+        self.assertIn("g_rel_t = sceKernelGetProcessTime();\n                    return rc0;", fn[n0:n0 + 900])
+
+
 if __name__ == "__main__":
     unittest.main()
