@@ -108,11 +108,11 @@ class Rcas8AaLight(unittest.TestCase):
         self.assertRegex(RCAS8, r"%stb = and i32 %rfl, 16\n\s*%use_st = icmp ne i32 %stb, 0")
         self.assertRegex(RCAS8, r"%om = call <4 x float> @eval_tile\([^)]*i1 %sharp, i1 %use_st\)")
         self.assertRegex(RCAS8, r"%oc = call <4 x float> @eval_tile\([^)]*i1 %sharp, i1 false\)")
-        self.assertIn("%doaa = and i1 %has_enh, %nst", RCAS8)
+        self.assertIn("%doaa0 = and i1 %has_enh, %nst", RCAS8)
         self.assertIn("br i1 %doaa, label %do_aa, label %rcas_only", RCAS8)
 
     def test_main_sets_static_bit_only_for_warp8_mids(self):
-        self.assertRegex(MAIN_C, r"return \(rcas_flags & 1u\) && !gv_warp_active\(\) \? \(rcas_flags \| 16u\) : rcas_flags;")
+        self.assertRegex(MAIN_C, r"return \(rcas_flags & 3u\) == 1u && !gv_warp_active\(\) \? \(rcas_flags \| 16u\) : rcas_flags;")
         self.assertIn("rcas_flags1 = rcas_static_flag(rcas_flags1);", MAIN_C)
         self.assertIn("rcas_flags2 = rcas_static_flag(rcas_flags2);", MAIN_C)
         self.assertEqual(MAIN_C.count("rcas_static_flag("), 3)       # definition + the two mid tables
@@ -132,6 +132,20 @@ class Rcas8AaLight(unittest.TestCase):
         for k in range(256):                                          # unorm8 load -> packed byte
             v = F32(k) / F32(255.0)
             self.assertEqual(int(v * F32(255.0) + F32(0.5)), k)
+
+    def test_edge_ramp_zero_early_out_is_identity(self):
+        for seed in range(4):
+            img = scene(seed)
+            for con in (0.0, vw.rcas_con(35)):
+                for emode in (1, 2):
+                    dbg = {}
+                    full = vw.rcas8(img, con, emode, dbg=dbg)
+                    flat = dbg['edge_ramp'] == 0
+                    self.assertTrue(flat.any() and (~flat).any())
+                    self.assertTrue(np.array_equal(vw.rcas8(img, con, emode, skip=flat), full))
+        self.assertRegex(RCAS8, r"%has_edge = fcmp ogt float %edge_ramp, 0\.0\n\s*%doaa0 = and i1 %has_enh, %nst\n\s*%doaa = and i1 %doaa0, %has_edge")
+        pre = RCAS8.split("br i1 %doaa, label %do_aa", 1)[0]
+        self.assertIn("%edge_ramp = call float @sat(float %er1)", pre)
 
 
 if __name__ == "__main__":
