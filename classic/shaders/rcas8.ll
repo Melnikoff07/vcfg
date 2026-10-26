@@ -56,11 +56,11 @@ define internal <4 x float> @scale4(<4 x float> %a, float %s) alwaysinline {
 }
 
 define internal i32 @q8(float %v) alwaysinline {
+  ; r >= 0.5 after sat, so fptoui (truncation) already equals floor: no v_floor
   %c = call float @sat(float %v)
   %s = fmul float %c, 255.0
   %r = fadd float %s, 0.5
-  %f = call float @llvm.floor.f32(float %r)
-  %i = fptoui float %f to i32
+  %i = fptoui float %r to i32
   ret i32 %i
 }
 
@@ -102,8 +102,12 @@ define internal <4 x float> @unpack_rgb(i32 %pk) alwaysinline {
 }
 
 define internal void @lds_put(<8 x i32> %t, i32 %bx0, i32 %by0, i32 %wm1, i32 %hm1, i32 %idx) alwaysinline {
-  %ty = udiv i32 %idx, 12
-  %tx = urem i32 %idx, 12
+  ; idx < 144: idx / 12 == (idx * 171) >> 11 exactly (idx < 192), on full-rate 24-bit multiplies instead of the
+  ; quarter-rate v_mul_hi_u32 / v_mul_lo_u32 of udiv / urem
+  %ty171 = mul nuw nsw i32 %idx, 171
+  %ty = lshr i32 %ty171, 11
+  %ty12 = mul nuw nsw i32 %ty, 12
+  %tx = sub nuw nsw i32 %idx, %ty12
   %x0 = add i32 %bx0, %tx
   %x1 = sub i32 %x0, 2
   %xc0 = call i32 @llvm.smax.i32(i32 %x1, i32 0)

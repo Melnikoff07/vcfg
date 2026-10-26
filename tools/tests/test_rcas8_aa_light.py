@@ -119,6 +119,20 @@ class Rcas8AaLight(unittest.TestCase):
         post8 = MAIN_C.split("static uint32_t build_dcb_post8(", 1)[1].split("\n}\n", 1)[0]
         self.assertNotIn("rcas_static_flag", post8)                   # real-frame-only pass never honours it
 
+    def test_lds_put_integer_shortcuts(self):
+        q8 = RCAS8.split("define internal i32 @q8(float %v) alwaysinline {", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn("@llvm.floor", q8)                           # fptoui truncation == floor for r >= 0.5
+        self.assertLess(q8.index("call float @sat("), q8.index("fptoui float"))
+        put = RCAS8.split("define internal void @lds_put(", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn("= udiv ", put)
+        self.assertNotIn("= urem ", put)
+        self.assertRegex(put, r"%ty171 = mul nuw nsw i32 %idx, 171\n\s*%ty = lshr i32 %ty171, 11")
+        for idx in range(144):                                        # 12x12 tile, tid + 0 / 64 / 128
+            self.assertEqual((idx * 171) >> 11, idx // 12)
+        for k in range(256):                                          # unorm8 load -> packed byte
+            v = F32(k) / F32(255.0)
+            self.assertEqual(int(v * F32(255.0) + F32(0.5)), k)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
