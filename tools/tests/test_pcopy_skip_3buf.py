@@ -4,12 +4,13 @@
 The statement of build_dcb_flow8 that calls fg8_resolve_2buf_history() is extracted literally, wrapped in a tiny C
 harness that includes the real classic/source/fg8_table.h and overlay/title_families.h, and run for each case:
 
-1. CUSA18723 (and a regional id of its family) with a 3-buffer ring and two_buffer=1 (g_pbuf reserved): copy_dst stays
-   0, so pcopy8 is not dispatched, and P is the game's previous buffer on every frame.
-2. The same title when the ring turns 2-buffer at runtime: the copy into g_pbuf comes back, and P reads g_pbuf from
+1. Any title (CUSA18723, a regional id of its family, and an unrelated CUSA00001) with a 3-buffer ring and
+   two_buffer=1 (g_pbuf reserved): copy_dst stays 0, so pcopy8 is not dispatched, and P is the game's previous buffer
+   on every frame. The gate has no title list.
+2. Any title when the ring turns 2-buffer at runtime: the copy into g_pbuf comes back, and P reads g_pbuf from
    the second frame on (the first one has no valid history yet).
-3. The same title with a 2-buffer ring, another title on a 3-buffer ring, and a real present copy into an own display
-   buffer (copy_dst != 0): exactly what fg8_resolve_2buf_history() does on its own, as before the gate.
+3. Any title with a 2-buffer ring, or with a real present copy into an own display buffer (copy_dst != 0): exactly
+   what fg8_resolve_2buf_history() does on its own, as before the gate.
 
 Compiler: config.json llvm_bin (clang.exe + lli.exe, as the other harnesses) when present, otherwise the host clang/cc
 building a native binary.
@@ -106,6 +107,9 @@ int main(void)
     run("ring2", "CUSA18723", 2, 0, 6, 2, 0);
     run("other3", "CUSA00001", 3, 0, 6, 3, 0);
     run("owncopy3", "CUSA18723", 3, 0, 6, 3, OWN_COPY);
+    run("other_runtime2", "CUSA00001", 3, 4, 9, 3, 0);
+    run("other_ring2", "CUSA00001", 2, 0, 6, 2, 0);
+    run("other_owncopy3", "CUSA00001", 3, 0, 6, 3, OWN_COPY);
     return 0;
 }
 """
@@ -142,32 +146,40 @@ class TestPcopySkip3Buf(unittest.TestCase):
             name, frame, p, copy = line.split()
             cls.rows.setdefault(name, []).append((int(frame), p[2:], copy[5:]))
 
-    def test_3buf_listed_title_no_copy_and_p_from_game(self) -> None:
-        for name in ("skip3", "skip3_region"):
+    def test_3buf_any_title_no_copy_and_p_from_game(self) -> None:
+        for name in ("skip3", "skip3_region", "other3"):
             for frame, p, copy in self.rows[name]:
                 self.assertEqual(copy, "none", f"{name} frame {frame}: copy_dst must stay 0 (no pcopy8)")
                 self.assertEqual(p, "game_prev", f"{name} frame {frame}: P must be the game's previous buffer")
 
     def test_runtime_2buf_brings_the_copy_back(self) -> None:
-        rows = self.rows["runtime2"]
-        for frame, p, copy in rows:
-            if frame < 4:
-                self.assertEqual((p, copy), ("game_prev", "none"), f"frame {frame} before the 2-buffer switch")
-            else:
-                self.assertEqual(copy, "pbuf", f"frame {frame}: history copy must be back after the switch")
-                self.assertEqual(p, "game_prev" if frame == 4 else "pbuf", f"frame {frame}: P after the switch")
+        for name in ("runtime2", "other_runtime2"):
+            for frame, p, copy in self.rows[name]:
+                if frame < 4:
+                    self.assertEqual((p, copy), ("game_prev", "none"), f"{name} frame {frame} before the 2-buffer switch")
+                else:
+                    self.assertEqual(copy, "pbuf", f"{name} frame {frame}: history copy must be back after the switch")
+                    self.assertEqual(p, "game_prev" if frame == 4 else "pbuf", f"{name} frame {frame}: P after the switch")
 
-    def test_2buf_ring_and_other_title_unchanged(self) -> None:
-        for name in ("ring2", "other3"):
+    def test_2buf_ring_unchanged(self) -> None:
+        for name in ("ring2", "other_ring2"):
             for frame, p, copy in self.rows[name]:
                 self.assertEqual(copy, "pbuf", f"{name} frame {frame}: history copy into g_pbuf as before")
                 self.assertEqual(p, "game_prev" if frame == 1 else "pbuf", f"{name} frame {frame}: P as before")
 
     def test_real_present_copy_unchanged(self) -> None:
-        for frame, p, copy in self.rows["owncopy3"]:
-            self.assertEqual(copy, "own", f"frame {frame}: a present copy into an own buffer keeps its target")
-            self.assertEqual(p, "game_prev" if frame == 1 else "other",
-                             f"frame {frame}: P follows the previous copy target, as fg8_resolve_2buf_history does")
+        for name in ("owncopy3", "other_owncopy3"):
+            for frame, p, copy in self.rows[name]:
+                self.assertEqual(copy, "own", f"{name} frame {frame}: a present copy into an own buffer keeps its target")
+                self.assertEqual(p, "game_prev" if frame == 1 else "other",
+                                 f"{name} frame {frame}: P follows the previous copy target, as fg8_resolve_2buf_history does")
+
+    def test_gate_has_no_title_list(self) -> None:
+        self.assertIn("int pbuf_skip = ", GATE)
+        stmt = GATE[GATE.index("int pbuf_skip = "):]
+        stmt = stmt[:stmt.index(";")]
+        self.assertNotIn("vcfg_in_family", stmt, "the history-copy skip must not depend on the title")
+        self.assertNotIn("g_title_id", stmt, "the history-copy skip must not depend on the title")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""AA Light on the real frame too, for CUSA18723 (post_mid = 0, Enhance on, Sharpness 0), with the static handling.
+"""AA Light on the real frame too, for every title (post_mid = 0, Enhance on, Sharpness 0), with the static handling.
 
 The real frame is post-processed in place and is the next pair's P (3-buffer ring, no history copy). AA on its static
 pixels made warp8 stop seeing them as static, so rcas8 flag bit 5 makes the cur pass:
@@ -12,8 +12,9 @@ Without b), every edge that once moved stays AA'd in P and never compares static
 2. IR (classic/shaders/rcas8.ll): bit 5 parse, the mid's static flag carried to the cur pass, the write-back test
    against T#prev (+0x00) on the packed RGB codes, the store skipped when it matches.
 3. main.c, compiled and executed: real_aa_default(), post_mid_only() and rcas_static_flag() extracted literally; only
-   the CUSA18723 family with post_mid 0, Enhance > 0, Sharpness 0, warp8 and P in the game's buffer gets flags 3 + 48;
-   every other case keeps today's flags.
+   any title (the CUSA18723 family and an unrelated CUSA00001) with post_mid 0, Enhance > 0, Sharpness 0, warp8 and P
+   in the game's buffer gets flags 3 + 48; Sharpness > 0, Enhance off, post_mid 1 / 2, game vectors and the 16-bpp
+   history keep the generated-frame-only flags, whatever the title.
 """
 import json
 import pathlib
@@ -140,6 +141,13 @@ int main(void)
     row("pm2", "CUSA18723", 2, 1, 0, 0, 0);
     row("gv", "CUSA18723", 0, 1, 0, 1, 0);
     row("half16", "CUSA18723", 0, 1, 0, 0, 1);
+    row("other_strong", "CUSA00001", 0, 2, 0, 0, 0);
+    row("other_sharp", "CUSA00001", 0, 1, 35, 0, 0);
+    row("other_enh_off", "CUSA00001", 0, 0, 0, 0, 0);
+    row("other_pm1", "CUSA00001", 1, 1, 0, 0, 0);
+    row("other_pm2", "CUSA00001", 2, 1, 0, 0, 0);
+    row("other_gv", "CUSA00001", 0, 1, 0, 1, 0);
+    row("other_half16", "CUSA00001", 0, 1, 0, 0, 1);
     return 0;
 }
 """
@@ -176,18 +184,20 @@ class MainRealS1(unittest.TestCase):
     def setUpClass(cls):
         cls.r = run_harness()
 
-    def test_on_for_the_family_only(self):
-        for k, enh in (("on", 4), ("on_region", 4), ("strong", 8)):
+    def test_on_for_every_title(self):
+        for k, enh in (("on", 4), ("on_region", 4), ("strong", 8), ("other", 4), ("other_strong", 8)):
             self.assertEqual(self.r[k], {"mid_only": "0", "f1": str(1 | enh | 16), "f3": str(3 | enh | 48)}, k)
 
     def test_everything_else_unchanged(self):
-        self.assertEqual(self.r["other"], {"mid_only": "1", "f1": "21", "f3": "7"})
-        self.assertEqual(self.r["sharp"], {"mid_only": "1", "f1": "21", "f3": "7"})
-        self.assertEqual(self.r["enh_off"], {"mid_only": "1", "f1": "17", "f3": "3"})
-        self.assertEqual(self.r["pm1"], {"mid_only": "1", "f1": "21", "f3": "7"})
-        self.assertEqual(self.r["pm2"], {"mid_only": "0", "f1": "21", "f3": "7"})   # explicit post_mid 2: no bit 5
-        self.assertEqual(self.r["gv"], {"mid_only": "0", "f1": "5", "f3": "7"})     # warp8g keeps the game's alpha
-        self.assertEqual(self.r["half16"], {"mid_only": "1", "f1": "21", "f3": "7"})
+        for pre in ("", "other_"):
+            self.assertEqual(self.r[pre + "sharp"], {"mid_only": "1", "f1": "21", "f3": "7"}, pre + "sharp")
+            self.assertEqual(self.r[pre + "enh_off"], {"mid_only": "1", "f1": "17", "f3": "3"}, pre + "enh_off")
+            self.assertEqual(self.r[pre + "pm1"], {"mid_only": "1", "f1": "21", "f3": "7"}, pre + "pm1")
+            # explicit post_mid 2: no bit 5
+            self.assertEqual(self.r[pre + "pm2"], {"mid_only": "0", "f1": "21", "f3": "7"}, pre + "pm2")
+            # warp8g keeps the game's alpha
+            self.assertEqual(self.r[pre + "gv"], {"mid_only": "0", "f1": "5", "f3": "7"}, pre + "gv")
+            self.assertEqual(self.r[pre + "half16"], {"mid_only": "1", "f1": "21", "f3": "7"}, pre + "half16")
 
 
 if __name__ == "__main__":

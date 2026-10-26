@@ -1239,16 +1239,16 @@ static void calc_rcas_params(uint32_t target_mask, uint32_t *con_bits_out, uint3
     *flags_out = rcas_flags;
 }
 
-// Per-title default (post_mid = 0, CUSA18723 only): with Enhance AA on and Sharpness 0, the real frame gets the same
-// AA as the generated one (rcas8 flags 3 in one dispatch, plus the static handling of bit 5 below), so edges are
-// smoothed the same way in both frames. Sharpness > 0 keeps the generated-frame-only post-process (sharpening the real
-// frame in place was measured worse, see post_mid_only); Enhance AA off or post_mid = 1 / 2 in a manual profile turn
-// it off or override it. P must be the game's own 8-bit buffer (the 3-buffer ring without the history copy, or a
-// full-size copy): with the 16-bpp history copy the write-back test of bit 5 cannot match, so it stays mid-only.
+// Default for every title (post_mid = 0, first measured on CUSA18723): with Enhance AA on and Sharpness 0, the real
+// frame gets the same AA as the generated one (rcas8 flags 3 in one dispatch, plus the static handling of bit 5 below),
+// so edges are smoothed the same way in both frames. Sharpness > 0 keeps the generated-frame-only post-process
+// (sharpening the real frame in place was measured worse, see post_mid_only); Enhance AA off or post_mid = 1 / 2 in a
+// manual profile turn it off or override it. P must be the game's own 8-bit buffer (the 3-buffer ring without the
+// history copy, or a full-size copy): with the 16-bpp history copy the write-back test of bit 5 cannot match, so it
+// stays mid-only.
 static int real_aa_default(void)
 {
-    return g_cfg.post_mid == 0 && g_cfg.upscale > 0 && g_cfg.sharpness == 0 && !g_t_prev_half16 &&
-           vcfg_in_family(g_title_id, "CUSA18723");
+    return g_cfg.post_mid == 0 && g_cfg.upscale > 0 && g_cfg.sharpness == 0 && !g_t_prev_half16;
 }
 
 // rcas8 flag bit 4: warp8 writes the mid's alpha as a static-pixel flag (1.0 where P == C in RGB, 254/255 elsewhere)
@@ -1395,16 +1395,16 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
                         | (pyr_warm ? FG8_FLAG_PYR_WARM : 0u)
                         | (cut_blocks8() << 16);
     uint32_t mid1_packed = (mid1_idx & 0x7FFFu) | ((t1_q16 & 0xFFFFu) << 16);
-    // History copy on a 3-buffer ring (CUSA18723 only for now): the game flips its buffers strictly in turn, so the
-    // previous real frame stays untouched in g_buf[g_prev_idx] until the game renders into it again two flips later,
-    // which is submitted after this DCB on the same graphics ring. The full-frame pcopy8 into g_pbuf (8.3 MB written to
+    // History copy on a 3-buffer ring (every title; proven on CUSA18723): a game that flips its buffers in turn leaves
+    // the previous real frame untouched in g_buf[g_prev_idx] until it renders into it again two flips later, which is
+    // submitted after this DCB on the same graphics ring. The full-frame pcopy8 into g_pbuf (8.3 MB written to
     // FlexibleMemory plus two barriers per real frame) then copies exactly what P already holds: skip it and keep P in
     // the game's buffer. Pacing is untouched (g_pcopy_on / g_pcopy_avail and the reserved g_pbuf stay as they are), and
     // the copy comes back by itself when the ring turns 2-buffer at runtime or a real present copy runs (copy_dst != 0).
-    // More titles: add their family to the vcfg_in_family() test below once their ring is proven to rotate in turn.
+    // A 3-buffer game that rewrote its previous buffer before the next flip would show the wrong P here.
     if (!g_bench_offscreen) {
         static int s_pbuf_skip_logged = 0;
-        int pbuf_skip = !copy_dst && g_ngame >= 3 && !g_runtime_2buf && vcfg_in_family(g_title_id, "CUSA18723");
+        int pbuf_skip = !copy_dst && g_ngame >= 3 && !g_runtime_2buf;
         if (pbuf_skip != s_pbuf_skip_logged) {
             s_pbuf_skip_logged = pbuf_skip;
             lg("history copy: %s\n", pbuf_skip ? "skipped (3-buffer ring, P read from the game's buffer)" : "on");
