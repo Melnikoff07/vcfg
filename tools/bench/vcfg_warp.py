@@ -3,6 +3,8 @@
 Float32 throughout. The texture sampler is an exact bilinear filter with clamp-to-edge (the GPU quantises the
 fractional part to 1/256 texel: not modelled).
 """
+import struct
+
 import numpy as np
 
 F32 = np.float32
@@ -131,21 +133,40 @@ def side_lerp(a2, b2, sp, sc, e0, eac, ebp, t, v_ex=0.0, w_occ=0.0, div_b=0.0):
     return a2 + (b2 - a2) * tab[..., None], adadb
 
 
+def _irf(bits):
+    """float constant written in warp8.ll as the bit pattern of the equivalent double (LLVM IR hex float)"""
+    return F32(struct.unpack('>d', bytes.fromhex(bits))[0])
+
+
+# @mlp_cw of warp8.ll: per hidden unit (bias, weights x0..x6, output weight), in the IR's evaluation order
+MLP_OUT_BIAS = _irf('3FA0F414A0000000')
+MLP_UNITS = [
+    ('3FAA7194A0000000', ('3FC3F44680000000', 'BFB065BB20000000', '3FCC696560000000', 'BFCD760280000000',
+                          '3FCA876A80000000', '3F91AA4D20000000', '3F9C0450A0000000'), '3FC5607260000000'),
+    ('3FB502A940000000', ('3FB7DEC400000000', 'BFCE7815E0000000', '3FB3174D20000000', '3FE3445960000000',
+                          '3F8D88B180000000', 'BFA1481FA0000000', '3F9858A580000000'), 'BFBEEB9EA0000000'),
+    ('3FB1FFCAE0000000', ('3FA57A3F20000000', 'BFBD902FC0000000', '3FBC89F040000000', '3FE3C65A20000000',
+                          'BFB5D25000000000', 'BF8994F1E0000000', 'BF949280A0000000'), 'BFC311BD60000000'),
+    ('3FB5F7C1A0000000', ('BFB118CFE0000000', 'BFC6C64040000000', 'BF75439B40000000', '3FE5C938E0000000',
+                          'BFBD267DC0000000', 'BF8AD32C60000000', 'BF957503E0000000'), 'BFC9E87220000000'),
+    ('3FA75E5680000000', ('3FB8A754A0000000', 'BFD45CA740000000', 'BFC288DB80000000', '3FE207A9E0000000',
+                          '3FBB9C1E00000000', 'BF973F9A40000000', '3F725395C0000000'), 'BFB4C43480000000'),
+    ('3FB94845C0000000', ('3FC2543F20000000', 'BFC28ECE00000000', '3FC7A203E0000000', '3F9AF58FC0000000',
+                          '3FB81CA580000000', '3F88B067A0000000', '3F8FB664A0000000'), '3FC2CAC0E0000000'),
+]
+MLP_UNITS = [(_irf(b), tuple(_irf(w) for w in ws), _irf(o)) for b, ws, o in MLP_UNITS]
+CW_ACT_THR = _irf('3F999999A0000000')   # 0.025: the residual is active above this motion error
+
+
 def mlp_cw(x0, x1, x2, x3, x4, x5, x6):
-    h0 = sat(F32(0.08378879) + x0 * F32(0.3122884) + x1 * F32(-0.06405229) + x2 * F32(0.39919406) +
-             x3 * F32(-0.40893617) + x4 * F32(0.39562488) + x5 * F32(0.03776005) + x6 * F32(0.05472043))
-    h1 = sat(F32(0.10258989) + x0 * F32(0.09324288) + x1 * F32(-0.45190883) + x2 * F32(0.07457424) +
-             x3 * F32(1.2041868) + x4 * F32(0.01678786) + x5 * F32(-0.06750677) + x6 * F32(0.04755138))
-    h2 = sat(F32(0.08788525) + x0 * F32(0.04194829) + x1 * F32(-0.23096271) + x2 * F32(0.11147978) +
-             x3 * F32(1.2359258) + x4 * F32(-0.08524036) + x5 * F32(-0.01249109) + x6 * F32(-0.02008916))
-    h3 = sat(F32(0.10726561) + x0 * F32(-0.06678485) + x1 * F32(-0.35585028) + x2 * F32(-0.00519136) +
-             x3 * F32(1.3616265) + x4 * F32(-0.22773714) + x5 * F32(-0.01309819) + x6 * F32(-0.02095419))
-    h4 = sat(F32(0.05736038) + x0 * F32(0.09630327) + x1 * F32(-0.6363102) + x2 * F32(-0.14480157) +
-             x3 * F32(1.126871) + x4 * F32(0.10785085) + x5 * F32(-0.01815644) + x6 * F32(0.00447425))
-    h5 = sat(F32(0.12341757) + x0 * F32(0.2863919) + x1 * F32(-0.28996587) + x2 * F32(0.3041999) +
-             x3 * F32(0.05265474) + x4 * F32(0.09418704) + x5 * F32(0.01205526) + x6 * F32(0.01750351))
-    return (F32(0.04139773) + h0 * F32(0.3545042) + h1 * F32(-0.24156542) + h2 * F32(-0.29795778) +
-            h3 * F32(-0.40481237) + h4 * F32(-0.08111887) + h5 * F32(0.29362506))
+    xs = (x0, x1, x2, x3, x4, x5, x6)
+    acc = F32(0.0) + MLP_OUT_BIAS
+    for b, ws, o in MLP_UNITS:
+        s_ = (xs[0] * ws[0]).astype(F32) + b
+        for xi, wi in zip(xs[1:], ws[1:]):
+            s_ = s_ + xi * wi
+        acc = acc + sat(s_) * o
+    return acc
 
 
 def _taps(tp, tc, u, v, vx, vy, t, sp, sc, es, str_en, quad, csh=0.5, use_cr=False, return_hl=False, return_spen=False):
@@ -282,6 +303,8 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         flx, fly = np.floor(fbx), np.floor(fby)
         wx, wy = fbx - flx, fby - fly
         ixr, iyr = flx.astype(np.int64), fly.astype(np.int64)
+        # nearest 16-px block (GK and fill lookups): warp8.ll takes it from the block weights before the 8x8 unpack
+        xh_r, yh_b0 = wx < F32(0.5), wy < F32(0.5)
         ix0, ix1 = np.clip(ixr, 0, nbx - 1), np.clip(ixr + 1, 0, nbx - 1)
         iy0, iy1 = np.clip(iyr, 0, nby - 1), np.clip(iyr + 1, 0, nby - 1)
         raw00, raw10, raw01, raw11 = F[iy0, ix0], F[iy0, ix1], F[iy1, ix0], F[iy1, ix1]
@@ -318,8 +341,6 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         coh_thr = ( np.maximum(vm4 * F32(0.125), F32(2.0))
                     if "coh_thr" not in wp else F32(wp["coh_thr"]) )
         coh = spr <= coh_thr
-        xh_r = wx < F32(0.5)
-        yh_b0 = wy < F32(0.5)
         gbx = np.where(xh_r, ix0, ix1)
         gby = np.where(yh_b0, iy0, iy1)
         vmn = np.minimum(np.minimum(lsum[0], lsum[1]), np.minimum(lsum[2], lsum[3]))
@@ -472,13 +493,12 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         dsw = sat((dl_s - F32(0.18)) * F32(2.5)) * sat((emov - F32(0.22)) * F32(5.0)) * sat((F32(0.30) - es) * F32(4.0))
         cw_base = np.maximum(np.maximum(cw2, bgw), dsw)
         res_cw = mlp_cw(ddm, emov, es, dmv, dl_s, spr, vmg)
-        dcw = sat((emov - F32(0.15)) * F32(10.0)) * res_cw
+        dcw = sat((emov - CW_ACT_THR) * F32(10.0)) * res_cw
         cw3_0 = sat(cw_base + dcw)
         gcw = sat((emov - es) * F32(4.0))
         cw3_1 = cw3_0 * gcw
         if prevF is not None:
-            gbx_m = np.where(wx < F32(0.5), ix0, ix1)
-            gby_m = np.where(wy < F32(0.5), iy0, iy1)
+            gbx_m, gby_m = gbx, gby
             fg_cx, fg_cy = F[gby_m, gbx_m, 0], F[gby_m, gbx_m, 1]
             fg_bx = np.clip(gbx_m + (fg_cx * F32(1.0 / block)).astype(np.int64), 0, nbx - 1)
             fg_by = np.clip(gby_m + (fg_cy * F32(1.0 / block)).astype(np.int64), 0, nby - 1)
