@@ -139,7 +139,7 @@ define internal <4 x float> @rd_c(i32 %idx) alwaysinline {
   ret <4 x float> %c
 }
 
-define internal <4 x float> @eval_tile(<8 x i32> %t, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st) alwaysinline {
+define internal { <4 x float>, i1 } @eval_tile(<8 x i32> %t, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st) alwaysinline {
 entry:
   %t2 = extractelement <8 x i32> %t, i32 2
   %wm1 = and i32 %t2, 16383
@@ -487,11 +487,16 @@ rcas_only:
 rcas_apply:
   %base_c = phi <4 x float> [ %aa_rgb, %do_aa ], [ %M, %rcas_only ]
   %w_eff  = phi float [ %w_eff_aa, %do_aa ], [ %w_rcas, %rcas_only ]
+  ; changed: the lane took the AA block. Otherwise (con == 0) out is M as read through the 8-bit LDS copy, which on
+  ; an 8_8_8_8 surface is the stored texel bit for bit, so main may skip its store
+  %chg = phi i1 [ true, %do_aa ], [ false, %rcas_only ]
   br i1 %sharp, label %rcas_full, label %aa_out
 
 aa_out:
   %out_aa = insertelement <4 x float> %base_c, float %aM, i32 3
-  ret <4 x float> %out_aa
+  %ra0 = insertvalue { <4 x float>, i1 } undef, <4 x float> %out_aa, 0
+  %ra1 = insertvalue { <4 x float>, i1 } %ra0, i1 %chg, 1
+  ret { <4 x float>, i1 } %ra1
 
 rcas_full:
 
@@ -526,7 +531,9 @@ rcas_full:
   %cl0 = call <4 x float> @llvm.maxnum.v4f32(<4 x float> %res0, <4 x float> %c_mn5)
   %cl1 = call <4 x float> @llvm.minnum.v4f32(<4 x float> %cl0, <4 x float> %c_mx5)
   %out = insertelement <4 x float> %cl1, float %aM, i32 3
-  ret <4 x float> %out
+  %rf0 = insertvalue { <4 x float>, i1 } undef, <4 x float> %out, 0
+  %rf1 = insertvalue { <4 x float>, i1 } %rf0, i1 true, 1
+  ret { <4 x float>, i1 } %rf1
 }
 
 define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 inreg %gy, i32 %tid) #0 {
@@ -552,12 +559,30 @@ entry:
   ; con == 0 (Sharpness 0): the RCAS weight is +-0 everywhere, so rcas_apply returns base_c bit for bit; skip it
   %conabs = and i32 %conb, 2147483647
   %sharp = icmp ne i32 %conabs, 0
+  ; unchanged lanes (no AA, no sharpening) skip their store only on an 8_8_8_8 surface (data format 10 in T# dword 1
+  ; bits 20..25, the same for T#cur and T#out): there the 8-bit LDS round trip returns the texel bit for bit, so the
+  ; store would rewrite the same value (and neighbour tiles read the same value either way). Other formats keep
+  ; storing every lane, as before.
+  %pdf = getelementptr i8, ptr addrspace(4) %tbl, i64 32
+  %tcd = load <4 x i32>, ptr addrspace(4) %pdf, align 16, !invariant.load !0
+  %t1w = extractelement <4 x i32> %tcd, i32 1
+  %dfs = lshr i32 %t1w, 20
+  %dfmt = and i32 %dfs, 63
+  %is8888 = icmp eq i32 %dfmt, 10
+  %keep_all = xor i1 %is8888, true
   br i1 %do_mid, label %pass_mid, label %check_cur
 pass_mid:
   %pto = getelementptr i8, ptr addrspace(4) %tbl, i64 64
   %to = load <8 x i32>, ptr addrspace(4) %pto, align 32, !invariant.load !0
-  %om = call <4 x float> @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st)
+  %omr = call { <4 x float>, i1 } @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st)
+  %om = extractvalue { <4 x float>, i1 } %omr, 0
+  %omc = extractvalue { <4 x float>, i1 } %omr, 1
+  %om_st = or i1 %omc, %keep_all
+  br i1 %om_st, label %st_mid, label %mid_join
+st_mid:
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %om, i32 15, i32 %x, i32 %y, <8 x i32> %to, i32 0, i32 0)
+  br label %mid_join
+mid_join:
   call void @bar()
   br label %check_cur
 check_cur:
@@ -567,7 +592,12 @@ check_cur:
 pass_cur:
   %ptc = getelementptr i8, ptr addrspace(4) %tbl, i64 32
   %tc = load <8 x i32>, ptr addrspace(4) %ptc, align 32, !invariant.load !0
-  %oc = call <4 x float> @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 false)
+  %ocr = call { <4 x float>, i1 } @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 false)
+  %oc = extractvalue { <4 x float>, i1 } %ocr, 0
+  %occ = extractvalue { <4 x float>, i1 } %ocr, 1
+  %oc_st = or i1 %occ, %keep_all
+  br i1 %oc_st, label %st_cur, label %done
+st_cur:
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %oc, i32 15, i32 %x, i32 %y, <8 x i32> %tc, i32 0, i32 0)
   br label %done
 done:

@@ -70,7 +70,7 @@ class Rcas8AaLight(unittest.TestCase):
         self.assertIn("br i1 %sharp, label %rcas_full, label %aa_out", RCAS8)
         aa_out = RCAS8.split("aa_out:\n", 1)[1].split("\n\n", 1)[0]
         self.assertIn("insertelement <4 x float> %base_c, float %aM, i32 3", aa_out)
-        self.assertIn("ret <4 x float> %out_aa", aa_out)
+        self.assertIn("insertvalue { <4 x float>, i1 } undef, <4 x float> %out_aa, 0", aa_out)   # returned with the changed flag
         # the weight block holds every reciprocal of the RCAS lobe, none of them stays on the con == 0 path
         rcas_w = RCAS8.split("rcas_w:\n", 1)[1].split("rcas_w_done:\n", 1)[0]
         for v in ("%hmin", "%hmax", "%w_karis", "%nz1"):
@@ -106,8 +106,8 @@ class Rcas8AaLight(unittest.TestCase):
         thr = hexf(re.search(r"%st_c = fcmp ogt float %aM, (0x[0-9A-F]+)", RCAS8).group(1))
         self.assertTrue(F32(254.0) * vw.RCP255 < thr < F32(255.0) * vw.RCP255)
         self.assertRegex(RCAS8, r"%stb = and i32 %rfl, 16\n\s*%use_st = icmp ne i32 %stb, 0")
-        self.assertRegex(RCAS8, r"%om = call <4 x float> @eval_tile\([^)]*i1 %sharp, i1 %use_st\)")
-        self.assertRegex(RCAS8, r"%oc = call <4 x float> @eval_tile\([^)]*i1 %sharp, i1 false\)")
+        self.assertRegex(RCAS8, r"%omr = call \{ <4 x float>, i1 \} @eval_tile\([^)]*i1 %sharp, i1 %use_st\)")
+        self.assertRegex(RCAS8, r"%ocr = call \{ <4 x float>, i1 \} @eval_tile\([^)]*i1 %sharp, i1 false\)")
         self.assertIn("%doaa0 = and i1 %has_enh, %nst", RCAS8)
         self.assertIn("br i1 %doaa, label %do_aa, label %rcas_only", RCAS8)
 
