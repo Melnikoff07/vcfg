@@ -67,6 +67,16 @@ CUSA_PROFILES = (
 )
 
 FG8_FLAG_PYR_WARM = 0x1000
+
+
+def load_pbuf_skip_titles(main_c: str) -> Tuple[str, ...]:
+    """CUSA families whose 3-buffer ring skips the g_pbuf history copy, read from the gate in build_dcb_flow8
+    (`int pbuf_skip = ... vcfg_in_family(g_title_id, "CUSAxxxxx") ...;`). Empty when the gate is absent."""
+    m = re.search(r"int pbuf_skip = ([^;]*);", main_c)
+    return tuple(re.findall(r'"(CUSA\d{5})"', m.group(1))) if m else ()
+
+
+PBUF_SKIP_TITLES = load_pbuf_skip_titles(MAIN_C_PATH.read_text(encoding="utf-8", errors="replace"))
 MAX_SHAVES = 512
 MAX_FLEX_VMAP = 512
 HIBERNATE_COOLDOWN_FLIPS = 180
@@ -126,6 +136,7 @@ class FrameStepResult:
     P_va: int
     C_va: int
     M1_va: int
+    copy_to_pbuf: bool = False  # pcopy8 copied C into g_pbuf this frame (copy_dst == g_pbuf in build_dcb_flow8)
 
 
 class V233RuntimeModel:
@@ -548,8 +559,10 @@ class V233RuntimeModel:
             self.g_pbuf_prev_va = 0
 
     def on_flip_2buf_track(self, index: int) -> None:
-        """Simulates on_flip_2buf_track() in main.c:2000-2039 + two_buffer_test.h:43-94."""
-        if self.g_cfg_two_buffer:
+        """Simulates on_flip_2buf_track() in main.c:2000-2039 + two_buffer_test.h:43-94.
+        Current source tracks the ring whatever two_buffer says, and only leaves runtime 2-buffer mode with
+        two_buffer == 0."""
+        if self.g_cfg_two_buffer and not self.apply_r18_fixes:
             return
         if index < 0 or index >= self.g_ngame:
             return
@@ -580,7 +593,8 @@ class V233RuntimeModel:
                     self.pyr_cache_invalidate()
         else:
             self.g_2buf_alt_streak = 1
-            if self.g_runtime_2buf and index != self.g_2buf_idx_a and index != self.g_2buf_idx_b:
+            if (self.g_runtime_2buf and index != self.g_2buf_idx_a and index != self.g_2buf_idx_b
+                    and not self.g_cfg_two_buffer):
                 # 3rd distinct buffer index seen -> switch back to 3-buffer mode
                 self.g_runtime_2buf = 0
                 self.g_2buf_idx_a = -1
@@ -739,6 +753,7 @@ class V233RuntimeModel:
         P_va = self.g_buf.get(self.g_prev_idx, 0) if self.g_prev_idx >= 0 else 0
 
         used_pbuf = False
+        copy_to_pbuf = False
         pyr_warm = False
         M1_va = 0
 
@@ -747,9 +762,13 @@ class V233RuntimeModel:
             two_buf_active = bool(self.g_cfg_two_buffer or self.g_runtime_2buf)
             if self.apply_r18_fixes:
                 if two_buf_active and self.g_pbuf != 0 and self.g_cfg_present_copy != 2:
-                    P_va, used_pbuf, _ = self.fg8_resolve_2buf_history(
-                        P_va, C_va, self.g_bw, self.g_bh, seq, two_buf_active=True
-                    )
+                    if self.pbuf_skip():
+                        # build_dcb_flow8 gate: 3-buffer ring of a listed title, no copy, P stays in the game's buffer
+                        self.g_pbuf_valid = 0
+                    else:
+                        P_va, used_pbuf, copy_to_pbuf = self.fg8_resolve_2buf_history(
+                            P_va, C_va, self.g_bw, self.g_bh, seq, two_buf_active=True
+                        )
             else:
                 # Unpatched v2.33: calls fg8_resolve_2buf_history whenever g_pbuf != NULL
                 if self.g_pbuf != 0 and self.g_cfg_present_copy != 2:
@@ -802,7 +821,21 @@ class V233RuntimeModel:
             P_va=P_va,
             C_va=C_va,
             M1_va=M1_va,
+            copy_to_pbuf=copy_to_pbuf,
         )
+
+    def pbuf_skip(self) -> bool:
+        """build_dcb_flow8: `pbuf_skip = !copy_dst && g_ngame >= 3 && !g_runtime_2buf && <title in list>`.
+        The model has no present copy into an own display buffer, so copy_dst is always 0 here."""
+        return self.g_ngame >= 3 and not self.g_runtime_2buf and self.title_id in PBUF_SKIP_TITLES
+
+    def register_buffers_two_buffer_cfg(self) -> None:
+        """on_register_buffers_2buf() with two_buffer=1 in the config: virtual queue on and g_pbuf reserved,
+        whatever the ring size (main.c, RegisterBuffers)."""
+        self.g_cfg_two_buffer = 1
+        if self.g_cfg_present_copy != 2:
+            self.g_vq_on = 1
+            self.alloc_pbuf_history()
 
     # ------------------------------------------------------------------
     # Subsystem 5: Adapt INI Persistence & Crash Signal Handler
@@ -1497,6 +1530,51 @@ int main(void) {
         self.assertGreater(total_2buf_to_3buf_switches, 50)
         self.assertEqual(total_res_changes, num_lifecycles)
         self.assertGreater(total_shave_map_release_cycles, 1000)
+
+    def test_08_pbuf_history_copy_skipped_on_3buf_ring_of_listed_title(self) -> None:
+        """
+        build_dcb_flow8 gate (q-pcopy): with two_buffer=1 in the config and a 3-buffer ring, CUSA18723 no longer
+        copies C into g_pbuf (copy_dst == 0, pcopy8 not dispatched) and P is the game's previous buffer. With a
+        2-buffer ring (at RegisterBuffers or detected at runtime), or any other title, the copy and the P
+        redirect to g_pbuf are what they were before. Pacing state (g_vq_on, g_pcopy_avail, g_pbuf) is untouched.
+        """
+        self.assertIn("CUSA18723", PBUF_SKIP_TITLES, "gate `int pbuf_skip = ...` missing from build_dcb_flow8")
+
+        def boot(title: str, ngame: int) -> V233RuntimeModel:
+            m = V233RuntimeModel(title, apply_r18_fixes=True)
+            m.boot_reserve_early_mem()
+            m.register_game_buffers(ngame=ngame)
+            m.register_buffers_two_buffer_cfg()
+            self.assertTrue(m.alloc_work_buffers_from_pre_mem())
+            return m
+
+        # 1. Listed title, 3-buffer ring: no copy, P = previous game buffer, pacing state unchanged.
+        m = boot("CUSA18723", 3)
+        steps = [m.step_frame(PHASE_GAMEPLAY_3BUF, i % 3) for i in range(12)]
+        for i, st in enumerate(steps[1:], start=1):
+            self.assertFalse(st.copy_to_pbuf, f"frame {i}: C copied into g_pbuf on a 3-buffer ring")
+            self.assertFalse(st.used_pbuf, f"frame {i}: P redirected to g_pbuf")
+            self.assertEqual(st.P_va, m.g_buf[(i - 1) % 3], f"frame {i}: P is not the previous game buffer")
+        self.assertEqual((m.g_vq_on, m.g_pcopy_avail), (1, 1))
+        self.assertNotEqual(m.g_pbuf, 0)
+
+        # 2. Same title, ring turns 2-buffer at runtime: the copy comes back, and P follows g_pbuf after one frame.
+        for i in range(8):
+            st = m.step_frame(PHASE_MENU_2BUF, i % 2)
+        self.assertEqual(m.g_runtime_2buf, 1)
+        self.assertTrue(st.copy_to_pbuf)
+        self.assertTrue(st.used_pbuf)
+        self.assertEqual(st.P_va, m.g_pbuf)
+
+        # 3. Same title with a 2-buffer ring at RegisterBuffers, and 4. another title on a 3-buffer ring: as before.
+        for title, ngame in (("CUSA18723", 2), ("CUSA00001", 3)):
+            m = boot(title, ngame)
+            steps = [m.step_frame(PHASE_GAMEPLAY_3BUF, i % ngame) for i in range(12)]
+            for i, st in enumerate(steps[1:], start=1):
+                self.assertTrue(st.copy_to_pbuf, f"[{title} ngame={ngame}] frame {i}: history copy missing")
+            for i, st in enumerate(steps[2:], start=2):
+                self.assertTrue(st.used_pbuf, f"[{title} ngame={ngame}] frame {i}: P not read from g_pbuf")
+                self.assertEqual(st.P_va, m.g_pbuf)
 
 
 if __name__ == "__main__":
