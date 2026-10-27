@@ -1025,6 +1025,31 @@ static int32_t shave_game_alloc(long s, long e, size_t len, size_t align, int ty
     return (int32_t)0x80020023u;
 }
 
+// Release our DirectMemory-backed g_pbuf, g_pre_work and g_pre_gpu when they overlap [s, e), EXCEPT g_pre_work /
+// g_pre_gpu sitting completely inside the sub-2MB region [0, g_low_sub2mb_end) for a >= 2 MB aligned request (where the
+// kernel can never place it anyway). Returns 1 when anything was released.
+static int yield_early_dm_in_range(long s, long e, size_t eff_align)
+{
+    int rel_any = 0;
+    g_own_alloc++;
+    if (g_pbuf && g_pbuf_phys > 0 && g_pbuf_phys < e && g_pbuf_phys + (long)g_pbuf_sz > s) {
+        release_pbuf();
+        rel_any = 1;
+    }
+    if (g_pre_work && g_pre_work_phys > 0 && g_pre_work_phys < e && g_pre_work_phys + (long)g_pre_work_sz > s &&
+        !(eff_align >= 0x200000u && g_pre_work_phys + (long)g_pre_work_sz <= g_low_sub2mb_end)) {
+        release_early_work();
+        rel_any = 1;
+    }
+    if (g_pre_gpu && g_pre_gpu_phys > 0 && g_pre_gpu_phys < e && g_pre_gpu_phys + (long)g_gpu_sz > s &&
+        !(eff_align >= 0x200000u && g_pre_gpu_phys + (long)g_gpu_sz <= g_low_sub2mb_end)) {
+        release_early_gpu();
+        rel_any = 1;
+    }
+    g_own_alloc--;
+    return rel_any;
+}
+
 int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t align, int type, long *phys)
 {
     if (!g_own_alloc) flush_map_run();
@@ -1103,24 +1128,7 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
         // command buffer (*g_done == g_last_seq, up to 25 ms) before releasing g_work_phys.
         if (pre_gpu_phase && (uint32_t)r == 0x80020023u &&
             ((g_pre_work && g_pre_work_phys > 0) || (g_pre_gpu && g_pre_gpu_phys > 0) || (g_pbuf && g_pbuf_phys > 0))) {
-            int rel_any = 0;
-            g_own_alloc++;
-            if (g_pbuf && g_pbuf_phys > 0 && g_pbuf_phys < e && g_pbuf_phys + (long)g_pbuf_sz > s) {
-                release_pbuf();
-                rel_any = 1;
-            }
-            if (g_pre_work && g_pre_work_phys > 0 && g_pre_work_phys < e && g_pre_work_phys + (long)g_pre_work_sz > s &&
-                !(eff_align >= 0x200000u && g_pre_work_phys + (long)g_pre_work_sz <= g_low_sub2mb_end)) {
-                release_early_work();
-                rel_any = 1;
-            }
-            if (g_pre_gpu && g_pre_gpu_phys > 0 && g_pre_gpu_phys < e && g_pre_gpu_phys + (long)g_gpu_sz > s &&
-                !(eff_align >= 0x200000u && g_pre_gpu_phys + (long)g_gpu_sz <= g_low_sub2mb_end)) {
-                release_early_gpu();
-                rel_any = 1;
-            }
-            g_own_alloc--;
-            if (rel_any) {
+            if (yield_early_dm_in_range(s, e, eff_align)) {
                 r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                                   s, e, len, align, type, phys);
             }
