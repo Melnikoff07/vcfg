@@ -205,7 +205,8 @@ static inline void ycocg420_decompress_frame(const uint32_t *ycocg_in, uint32_t 
 #define W8_FA  0x151000u   // 120x68 float2, full-res px, mid grid (ping-pong: current / previous frame)
 #define W8_FB  0x161000u
 #define W8_MISC 0x171000u  // [0] scene-change count, [1] t, [2..3] luma sums by parity, [4..5] dominant motion (gm8),
-                           // [6] foreground L2 blocks (fgs8), [7] fade decision (me1)
+                           // [6] foreground L2 blocks (fgs8), [7] fade decision (me1), [8..9] scene-change count of
+                           // the pair that wrote F of that parity (phase8: F prev cleared after a scene change)
 #define W8_S2  0x172000u   // 60x34 u32: L2 SAD of the best | SAD of the zero vector << 16 (me2)
 #define W8_GK  0x174000u   // 120x68 u32: foreground splat keys (fgs8; zeroed by pyr8)
 #define W8_FT  0x17C000u   // 120x68 float2: raw me1 field, filtered by mf8 into F cur (8.3)
@@ -244,7 +245,7 @@ static inline void fill_table8_wh(uint32_t *tb, uint64_t P, uint64_t C, uint64_t
         make_v(tb + 60, WA(W8_V2), 60 * 34 * 4);                        // +0xF0 V2
         make_v(tb + 64, WA(r ? W8_FB : W8_FA), 120 * 68 * 8);           // +0x100 F cur
         make_v(tb + 68, WA(r ? W8_FA : W8_FB), 120 * 68 * 8);           // +0x110 F prev
-        make_v(tb + 72, WA(W8_MISC), 32);                               // +0x120 misc
+        make_v(tb + 72, WA(W8_MISC), 48);                               // +0x120 misc
         make_v(tb + 80, WA(W8_S2), 60 * 34 * 4);                        // +0x140 S2
         make_v(tb + 84, WA(W8_GK), 120 * 68 * 4);                       // +0x150 GK
         make_v(tb + 96, WA(W8_FT), 120 * 68 * 8);                       // +0x180 FT: raw me1 field (me1 -> mf8)
