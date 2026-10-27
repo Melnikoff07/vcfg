@@ -779,6 +779,21 @@ static void replay_register_buffers_fmt(int start_idx, int num_buf, uint32_t bw,
     }
 }
 
+/* What backs a game AllocateDirectMemory(len=AUDIO_FIX_TAIL) result, read right after the call:
+ * 0 real DirectMemory, 1 tail-only synthetic chunk (FlexibleMemory on map), 2 partial shave (FlexibleMemory tail),
+ * 3 not allocated in the simulated pool, 4 overlaps the display buffer. */
+static int sim_audio_kind(long p)
+{
+    for (int si = 0; si < g_shave_n; si++) {
+        if (!g_shaves[si].orig_len) continue;
+        if (g_shaves[si].real_len == 0 && p >= g_shaves[si].phys && p < g_shaves[si].phys + (long)g_shaves[si].orig_len) return 1;
+        if (g_shaves[si].phys == p && g_shaves[si].orig_len == AUDIO_FIX_TAIL && g_shaves[si].real_len < AUDIO_FIX_TAIL) return 2;
+    }
+    if (!sim_dm_is_allocated_range(p, AUDIO_FIX_TAIL)) return 3;
+    if (g_pre_mem && p < g_pre_mem_phys + (long)g_pre_size && p + (long)AUDIO_FIX_TAIL > g_pre_mem_phys) return 4;
+    return 0;
+}
+
 static void replay_register_buffers(int start_idx, int num_buf, uint32_t bw, uint32_t bh, uint32_t pitch)
 {
     cusa10249_apply_deferred_tail_if_needed();
@@ -864,6 +879,178 @@ static void replay_register_buffers(int start_idx, int num_buf, uint32_t bw, uin
 """.replace("__PCOPY_HAS_MAX_EXTRA__", str(PCOPY_GATE_HAS_MAX_EXTRA)).replace(
     "__HAS_CUSA10249_AUDIO_FIX__", str(HAS_CUSA10249_AUDIO_FIX)
 ).replace("__HAS_FAMILY_AUDIO_FIX__", str(HAS_FAMILY_AUDIO_FIX))
+
+
+FAMILY_04529 = set(re.findall(r'\{\s*"(CUSA\d{5})",\s*"CUSA04529"\s*\}', FAMILIES_H))
+AUDIO_LEN = 0x600000
+
+
+def expected_preshave(tr: dict, af: int) -> bool:
+    """Test oracle for audio_fix_preshave_arena: does a boot arena of this trace match the Variant C / D role?"""
+    main0, t3 = 0, 0
+    for ev in tr["events"]:
+        if ev["op"] != "alloc" or ev.get("flips", 0) != 0 or ev["orig_ret"] != "0x0":
+            continue
+        ln, ty = int(ev["len"], 16), ev["type"]
+        if af == 1 and ty == 0 and 0x4000000 <= ln <= 0x20000000 and main0 > ln:
+            return True
+        if af == 2 and ty == 3 and 0x10000000 <= ln <= 0x3FE00000 and t3 > 0:
+            return True
+        if ty == 0 and ln >= 0x40000000:
+            main0 = max(main0, ln)
+        if ty == 3 and ln >= 0x40000000:
+            t3 += 1
+    return False
+
+
+def generate_family_audio_c(traces: list[dict]) -> list[str]:
+    """CUSA04529-family audio_fix replays: every family trace, followed by the 0x600000 type 0 audio allocation (appended
+    at the end when the trace stops before it), under the per-title default on base PS4, audio_fix=2, the audio_fix=0
+    override and the PS4 Pro default; the console boots also with the audio allocation before the first RegisterBuffers
+    (boot-CUSA00341.prev.txt order). With the fix the audio allocation must be real DirectMemory (never the tail-only
+    synthetic chunk or a FlexibleMemory tail), mapped without FlexibleMemory, and the 8 MB display buffer must survive."""
+    lines: list[str] = ["    int family_audio_passed = 0;"]
+    for tr in traces:
+        tid = tr["title_id"]
+        if tid not in FAMILY_04529:
+            continue
+        tkey, dm_sz, pre_occ = tr["trace_key"], tr["dm_size"], tr["pre_occupied_low"]
+        events = list(tr["events"])
+        has_audio = any(ev["op"] == "alloc" and int(ev["len"], 16) == AUDIO_LEN and ev["type"] == 0 for ev in events)
+        if not has_audio:
+            last_flips = events[-1].get("flips", 0) if events else 0
+            events.append({"op": "alloc", "id": 255, "flips": last_flips, "s": "0x0", "e": dm_sz, "len": hex(AUDIO_LEN),
+                           "align": "0x200000", "type": 0, "orig_ret": "0x0", "orig_phys": "0x0"})
+        has_reg = any(ev["op"] == "reg_buffers" for ev in events)
+        console_boot = tkey.endswith("_v2.34")
+        modes = [("default", 0, None, events), ("af2", 0, 2, events), ("af0", 0, 0, events), ("neo", 1, None, events)]
+        if console_boot:
+            audio_i = next(i for i, ev in enumerate(events) if ev["op"] == "alloc" and int(ev["len"], 16) == AUDIO_LEN)
+            reg_i = next(i for i, ev in enumerate(events) if ev["op"] == "reg_buffers")
+            first = events[:reg_i] + [events[audio_i]] + [ev for i, ev in enumerate(events[reg_i:], reg_i) if i != audio_i]
+            modes.append(("audio_first", 0, None, first))
+        for mode, neo, af, evs in modes:
+            tag = f"{tkey}_audio_{mode}"
+            lines.append(f"    /* Family audio_fix: {tkey} [{mode}] */")
+            lines.append("    {")
+            lines.append(f"        g_sim_neo = {neo};")
+            lines.append(f'        apply_title_defaults_sim("{tid}");')
+            if af is not None:
+                lines.append(f"        g_cfg.audio_fix = {af};")
+            lines.append(f"        setup_plugin_load_early({dm_sz}ULL, {pre_occ}LL);")
+            if tkey == "CUSA10249_0x137200000":
+                lines.append("        g_sim_flex_avail = 0xE00000u;")
+            lines.append("        int flex_calls_boot = g_sim_map_flex_calls, flex_calls_pre_reg = -1;")
+            lines.append("        int n_audio = 0, n_audio_real = 0, n_audio_syn = 0, n_audio_flex_map = 0, n_audio_failed = 0;")
+            lines.append("        long audio_p_last = -1;")
+            lines.append("        long id_phys[256]; size_t id_len[256];")
+            lines.append("        memset(id_phys, 0, sizeof(id_phys)); memset(id_len, 0, sizeof(id_len));")
+            for step_i, ev in enumerate(evs):
+                lines.append(f"        g_flips = {ev.get('flips', 0)}u;")
+                op = ev["op"]
+                if op == "release_id":
+                    rid = ev["id"]
+                    if 0 < rid < 256:
+                        lines.append(
+                            f"        if (id_len[{rid}] > 0) {{ sceKernelReleaseDirectMemory(id_phys[{rid}], id_len[{rid}]); id_len[{rid}] = 0; }}"
+                        )
+                elif op == "reg_buffers":
+                    lines.append("        if (flex_calls_pre_reg < 0) flex_calls_pre_reg = g_sim_map_flex_calls;")
+                    lines.append(
+                        f"        replay_register_buffers({ev['start']}, {ev['num']}, {ev['w']}u, {ev['h']}u, {ev['pitch']}u);"
+                    )
+                elif op == "alloc":
+                    elen, aid = ev["len"], ev.get("id", 0)
+                    is_audio = int(elen, 16) == AUDIO_LEN and ev["type"] == 0
+                    lines.append("        {")
+                    if ev["orig_ret"] == "0x0" and is_audio:
+                        # Audio allocation: classified, never asserted to succeed here (see the per-mode checks below).
+                        lines.append("            long p = 0; void *va = NULL;")
+                        lines.append(
+                            f"            int32_t r = sceKernelAllocateDirectMemory({ev['s']}LL, {ev['e']}LL, {elen}ULL, {ev['align']}ULL, {ev['type']}, &p);"
+                        )
+                        lines.append("            n_audio++;")
+                        lines.append("            if (r != 0) {")
+                        lines.append("                n_audio_failed++;")
+                        lines.append("            } else {")
+                        lines.append("                int kind = sim_audio_kind(p), fc = g_sim_map_flex_calls;")
+                        lines.append(
+                            f"                int32_t mr = sceKernelMapDirectMemory(&va, {elen}ULL, 0x33, 0, p, {ev['align']}ULL);"
+                        )
+                        lines.append(f'                ASSERT_MSG(mr == 0 && va != NULL, "{tag}", {step_i}, {elen}ULL);')
+                        lines.append("                audio_p_last = p;")
+                        lines.append("                if (kind == 0) n_audio_real++;")
+                        lines.append("                if (kind == 1) n_audio_syn++;")
+                        lines.append("                if (g_sim_map_flex_calls != fc) n_audio_flex_map++;")
+                        if 0 < aid < 256:
+                            lines.append(f"                id_phys[{aid}] = p; id_len[{aid}] = {elen}ULL;")
+                        lines.append("            }")
+                    elif ev["orig_ret"] == "0x0":
+                        lines.append("            long p = 0; void *va = NULL;")
+                        lines.append(
+                            f"            int32_t r = sceKernelAllocateDirectMemory({ev['s']}LL, {ev['e']}LL, {elen}ULL, {ev['align']}ULL, {ev['type']}, &p);"
+                        )
+                        lines.append(f'            ASSERT_MSG(r == 0, "{tag}", {step_i}, {elen}ULL);')
+                        lines.append(
+                            f"            int32_t mr = sceKernelMapDirectMemory(&va, {elen}ULL, 0x33, 0, p, {ev['align']}ULL);"
+                        )
+                        lines.append(f'            ASSERT_MSG(mr == 0 && va != NULL, "{tag}", {step_i}, {elen}ULL);')
+                        if 0 < aid < 256:
+                            lines.append(f"            id_phys[{aid}] = p; id_len[{aid}] = {elen}ULL;")
+                    else:
+                        lines.append("            long p = 0;")
+                        lines.append(
+                            f"            int32_t r = sceKernelAllocateDirectMemory({ev['s']}LL, {ev['e']}LL, {elen}ULL, {ev['align']}ULL, {ev['type']}, &p);"
+                        )
+                        lines.append(f"            if (r == 0) sceKernelReleaseDirectMemory(p, {elen}ULL);")
+                    lines.append("        }")
+            fix_on = mode in ("default", "af2", "audio_first") or (mode == "neo" and tid == "CUSA10249")
+            if fix_on:
+                variant = 2 if mode == "af2" else 1
+                engaged = expected_preshave(tr, variant)
+                lines.append(f'        ASSERT_MSG(cusa04529_audio_fix() == {variant}, "{tag}", 900, g_cfg.audio_fix);')
+                # With the fix active the audio allocation is never the synthetic chunk nor FlexibleMemory on map.
+                lines.append(
+                    f'        ASSERT_MSG(n_audio >= 1 && n_audio_syn == 0 && n_audio_flex_map == 0 && n_audio_real + n_audio_failed == n_audio, "{tag}", 901, n_audio_syn);'
+                )
+                if engaged or variant == 1:
+                    # ... and, with the role-matched arena pre-shaved, it is real DirectMemory.
+                    lines.append(f'        ASSERT_MSG(n_audio_failed == 0 && n_audio_real == n_audio, "{tag}", 908, n_audio_failed);')
+                if engaged or has_reg:
+                    # The display buffer (at least the 8 MB mid buffer) survives in real DirectMemory. (Without a pre-shave
+                    # and before any RegisterBuffers, the memory valve may still yield it to the audio allocation.)
+                    lines.append(
+                        f'        ASSERT_MSG(g_pre_mem != NULL && g_pre_size >= 0x800000ULL && sim_dm_is_allocated_range(g_pre_mem_phys, g_pre_size), "{tag}", 902, g_pre_size);'
+                    )
+                if has_reg:
+                    lines.append(f'        ASSERT_MSG(g_mbuf_state == 1 && IS_MID(g_mbase), "{tag}", 903, g_mbuf_state);')
+                    # No FlexibleMemory is mapped before the first RegisterBuffers (the Variant C tail is deferred to it).
+                    lines.append(f'        ASSERT_MSG(flex_calls_pre_reg == flex_calls_boot, "{tag}", 904, flex_calls_pre_reg);')
+                    lines.append(f'        ASSERT_MSG(g_c10249_first_reg_done == 1 && g_c10249_tail_pending == 0, "{tag}", 905, g_c10249_tail_pending);')
+                if engaged:
+                    lines.append(
+                        f'        ASSERT_MSG(g_af_preshave_len != 0 && g_shave_n >= 1 && g_shaves[0].orig_len == g_af_preshave_len && g_shaves[0].orig_len - g_shaves[0].real_len == AUDIO_FIX_TAIL, "{tag}", 906, g_af_preshave_len);'
+                    )
+                    if variant == 2:
+                        lines.append(f'        ASSERT_MSG(g_sim_map_flex_calls == flex_calls_boot, "{tag}", 907, g_sim_map_flex_calls);')
+                if console_boot and mode in ("default", "audio_first"):
+                    # Console boot with the fix: the audio allocation sits right below the 8 MB display buffer at the top.
+                    top = int(dm_sz, 16) - 0x800000 - AUDIO_LEN
+                    lines.append(f'        ASSERT_MSG(audio_p_last == {hex(top)}LL && g_pre_mem_phys == {hex(top + AUDIO_LEN)}LL, "{tag}", 909, audio_p_last);')
+            else:
+                lines.append(f'        ASSERT_MSG(cusa04529_audio_fix() == 0 && g_af_preshave_len == 0, "{tag}", 910, g_cfg.audio_fix);')
+                if mode == "af0" and console_boot:
+                    # audio_fix=0 reproduces the console boot: the audio allocation lands on the synthetic chunk.
+                    audio_ev = next(ev for ev in events if ev["op"] == "alloc" and int(ev["len"], 16) == AUDIO_LEN and ev["type"] == 0)
+                    lines.append(f'        ASSERT_MSG(n_audio == 1 && n_audio_syn == 1 && audio_p_last == {audio_ev["orig_phys"]}LL, "{tag}", 911, audio_p_last);')
+            lines.append(f'        ASSERT_MSG(on_sub() >= 0, "{tag}", 1000, 0);')
+            lines.append("        (void)flex_calls_boot; (void)flex_calls_pre_reg; (void)n_audio; (void)n_audio_real; (void)n_audio_syn; (void)n_audio_flex_map; (void)n_audio_failed; (void)audio_p_last;")
+            lines.append("        family_audio_passed++;")
+            lines.append("    }")
+    lines.append(
+        '    printf("CUSA04529 family audio_fix replay: %d/%d cases passed (audio allocation in real DirectMemory, display buffer kept)\\n", family_audio_passed, family_audio_passed);'
+    )
+    return lines
 
 
 def generate_trace_c(traces: list[dict]) -> str:
@@ -1262,6 +1449,7 @@ def generate_trace_c(traces: list[dict]) -> str:
                     lines.append(f'        ASSERT_MSG(g_pbuf != NULL && g_pbuf_ycocg == 1 && g_shave_n == 1, "{tkey}_af0", 997, g_pbuf_sz);')
                 lines.append(f'        ASSERT_MSG(on_sub() >= 0, "{tkey}_af{extra_af}", 1000, 0);')
                 lines.append("    }")
+    lines.extend(generate_family_audio_c(traces))
     lines.append('    printf("real hardware traces replay: %d/%d CUSAxxxxx boot traces passed 100%%\\n", passed, passed);')
     lines.append("    return 0;")
     lines.append("}")
