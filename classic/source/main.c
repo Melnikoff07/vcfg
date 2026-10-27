@@ -3173,6 +3173,15 @@ static uint32_t pll_adaptive_hold_us(int32_t handle, uint64_t now_us, uint64_t d
 
 static uint64_t g_dbl_frames = 0;
 static int64_t g_pace_off = 0;
+// Present-copy state as the pacers see it. With two_buffer or present_copy forced, the history buffer makes
+// g_pcopy_avail 1 (on_register_buffers_2buf), so g_pcopy_on = g_pcopy_avail && present_copy != 2 picks timer pacing,
+// post-submit release and the deeper drain threshold for that title. shave14 withholds that history buffer
+// (g_s14_tail_extra, alloc_pbuf_history) and takes g_pcopy_on to 0 with it; the pacers keep the decision the title has
+// without shave14. Rendering still follows g_pcopy_on (no history buffer to copy into).
+static int pace_pcopy(void)
+{
+    return g_pcopy_on || (g_s14_tail_extra && g_cfg.present_copy != 2);
+}
 static void pace_vblank_ex(int prev2_real, int prev_real, int cur_real, int32_t handle, uint64_t dt_enter_us, int pace_pre)
 {
     if (!g_mon_on) { pace_30(); return; }
@@ -3180,7 +3189,7 @@ static void pace_vblank_ex(int prev2_real, int prev_real, int cur_real, int32_t 
     volatile uint64_t *cnt = g_opt_early ? &g_mids_shown : &g_reals_shown;
     // Present copy (2-buffer games): release the game when the frame before the previous one is on screen, so its CPU
     // work overlaps the GPU of the previous frame (waiting for the previous one serialised them: 26 + 26 ms, 24 fps).
-    int64_t step = g_pcopy_on ? 2 : 1;
+    int64_t step = pace_pcopy() ? 2 : 1;
     int64_t target = (int64_t)g_dbl_frames - step + g_pace_off;
     int64_t have = (int64_t)*cnt;
     if (have > target) {
@@ -3209,7 +3218,7 @@ static void pace_vblank_ex(int prev2_real, int prev_real, int cur_real, int32_t 
     }
     int distinct_ok = (g_ngame == 2) ? (prev_real >= 0 && prev_real != cur_real)
                                      : (prev2_real != cur_real && prev_real != cur_real && prev2_real != prev_real);
-    if (distinct_ok && g_pcopy_on) {
+    if (distinct_ok && pace_pcopy()) {
         VoFlipStatus fs;
         memset(&fs, 0, sizeof(fs));
         if (read_flip_status(g_handle, &fs) == 0) {
@@ -3263,7 +3272,7 @@ static void pace_pair_ex(int32_t handle, uint64_t dt_enter_us, int pace_pre, uin
             g_pair_next = now + period;
         }
     }
-    uint32_t drain_thr = g_pcopy_on ? 5u : (pace_pre ? 3u : 4u);
+    uint32_t drain_thr = pace_pcopy() ? 5u : (pace_pre ? 3u : 4u);
     if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= drain_thr) g_pair_next += g_freq / 500u;   // drain: +2 ms
     g_rel_t = sceKernelGetProcessTime();
 }
@@ -3272,14 +3281,15 @@ static int pace_timer_on(void)
 {
     if (g_cfg.pace_order == 3) return 1;
     if (g_cfg.pace_order == 0 &&
-        (g_pcopy_on ||
+        (pace_pcopy() ||
          vcfg_in_family(g_title_id, "CUSA05571") ||
          vcfg_in_family(g_title_id, "CUSA09311") ||
          vcfg_in_family(g_title_id, "CUSA18534") ||
          vcfg_in_family(g_title_id, "CUSA10123"))) {
         if (g_pace_timer < 0) {
             g_pace_timer = 1;
-            lg("pacing: timer (auto for pcopy/%s)\n", g_title_id);
+            lg("pacing: timer (auto for pcopy/%s)%s\n", g_title_id,
+               (!g_pcopy_on && g_s14_tail_extra) ? " (shave14: history buffer withheld, present-copy pacing kept)" : "");
         }
         return 1;
     }
@@ -3906,7 +3916,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 if (third_flip)  { for (uint32_t i = 0; i < tail_dw; i++) fb2[i] = tail[i]; }
                 if (second_flip) { for (uint32_t i = 0; i < tail_dw; i++) fb[i]  = tail[i]; }
                 static int last_show = -1;                  // with present copy the shown real buffers are the copies
-                int pace_pre = (g_cfg.pace_order == 1) ? 1 : (g_cfg.pace_order == 2) ? 0 : (!g_pcopy_on);
+                int pace_pre = (g_cfg.pace_order == 1) ? 1 : (g_cfg.pace_order == 2) ? 0 : (!pace_pcopy());
                 g_last_pace_pre = pace_pre;
                 if (hold_mid_us > 0) {
                     if (pace_pre) {
@@ -4388,7 +4398,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
 
             if (n > 0) {
                 static int vo_last_show = -1;
-                int pace_pre = (g_cfg.pace_order == 1) ? 1 : (g_cfg.pace_order == 2) ? 0 : (!g_pcopy_on);
+                int pace_pre = (g_cfg.pace_order == 1) ? 1 : (g_cfg.pace_order == 2) ? 0 : (!pace_pcopy());
                 g_last_pace_pre = pace_pre;
                 if (hold_mid_us > 0) {
                     if (pace_pre) {

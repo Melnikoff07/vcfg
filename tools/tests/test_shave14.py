@@ -87,11 +87,12 @@ __ALLOCS__
     s14_after_register(g_nbuf - g_mbase, one, (const uint8_t *)g_pre_mem, g_mbase + 1);
     size_t shaved = 0;
     for (int i = 0; i < g_shave_n; i++) shaved += g_shaves[i].orig_len - g_shaves[i].real_len;
+    g_pcopy_on = g_pcopy_avail && g_cfg.present_copy != 2;   /* as the mode-8 FG branch sets it every frame */
     printf("%s shave_n=%d shaved=0x%zx pre=0x%zx nmid=%d mbase=%d nbuf=%d state=%d extra=0x%zx pbuf=0x%zx flex=0x%zx "
-           "free64=0x%zx free2m=0x%zx fails=%u tail_mapped=%d\n",
+           "free64=0x%zx free2m=0x%zx fails=%u tail_mapped=%d pcopy_on=%d pace_pcopy=%d\n",
            tag, g_shave_n, shaved, g_pre_size, g_nmid, g_mbase, g_nbuf, g_s14_state, g_s14_tail_extra,
            g_pbuf ? g_pbuf_sz : (size_t)0, g_sim_flex_avail, dm_avail(0x10000u), dm_avail(0x200000u),
-           g_dbg_alloc_fail, g_shave_tail_mapped);
+           g_dbg_alloc_fail, g_shave_tail_mapped, (int)g_pcopy_on, pace_pcopy());
 }
 int main(void)
 {
@@ -107,7 +108,8 @@ int main(void)
     full = "\n".join([
         harness, rt["FAMILIES_BODY"], rt["HOOKS_DECLS"], rt["HOOKS_VMAP"], rt["MAIN_ALLOC_PART1"], rt["HOOKS_CORE"],
         rt["MAIN_ALLOC_PART2"], replay, S14_LOG_DECLS, extract_function(MAIN_C, "static void s14_log_decision("),
-        extract_function(MAIN_C, "static void s14_after_register("), main])
+        extract_function(MAIN_C, "static void s14_after_register("), extract_function(MAIN_C, "static int pace_pcopy("),
+        main])
     full = re.sub(r"\b(0x[0-9a-fA-F]+)L\b", r"\1LL", full)
     full = re.sub(r"\b(\d+)L\b", r"\1LL", full)
     full = full.replace("unsigned long long", "uint64_t").replace("long long", "int64_t").replace("unsigned long", "uint64_t")
@@ -212,6 +214,14 @@ class Shave14BootReplay(unittest.TestCase):
         self.assertEqual((big_on["shaved"], big_on["nmid"], big_on["pbuf"]), ("0xe00000", "2", "0x0"))
         self.assertEqual(big_on["flex"], big_off["flex"])
 
+    def test_pacing_keeps_the_present_copy_decision(self):
+        # 150d759 / de139b7 on the console: no history buffer -> g_pcopy_on 0 -> pace_timer_on() 0 -> b30_available 0,
+        # every BELOW30 line "off". The pacers must see the title's decision without shave14.
+        off, on = self.r["off"], self.r["on"]
+        self.assertEqual((off["pcopy_on"], off["pace_pcopy"]), ("1", "1"))
+        self.assertEqual((on["pcopy_on"], on["pace_pcopy"]), ("0", "1"))
+        self.assertEqual(self.r["short_on"]["pace_pcopy"], self.r["short_off"]["pace_pcopy"])
+
     def test_short_flexible_memory_falls_back_to_today(self):
         so, sn = self.r["short_off"], self.r["short_on"]
         self.assertEqual(sn["state"], "-1")
@@ -240,6 +250,56 @@ class Shave14Decide(unittest.TestCase):
         self.assertEqual(r["pcopy1"], ("1", "0"))
         for k in ("mode4", "bench", "observe", "shave1", "shave2", "b30off", "twobuf0", "pcopy2", "audio"):
             self.assertEqual(r[k], ("0", "0"), k)
+
+
+PACE = r"""
+#include <stdio.h>
+#include <string.h>
+#define LOG_DIR "/data/bb_probe"
+typedef struct { int pace_order, present_copy; } Cfg;
+static Cfg g_cfg;
+static char g_title_id[16] = "CUSA18723";
+static volatile int g_pcopy_on;
+static size_t g_s14_tail_extra;
+static int g_file;
+static int vcfg_in_family(const char *t, const char *f) { return strcmp(t, f) == 0; }
+static void lg(const char *f, ...) { (void)f; }
+#define fopen(p, m) ((void)(p), (void)(m), g_file ? stdin : (FILE *)0)
+#define fclose(f) ((void)(f), 0)
+__FNS__
+int main(void)
+{
+    /* pcopy_on, tail_extra, present_copy, pace_order, pace_timer file */
+    static const int c[][5] = { {1, 0, 0, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 1}, {0, 1, 2, 0, 0},
+                                {0, 1, 0, 2, 0} };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        g_pcopy_on = c[i][0]; g_s14_tail_extra = c[i][1] ? 0x800000u : 0u; g_cfg.present_copy = c[i][2];
+        g_cfg.pace_order = c[i][3]; g_file = c[i][4]; g_pace_timer = -1;
+        printf("%d%d ", pace_pcopy(), pace_timer_on());
+    }
+    printf("\n");
+    return 0;
+}
+"""
+
+
+class Shave14Pacing(unittest.TestCase):
+    def test_timer_pacing_with_the_history_buffer_withheld(self):
+        fns = "static int g_pace_timer = -1;\n" + extract_function(MAIN_C, "static int pace_pcopy(") + "\n" + \
+            extract_function(MAIN_C, "static int pace_timer_on(")
+        out = compile_and_run(PACE.replace("__FNS__", fns)).split()
+        # today with the history buffer; shave14 without it; neither (vblank); neither + pace_timer file;
+        # present_copy=2 (no history buffer anyway); pace_order=2 (post-submit forced, not the timer)
+        self.assertEqual(out, ["11", "11", "00", "01", "00", "10"])
+
+    def test_every_pacer_reads_pace_pcopy(self):
+        for sig in ("static void pace_vblank_ex(", "static void pace_pair_ex(", "static int pace_timer_on("):
+            body = extract_function(MAIN_C, sig)
+            self.assertNotIn("g_pcopy_on ?", body, sig)
+            self.assertNotIn("(g_pcopy_on ||", body, sig)
+            self.assertNotIn("&& g_pcopy_on)", body, sig)
+        self.assertEqual(MAIN_C.count("(g_cfg.pace_order == 2) ? 0 : (!pace_pcopy());"), 2)
+        self.assertNotIn("(g_cfg.pace_order == 2) ? 0 : (!g_pcopy_on);", MAIN_C)
 
 
 class Shave14CallSites(unittest.TestCase):
