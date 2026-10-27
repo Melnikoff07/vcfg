@@ -66,7 +66,24 @@ def motion(A, B, params=None):
     sum_a = int(L3a.sum()) if p['prev_luma_sum'] is None else p['prev_luma_sum']
     FT, cutn, fade = vm.me1(L1a, L1b, V2, GK, gm, sum_b, sum_a, prevF, p.get('mp'))
     F = vm.mf8(L1a, L1b, FT, GK, V2, gm, fade, p.get('mp'), prevF=prevF)
-    return dict(V3=V3, V2=V2, S2=S2, gm=gm, GK=GK, FT=FT, F=F, cutn=cutn, fade=fade, prevF=prevF)
+    return dict(V3=V3, V2=V2, S2=S2, gm=gm, GK=GK, FT=FT, F=F, cutn=cutn, fade=fade,
+                prevF=warp_prevF(prevF, p.get('prev_cutn'), p.get('cut_thr', 0)))
+
+
+def cut_threshold(cut_thr=0):
+    """scene-change threshold in unmatched blocks of 8160 (consts.flags bits 16..31 = blocks / 8; 0 = default 5600)"""
+    return int(cut_thr) if cut_thr else 5600
+
+
+def warp_prevF(prevF, prev_cutn, cut_thr=0):
+    """the previous field as warp8 sees it. prev_cutn = unmatched blocks of the pair that wrote prevF (phase8 keeps it
+    in misc dword 8 + parity). When that pair was a scene change, phase8 clears F prev after the motion stages used it
+    as a candidate source, so warp8's quadratic trajectory offset gets no motion of the old scene (zero field = the
+    same frame as no history). A count above 8160 blocks is uninitialised memory (no reset); prev_cutn None = no chain
+    information: prevF unchanged."""
+    if prevF is None or prev_cutn is None or not cut_threshold(cut_thr) < int(prev_cutn) <= 8160:
+        return prevF
+    return np.zeros_like(prevF)
 
 
 def render(A, B, st, params=None, return_all=False):
