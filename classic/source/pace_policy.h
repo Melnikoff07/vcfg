@@ -226,3 +226,82 @@ static inline int b30_available(int cfg_on, int nmid, int mem_tight, int preset,
 {
     return cfg_on && nmid >= 2 && !mem_tight && preset != 1 && !fg_off && pace_timer && fps_lock != 20;
 }
+// ---- below-30 regime cost: buffer order (mid_lru) and feed (b30x), both part of the regime ----
+// On the console (27/10, CUSA18723, 2 generated-frame buffers) the regime cost 11 % of the real frame rate: the game is
+// GPU-serialised (the game span between two of our DCBs stays 32.7 ms p50 with the regime off and on, and the interval
+// grows by our extra DCB time), and two of our own choices fed each other:
+//  * the generated-frame buffer was g_mbase + g_flips % g_nmid. After a 3-slot pair (mid1 in A, mid2 in B) the next
+//    pair writes into the buffer the pair before flipped LAST, so its WaitFlipDone holds the graphics ring until the
+//    previous real latched ("fence" 2.5 ms p50, 0.0 with the regime off), and the game waits for that ring;
+//  * the regime and the accumulator read the game's own time, which then includes that wait and the 2nd generated
+//    frame (~2.85 ms): more 3-slot pairs, more waits (median own 2.15 -> 2.48 refreshes, half the pairs 3-slot where
+//    the game needs ~17 %).
+// mid_lru: the pair writes its first generated frame into the buffer flipped longest ago and the second one into the
+// next (round robin, i.e. today's order, while every pair has 2 slots).
+#define MID_LRU_MAX 4u
+typedef struct { uint8_t ord[MID_LRU_MAX]; uint32_t n; } MidLru;
+static inline void mid_lru_reset(MidLru *l, uint32_t n)
+{
+    l->n = n > MID_LRU_MAX ? MID_LRU_MAX : n;
+    for (uint32_t i = 0; i < MID_LRU_MAX; i++) l->ord[i] = (uint8_t)i;
+}
+// j-th least recently flipped buffer (0 = flipped longest ago), relative to g_mbase.
+static inline uint32_t mid_lru_pick(const MidLru *l, uint32_t j)
+{
+    return l->n ? l->ord[j % l->n] : 0u;
+}
+static inline void mid_lru_touch(MidLru *l, uint32_t b)
+{
+    uint32_t i = 0;
+    while (i < l->n && l->ord[i] != b) i++;
+    if (i >= l->n) return;
+    for (; i + 1u < l->n; i++) l->ord[i] = l->ord[i + 1u];
+    l->ord[l->n - 1u] = (uint8_t)b;
+}
+// The pair flipped a (and then b when two): both move to the most recent end, in flip order.
+static inline void mid_lru_flipped(MidLru *l, uint32_t a, int two, uint32_t b)
+{
+    mid_lru_touch(l, a);
+    if (two && b != a) mid_lru_touch(l, b);
+}
+// Feed: our extra GPU time per real frame, from the GPU timestamps of the slot read back 3 frames later: the
+// WaitFlipDone before the first generated frame (fence) plus, in a 3-slot pair, the post block beyond the 2-slot one
+// (t2[5]..t2[7]: rcas8/osd of the first generated frame, then fence 2 + phase8 + warp8 + rcas8 + osd of the second).
+// The regime and the accumulator are fed own - EMA(extra): the game's time without what the regime itself adds.
+typedef struct { uint32_t ema_us, post2_us, n2, n, fence_sum_us, g2_sum_us, nw, n3; } B30Extra;   // nw, n3, sums: log window
+static inline void b30x_reset(B30Extra *x)
+{
+    x->ema_us = x->post2_us = x->n2 = x->n = x->fence_sum_us = x->g2_sum_us = x->nw = x->n3 = 0u;
+}
+static inline uint32_t b30x_ticks_us(uint64_t ticks, uint32_t ticks_per_ms)
+{
+    if (!ticks_per_ms) return 0u;
+    uint64_t us = ticks * 1000u / ticks_per_ms;
+    return us > 100000u ? 100000u : (uint32_t)us;
+}
+// One read-back slot: fence and post-block durations in us, whether that pair had 3 slots.
+static inline void b30x_add(B30Extra *x, uint32_t fence_us, uint32_t post_us, int three)
+{
+    uint32_t g2 = 0u;
+    if (!three) {
+        x->post2_us = x->n2 ? x->post2_us + (uint32_t)(((int32_t)post_us - (int32_t)x->post2_us) / 8) : post_us;
+        x->n2++;
+    } else {
+        g2 = post_us > x->post2_us ? post_us - x->post2_us : 0u;
+        x->n3++;
+    }
+    uint32_t e = fence_us + g2;
+    x->ema_us = x->n ? x->ema_us + (uint32_t)(((int32_t)e - (int32_t)x->ema_us) / 8) : e;
+    x->n++;
+    x->nw++;
+    x->fence_sum_us += fence_us;
+    x->g2_sum_us += g2;
+}
+// Own time fed to the regime: own minus our extra; 0 stays 0 (not eligible: resets), never below half the own time.
+static inline uint32_t b30_feed_us(uint32_t own_us, uint32_t extra_us)
+{
+    if (!own_us) return 0u;
+    uint32_t f = own_us > extra_us ? own_us - extra_us : 0u;
+    return f < own_us / 2u ? own_us / 2u : f;
+}
+

@@ -2601,6 +2601,13 @@ static volatile uint32_t g_pll_t2_q16 = 43690u;   // phase of the 2nd generated 
 static volatile uint32_t g_pair_slots = 2u;       // refreshes of the pair being submitted: 2, or 3 in the below-30 regime
 static uint32_t b30_win_frames, b30_win_on, b30_win_on_vb, b30_win_three, b30_win_cut;   // BELOW30 log line, per HOOK window
 static Below30 g_b30;                             // below-30 regime state (pace_policy.h), game thread only
+// Below-30 regime cost (pace_policy.h mid_lru / b30x), with below30 on: the 1st generated frame goes into the buffer
+// flipped longest ago, and the regime is fed own - our extra GPU time.
+static MidLru g_mid_lru;
+static B30Extra g_b30x;
+static uint32_t g_ts_ticks_per_ms = 0;            // GPU timestamp clock, from the PASSES window (0 = not measured yet)
+static uint8_t g_slot_three[4];                   // the pair of each DCB slot had 3 slots (read back 3 frames later)
+static uint32_t b30c_win_f1_after3_us, b30c_win_n_after3, b30c_win_f1_us, b30c_win_n;   // B30COST line, per HOOK window
 static volatile uint32_t g_pll_t_permille = 500u;
 static volatile uint32_t g_pll_lock = 0;
 static uint64_t g_last_submit_enter_t = 0;
@@ -3301,6 +3308,22 @@ static int pace_timer_on(void)
     return g_pace_timer;
 }
 
+// The below-30 regime's buffer order and feed state, set up once on the game thread (never in plugin_load).
+static void b30cost_init(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    mid_lru_reset(&g_mid_lru, (uint32_t)g_nmid);
+    b30x_reset(&g_b30x);
+}
+// Own time the below-30 regime and its accumulator read: without the GPU time the regime itself adds.
+static uint32_t b30_feed(uint64_t own_us)
+{
+    uint32_t o = own_us < 1000000ull ? (uint32_t)own_us : 0u;
+    return b30_feed_us(o, g_b30x.ema_us);
+}
+
 static uint32_t med3_u32(uint32_t a, uint32_t b, uint32_t c)
 {
     if (a > b) { uint32_t t = a; a = b; b = t; }
@@ -3606,6 +3629,14 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                     g_pp_split[1] += t2[7] - t2[5];
                                     g_pp_split[2] += t2[6] - t2[7];
                                     g_pp_split_n++;
+                                    if (g_cfg.below30 && g_ts_ticks_per_ms)
+                                        b30x_add(&g_b30x, b30x_ticks_us(ts[3] > ts[2] ? ts[3] - ts[2] : 0u, g_ts_ticks_per_ms),
+                                                 b30x_ticks_us(t2[7] - t2[5], g_ts_ticks_per_ms), g_slot_three[ps]);
+                                    if (g_cfg.below30) {   // B30COST: fence before the 1st generated frame, by the pair before
+                                        uint32_t f1 = b30x_ticks_us(ts[3] > ts[2] ? ts[3] - ts[2] : 0u, g_ts_ticks_per_ms);
+                                        b30c_win_f1_us += f1; b30c_win_n++;
+                                        if (g_slot_three[(ps + 3u) & 3u]) { b30c_win_f1_after3_us += f1; b30c_win_n_after3++; }
+                                    }
                                 }
                             }
                         }
@@ -3635,6 +3666,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             double secs = (double)(g_ts_cpu_last - g_ts_cpu_first) / (double)g_freq;
                             double unit = (double)(g_ts_last - g_ts_first) / secs;
                             gv_set_gpu_rate(unit);
+                            if (unit > 1e6 && unit < 1e10) g_ts_ticks_per_ms = (uint32_t)(unit / 1000.0 + 0.5);
                             double ms[4], tot = 0;
                             for (int i = 0; i < 4; i++) { ms[i] = (double)g_ts_pass[i] / (double)g_ts_n / unit * 1000.0; tot += ms[i]; }
                             double span = g_ts_span_n ? (double)g_ts_span / g_ts_span_n / unit * 1000.0 : 0.0;
@@ -3696,6 +3728,15 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     g_pcopy_on = pcopy;
                     uint32_t mi1 = (pcopy && g_pcopy_k >= 2) ? (uint32_t)g_mbase + (g_flips % (uint32_t)g_pcopy_k) : (uint32_t)g_mbase + (g_flips % (uint32_t)g_nmid);
                     uint32_t mi2 = (uint32_t)g_mbase + ((g_flips + 1u) % (uint32_t)g_nmid);
+                    b30cost_init();
+                    // below30: the 1st generated frame goes into the buffer flipped longest ago, the 2nd into the next one
+                    // (pace_policy.h mid_lru); with 2-slot pairs only this is the round robin above. below30 off: as v2.35.
+                    int mid_lru_on = g_cfg.below30 && !(pcopy && g_pcopy_k >= 2) && g_nmid >= 2 && (uint32_t)g_nmid <= MID_LRU_MAX;
+                    if (mid_lru_on) {
+                        if (g_mid_lru.n != (uint32_t)g_nmid) mid_lru_reset(&g_mid_lru, (uint32_t)g_nmid);
+                        mi1 = (uint32_t)g_mbase + mid_lru_pick(&g_mid_lru, 0u);
+                        mi2 = (uint32_t)g_mbase + mid_lru_pick(&g_mid_lru, 1u);
+                    }
                     int tb_fast = VCFG_2BUF_TEST == 3 && tb_title() && pcopy && !g_fg_off;
                     static uint32_t tb_mid_cursor;
                     if (tb_fast) {
@@ -3756,7 +3797,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         g_q2x_hold_acc = 0;
                         uint32_t pq8 = refresh_period_q8();
                         int b30_ok = b30_available(g_cfg.below30, g_nmid, g_mem_tight && g_s14_state != 2, g_cfg.preset, g_fg_off, pace_timer_on(), g_cfg.fps_lock);
-                        int b30_on = b30_regime_step(&g_b30, (b30_ok && !force_repeat) ? (uint32_t)(ft_own_us < 1000000ull ? ft_own_us : 0ull) : 0u, pq8);
+                        int b30_on = b30_regime_step(&g_b30, (b30_ok && !force_repeat) ? b30_feed(ft_own_us) : 0u, pq8);
                         b30_win_frames++;
                         if (b30_on) b30_win_on++;
                         if (force_repeat) {
@@ -3766,7 +3807,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                 uint32_t vbu = 16683u;
                                 uint32_t to_vb = vblank_to_next_edge_us((int32_t)handle, sceKernelGetProcessTime(), &vbu);
                                 int cut = 0;
-                                uint32_t m_out = b30_slots(&g_b30, g_cpu_ema_us, pq8,
+                                uint32_t m_out = b30_slots(&g_b30, b30_feed(g_cpu_ema_us), pq8,
                                                            b30_queue_ahead_q8(__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE), to_vb, pq8), &cut);
                                 if (cut) b30_win_cut++;
                                 if (m_out == 3u && g_nmid >= 2 && mi1 != mi2) {
@@ -3814,6 +3855,10 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         else { t2_q16 = 43690u; __atomic_store_n(&g_pair_slots, 2u, __ATOMIC_RELEASE); }   // the copy runs
                     }
                     if (third_flip && g_cfg.preset != 1 && !tb_fast) b30_win_three++;
+                    if (mid_lru_on)   // a 2nd generated frame outside the ring (late DirectMemory buffer) leaves the order alone
+                        mid_lru_flipped(&g_mid_lru, mi1 - (uint32_t)g_mbase, third_flip && mid2_flip_idx == mi2 && mi2 >= (uint32_t)g_mbase &&
+                                        mi2 < (uint32_t)g_mbase + (uint32_t)g_nmid, mi2 - (uint32_t)g_mbase);
+                    g_slot_three[slot] = (uint8_t)(third_flip ? 1 : 0);
                     n = build_dcb_flow8(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi1], g_buf[mi2], g_pitch,
                                         tidx, px * 4, slot, g_flips, tail64, (int32_t)handle, mi1, mi2,
                                         t1_q16, t2_q16, two_mids, force_repeat, pcopy ? g_buf[ci] : 0ull, ci);
@@ -4062,6 +4107,17 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                b30_win_three, b30_win_cut, b30_median_q8(&g_b30) / 256.0, B30_ENTER_Q8 / 256.0, B30_EXIT_Q8 / 256.0,
                                g_s14_state == 2 ? " | 2nd buffer: shave14 DirectMemory reserve"
                                : (g_nmid < 2 || g_mem_tight) ? " | unavailable: one generated-frame buffer (memory tight)" : "");
+                        }
+                        if (g_cfg.below30 && b30_win_frames) {   // separate line, as BELOW30
+                            lg("B30COST: fence before the 1st generated frame avg %.2f ms (%u), after a 3-slot pair %.2f ms (%u) | "
+                               "extra GPU fed back avg %.2f ms (fence %.2f + 2nd generated %.2f over %u frames, %u 3-slot) | own %.1f fed %.1f ms\n",
+                               b30c_win_n ? b30c_win_f1_us / 1000.0 / b30c_win_n : 0.0, b30c_win_n,
+                               b30c_win_n_after3 ? b30c_win_f1_after3_us / 1000.0 / b30c_win_n_after3 : 0.0, b30c_win_n_after3,
+                               g_b30x.ema_us / 1000.0, g_b30x.nw ? g_b30x.fence_sum_us / 1000.0 / g_b30x.nw : 0.0,
+                               g_b30x.nw ? g_b30x.g2_sum_us / 1000.0 / g_b30x.nw : 0.0, g_b30x.nw, g_b30x.n3,
+                               g_cpu_ema_us / 1000.0, b30_feed(g_cpu_ema_us) / 1000.0);
+                            b30c_win_f1_us = b30c_win_n = b30c_win_f1_after3_us = b30c_win_n_after3 = 0;
+                            g_b30x.fence_sum_us = g_b30x.g2_sum_us = g_b30x.nw = g_b30x.n3 = 0;
                         }
                         b30_win_frames = b30_win_on = b30_win_on_vb = b30_win_three = b30_win_cut = 0;
                     }
