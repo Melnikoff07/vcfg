@@ -400,12 +400,15 @@ define internal { <4 x float>, float, float } @accum({ <4 x float>, float, float
   %w_eff = select i1 %fg_bst, float %w_b1, float %w_raw
   %e = fadd float %e0, -0.0 ; the candidate's own error, also for a boosted foreground sub-block
   %em1 = call float @llvm.minnum.f32(float %em, float %e)
-  %d0 = fsub float %em1, %em
-  %k0 = fmul float %d0, 8.0
-  %sc = call float @llvm.exp2.f32(float %k0)
-  %d1 = fsub float %em1, %e
-  %k1 = fmul float %d1, 8.0
-  %x1 = call float @llvm.exp2.f32(float %k1)
+  ; exp2(8 (em1 - em)) and exp2(8 (em1 - e)): one of them is exp2(0) = 1 and the other equals exp2(-8 |em - e|) bit
+  ; for bit (fl(a - b) == -fl(b - a), 8 a power of two), so one quarter-rate v_exp_f32 per candidate instead of two
+  %d0 = fsub float %em, %e
+  %ad0 = call float @llvm.fabs.f32(float %d0)
+  %k0 = fmul float %ad0, -8.0
+  %z = call float @llvm.exp2.f32(float %k0)
+  %lo = fcmp olt float %e, %em
+  %sc = select i1 %lo, float %z, float 1.0
+  %x1 = select i1 %lo, float 1.0, float %z
   %w5 = fadd float %w_eff, 0x3FB47AE140000000; 0.08
   %om = fmul float %w5, %x1
   %acs = call <4 x float> @scale4(<4 x float> %acc, float %sc)

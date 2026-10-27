@@ -433,8 +433,12 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
                 if em is None:
                     em = e_eff.copy()
                 em1 = np.minimum(em, e_eff)
-                scl = np.exp2((em1 - em) * F32(wp.get("k", 8.0)))
-                x1 = np.exp2((em1 - e_eff) * F32(wp.get("k", 8.0)))
+                # one exp2 per candidate (warp8.ll @accum): one of the two factors is exp2(0) = 1, and the other is
+                # exp2(-k * |em - e|) bit for bit, since fl(a - b) == -fl(b - a) and k is a power of two
+                z = np.exp2(np.abs(em - e_eff) * F32(-wp.get("k", 8.0)))
+                lo = e_eff < em
+                scl = np.where(lo, z, F32(1.0)).astype(F32)
+                x1 = np.where(lo, F32(1.0), z).astype(F32)
                 om = x1 if w_eff is None else (w_eff + F32(wp.get("w_eps", 0.08))) * x1
                 acc = acc * scl[..., None] + m_s * om[..., None]
                 sw = sw * scl + om
@@ -631,13 +635,17 @@ def rcas8_real(cur, prev, con, emode, dbg=None):
     return np.where(same[..., None], cur, out).astype(F32)
 
 
-def rcas8(mid, con, emode, force_apply=False, skip=None, dbg=None):
+def rcas8(mid, con, emode, force_apply=False, skip=None, dbg=None, still=None):
     """mid (H, W, 3) float32 (already quantised like the T# store). Neighbour colours come from the 8-bit LDS copy,
     luma from the full precision value. con == 0 (Sharpness 0) skips the RCAS weight and the RCAS apply, as rcas8.ll
     does: the weight is +-0 there, so the apply returns base_c bit for bit. force_apply runs the full apply anyway
     (tests prove the identity with it). skip (H, W) bool: warp8's static flag (rcas flag bit 4, mid pass); those
     pixels take the rcas_only path (no AA, RCAS as with Enhance off). Lanes with edge_ramp == 0 take that path in
-    rcas8.ll too, which is the identity here (wAA == 0, w_eff == w_rcas). dbg: dict, receives edge_ramp."""
+    rcas8.ll too, which is the identity here (wAA == 0, w_eff == w_rcas). dbg: dict, receives edge_ramp.
+    still (H, W) bool: warp8's static flag on the mid pass of rcas8.ll (flag bit 4): the real frames around the
+    mid show those pixels raw, so the mid keeps them raw too (no AA and no sharpening: out = the 8-bit texel);
+    sharpening only the mid there alternated at 30 Hz like the AA did. A wave whose 64 lanes are all still skips
+    the whole pass after the tile load."""
     H, W = mid.shape[:2]
     c = mid.astype(F32)
     luma = c[..., 1] * F32(0.5) + (c[..., 0] + c[..., 2]) * F32(0.25)
@@ -745,6 +753,8 @@ def rcas8(mid, con, emode, force_apply=False, skip=None, dbg=None):
             w_eff = np.where(skip, w_rcas, w_eff)
     else:
         base_c, w_eff = M, w_rcas
+    if still is not None:
+        base_c = np.where(still[..., None], M, base_c)
     if not sharp and not force_apply:
         return base_c.astype(F32)
     a_ns0 = (dNS * F32(2.0)) / (dNS + dWE + eps)
@@ -757,7 +767,8 @@ def rcas8(mid, con, emode, force_apply=False, skip=None, dbg=None):
     res0 = num * (F32(1.0) / (F32(1.0) + w_eff * F32(4.0)))[..., None]
     c_mn = np.minimum(np.minimum(np.minimum(N, Wc), np.minimum(E, S)), base_c)
     c_mx = np.maximum(np.maximum(np.maximum(N, Wc), np.maximum(E, S)), base_c)
-    return np.minimum(np.maximum(res0, c_mn), c_mx).astype(F32)
+    out = np.minimum(np.maximum(res0, c_mn), c_mx).astype(F32)
+    return out if still is None else np.where(still[..., None], M, out).astype(F32)
 
 
 def boxf(e, n):

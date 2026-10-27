@@ -1253,8 +1253,9 @@ static int real_aa_default(void)
 }
 
 // rcas8 flag bit 4: warp8 writes the mid's alpha as a static-pixel flag (1.0 where P == C in RGB, 254/255 elsewhere)
-// and rcas8 skips the AA there on the mid pass: the real frames show those pixels raw, so AA only in the generated
-// frame alternates at 30 Hz (HUD, still scenery). warp8g keeps the game's alpha, so the bit is set only for warp8, and
+// and rcas8 leaves those pixels raw on the mid pass (no AA and, with Sharpness > 0, no sharpening either; no store,
+// and a wave whose 64 pixels are all static skips the pass after its tile load): the real frames show those pixels
+// raw, so a post-process only in the generated frame alternates at 30 Hz (HUD, still scenery). warp8g keeps the game's alpha, so the bit is set only for warp8, and
 // only when the real frame is not post-processed in the same dispatch (bit 1, post_mid = 2): then both frames get the
 // AA and a static pixel must get it in the mid too.
 //

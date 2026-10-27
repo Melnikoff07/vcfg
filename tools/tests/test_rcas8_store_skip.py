@@ -75,7 +75,8 @@ class Rcas8StoreSkip(unittest.TestCase):
         self.assertIn("define internal { <4 x float>, i1, i1 } @eval_tile(", RCAS8)
         self.assertIn("%chg = phi i1 [ true, %do_aa ], [ false, %rcas_only ]", RCAS8)
         self.assertRegex(RCAS8, r"%ra1 = insertvalue \{ <4 x float>, i1, i1 \} %ra0, i1 %chg, 1")
-        self.assertRegex(RCAS8, r"%rf1 = insertvalue \{ <4 x float>, i1, i1 \} %rf0, i1 true, 1")   # sharpening path
+        # sharpening path: every lane but the static ones of the mid pass (w_eff 0 there returns M bit for bit)
+        self.assertRegex(RCAS8, r"%rf1 = insertvalue \{ <4 x float>, i1, i1 \} %rf0, i1 %nst, 1")
 
     def test_ir_guards_both_stores(self):
         self.assertRegex(RCAS8, r"%pdf = getelementptr i8, ptr addrspace\(4\) %tbl, i64 32\n"
