@@ -561,7 +561,7 @@ define internal i32 @cost5(<4 x i32> %vp, <4 x i32> %vc, i32 %X, i32 %Y, i32 %cx
   ret i32 %key
 }
 
-attributes #0 = { "amdgpu-flat-work-group-size"="64,64" }
+attributes #0 = { "amdgpu-flat-work-group-size"="64,64" "denormal-fp-math-f32"="preserve-sign,preserve-sign" }
 !0 = !{}
 
 ; lower-middle of 4 values: min(max(min(a,b), min(c,d)), min(max(a,b), max(c,d))) (a value between the 2nd and 3rd)

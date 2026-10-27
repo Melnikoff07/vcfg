@@ -63,7 +63,8 @@ typedef struct {
     int pace_order;      // 0 = auto (!pcopy -> pre-submit), 1 = force pre-submit, 2 = force post-submit, 3 = timer pacing
     int shave_mode;      // 0 = auto (Valve+Shave), 1 = Valve only (no Shave), 2 = Late alloc (no early alloc at boot)
     int reg_mode;        // 0 = auto (inline extend + auto-reloc), 1 = separate group at top (16-N), 2 = deferred (frame 120)
-    int post_mid;        // 0 = auto, 1 = generated mid frames only, 2 = generated + real frames
+    int post_mid;        // 0 = auto, 1 = generated mid frames only, 2 = generated + real frames,
+                         //     3 = AA Light on the real frame too, with the static handling (Sharpness 0 only)
     int manual_mode;     // 0 = auto (algorithm), 1 = manual dev overrides active in config-<TITLE>.ini
     int vout_path;       // 0 = auto, 1 = decoupled sceVideoOutSubmitFlip path learned at runtime
     int gv_conv;         // -1 = auto/uncalibrated, 0..15 = learned motion-vector convention
@@ -320,6 +321,8 @@ static uint64_t g_slot_cpu[4], g_ts_slot_seen = 0, g_ts_first = 0, g_ts_cpu_firs
 static uint32_t g_ts_n = 0;
 static uint64_t g_praw[12];
 static uint64_t g_ts_pass[4], g_pp[10], g_ts_span = 0, g_ts_span_max = 0;
+static uint64_t g_pp_split[3];   // mode 8, per window: warp8 t2[4]..t2[5], rcas8+osd t2[5]..t2[7], pcopy8 t2[7]..t2[6]
+static uint32_t g_pp_split_n = 0;
 static uint32_t g_ts_span_n = 0;
 static uint32_t g_pend_seq = 0, g_pend_slot = 0;
 static int g_inject_on = 0;
@@ -1237,6 +1240,40 @@ static void calc_rcas_params(uint32_t target_mask, uint32_t *con_bits_out, uint3
     *flags_out = rcas_flags;
 }
 
+// Option post_mid = 3 (first measured on CUSA18723): with Enhance AA on and Sharpness 0, the real frame gets the same
+// AA as the generated one (rcas8 flags 3 in one dispatch, plus the static handling of bit 5 below), so edges are
+// smoothed the same way in both frames. Not the default: the real frame is the next pair's P, so a moving edge is
+// smoothed in P and again in the generated frame (corpus, Sharpness 0: moving-edge PSNR -0.32 dB training, -0.74 dB
+// validation against v2.35). Sharpness > 0 keeps the generated-frame-only post-process (sharpening the real frame in
+// place was measured worse, see post_mid_only). P must be the game's own 8-bit buffer (the 3-buffer ring without the
+// history copy, or a full-size copy): with the 16-bpp history copy the write-back test of bit 5 cannot match, so it
+// stays mid-only. Game vectors (warp8g) keep the game's alpha, so the static bits 4 and 5 below are never set and the
+// real frame would get the AA on its static pixels too (offline: HUD -1.9 dB, still areas -3.2 dB): mid-only there.
+static int real_aa_on(void)
+{
+    return g_cfg.post_mid == 3 && g_cfg.upscale > 0 && g_cfg.sharpness == 0 && !g_t_prev_half16 && !gv_warp_active();
+}
+
+// rcas8 flag bit 4: warp8 writes the mid's alpha as a static-pixel flag (1.0 where P == C in RGB, 254/255 elsewhere)
+// and rcas8 leaves those pixels raw on the mid pass (no AA and, with Sharpness > 0, no sharpening either; no store,
+// and a wave whose 64 pixels are all static skips the pass after its tile load): the real frames show those pixels
+// raw, so a post-process only in the generated frame alternates at 30 Hz (HUD, still scenery). warp8g keeps the game's alpha, so the bit is set only for warp8, and
+// only when the real frame is not post-processed in the same dispatch (bit 1, post_mid = 2): then both frames get the
+// AA and a static pixel must get it in the mid too.
+//
+// Bit 5 (with bits 0, 1 and 4, real_aa_on() only): the real frame gets the AA too, in place, and it is the next
+// pair's P. AA on the static pixels of P made warp8 stop seeing them as static (offline: HUD -1.9 dB, still areas
+// -3.2 dB, HUD flicker +18 % against the mid-only AA), so the cur pass skips the AA where the mid pass found the static
+// flag, and writes the pixel back raw where its AA result equals P's stored code (static, but P holds last frame's AA
+// of it; without that, every edge that once moved stays AA'd in P and never compares static again).
+static uint32_t rcas_static_flag(uint32_t rcas_flags)
+{
+    if (gv_warp_active()) return rcas_flags;
+    if ((rcas_flags & 3u) == 1u) return rcas_flags | 16u;
+    if ((rcas_flags & 3u) == 3u && real_aa_on()) return rcas_flags | 48u;
+    return rcas_flags;
+}
+
 // 1.4: Native post-processing pass on T#cur only (when FrameGen is OFF or inert due to resolution / 60fps / no mbuf).
 // Keeps L3+R3 menu, corner FPS overlay, and Enhance AA + RCAS working in ANY game without locking to 30 fps!
 static uint32_t build_dcb_post8(uint32_t *p0, uint64_t C, uint32_t w, uint32_t h, uint32_t pitch, uint32_t tidx,
@@ -1326,6 +1363,7 @@ static int post_mid_only(void)
 {
     if (g_cfg.post_mid == 1) return 1;
     if (g_cfg.post_mid == 2) return 0;
+    if (real_aa_on()) return 0;
     if (g_mid_only < 0) {
         g_mid_only = 1;
         lg("post-process target: generated frames only (default, keeps real C/P unmodified)\n");
@@ -1361,7 +1399,23 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
                         | (pyr_warm ? FG8_FLAG_PYR_WARM : 0u)
                         | (cut_blocks8() << 16);
     uint32_t mid1_packed = (mid1_idx & 0x7FFFu) | ((t1_q16 & 0xFFFFu) << 16);
-    if (!g_bench_offscreen) fg8_resolve_2buf_history(&P, C, &copy_dst, &copy_idx, seq);
+    // History copy on a 3-buffer ring (every title; proven on CUSA18723): a game that flips its buffers in turn leaves
+    // the previous real frame untouched in g_buf[g_prev_idx] until it renders into it again two flips later, which is
+    // submitted after this DCB on the same graphics ring. The full-frame pcopy8 into g_pbuf (8.3 MB written to
+    // FlexibleMemory plus two barriers per real frame) then copies exactly what P already holds: skip it and keep P in
+    // the game's buffer. Pacing is untouched (g_pcopy_on / g_pcopy_avail and the reserved g_pbuf stay as they are), and
+    // the copy comes back by itself when the ring turns 2-buffer at runtime or a real present copy runs (copy_dst != 0).
+    // A 3-buffer game that rewrote its previous buffer before the next flip would show the wrong P here.
+    if (!g_bench_offscreen) {
+        static int s_pbuf_skip_logged = 0;
+        int pbuf_skip = !copy_dst && g_ngame >= 3 && !g_runtime_2buf;
+        if (pbuf_skip != s_pbuf_skip_logged) {
+            s_pbuf_skip_logged = pbuf_skip;
+            lg("history copy: %s\n", pbuf_skip ? "skipped (3-buffer ring, P read from the game's buffer)" : "on");
+        }
+        if (pbuf_skip) { g_t_prev_half16 = 0; g_pcopy_dst_half16 = 0; g_pbuf_valid = 0; }
+        else fg8_resolve_2buf_history(&P, C, &copy_dst, &copy_idx, seq);
+    }
 
     fill_table8_wh(tb, P, C, M1, g_bw, g_bh, pitch, tidx, r, mid1_packed, base_flags, g_work, g_mon, stats);
 
@@ -1371,12 +1425,13 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     if (!g_mem_tight || g_cfg.upscale > 0)
         calc_rcas_params((post_mid_only() || g_bench_offscreen) ? 1u /*mid1 only*/ : mask1, &rcas_con_bits, &rcas_flags1);
     if (g_sh8_off[15] && !g_bench_offscreen) osd_build_slot(slotb + OSD_SLOT_OFF, &osd_xy, &osd_wh1, mask1);
+    rcas_flags1 = rcas_static_flag(rcas_flags1);
     fill_table8_ext(tb, g_gpu, slotb, rcas_con_bits, rcas_flags1, osd_xy, osd_wh1);
 
     *(volatile uint64_t *)(slotb + 0x900) = 0;
     *(volatile uint64_t *)(slotb + 0x908) = 0;
     for (int i = 0; i < 5; i++) *(volatile uint64_t *)(slotb + 0x910 + i * 8) = 0;
-    for (int i = 0; i < 7; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
+    for (int i = 0; i < 8; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
 #define DISPATCH(x, y) do { *p++ = PKT3(0x15, 4, 1); *p++ = (x); *p++ = (y); *p++ = 1; *p++ = 1; } while (0)
     const FgDim D = fg_dim(g_bw, g_bh);   // 1080p: the literals that stood here (30 x 68, 240 x 135, ...), see fg_res.h
     *p++ = PKT3(0x46, 1, 0); *p++ = 0x0000002E;
@@ -1472,6 +1527,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         tb2[29] = (mid2_idx & 0x7FFFu) | 0x8000u /*skip_st*/ | ((t2_q16 & 0xFFFFu) << 16);
         uint32_t rcas_con2 = 0, rcas_flags2 = 0, osd_wh2 = (osd_wh1 & 0x00FFFFFFu) | (3u << 24);
         calc_rcas_params(post_mid_only() ? 1u /*mid2 only*/ : 3u /*mid2 + cur*/, &rcas_con2, &rcas_flags2);
+        rcas_flags2 = rcas_static_flag(rcas_flags2);
         fill_table8_ext(tb2, g_gpu, slotb, rcas_con2, rcas_flags2, osd_xy, osd_wh1 ? osd_wh2 : 0u);
 
         int32_t fr2 = insert_wait_flip_done(p, 7, vo_handle, mid2_idx);
@@ -1510,6 +1566,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         g_dump_req = 0;
         g_dump_frame = seq;
     }
+    TS2(7);   // t2[5]..t2[7] = rcas8 (+ osd8 / FG Fast mid2), t2[7]..t2[6] = pcopy8 (0 when no copy runs)
     if (copy_dst && g_sh8_off[16]) {   // present copy: finished real frame -> own display or history buffer (see g_pcopy_avail / g_pbuf)
         uint32_t *tb3 = (uint32_t *)(slotb + OSD_SLOT_OFF);   // old text-grid OSD area, unused since the bitmap overlay
         uint64_t tbl3 = (uint64_t)(uintptr_t)tb3;
@@ -1669,7 +1726,7 @@ static int parse_ini_file_ex(const char *path, fg_config_t *c, uint32_t *hash_io
                 else if (strcmp(key, "pace_order") == 0) raw_pace = val < 0 ? 0 : (val > 3 ? 3 : val);
                 else if (strcmp(key, "shave_mode") == 0) raw_shave = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "reg_mode") == 0) raw_reg = val < 0 ? 0 : (val > 2 ? 2 : val);
-                else if (strcmp(key, "post_mid") == 0) raw_post = val < 0 ? 0 : (val > 2 ? 2 : val);
+                else if (strcmp(key, "post_mid") == 0) raw_post = val < 0 ? 0 : (val > 3 ? 3 : val);
                 else if (strcmp(key, "adapt_ver") == 0) raw_adapt_ver = val;
                 else if (strcmp(key, "shave2_failed") == 0) raw_shave2_failed = (val != 0);
                 else if (strcmp(key, "early_crashes") == 0) raw_early_crashes = val < 0 ? 0 : (val > 99 ? 99 : val);
@@ -3334,6 +3391,12 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                 uint64_t mk[9] = { ts[0], ts[1], t2[0], t2[1], t2[2], t2[3], ts[2], ts[3], t2[4] };
                                 for (int i = 0; i < 8; i++) g_pp[i] += (mk[i + 1] > mk[i]) ? mk[i + 1] - mk[i] : 0;
                                 g_pp[8] += (ts[4] > t2[4]) ? ts[4] - t2[4] : 0;
+                                if (t2[7] && t2[5] >= t2[4] && t2[7] >= t2[5] && t2[6] >= t2[7]) {
+                                    g_pp_split[0] += t2[5] - t2[4];
+                                    g_pp_split[1] += t2[7] - t2[5];
+                                    g_pp_split[2] += t2[6] - t2[7];
+                                    g_pp_split_n++;
+                                }
                             }
                         }
                         g_ts_n++;
@@ -3377,7 +3440,13 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                    (double)g_pp[3] / g_ts_n / unit * 1000.0, (double)g_pp[4] / g_ts_n / unit * 1000.0, (double)g_pp[5] / g_ts_n / unit * 1000.0,
                                    (double)g_pp[6] / g_ts_n / unit * 1000.0, (double)g_pp[7] / g_ts_n / unit * 1000.0, (double)g_pp[8] / g_ts_n / unit * 1000.0);
                                 lg("PASS RAW last frame: ts %llu %llu %llu %llu %llu | t2 %llu %llu %llu %llu %llu %llu %llu\n", (unsigned long long)g_praw[0], (unsigned long long)g_praw[1], (unsigned long long)g_praw[2], (unsigned long long)g_praw[3], (unsigned long long)g_praw[4], (unsigned long long)g_praw[5], (unsigned long long)g_praw[6], (unsigned long long)g_praw[7], (unsigned long long)g_praw[8], (unsigned long long)g_praw[9], (unsigned long long)g_praw[10], (unsigned long long)g_praw[11]);
+                                if (g_pp_split_n)   // separate line: parsers of "PASSES ms:" / "PASS RAW" stay valid
+                                    lg("PASSES split ms: warp8 %.2f rcas8+osd %.2f pcopy8 %.2f (frames %u)\n",
+                                       (double)g_pp_split[0] / g_pp_split_n / unit * 1000.0, (double)g_pp_split[1] / g_pp_split_n / unit * 1000.0,
+                                       (double)g_pp_split[2] / g_pp_split_n / unit * 1000.0, g_pp_split_n);
                                 for (int i = 0; i < 10; i++) g_pp[i] = 0;
+                                for (int i = 0; i < 3; i++) g_pp_split[i] = 0;
+                                g_pp_split_n = 0;
                                 if (g_st_n)
                                     lg("FRAMES %u: unmatched blocks avg %.0f max %u, scene-cut frames %u, fade frames %u | foreground: "
                                        "in %u frames, avg %.1f L2 blocks | camera %d,%d L2 px | log lines dropped %u\n", g_st_n,
