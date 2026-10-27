@@ -243,13 +243,24 @@ static void log_open(void)
 
 #define VCFG_ENGINE "classic"
 #include "vcfg_trace.h"
+#include "cpu_cost.h"
+
+// q-cpucost cuts (cpu_cost.h), one opt-in file each, read once by cc_read_cuts when the io thread starts.
+static int g_cc_monev = 0, g_cc_iolazy = 0, g_cc_nospin = 0, g_cc_quiet = 0;
+static volatile uint32_t g_cc_lines = 0, g_cc_klog_bytes = 0;   // lines through klog and their bytes (CPU plugin line)
 
 static volatile uint32_t g_lgw_lock;   // lg_write may run on the game's thread (sync window) and the io thread at once
 static void lg_write(const char *buf)
 {
     while (__atomic_exchange_n(&g_lgw_lock, 1u, __ATOMIC_ACQUIRE)) sceKernelUsleep(50);
-    klog("[bb_probe] %s", buf);
-    vcfg_trace(buf);
+    if (buf[0] == CC_QUIET_MARK) {   // quietlog: a periodic diagnostic line, probe.log only
+        buf++;
+    } else {
+        klog("[bb_probe] %s", buf);
+        g_cc_lines++;
+        g_cc_klog_bytes += (uint32_t)strlen(buf) + 11u;
+        vcfg_trace(buf);
+    }
     log_open();
     if (g_log) { fputs(buf, g_log); fflush(g_log); }
     __atomic_store_n(&g_lgw_lock, 0u, __ATOMIC_RELEASE);
@@ -272,6 +283,18 @@ static int lgq_trylock(void)
 }
 static void lgq_unlock(void) { __atomic_store_n(&g_lgq_lock, 0u, __ATOMIC_RELEASE); }
 
+// buf is a 384-byte line buffer (the size of a queue slot), so the whole slot is copied.
+static void lg_put(char *buf)
+{
+    if (g_lg_async && !lg_sync_window()) {
+        if (lgq_trylock()) {
+            if (g_lgq_w - g_lgq_r < LGQ_N) { memcpy(g_lgq[g_lgq_w % LGQ_N], buf, sizeof(g_lgq[0])); g_lgq_w++; } else g_lgq_drop++;
+            lgq_unlock();
+        } else g_lgq_drop++;
+        return;
+    }
+    lg_write(buf);
+}
 void lg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void lg(const char *fmt, ...)
 {
@@ -280,14 +303,22 @@ void lg(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (g_lg_async && !lg_sync_window()) {
-        if (lgq_trylock()) {
-            if (g_lgq_w - g_lgq_r < LGQ_N) { memcpy(g_lgq[g_lgq_w % LGQ_N], buf, sizeof(buf)); g_lgq_w++; } else g_lgq_drop++;
-            lgq_unlock();
-        } else g_lgq_drop++;
-        return;
-    }
-    lg_write(buf);
+    lg_put(buf);
+}
+// Periodic diagnostic line (LATENCY, CADENCE, PASSES, FRAMES, ...): the same as lg() unless quietlog is on; then it
+// goes to probe.log only, and without the debug log it is not even formatted.
+static void lgd(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void lgd(const char *fmt, ...)
+{
+    if (g_cc_quiet && !g_log) return;
+    char buf[384];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf + (g_cc_quiet ? 1 : 0), sizeof(buf) - 1u, fmt, ap);
+    va_end(ap);
+    buf[sizeof(buf) - 1u] = 0;
+    if (g_cc_quiet) buf[0] = CC_QUIET_MARK;
+    lg_put(buf);
 }
 
 // File only (no klog, no trace copy): bulk debug lines such as FTRACE.
@@ -2494,6 +2525,205 @@ static uint32_t refresh_period_q8(void)
     uint32_t q = __atomic_load_n(&g_vb_win_q8, __ATOMIC_ACQUIRE);
     return q ? q : vb_period_q8_from_hz10(g_last_hz_x10);
 }
+
+// ---- q-cpucost (cpu_cost.h): opt-in cuts of the plugin's own CPU work and the CPU plugin line ----
+static uint32_t g_cpu_ema_us;   // defined with the pacers' state below
+int32_t sceVideoOutAddVblankEvent(OrbisKernelEqueue eq, int32_t handle, void *udata);
+int32_t sceVideoOutAddFlipEvent(OrbisKernelEqueue eq, int32_t handle, void *udata);
+static volatile uint32_t g_cc_mon_wakes, g_cc_mon_vb, g_cc_mon_flip, g_cc_mon_to, g_cc_mon_lat_n, g_cc_mon_lat_max;
+static volatile uint64_t g_cc_mon_lat_sum;
+static volatile uint32_t g_cc_io_wakes, g_cc_pad_wakes, g_cc_shq_polls, g_cc_pace_n, g_cc_pace_err_max;
+static volatile uint64_t g_cc_spin_us, g_cc_pace_err_sum;
+static volatile uint64_t g_cc_io_cpu_us, g_cc_pad_cpu_us;   // cumulative thread CPU of the io and pad threads (us)
+static uint64_t g_cc_off_rel = 0;                           // framegen=0: when the game's SubmitAndFlip returned (us)
+static uint32_t g_cc_off_n = 0, g_cc_off_sum_us = 0, g_cc_off_max_us = 0;   // hook thread only
+static uint32_t g_cc_late_ema = 0;                          // pacer sleep lateness (hook thread only)
+static int32_t g_cc_clk_rc = 0;                             // last refusal of a CPU clock (0: none)
+#define CC_CLK_THREAD  14   // FreeBSD CLOCK_THREAD_CPUTIME_ID (the toolchain's time.h has the Linux numbers)
+#define CC_CLK_PROCESS 15   // FreeBSD CLOCK_PROCESS_CPUTIME_ID (Sony's header names 15 PROCTIME: checked against CLOCK_PROF)
+#define CC_CLK_PROF    2    // FreeBSD CLOCK_PROF: user + system time of the process
+
+// CPU time of the calling thread or of the whole game process (us), through sceKernelClockGettime (declared without a
+// prototype in the toolchain header). 0, with the error code kept in g_cc_clk_rc, when the clock is refused.
+static uint64_t cc_cpu_us(int32_t clk)
+{
+    struct timespec ts;
+    memset(&ts, 0, sizeof(ts));
+    int32_t rc = ((int32_t (*)(int32_t, struct timespec *))sceKernelClockGettime)(clk, &ts);
+    if (rc) { g_cc_clk_rc = rc; return 0u; }
+    return cc_ts_us((int64_t)ts.tv_sec, (int64_t)ts.tv_nsec);
+}
+static int cc_file(const char *name)
+{
+    char p[64];
+    snprintf(p, sizeof(p), LOG_DIR "/%s_%s", name, g_title_id);
+    int fd = sceKernelOpen(p, 0, 0666);
+    if (fd < 0) return 0;
+    sceKernelClose(fd);
+    return 1;
+}
+// Once, when the io thread starts (title known, outside plugin_load).
+static void cc_read_cuts(void)
+{
+    g_cc_monev = cc_file("monev");
+    g_cc_iolazy = cc_file("iolazy");
+    g_cc_nospin = cc_file("nospin");
+    g_tr_lite = cc_file("tracelite");
+    g_cc_quiet = cc_file("quietlog");
+    lg("cpu cuts: monev=%d iolazy=%d nospin=%d tracelite=%d quietlog=%d (files " LOG_DIR "/<cut>_%s)\n",
+       g_cc_monev, g_cc_iolazy, g_cc_nospin, g_tr_lite, g_cc_quiet, g_title_id);
+}
+
+// Timer pacers: wait until the process-time counter reaches target. Today: sleep until 1 ms before it (nothing below
+// 1.5 ms) and spin the rest. nospin: sleep the remaining time minus the measured lateness and return, never spin.
+// Both measure the spin and how far from the target the game is released.
+static void cc_wait_until(uint64_t target)
+{
+    uint64_t now = sceKernelGetProcessTimeCounter();
+    if (now >= target || !g_freq) return;
+    uint64_t rem_us = (target - now) * 1000000ull / g_freq;
+    uint32_t s = g_cc_nospin ? cc_nospin_sleep_us(rem_us, g_cc_late_ema) : cc_spin_sleep_us(rem_us);
+    if (s) {
+        uint64_t a = sceKernelGetProcessTime();
+        sceKernelUsleep(s);
+        g_cc_late_ema = cc_late_ema(g_cc_late_ema, s, sceKernelGetProcessTime() - a);
+    }
+    if (!g_cc_nospin) {
+        uint64_t s0 = sceKernelGetProcessTimeCounter();
+        while (sceKernelGetProcessTimeCounter() < target) { }
+        uint64_t s1 = sceKernelGetProcessTimeCounter();
+        if (s1 > s0) g_cc_spin_us += (s1 - s0) * 1000000ull / g_freq;
+    }
+    uint64_t end = sceKernelGetProcessTimeCounter();
+    uint64_t err = (end > target ? end - target : target - end) * 1000000ull / g_freq;
+    g_cc_pace_n++;
+    g_cc_pace_err_sum += err;
+    if (err > g_cc_pace_err_max) g_cc_pace_err_max = err > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)err;
+}
+
+// Pending flips for a decision in the hook. With monev the monitor sleeps between vblanks, so its sample misses the
+// flips the hook submitted since: read the raw status instead (one VideoOut call per decision, a few per frame).
+static uint32_t cc_pending_flips(void)
+{
+    if (g_cc_monev && g_handle >= 0) {
+        VoFlipStatus fs;
+        memset(&fs, 0, sizeof(fs));
+        if (read_flip_status(g_handle, &fs) == 0) return (uint32_t)(fs.flipPendingNum > 0 ? fs.flipPendingNum : 0);
+    }
+    return __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE);
+}
+
+// monev: our own event queue on the game's handle, vblank + flip events (udata tells them apart). Returns 1 while
+// vblank events are on; on any refusal the monitor polls as before.
+static OrbisKernelEqueue g_cc_eq;
+static int g_cc_eq_made = 0, g_cc_eq_vb = 0;
+static int32_t g_cc_eq_h = -1;
+static int cc_mon_attach(int32_t h)
+{
+    if (g_cc_eq_h == h) return g_cc_eq_vb;
+    if (!g_cc_eq_made) {
+        int32_t r = sceKernelCreateEqueue(&g_cc_eq, "bb_mon");
+        if (r) { lg("monitor events: equeue 0x%08x -> polling as before\n", (unsigned)r); g_cc_monev = 0; return 0; }
+        g_cc_eq_made = 1;
+    }
+    int32_t rv = sceVideoOutAddVblankEvent(g_cc_eq, h, CC_EV_VBLANK);
+#if VCFG_2BUF_TEST
+    int32_t rf = -1;   // test builds hook sceVideoOutAddFlipEvent to find the game's own waits: vblank events only
+#else
+    int32_t rf = sceVideoOutAddFlipEvent(g_cc_eq, h, CC_EV_FLIP);
+#endif
+    g_cc_eq_h = h;
+    g_cc_eq_vb = rv == 0;
+    lg("monitor events on handle %d: vblank 0x%08x flip 0x%08x -> %s\n", (int)h, (unsigned)rv, (unsigned)rf,
+       g_cc_eq_vb ? "event wait" : "polling as before");
+    if (!g_cc_eq_vb) g_cc_monev = 0;
+    return g_cc_eq_vb;
+}
+// Monitor wait: 1 when a vblank event woke it (the vblank status then belongs to the vblank that just happened).
+static int cc_mon_wait(void)
+{
+    if (g_cc_monev && g_handle >= 0 && cc_mon_attach(g_handle)) {
+        OrbisKernelEvent ev[4];
+        int32_t n = 0, vb = 0;
+        OrbisKernelUseconds to = CC_MON_EV_TIMEOUT_US;
+        int32_t rc = sceKernelWaitEqueue(g_cc_eq, ev, 4, &n, &to);
+        if (rc == 0 && n > 0) {
+            for (int32_t i = 0; i < n && i < 4; i++) {
+                if (ev[i].udata == CC_EV_VBLANK) { vb = 1; g_cc_mon_vb++; }
+                else if (ev[i].udata == CC_EV_FLIP) g_cc_mon_flip++;
+            }
+        } else if (rc == 0 || (uint32_t)rc == 0x8002003cu || (uint32_t)rc == 0x80020004u) {
+            g_cc_mon_to++;   // timeout or interrupted: sample anyway
+        } else {
+            lg("monitor events: wait 0x%08x -> polling as before\n", (unsigned)rc);
+            g_cc_monev = 0;
+        }
+        return vb;
+    }
+    sceKernelUsleep(CC_MON_POLL_US);
+    return 0;
+}
+static void cc_mon_vblank_latency(uint64_t vb_t)
+{
+    uint64_t now = sceKernelGetProcessTime();
+    uint64_t l = now > vb_t ? now - vb_t : 0u;
+    if (l > 0xFFFFFFFFull) l = 0xFFFFFFFFull;
+    g_cc_mon_lat_n++;
+    g_cc_mon_lat_sum += l;
+    if ((uint32_t)l > g_cc_mon_lat_max) g_cc_mon_lat_max = (uint32_t)l;
+}
+// Monitor window (2 s), debug log on: wake-ups per second of each plugin thread, their CPU and the game process's CPU,
+// the pacer's spin and release error, the shallow queue's polls, the flight recorder's and klog's writes, the cuts on
+// and the game's own time per frame. The same line with and without a cut file compares it in the same scene.
+static void cc_window_log(uint64_t dt_us)
+{
+    static uint64_t last_mon, last_io, last_pad, last_proc, last_prof, last_tr_bytes;
+    static uint32_t last_tr_flushes;
+    static int primed = 0;
+    uint64_t mon = cc_cpu_us(CC_CLK_THREAD), proc = cc_cpu_us(CC_CLK_PROCESS), prof = cc_cpu_us(CC_CLK_PROF);
+    uint64_t io = __atomic_load_n(&g_cc_io_cpu_us, __ATOMIC_ACQUIRE), pad = __atomic_load_n(&g_cc_pad_cpu_us, __ATOMIC_ACQUIRE);
+    uint32_t wk = __atomic_exchange_n(&g_cc_mon_wakes, 0u, __ATOMIC_ACQ_REL), vb = __atomic_exchange_n(&g_cc_mon_vb, 0u, __ATOMIC_ACQ_REL);
+    uint32_t fl = __atomic_exchange_n(&g_cc_mon_flip, 0u, __ATOMIC_ACQ_REL), to = __atomic_exchange_n(&g_cc_mon_to, 0u, __ATOMIC_ACQ_REL);
+    uint32_t ln = __atomic_exchange_n(&g_cc_mon_lat_n, 0u, __ATOMIC_ACQ_REL), lmax = __atomic_exchange_n(&g_cc_mon_lat_max, 0u, __ATOMIC_ACQ_REL);
+    uint64_t lsum = __atomic_exchange_n(&g_cc_mon_lat_sum, 0ull, __ATOMIC_ACQ_REL);
+    uint32_t iow = __atomic_exchange_n(&g_cc_io_wakes, 0u, __ATOMIC_ACQ_REL), pw = __atomic_exchange_n(&g_cc_pad_wakes, 0u, __ATOMIC_ACQ_REL);
+    uint32_t shq = __atomic_exchange_n(&g_cc_shq_polls, 0u, __ATOMIC_ACQ_REL), pn = __atomic_exchange_n(&g_cc_pace_n, 0u, __ATOMIC_ACQ_REL);
+    uint32_t pmax = __atomic_exchange_n(&g_cc_pace_err_max, 0u, __ATOMIC_ACQ_REL);
+    uint64_t psum = __atomic_exchange_n(&g_cc_pace_err_sum, 0ull, __ATOMIC_ACQ_REL), spin = __atomic_exchange_n(&g_cc_spin_us, 0ull, __ATOMIC_ACQ_REL);
+    uint32_t lines = __atomic_exchange_n(&g_cc_lines, 0u, __ATOMIC_ACQ_REL), kb = __atomic_exchange_n(&g_cc_klog_bytes, 0u, __ATOMIC_ACQ_REL);
+    uint32_t trf = g_tr_flushes;
+    uint64_t trb = g_tr_bytes;
+    if (primed && g_log && dt_us) {
+        double k = 1000.0 / (double)dt_us;   // us of CPU over the window -> ms per second
+        lgd("CPU plugin: wake/s mon %.0f (vb %u flip %u to %u, vb lat avg %.0f max %u us) io %.0f pad %.0f | cpu ms/s mon %.2f "
+            "io %.2f pad %.2f game process %.0f (prof %.0f) | pacer spin ms/s %.2f err avg %.0f max %u us (%u) | shq polls/s %.0f | "
+            "trace %u flushes %.0f B/s | klog %.1f lines/s %.0f B/s | cuts %d%d%d%d%d clk 0x%x | own %.1f ms\n",
+            cc_per_s(wk, dt_us), vb, fl, to, ln ? (double)lsum / ln : 0.0, lmax, cc_per_s(iow, dt_us), cc_per_s(pw, dt_us),
+            (double)(mon - last_mon) * k, (double)(io - last_io) * k,
+            (double)(pad - last_pad) * k, (double)(proc - last_proc) * k, (double)(prof - last_prof) * k,
+            (double)spin * k, pn ? (double)psum / pn : 0.0, pmax, pn, cc_per_s(shq, dt_us),
+            trf - last_tr_flushes, cc_per_s(trb - last_tr_bytes, dt_us), cc_per_s(lines, dt_us), cc_per_s(kb, dt_us),
+            g_cc_monev, g_cc_iolazy, g_cc_nospin, g_tr_lite, g_cc_quiet, (unsigned)g_cc_clk_rc, g_cpu_ema_us / 1000.0);
+    }
+    primed = 1;
+    last_mon = mon; last_io = io; last_pad = pad; last_proc = proc; last_prof = prof; last_tr_flushes = trf; last_tr_bytes = trb;
+}
+// framegen=0 (no monitor thread): the game's own time per frame (its SubmitAndFlip returning -> the next one entering)
+// and the process CPU, from the STAT gnm window, debug log on. The same scene with framegen=1 separates the CPU.
+static void cc_fgoff_log(void)
+{
+    static uint64_t last_proc, last_prof, last_t;
+    uint64_t proc = cc_cpu_us(CC_CLK_PROCESS), prof = cc_cpu_us(CC_CLK_PROF), t = sceKernelGetProcessTime();
+    uint32_t n = g_cc_off_n, sum = g_cc_off_sum_us, mx = g_cc_off_max_us;
+    g_cc_off_n = g_cc_off_sum_us = g_cc_off_max_us = 0;
+    if (last_t && t > last_t && g_log)
+        lgd("OWN fg-off: game release->submit avg %.1f max %.1f ms (%u frames) | game process cpu ms/s %.0f (prof %.0f) | klog %u lines clk 0x%x\n",
+            n ? sum / 1000.0 / n : 0.0, mx / 1000.0, n, (double)(proc - last_proc) / (double)(t - last_t) * 1000.0,
+            (double)(prof - last_prof) / (double)(t - last_t) * 1000.0,
+            __atomic_exchange_n(&g_cc_lines, 0u, __ATOMIC_ACQ_REL), (unsigned)g_cc_clk_rc);
+    last_proc = proc; last_prof = prof; last_t = t;
+}
+
 static void pace_hz(uint32_t hz)
 {
     if (!hz || !g_freq) return;
@@ -2501,11 +2731,7 @@ static void pace_hz(uint32_t hz)
     uint64_t period = vb_ticks(g_freq, vb_q8, vb_per_frame(hz, vb_q8));   // whole refreshes: 60 -> 1, 30 -> 2, 20 -> 3
     uint64_t now = sceKernelGetProcessTimeCounter();
     if (g_pace_next == 0 || now > g_pace_next + period * 4) { g_pace_next = now + period; return; }
-    if (now < g_pace_next) {
-        uint64_t us = (g_pace_next - now) * 1000000ull / g_freq;
-        if (us > 1500) sceKernelUsleep((uint32_t)(us - 1000));
-        while (sceKernelGetProcessTimeCounter() < g_pace_next) { }
-    }
+    if (now < g_pace_next) cc_wait_until(g_pace_next);
     g_pace_next += period;
 }
 // ---- shave14: 2nd generated-frame buffer from a 16 MiB display reserve (S14_KEEP) ----
@@ -2782,10 +3008,13 @@ static void *io_thread(void *arg)
 {
     (void)arg;
     unsigned poll_n = 0;
-    int no_flip_logged = 0;
+    int no_flip_logged = 0, inert_checked = 0, busy = 1;
+    uint64_t io_t0 = sceKernelGetProcessTime(), cfg_t = io_t0, cpu_t = io_t0;
     for (;;) {
-        sceKernelUsleep(2000);
-        if (g_lgq_r != g_lgq_w) lg_drain();
+        sceKernelUsleep(cc_io_sleep_us(g_cc_iolazy, busy || g_cfg.game_vectors));   // 2 ms; iolazy 10 ms while idle
+        g_cc_io_wakes++;
+        busy = 0;
+        if (g_lgq_r != g_lgq_w) { lg_drain(); busy = 1; }
         if (g_log) {   // FTRACE: 15 records per line, each at least 6 real frames old (the monitor has completed it)
             uint32_t w = __atomic_load_n(&g_ft_w, __ATOMIC_ACQUIRE);
             if (w - g_ft_r > FT_N - 8u) { g_ft_r = w - (FT_N - 8u); g_ft_prev_h = 0; }   // fell behind: skip, restart dh
@@ -2795,7 +3024,7 @@ static void *io_thread(void *arg)
                     for (int j = 0; j < 3; j++) rec[i][j] = __atomic_load_n(&g_ft[(g_ft_r + i) % FT_N][j], __ATOMIC_RELAXED);
                 char fb[512];
                 uint32_t nd = ft_format(fb, sizeof(fb), (const uint32_t (*)[3])rec, 15u, g_ft_prev_h);
-                if (nd) { g_ft_prev_h = rec[nd - 1][0]; g_ft_r += nd; lg_file_only(fb); }
+                if (nd) { g_ft_prev_h = rec[nd - 1][0]; g_ft_r += nd; lg_file_only(fb); busy = 1; }
                 else g_ft_r += 15u;
             }
         }
@@ -2803,7 +3032,14 @@ static void *io_thread(void *arg)
         if (__atomic_exchange_n(&g_cfg_save_req, 0, __ATOMIC_ACQ_REL)) cfg_save_game_ini();
         if (g_inject_on == 8) gv_io_tick();
         poll_n++;
-        if (!no_flip_logged && poll_n == 5000 && g_flips == 0 && g_vo_submit_flips == 0) {
+        uint64_t io_now = sceKernelGetProcessTime();
+        // Periodic jobs: by wake-up count as before (5000 x 2 ms, 250 x 2 ms), by elapsed time with iolazy.
+        int inert_due = g_cc_iolazy ? (!inert_checked && io_now - io_t0 >= CC_IO_INERT_US) : (poll_n == 5000);
+        int cfg_due = g_cc_iolazy ? (io_now - cfg_t >= CC_IO_CFG_US) : ((poll_n % 250) == 0);
+        if (inert_due) inert_checked = 1;
+        if (cfg_due) cfg_t = io_now;
+        if (io_now - cpu_t >= 1000000ull) { cpu_t = io_now; __atomic_store_n(&g_cc_io_cpu_us, cc_cpu_us(CC_CLK_THREAD), __ATOMIC_RELEASE); }
+        if (!no_flip_logged && inert_due && g_flips == 0 && g_vo_submit_flips == 0) {
             no_flip_logged = 1;
             snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: NO GNM FLIP");
             size_t dm2m = dm_avail(0x200000), dm4k = dm_avail(0x4000);
@@ -2818,7 +3054,7 @@ static void *io_thread(void *arg)
                   g_dbg_allocs, g_dbg_alloc_fail, g_dbg_maps, g_dbg_releases, g_dbg_batch_maps,
                   rw ? g_api_ring[(rw - 1u) % API_RING_N] : "none");
         }
-        if ((poll_n % 250) == 0 && g_inject_on == 8 && !g_bench_enabled) {
+        if (cfg_due && g_inject_on == 8 && !g_bench_enabled) {
             save_adapt_ini();
             cfg_reload_from_disk(0);
         }
@@ -2856,7 +3092,8 @@ static void *mon_thread(void *arg)
     int last_buf = -1, pend_max = 0, gcq_max = 0;
     uint32_t ft_mid_nv = 0, ft_real_rec = 0;   // FTRACE: hold of the last generated frame, record of the real on screen
     for (;;) {
-        sceKernelUsleep(500);
+        int woke_vb = cc_mon_wait();   // 500 us sleep as before, or with monev the next vblank / flip event
+        g_cc_mon_wakes++;
         if (g_handle < 0) continue;
         memset(&fs, 0, sizeof(fs));
         memset(&vs, 0, sizeof(vs));
@@ -2865,6 +3102,7 @@ static void *mon_thread(void *arg)
             __atomic_store_n(&g_vblank_t_us, vs.processTime, __ATOMIC_RELEASE);
             __atomic_store_n(&g_vblank_cnt, vs.count, __ATOMIC_RELEASE);
             vblank_pll_update(vs.count, vs.processTime);
+            if (woke_vb) cc_mon_vblank_latency(vs.processTime);
         }
         __atomic_store_n(&g_cur_pending_flips, (uint32_t)(fs.flipPendingNum > 0 ? fs.flipPendingNum : 0), __ATOMIC_RELEASE);
         __atomic_store_n(&g_cur_gcq, (uint32_t)(fs.gcQueueNum > 0 ? fs.gcQueueNum : 0), __ATOMIC_RELEASE);
@@ -2955,11 +3193,11 @@ static void *mon_thread(void *arg)
             uint32_t cn_ = __atomic_exchange_n(&g_cpu_n, 0u, __ATOMIC_ACQ_REL);
             uint32_t csum_ = __atomic_exchange_n(&g_cpu_sum_us, 0u, __ATOMIC_ACQ_REL);
             uint32_t cmax_ = __atomic_exchange_n(&g_cpu_max_us, 0u, __ATOMIC_ACQ_REL);
-            lg("LATENCY real frame hand-over -> on screen: avg %.1f max %.1f ms (%llu frames) | FG %s preset %d | pending max %d\n",
+            lgd("LATENCY real frame hand-over -> on screen: avg %.1f max %.1f ms (%llu frames) | FG %s preset %d | pending max %d\n",
                g_lat_n ? (double)g_lat_sum / 1000.0 / (double)g_lat_n : 0.0, (double)g_lat_max / 1000.0,
                (unsigned long long)g_lat_n, (g_cfg.framegen && !g_fg_off && g_fmt_supported && g_mbuf_state == 1 && !g_inert_reason[0]) ? "on" : "off", g_cfg.preset, pend_max);
             g_lat_sum = g_lat_n = g_lat_max = 0;
-            lg("CADENCE (vblanks on screen) mid 1:%u 2:%u 3:%u 4+:%u | real 1:%u 2:%u 3:%u 4+:%u | refresh %.3f Hz | "
+            lgd("CADENCE (vblanks on screen) mid 1:%u 2:%u 3:%u 4+:%u | real 1:%u 2:%u 3:%u 4+:%u | refresh %.3f Hz | "
                "pending max %d gcq max %d | missed %u (gaps %u) | pace timeouts %u resync %u fix %u | game cpu release->submit avg %.1f max %.1f ms\n",
                g_hist[0][0], g_hist[0][1], g_hist[0][2], g_hist[0][3], g_hist[1][0], g_hist[1][1], g_hist[1][2], g_hist[1][3],
                hz, pend_max, gcq_max, g_mon_missed, g_mon_gaps, g_pace_timeouts, g_pace_resync, g_pace_fix,
@@ -2967,12 +3205,13 @@ static void *mon_thread(void *arg)
             memset(g_hist, 0, sizeof(g_hist));
             // Keep the CPU measurement visible in the 200-byte flight-recorder rows.
             if (tb_title()) {
-                lg("CPU release->submit avg %.1f max %.1f ms | test=%d FG=%d pcopy=%d preset=%d\n",
+                lgd("CPU release->submit avg %.1f max %.1f ms | test=%d FG=%d pcopy=%d preset=%d\n",
                    cn_ ? csum_ / 1000.0 / cn_ : 0.0, cmax_ / 1000.0,
                    VCFG_2BUF_TEST, !g_fg_off, g_pcopy_on, g_cfg.preset);
                 tb_report();
             }
             vq_report();
+            cc_window_log(vs.processTime - win_t);
             {
                 static uint32_t stall_last_flips = 0, stall_win_cnt = 0;
                 uint32_t cur_flips = g_flips + g_vo_submit_flips;
@@ -3013,6 +3252,7 @@ static void io_start(void)
     static int io_started = 0;
     if (io_started) return;
     io_started = 1;
+    cc_read_cuts();
     OrbisPthread th2;
     int r2 = scePthreadCreate(&th2, NULL, io_thread, NULL, "bb_io");
     g_lg_async = (r2 == 0);
@@ -3207,12 +3447,12 @@ static void pace_vblank_ex(int prev2_real, int prev_real, int cur_real, int32_t 
     }
     uint64_t t0 = sceKernelGetProcessTime();
     uint64_t max_wait_us = 60000ull;
-    if (pace_pre && dt_enter_us > 0 && __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) <= 1u) {
+    if (pace_pre && dt_enter_us > 0 && cc_pending_flips() <= 1u) {
         max_wait_us = pll_adaptive_hold_us(handle, t0, dt_enter_us, 60000u);
     }
     while ((int64_t)*cnt < target) {
         uint64_t el = sceKernelGetProcessTime() - t0;
-        if (el >= max_wait_us && __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) <= 1u) {
+        if (el >= max_wait_us && cc_pending_flips() <= 1u) {
             g_pace_off = (int64_t)*cnt - ((int64_t)g_dbl_frames - step);
             break;
         }
@@ -3264,8 +3504,7 @@ static void pace_pair_ex(int32_t handle, uint64_t dt_enter_us, int pace_pre, uin
                 g_pair_next = now + (uint64_t)us * g_freq / 1000000ull;
             }
         }
-        if (us > 1500) sceKernelUsleep((uint32_t)(us - 1000));
-        while (sceKernelGetProcessTimeCounter() < g_pair_next) { }
+        cc_wait_until(g_pair_next);
         now = sceKernelGetProcessTimeCounter();
     }
     g_pair_next += period;
@@ -3280,7 +3519,7 @@ static void pace_pair_ex(int32_t handle, uint64_t dt_enter_us, int pace_pre, uin
         }
     }
     uint32_t drain_thr = pace_pcopy() ? 5u : (pace_pre ? 3u : 4u);
-    if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= drain_thr) g_pair_next += g_freq / 500u;   // drain: +2 ms
+    if (cc_pending_flips() >= drain_thr) g_pair_next += g_freq / 500u;   // drain: +2 ms
     g_rel_t = sceKernelGetProcessTime();
 }
 static void pace_pair(void) { pace_pair_ex(g_handle, 0ull, 0, 2u); }
@@ -3404,7 +3643,8 @@ static void tick(uint32_t n, uint32_t handle, uint32_t index, uint32_t mode)
         lg("gnm #%u t=%.3fs dt=%.2fms idx=%u mode=%u\n", n, (now - g_t0) / (double)g_freq, dt, index, mode);
     if (now - g_win_t >= g_freq * 2) {
         double secs = (now - g_win_t) / (double)g_freq;
-        lg("STAT gnm: %.1f flips/s, max dt %.1f ms (window %.1fs)\n", g_win_n / secs, g_win_max, secs);
+        lgd("STAT gnm: %.1f flips/s, max dt %.1f ms (window %.1fs)\n", g_win_n / secs, g_win_max, secs);
+        if (!g_mon_on) cc_fgoff_log();
         g_win_t = now; g_win_n = 0; g_win_max = 0.0;
     }
 }
@@ -3524,6 +3764,11 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
            g_vq_on, g_status_hooked);
     }
     uint64_t ft_own_us = 0;
+    if (g_cc_off_rel) {   // framegen=0, debug log: kept apart from g_cpu_* (the pacers' own-time average)
+        uint64_t us = sceKernelGetProcessTime() - g_cc_off_rel;
+        g_cc_off_rel = 0;
+        if (us < 1000000) { g_cc_off_n++; g_cc_off_sum_us += (uint32_t)us; if (us > g_cc_off_max_us) g_cc_off_max_us = (uint32_t)us; }
+    }
     if (g_rel_t) {
         uint64_t us = sceKernelGetProcessTime() - g_rel_t;
         ft_own_us = us;
@@ -3675,29 +3920,29 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             if (g_inject_on == 8) {
                                 double gpu_act = ms[0] + ms[1] + ms[3];
                                 g_last_gpu_ms_x100 = (uint32_t)(gpu_act * 100.0 + 0.5);
-                                lg("GPU time of our passes: pyramid %.2f + motion %.2f + warp/post %.2f = %.2f ms (+ fence wait %.2f) | "
+                                lgd("GPU time of our passes: pyramid %.2f + motion %.2f + warp/post %.2f = %.2f ms (+ fence wait %.2f) | "
                                    "game span avg %.1f max %.1f ms\n", ms[0], ms[1], ms[3], gpu_act, ms[2], span, spanmax);
-                                lg("PASSES ms: pyr8 %.2f me3 %.2f me2 %.2f gm8+fgs8 %.2f me1 %.2f mf8 %.2f fence %.2f phase8 %.2f warp8+rcas+osd %.2f\n",
+                                lgd("PASSES ms: pyr8 %.2f me3 %.2f me2 %.2f gm8+fgs8 %.2f me1 %.2f mf8 %.2f fence %.2f phase8 %.2f warp8+rcas+osd %.2f\n",
                                    (double)g_pp[0] / g_ts_n / unit * 1000.0, (double)g_pp[1] / g_ts_n / unit * 1000.0, (double)g_pp[2] / g_ts_n / unit * 1000.0,
                                    (double)g_pp[3] / g_ts_n / unit * 1000.0, (double)g_pp[4] / g_ts_n / unit * 1000.0, (double)g_pp[5] / g_ts_n / unit * 1000.0,
                                    (double)g_pp[6] / g_ts_n / unit * 1000.0, (double)g_pp[7] / g_ts_n / unit * 1000.0, (double)g_pp[8] / g_ts_n / unit * 1000.0);
-                                lg("PASS RAW last frame: ts %llu %llu %llu %llu %llu | t2 %llu %llu %llu %llu %llu %llu %llu\n", (unsigned long long)g_praw[0], (unsigned long long)g_praw[1], (unsigned long long)g_praw[2], (unsigned long long)g_praw[3], (unsigned long long)g_praw[4], (unsigned long long)g_praw[5], (unsigned long long)g_praw[6], (unsigned long long)g_praw[7], (unsigned long long)g_praw[8], (unsigned long long)g_praw[9], (unsigned long long)g_praw[10], (unsigned long long)g_praw[11]);
+                                lgd("PASS RAW last frame: ts %llu %llu %llu %llu %llu | t2 %llu %llu %llu %llu %llu %llu %llu\n", (unsigned long long)g_praw[0], (unsigned long long)g_praw[1], (unsigned long long)g_praw[2], (unsigned long long)g_praw[3], (unsigned long long)g_praw[4], (unsigned long long)g_praw[5], (unsigned long long)g_praw[6], (unsigned long long)g_praw[7], (unsigned long long)g_praw[8], (unsigned long long)g_praw[9], (unsigned long long)g_praw[10], (unsigned long long)g_praw[11]);
                                 if (g_pp_split_n)   // separate line: parsers of "PASSES ms:" / "PASS RAW" stay valid
-                                    lg("PASSES split ms: warp8 %.2f rcas8+osd %.2f pcopy8 %.2f (frames %u)\n",
+                                    lgd("PASSES split ms: warp8 %.2f rcas8+osd %.2f pcopy8 %.2f (frames %u)\n",
                                        (double)g_pp_split[0] / g_pp_split_n / unit * 1000.0, (double)g_pp_split[1] / g_pp_split_n / unit * 1000.0,
                                        (double)g_pp_split[2] / g_pp_split_n / unit * 1000.0, g_pp_split_n);
                                 for (int i = 0; i < 10; i++) g_pp[i] = 0;
                                 for (int i = 0; i < 3; i++) g_pp_split[i] = 0;
                                 g_pp_split_n = 0;
                                 if (g_st_n)
-                                    lg("FRAMES %u: unmatched blocks avg %.0f max %u, scene-cut frames %u, fade frames %u | foreground: "
+                                    lgd("FRAMES %u: unmatched blocks avg %.0f max %u, scene-cut frames %u, fade frames %u | foreground: "
                                        "in %u frames, avg %.1f L2 blocks | camera %d,%d L2 px | log lines dropped %u\n", g_st_n,
                                        (double)g_st_cut_sum / g_st_n, g_st_cut_max, g_st_cuts, g_st_fades, g_st_fgf,
                                        (double)g_st_fg_sum / g_st_n, g_st_gmx, g_st_gmy, g_lgq_drop);
                                 g_st_n = g_st_cut_max = g_st_cuts = g_st_fgf = g_st_fades = 0; g_st_cut_sum = g_st_fg_sum = 0;
                             }
                             else
-                                lg("GPU time of our passes: total %.2f ms = luma %.2f + search %.2f + refine %.2f + warp %.2f\n", tot, ms[0], ms[1], ms[2], ms[3]);
+                                lgd("GPU time of our passes: total %.2f ms = luma %.2f + search %.2f + refine %.2f + warp %.2f\n", tot, ms[0], ms[1], ms[2], ms[3]);
                             g_ts_n = 0; g_ts_first = 0; for (int i = 0; i < 4; i++) g_ts_pass[i] = 0;
                         }
                         ts[0] = 0;   // consumed: a slot no DCB rewrites (nothing injected) is not read again as new
@@ -3764,7 +4009,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             if (m_out < 2) m_out = 2;
                             if (m_out > 3) m_out = 3;
                             // Queue backpressure guard: drop to M=2 if flip queue has >=3 pending flips
-                            if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= 3u) m_out = 2;
+                            if (cc_pending_flips() >= 3u) m_out = 2;
                             g_fast_acc_q16 = acc_new - (m_out << 16);
                             if (g_fast_acc_q16 < -49152) g_fast_acc_q16 = -49152;
                             if (g_fast_acc_q16 >  49152) g_fast_acc_q16 =  49152;
@@ -3808,7 +4053,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                 uint32_t to_vb = vblank_to_next_edge_us((int32_t)handle, sceKernelGetProcessTime(), &vbu);
                                 int cut = 0;
                                 uint32_t m_out = b30_slots(&g_b30, b30_feed(g_cpu_ema_us), pq8,
-                                                           b30_queue_ahead_q8(__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE), to_vb, pq8), &cut);
+                                                           b30_queue_ahead_q8(cc_pending_flips(), to_vb, pq8), &cut);
                                 if (cut) b30_win_cut++;
                                 if (m_out == 3u && g_nmid >= 2 && mi1 != mi2) {
                                     two_mids = 1;
@@ -3990,6 +4235,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         memset(&qs, 0, sizeof(qs));
                         if (read_flip_status((int32_t)handle, &qs) != 0 || qs.flipPendingNum <= SHQ_MAX_PENDING) break;
                         if (sceKernelGetProcessTime() - t_shq0 > 40000ull) { s_shq_timeouts++; break; }
+                        g_cc_shq_polls++;
                         sceKernelUsleep(200);
                     }
                 }
@@ -4089,19 +4335,19 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     a_pace += pace_pre ? (t_p1 - t_p0) : (t_end - t_s2e); a_n++;
                     if (a_n >= 60) {
                         double k = 1.0 / 1000.0 / (double)a_n;
-                        lg("HOOK ms per FG frame: build %.1f submit %.1f hold %.1f flip2 %.1f pace %.1f total %.1f | game own %.1f | pending %u pll %u\n",
+                        lgd("HOOK ms per FG frame: build %.1f submit %.1f hold %.1f flip2 %.1f pace %.1f total %.1f | game own %.1f | pending %u pll %u\n",
                            a_build * k, a_sub * k, a_hold * k, a_flip2 * k, a_pace * k, (a_build + a_sub + a_hold + a_flip2 + a_pace) * k,
                            g_cpu_ema_us / 1000.0, __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE), g_pll_shortened);
                         a_build = a_sub = a_hold = a_flip2 = a_pace = a_n = 0;
                         if (s_shq_frames)   // separate line: parsers of "HOOK ms per FG frame" stay valid
-                            lg("QUEUE shallow %s: on in %u of %u frames, wait avg %.2f max %.2f ms, timeouts %u (on below %.1f ms own for %u frames, off above %.1f)\n",
+                            lgd("QUEUE shallow %s: on in %u of %u frames, wait avg %.2f max %.2f ms, timeouts %u (on below %.1f ms own for %u frames, off above %.1f)\n",
                                shq_on ? "on" : "off", s_shq_on_frames, s_shq_frames,
                                s_shq_on_frames ? (double)s_shq_wait_sum / 1000.0 / s_shq_on_frames : 0.0, (double)s_shq_wait_max / 1000.0,
                                s_shq_timeouts, SHQ_ENTER_US / 1000.0, SHQ_DWELL, SHQ_EXIT_US / 1000.0);
                         s_shq_frames = s_shq_on_frames = s_shq_timeouts = 0; s_shq_wait_sum = s_shq_wait_max = 0;
                         if (g_cfg.below30 && b30_win_frames) {   // separate line, as QUEUE
                             uint32_t pq = refresh_period_q8();
-                            lg("BELOW30 %s: regime %u of %u frames (%.1f s), 3-slot pairs %u, 2nd generated dropped by the queue %u, "
+                            lgd("BELOW30 %s: regime %u of %u frames (%.1f s), 3-slot pairs %u, 2nd generated dropped by the queue %u, "
                                "median own %.2f refreshes (on above %.2f, off below %.2f)%s\n",
                                g_b30.on ? "on" : "off", b30_win_on, b30_win_frames, (double)b30_win_on_vb * pq / 256.0 / 1e6,
                                b30_win_three, b30_win_cut, b30_median_q8(&g_b30) / 256.0, B30_ENTER_Q8 / 256.0, B30_EXIT_Q8 / 256.0,
@@ -4146,7 +4392,9 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
     }
 #endif
     g_last_submit_enter_t = sceKernelGetProcessTime();
-    return gnm_submit_and_flip_raw(has_wl, workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+    int32_t prc = gnm_submit_and_flip_raw(has_wl, workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+    if (!g_mon_on && g_log) g_cc_off_rel = sceKernelGetProcessTime();   // framegen=0: own time per frame (cc_fgoff_log)
+    return prc;
 }
 
 #include "vout_trace.h"
@@ -4395,7 +4643,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                     int m_out = (int)((acc_new + 32768) >> 16);
                     if (m_out < 2) m_out = 2;
                     if (m_out > 3) m_out = 3;
-                    if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= 3u) m_out = 2;
+                    if (cc_pending_flips() >= 3u) m_out = 2;
                     g_fast_acc_q16 = acc_new - (m_out << 16);
                     if (g_fast_acc_q16 < -49152) g_fast_acc_q16 = -49152;
                     if (g_fast_acc_q16 >  49152) g_fast_acc_q16 =  49152;
@@ -5179,8 +5427,11 @@ static void *pad_poll_thread(void *arg)
     (void)arg;
     int32_t uid = -1, handle = -1, errs = 0, got_tries = 0;
     uint64_t next_got_try = 0;
+    uint32_t cpu_n = 0;
     for (;;) {
         sceKernelUsleep(16000);
+        g_cc_pad_wakes++;
+        if ((++cpu_n & 63u) == 0) __atomic_store_n(&g_cc_pad_cpu_us, cc_cpu_us(CC_CLK_THREAD), __ATOMIC_RELEASE);
         if (g_flips < INJECT_AFTER_FLIPS + 60 && g_vo_submit_flips < INJECT_AFTER_FLIPS + 60) continue;
         uint64_t now = sceKernelGetProcessTime();
         // 1.4: Retry GOT patching up to 12 times (every 5 s) in case the game resolves lazy PLT slots after splash screens

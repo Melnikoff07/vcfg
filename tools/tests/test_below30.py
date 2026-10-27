@@ -252,7 +252,7 @@ class TestBelow30MainC(unittest.TestCase):
 
     def test_logs(self) -> None:
         fn = self.FLIP
-        self.assertIn('lg("BELOW30 %s: regime %u of %u frames (%.1f s), 3-slot pairs %u, 2nd generated dropped by the queue %u, "', fn)
+        self.assertIn('lgd("BELOW30 %s: regime %u of %u frames (%.1f s), 3-slot pairs %u, 2nd generated dropped by the queue %u, "', fn)
         self.assertIn("ft_with_ngen(0u, (second_flip && can_fg8 && want_fg", fn)
 
     def test_settings_read_written_and_logged(self) -> None:
