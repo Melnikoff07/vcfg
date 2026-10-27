@@ -103,6 +103,7 @@ MAIN_ALLOC_PART2 = extract_between(
 )
 PCOPY_GATE_HAS_MAX_EXTRA = 1 if ("nm < 2 && max_extra >= 2" in MAIN_C or "nm < 2 && nm < max_extra" in MAIN_C) else 0
 HAS_CUSA10249_AUDIO_FIX = 1 if "cusa10249_audio_fix" in HOOKS_H else 0
+HAS_FAMILY_AUDIO_FIX = 1 if "cusa04529_audio_fix" in HOOKS_H else 0
 HOOKS_DECLS = extract_between(
     HOOKS_H,
     "#define SHAVE_MAX ",
@@ -172,6 +173,7 @@ typedef struct {
 
 static char g_title_id[16] = "UNKNOWN";
 static int g_known_game = 0;
+static int g_sim_neo = 0;
 static fg_config_t g_cfg = { 1, 0, 0, 0, 0, 0, 0 };
 static int g_dm_hooks = 1;
 static volatile int g_own_alloc = 0;
@@ -587,6 +589,13 @@ static int g_c10249_first_reg_done = 0;
 static inline int cusa10249_audio_fix(void) { return 0; }
 static inline void cusa10249_apply_deferred_tail_if_needed(void) {}
 #endif
+#if !__HAS_FAMILY_AUDIO_FIX__
+#define AUDIO_FIX_TAIL 0x600000u
+static size_t g_af_main_t0_len = 0;
+static int g_af_t3_arenas = 0;
+static size_t g_af_preshave_len = 0;
+static inline int cusa04529_audio_fix(void) { return cusa10249_audio_fix(); }
+#endif
 
 static void reset_shave_state(void)
 {
@@ -619,6 +628,9 @@ static void reset_shave_state(void)
     g_pbuf_valid = 0;
     g_c10249_tail_pending = 0;
     g_c10249_first_reg_done = 0;
+    g_af_main_t0_len = 0;
+    g_af_t3_arenas = 0;
+    g_af_preshave_len = 0;
 }
 
 static void apply_title_defaults_sim(const char *tid)
@@ -631,7 +643,9 @@ static void apply_title_defaults_sim(const char *tid)
     g_cfg.shave_mode = 0;
     g_cfg.reg_mode = 0;
     g_cfg.pace_order = 0;
+    /* cfg_apply_title_defaults: CUSA10249 on any console, the rest of the CUSA04529 family on base PS4 only. */
     g_cfg.audio_fix = (strcmp(g_title_id, "CUSA10249") == 0) ? 1 : 0;
+    if (__HAS_FAMILY_AUDIO_FIX__ && !g_cfg.audio_fix && vcfg_in_family(g_title_id, "CUSA04529") && !g_sim_neo) g_cfg.audio_fix = 1;
     if (vcfg_in_family(g_title_id, "CUSA11456")) {
         g_cfg.present_copy = 2;
         g_cfg.two_buffer = 0;
@@ -849,7 +863,7 @@ static void replay_register_buffers(int start_idx, int num_buf, uint32_t bw, uin
 }
 """.replace("__PCOPY_HAS_MAX_EXTRA__", str(PCOPY_GATE_HAS_MAX_EXTRA)).replace(
     "__HAS_CUSA10249_AUDIO_FIX__", str(HAS_CUSA10249_AUDIO_FIX)
-)
+).replace("__HAS_FAMILY_AUDIO_FIX__", str(HAS_FAMILY_AUDIO_FIX))
 
 
 def generate_trace_c(traces: list[dict]) -> str:
@@ -1091,6 +1105,7 @@ def generate_trace_c(traces: list[dict]) -> str:
         pre_occ = tr["pre_occupied_low"]
         lines.append(f"    /* Trace {idx + 1}: {tkey} (v{tr['log_version']}) */")
         lines.append("    {")
+        lines.append(f"        g_sim_neo = {int(tr.get('neo', 0))};")
         lines.append(f'        apply_title_defaults_sim("{tid}");')
         if "shave_mode" in tr:
             lines.append(f'        g_cfg.shave_mode = {int(tr["shave_mode"])};')
@@ -1149,8 +1164,9 @@ def generate_trace_c(traces: list[dict]) -> str:
                     lines.append(f"            if (r == 0) sceKernelReleaseDirectMemory(p, {elen}ULL);")
                     lines.append("        }")
         if tid in ("CUSA07820", "CUSA00341", "CUSA07737"):
+            # Only tail-only (synthetic) shaves, except the audio_fix pre-shave (exactly AUDIO_FIX_TAIL, its tail deferred).
             lines.append(
-                f'        for (int si = 0; si < g_shave_n; si++) ASSERT_MSG(g_shaves[si].real_len == 0, "{tkey}", 999, g_shaves[si].orig_len);'
+                f'        for (int si = 0; si < g_shave_n; si++) ASSERT_MSG(g_shaves[si].real_len == 0 || (cusa04529_audio_fix() != 0 && g_shaves[si].orig_len == g_af_preshave_len && g_shaves[si].orig_len - g_shaves[si].real_len == AUDIO_FIX_TAIL), "{tkey}", 999, g_shaves[si].orig_len);'
             )
         if tid in ("CUSA13323", "CUSA11456"):
             lines.append(
