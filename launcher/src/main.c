@@ -608,6 +608,8 @@ static void refresh_dev_status(Game *g)
     unsigned missed_vb = (unsigned)kv_uint_after(ts, "missed ", 0);
     int fg_ran         = (strstr(ts, "mode4 #") != NULL || strstr(ts, "vout fg #") != NULL ||
                           strstr(bs, "gnm #100") != NULL || strstr(bs, "flip #100") != NULL);
+    // alloc_dm logs a FAILED line for each range it tries; only a failure gpu_init never recovered from is OOM.
+    int alloc_dm_oom   = (strstr(bs, "alloc_dm FAIL") != NULL && strstr(bs, "gpu_init ok") == NULL);
 
     if (cb) {
         const char *sig = strstr(cs, "SIGBUS") ? "SIGBUS" :
@@ -748,7 +750,7 @@ static void refresh_dev_status(Game *g)
                  rec_shave_label(d->rec_shave_mode));
         snprintf(d->step2, sizeof(d->step2), "2. Or press TRIANGLE to restore AUTO (ALGORITHM).");
         snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch and test.");
-    } else if (has_safe_mem || strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory") || strstr(ts, "work memory: none") || strstr(bs, "alloc_dm FAIL")) {
+    } else if (has_safe_mem || strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory") || strstr(ts, "work memory: none") || alloc_dm_oom) {
         d->diag_kind      = DIAG_OOM_BOOT;
         d->rec_manual     = 1;
         d->rec_eng_sel    = SEL_ALT;
