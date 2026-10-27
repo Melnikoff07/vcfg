@@ -19,6 +19,7 @@ PARAMS = dict(
     qmax=1023.0,            # scanout format code range (1023 for 2_10_10_10, 255 for 8888)
     sharpness=40,           # profile sharpness, percent
     enhance=1,              # profile Enhance AA mode 0 / 1 / 2
+    aa_static_skip=True,    # rcas8 flag bit 4: no AA where warp8 flags the pixel static (P == C), as main.c sets it
     prev_luma_sum=0,        # None = sum of the previous frame's L3 (normal play); 0 = capture build
     t=0.5,
 )
@@ -75,7 +76,8 @@ def render(A, B, st, params=None, return_all=False):
         p.update(params)
     mid = vw.warp8(A, B, st['F'], st['GK'], st['cutn'], t=p['t'], flags=p.get('warp_flags', 0), flags_cut_thr=p.get('cut_thr', 0), cut_emov=p.get('cut_emov', 0.3), wp=p.get('wp'), prevF=st.get('prevF', p.get('prevF')))
     mid_q = quant(mid, p['qmax'])
-    out = quant(vw.rcas8(mid_q, vw.rcas_con(p['sharpness']), p['enhance']) if (p['sharpness'] > 0 or p['enhance'] > 0) else mid_q,
+    skip = vw.static_px(A, B) if p.get('aa_static_skip', True) else None
+    out = quant(vw.rcas8(mid_q, vw.rcas_con(p['sharpness']), p['enhance'], skip=skip) if (p['sharpness'] > 0 or p['enhance'] > 0) else mid_q,
                 p['qmax'])
     if return_all:
         return out, dict(st, pre=mid_q)

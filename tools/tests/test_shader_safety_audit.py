@@ -111,7 +111,7 @@ class TestShaderSafetyAudit(unittest.TestCase):
         # Total counts across all 27 shaders
         self.assertEqual(len(fdiv_sites), 29, f"Unexpected fdiv count: {len(fdiv_sites)}")
         self.assertEqual(len(sqrt_sites), 4, f"Unexpected sqrt count: {len(sqrt_sites)}")
-        self.assertEqual(len(exp2_sites), 4, f"Unexpected exp2 count: {len(exp2_sites)}")
+        self.assertEqual(len(exp2_sites), 3, f"Unexpected exp2 count: {len(exp2_sites)}")
 
         # Verify every integer division/remainder uses a non-zero constant divisor,
         # or (in legacy warp.ll) block size bs = 8 * sx >= 16.
@@ -144,10 +144,16 @@ class TestShaderSafetyAudit(unittest.TestCase):
         self.assertIn("%zs1 = call float @llvm.sqrt.f32(float %zn)", self.ll_texts["gvz8.ll"])
         self.assertIn("%zs = call float @llvm.sqrt.f32(float %zs1)", self.ll_texts["gvz8.ll"])
 
-        # Verify all 4 exp2 sites in warp8.ll and warp8g.ll have non-positive arguments:
-        # %em1 = min(%em, %e), so %d0 = %em1 - %em <= 0 and %d1 = %em1 - %e <= 0;
-        # %k0 = %d0 * c <= 0 and %k1 = %d1 * c <= 0 (c = 8.0 in warp8.ll, 9.617967 in warp8g.ll).
-        for wname, k_scale in (("warp8.ll", "8.0"), ("warp8g.ll", "0x40233C6620000000")):
+        # Verify all 3 exp2 sites in warp8.ll and warp8g.ll have non-positive arguments.
+        # warp8.ll (one exp2 per candidate): %k0 = |%em - %e| * -8.0 <= 0.
+        warp8 = self.ll_texts["warp8.ll"]
+        self.assertIn("%d0 = fsub float %em, %e", warp8)
+        self.assertIn("%ad0 = call float @llvm.fabs.f32(float %d0)", warp8)
+        self.assertIn("%k0 = fmul float %ad0, -8.0", warp8)
+        self.assertIn("%z = call float @llvm.exp2.f32(float %k0)", warp8)
+        # warp8g.ll: %em1 = min(%em, %e), so %d0 = %em1 - %em <= 0 and %d1 = %em1 - %e <= 0;
+        # %k0 = %d0 * c <= 0 and %k1 = %d1 * c <= 0 (c = 9.617967).
+        for wname, k_scale in (("warp8g.ll", "0x40233C6620000000"),):
             wtxt = self.ll_texts[wname]
             self.assertIn("%em1 = call float @llvm.minnum.f32(float %em, float %e)", wtxt)
             self.assertIn("%d0 = fsub float %em1, %em", wtxt)
@@ -765,6 +771,9 @@ class TestShaderSafetyAudit(unittest.TestCase):
 
         end_off = 0x8000 + total_aligned
         dcb8_off = 0x1C000
+        # layout snapshot of the current shaders.h (fp32 preserve-sign denormal attribute: mad/mac fusion shrank
+        # warp8 by 512 B and rcas8 by 256 B; rcas8's guarded stores of unchanged lanes added 256 B back, its bit-5
+        # real-frame static handling another 256 B); the budget is the assertLessEqual against DCB8_OFF below
         self.assertEqual(total_aligned, 0x13E00)
         self.assertEqual(end_off, 0x1BE00)
         self.assertLessEqual(

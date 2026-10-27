@@ -380,6 +380,9 @@ define internal { float, float, i1 } @sub_corner(<2 x float> %r00, <2 x float> %
   ret { float, float, i1 } %o2
 }
 
+; slow-path mix of the 4 corner candidates: weight (w_eff + 0.08) * exp2(8 * (emin - e)). A clean foreground sub-block
+; (e < 0.18) gets w * 4 + 0.16; its error e is no longer lowered by 0.08, which pulled the mix and emov towards the
+; foreground at motion boundaries (round 2 of the CUSA18723 image work)
 define internal { <4 x float>, float, float } @accum({ <4 x float>, float, float } %st,
         { <4 x float>, float } %c, float %w) alwaysinline {
   %acc = extractvalue { <4 x float>, float, float } %st, 0
@@ -395,16 +398,17 @@ define internal { <4 x float>, float, float } @accum({ <4 x float>, float, float
   %w_b0 = fmul float %w_raw, 4.0
   %w_b1 = fadd float %w_b0, 0x3FC47AE140000000 ; 0.16
   %w_eff = select i1 %fg_bst, float %w_b1, float %w_raw
-  %e_s0 = fsub float %e0, 0x3FB47AE140000000 ; 0.08
-  %e_s1 = call float @llvm.maxnum.f32(float %e_s0, float 0.0)
-  %e = select i1 %fg_bst, float %e_s1, float %e0
+  %e = fadd float %e0, -0.0 ; the candidate's own error, also for a boosted foreground sub-block
   %em1 = call float @llvm.minnum.f32(float %em, float %e)
-  %d0 = fsub float %em1, %em
-  %k0 = fmul float %d0, 8.0
-  %sc = call float @llvm.exp2.f32(float %k0)
-  %d1 = fsub float %em1, %e
-  %k1 = fmul float %d1, 8.0
-  %x1 = call float @llvm.exp2.f32(float %k1)
+  ; exp2(8 (em1 - em)) and exp2(8 (em1 - e)): one of them is exp2(0) = 1 and the other equals exp2(-8 |em - e|) bit
+  ; for bit (fl(a - b) == -fl(b - a), 8 a power of two), so one quarter-rate v_exp_f32 per candidate instead of two
+  %d0 = fsub float %em, %e
+  %ad0 = call float @llvm.fabs.f32(float %d0)
+  %k0 = fmul float %ad0, -8.0
+  %z = call float @llvm.exp2.f32(float %k0)
+  %lo = fcmp olt float %e, %em
+  %sc = select i1 %lo, float %z, float 1.0
+  %x1 = select i1 %lo, float 1.0, float %z
   %w5 = fadd float %w_eff, 0x3FB47AE140000000; 0.08
   %om = fmul float %w5, %x1
   %acs = call <4 x float> @scale4(<4 x float> %acc, float %sc)
@@ -1076,17 +1080,6 @@ merge:
   %vmg = phi float [ %vmb, %fastzero ], [ %vmb, %fastside ], [ 0.0, %slow ]
   %hl_mov = extractelement <4 x float> %mov, i32 3
   %is_wire_fol = fcmp oge float %hl_mov, 4.0
-  %wom0 = fsub float %spr, 12.0
-  %wom1 = fmul float %wom0, 0.5
-  %w_om_s = call float @sat(float %wom1)
-  %wom_es0 = fsub float %es, 0x3FE99999A0000000 ; 0.80
-  %wom_es1 = fmul float %wom_es0, 4.0
-  %w_om_es = call float @sat(float %wom_es1)
-  %wom_em0 = fsub float 0x3FD3D70A40000000, %emov ; 0.31
-  %wom_em1 = fmul float %wom_em0, 4.0
-  %w_om_em = call float @sat(float %wom_em1)
-  %w_om01 = fmul float %w_om_s, %w_om_es
-  %w_occ_m = fmul float %w_om01, %w_om_em
   %stat = call <4 x float> @lerp4(<4 x float> %sp, <4 x float> %sc, float %t)
   %l_mov = call float @sum3(<4 x float> %mov)
   %l_stat = call float @sum3(<4 x float> %stat)
@@ -1168,6 +1161,31 @@ merge:
   %fl0b = extractelement <4 x i32> %cn0, i32 2
   %nocfb = and i32 %fl0b, 8
   %nocf = icmp ne i32 %nocfb, 0
+  ; fill weight: cw is exactly 0 when emov <= 0.025 (residual and every base term off), when emov <= es
+  ; (gcw = 0), on hl_act, under the full foreground kill (ws_keep = 0) or with the no-fill flag; then movc = mov
+  ; and the wave skips the fill block
+  %cwa = fcmp ogt float %emov, 0x3F999999A0000000 ; 0.025
+  %cwg = fcmp ogt float %emov, %es
+  %cwl0 = and i1 %cwa, %cwg
+  %nhlact = xor i1 %hl_act, true
+  %wsk_pos = fcmp ogt float %ws_keep, 0.0
+  %nfgkill = and i1 %nhlact, %wsk_pos
+  %nnocf = xor i1 %nocf, true
+  %cwl1 = and i1 %cwl0, %nfgkill
+  %cw_live = and i1 %cwl1, %nnocf
+  br i1 %cw_live, label %fill, label %fdone
+fill:
+  %wom0 = fsub float %spr, 12.0
+  %wom1 = fmul float %wom0, 0.5
+  %w_om_s = call float @sat(float %wom1)
+  %wom_es0 = fsub float %es, 0x3FE99999A0000000 ; 0.80
+  %wom_es1 = fmul float %wom_es0, 4.0
+  %w_om_es = call float @sat(float %wom_es1)
+  %wom_em0 = fsub float 0x3FD3D70A40000000, %emov ; 0.31
+  %wom_em1 = fmul float %wom_em0, 4.0
+  %w_om_em = call float @sat(float %wom_em1)
+  %w_om01 = fmul float %w_om_s, %w_om_es
+  %w_occ_m = fmul float %w_om01, %w_om_em
   %dmp = call float @diff3_k(<4 x float> %mov, <4 x float> %sp)
   %dmc = call float @diff3_k(<4 x float> %mov, <4 x float> %sc)
   %dmv = call float @diff3_k(<4 x float> %mov, <4 x float> %stat)
@@ -1272,7 +1290,10 @@ merge:
   %cw3_s = fmul float %cw3_1, %ws_keep
   %cw3 = select i1 %hl_act, float 0.0, float %cw3_s
   %cw = select i1 %nocf, float 0.0, float %cw3
-  %movc = call <4 x float> @lerp4(<4 x float> %mov, <4 x float> %fillc, float %cw)
+  %movf = call <4 x float> @lerp4(<4 x float> %mov, <4 x float> %fillc, float %cw)
+  br label %fdone
+fdone:
+  %movc = phi <4 x float> [ %mov, %merge ], [ %movf, %fill ]
   %out0 = call <4 x float> @lerp4(<4 x float> %movc, <4 x float> %stat, float %ws)
   ; scene change: > 68 % unmatched blocks -> per-pixel fallback only where both motion and static samples disagree
   ; per-title scene-change threshold: consts flags bits 16..31 = blocks / 8 (0 = default 5600 of 8160)
@@ -1300,6 +1321,11 @@ merge:
   %mk1 = icmp ult i32 %mxy, 32
   %mk = and i1 %mk0, %mk1
   %hudw = extractelement <4 x i32> %cn, i32 3
+  ; HUD rectangle (hud file): uniform skip of the per-lane rectangle test when no rectangle is set (hudw == 0)
+  %hnz = icmp ne i32 %hudw, 0
+  br i1 %hnz, label %hud_rect, label %hud_done
+
+hud_rect:
   %hb0 = and i32 %hudw, 255
   %hb1a = lshr i32 %hudw, 8
   %hb1 = and i32 %hb1a, 255
@@ -1328,11 +1354,16 @@ merge:
   %cin = icmp ule i32 %cd2, %crr
   %iscirc = icmp eq i32 %hy1, 0
   %hcsel = select i1 %iscirc, i1 %cin, i1 %hcx
-  %hnz = icmp ne i32 %hudw, 0
-  %inhud = and i1 %hcsel, %hnz
+  br label %hud_done
+
+hud_done:
+  %inhud = phi i1 [ %hcsel, %hud_rect ], [ false, %fdone ]
   %out1h = select i1 %inhud, <4 x float> %sc, <4 x float> %out1
   %out2 = select i1 %mk, <4 x float> <float 1.0, float 0.0, float 1.0, float 1.0>, <4 x float> %out1h
-  %alpha = extractelement <4 x float> %sc, i32 3
+  ; alpha = static-pixel flag for rcas8 (P == C in RGB at this pixel, es == 0): 1.0 static, 254/255 otherwise.
+  ; Only the scanout and osd8 (pass-through) see the mid's alpha; rcas8 skips the AA where the flag is set.
+  %st_px = fcmp oeq float %es, 0.0
+  %alpha = select i1 %st_px, float 1.0, float 0x3FEFDFDFE0000000 ; 254/255
   %out = insertelement <4 x float> %out2, float %alpha, i32 3
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %out, i32 15, i32 %x, i32 %y, <8 x i32> %to, i32 0, i32 0)
   ret void
