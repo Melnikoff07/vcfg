@@ -364,8 +364,11 @@ static uint64_t g_slot_cpu[4], g_ts_slot_seen = 0, g_ts_first = 0, g_ts_cpu_firs
 static uint32_t g_ts_n = 0;
 static uint64_t g_praw[12];
 static uint64_t g_ts_pass[4], g_pp[10], g_ts_span = 0, g_ts_span_max = 0;
-static uint64_t g_pp_split[3];   // mode 8, per window: warp8 t2[4]..t2[5], rcas8+osd t2[5]..t2[7], pcopy8 t2[7]..t2[6]
+static uint64_t g_pp_split[5];   // mode 8, per window: warp8 t2[4]..t2[5], rcas8+osd t2[5]..t2[7], pcopy8 t2[7]..t2[6],
+                                 // rcas8 of the 1st mid t2[5]..t2[8], the rest (osd, 2nd mid) t2[8]..t2[7]
 static uint32_t g_pp_split_n = 0;
+static uint64_t g_pp_g2[3];      // 2nd generated frame (two_mids): osd + flip wait t2[8]..t2[9], phase8 + warp8 t2[9]..t2[10],
+static uint32_t g_pp_g2_n = 0;   // rcas8 + osd t2[10]..t2[7]; frames that had it
 static uint32_t g_ts_span_n = 0;
 static uint32_t g_pend_seq = 0, g_pend_slot = 0;
 static int g_inject_on = 0;
@@ -1144,7 +1147,7 @@ static uint32_t build_dcb_flow(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M,
     *(volatile uint64_t *)(slotb + 0x900) = 0;
     *(volatile uint64_t *)(slotb + 0x908) = 0;
     for (int i = 0; i < 5; i++) *(volatile uint64_t *)(slotb + 0x910 + i * 8) = 0;
-    for (int i = 0; i < 8; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
+    for (int i = 0; i < 11; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
 #define TS_EOP(i) do { uint64_t a_ = (uint64_t)(uintptr_t)(slotb + 0x910 + (i) * 8); \
         *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)a_; *p++ = 0x60000000u | ((uint32_t)(a_ >> 32) & 0xFFFFu); *p++ = 0; *p++ = 0; } while (0)
 #define TS2(j) do { uint64_t a2_ = (uint64_t)(uintptr_t)(slotb + 0x980 + (j) * 8); \
@@ -1386,7 +1389,7 @@ static uint32_t build_dcb_post8(uint32_t *p0, uint64_t C, uint32_t w, uint32_t h
     // slots and divided them by the CPU time: "GPU time ... 400 ms"); pyramid / motion / fence are 0, warp/post = the
     // post pass. No frame statistics (no motion search): marked absent for the FRAMES line.
     for (int i = 0; i < 5; i++) *(volatile uint64_t *)(slotb + 0x910 + i * 8) = 0;
-    for (int i = 0; i < 8; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
+    for (int i = 0; i < 11; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
     for (int i = 0; i < 8; i++) ((volatile uint32_t *)(slotb + STATS_OFF))[i] = 0xFFFFFFFFu;
 
     uint32_t *p = p0;
@@ -1526,7 +1529,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     *(volatile uint64_t *)(slotb + 0x900) = 0;
     *(volatile uint64_t *)(slotb + 0x908) = 0;
     for (int i = 0; i < 5; i++) *(volatile uint64_t *)(slotb + 0x910 + i * 8) = 0;
-    for (int i = 0; i < 8; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
+    for (int i = 0; i < 11; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
 #define DISPATCH(x, y) do { *p++ = PKT3(0x15, 4, 1); *p++ = (x); *p++ = (y); *p++ = 1; *p++ = 1; } while (0)
     const FgDim D = fg_dim(g_bw, g_bh);   // 1080p: the literals that stood here (30 x 68, 240 x 135, ...), see fg_res.h
     *p++ = PKT3(0x46, 1, 0); *p++ = 0x0000002E;
@@ -1584,6 +1587,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy);
         PASS_BARRIER();
     }
+    TS2(8);   // t2[5]..t2[8] = rcas8 of the 1st mid alone (0 without post-process)
     // post_mid_only: the real frame gets the profile's Enhance AA WITHOUT sharpening (Enhance off = real untouched), so
     // the aliasing that crawls on edges is smoothed the same way in real and generated frames, and the sharpening only
     // compensates the generated frame's softness. Separate table in the tb2 region (only FG Fast's mid2 uses it; in that
@@ -1628,6 +1632,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         int32_t fr2 = insert_wait_flip_done(p, 7, vo_handle, mid2_idx);
         if (fr2 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
         p += 7;
+        TS2(9);   // t2[8]..t2[9] = osd8 of the 1st mid + the wait for the 2nd mid's buffer
 
         *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; // inv scalar cache
         *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl2; *p++ = (uint32_t)(tbl2 >> 32);
@@ -1637,6 +1642,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         else { SET_PASS(g_sh8_off[5], WARP8_RSRC1, WARP8_RSRC2); }
         DISPATCH(D.wx, D.wy);
         PASS_BARRIER();
+        TS2(10);  // t2[9]..t2[10] = phase8 + warp8 of the 2nd mid, t2[10]..t2[7] = its rcas8 + osd8
         if (rcas_flags2) {
             SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy);
             PASS_BARRIER();
@@ -3882,6 +3888,16 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                         b30c_win_f1_us += f1; b30c_win_n++;
                                         if (g_slot_three[(ps + 3u) & 3u]) { b30c_win_f1_after3_us += f1; b30c_win_n_after3++; }
                                     }
+                                    if (t2[8] >= t2[5] && t2[7] >= t2[8]) {
+                                        g_pp_split[3] += t2[8] - t2[5];
+                                        g_pp_split[4] += t2[7] - t2[8];
+                                        if (t2[9] >= t2[8] && t2[10] >= t2[9] && t2[7] >= t2[10]) {
+                                            g_pp_g2[0] += t2[9] - t2[8];
+                                            g_pp_g2[1] += t2[10] - t2[9];
+                                            g_pp_g2[2] += t2[7] - t2[10];
+                                            g_pp_g2_n++;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3927,13 +3943,22 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                    (double)g_pp[3] / g_ts_n / unit * 1000.0, (double)g_pp[4] / g_ts_n / unit * 1000.0, (double)g_pp[5] / g_ts_n / unit * 1000.0,
                                    (double)g_pp[6] / g_ts_n / unit * 1000.0, (double)g_pp[7] / g_ts_n / unit * 1000.0, (double)g_pp[8] / g_ts_n / unit * 1000.0);
                                 lgd("PASS RAW last frame: ts %llu %llu %llu %llu %llu | t2 %llu %llu %llu %llu %llu %llu %llu\n", (unsigned long long)g_praw[0], (unsigned long long)g_praw[1], (unsigned long long)g_praw[2], (unsigned long long)g_praw[3], (unsigned long long)g_praw[4], (unsigned long long)g_praw[5], (unsigned long long)g_praw[6], (unsigned long long)g_praw[7], (unsigned long long)g_praw[8], (unsigned long long)g_praw[9], (unsigned long long)g_praw[10], (unsigned long long)g_praw[11]);
-                                if (g_pp_split_n)   // separate line: parsers of "PASSES ms:" / "PASS RAW" stay valid
-                                    lgd("PASSES split ms: warp8 %.2f rcas8+osd %.2f pcopy8 %.2f (frames %u)\n",
+                                if (g_pp_split_n) {   // separate line: parsers of "PASSES ms:" / "PASS RAW" stay valid
+                                    // the fields after "(frames N)" split rcas8+osd: rcas8 of the 1st mid alone, then the rest; with two
+                                    // generated frames per pair (below30, FG Fast) the rest holds the 2nd mid, split again per G2 frame
+                                    double g2n = g_pp_g2_n ? (double)g_pp_g2_n : 1.0;
+                                    lgd("PASSES split ms: warp8 %.2f rcas8+osd %.2f pcopy8 %.2f (frames %u) | rcas8 %.2f rest %.2f | "
+                                       "G2 frames %u: osd+wait %.2f phase8+warp8 %.2f rcas8+osd %.2f\n",
                                        (double)g_pp_split[0] / g_pp_split_n / unit * 1000.0, (double)g_pp_split[1] / g_pp_split_n / unit * 1000.0,
-                                       (double)g_pp_split[2] / g_pp_split_n / unit * 1000.0, g_pp_split_n);
+                                       (double)g_pp_split[2] / g_pp_split_n / unit * 1000.0, g_pp_split_n,
+                                       (double)g_pp_split[3] / g_pp_split_n / unit * 1000.0, (double)g_pp_split[4] / g_pp_split_n / unit * 1000.0,
+                                       g_pp_g2_n, (double)g_pp_g2[0] / g2n / unit * 1000.0, (double)g_pp_g2[1] / g2n / unit * 1000.0,
+                                       (double)g_pp_g2[2] / g2n / unit * 1000.0);
+                                }
                                 for (int i = 0; i < 10; i++) g_pp[i] = 0;
-                                for (int i = 0; i < 3; i++) g_pp_split[i] = 0;
-                                g_pp_split_n = 0;
+                                for (int i = 0; i < 5; i++) g_pp_split[i] = 0;
+                                for (int i = 0; i < 3; i++) g_pp_g2[i] = 0;
+                                g_pp_split_n = 0; g_pp_g2_n = 0;
                                 if (g_st_n)
                                     lgd("FRAMES %u: unmatched blocks avg %.0f max %u, scene-cut frames %u, fade frames %u | foreground: "
                                        "in %u frames, avg %.1f L2 blocks | camera %d,%d L2 px | log lines dropped %u\n", g_st_n,

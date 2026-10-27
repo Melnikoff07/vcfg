@@ -8,6 +8,8 @@ timestamps that split the console's pass line.
    branch). The reference keeps the old `skip` (no AA) and adds `still` (raw).
 2. warp8 @accum: exp2(8 (em1 - em)) and exp2(8 (em1 - e)) are exp2(0) = 1 and exp2(-8 |em - e|), bit for bit
    (fl(a - b) == -fl(b - a), 8 a power of two), so one quarter-rate v_exp_f32 per slow-path candidate instead of two.
+3. Console log: t2[8] after the 1st mid's rcas8, t2[9] after the wait for the 2nd mid's buffer and t2[10] after its
+   warp8 split the "rcas8+osd" field, which held the whole 2nd generated frame below 30 fps.
 """
 import pathlib
 import re
@@ -109,6 +111,31 @@ class Warp8AccumOneExp(unittest.TestCase):
         self.assertIn("%x1 = select i1 %lo, float 1.0, float %z", acc)
         self.assertIn('z = np.exp2(np.abs(em - e_eff) * F32(-wp.get("k", 8.0)))', VW_SRC)
         self.assertEqual(VW_SRC.count("np.exp2((em1 - "), 0)
+
+
+class PassTimestamps(unittest.TestCase):
+    def test_split_timestamps(self):
+        flow8 = MAIN_C.split("static uint32_t build_dcb_flow8(", 1)[1].split("\n}\n", 1)[0]
+        order = [flow8.index(m) for m in ("TS2(4);", "TS2(5);", "TS2(8);", "TS2(9);", "TS2(10);", "TS2(7);", "TS2(6);")]
+        self.assertEqual(order, sorted(order))
+        rc = flow8.index("if (rcas_flags1) {")
+        self.assertLess(rc, flow8.index("TS2(8);"))
+        self.assertLess(flow8.index("TS2(8);"), flow8.index("if (osd_wh1) {"))
+        g2 = flow8.split("if (two_mids) {", 1)[1]
+        self.assertLess(g2.index("insert_wait_flip_done(p, 7, vo_handle, mid2_idx)"), g2.index("TS2(9);"))
+        self.assertLess(g2.index("TS2(9);"), g2.index("PHASE8_RSRC1"))
+        self.assertLess(g2.index("WARP8_RSRC1"), g2.index("TS2(10);"))
+        self.assertLess(g2.index("TS2(10);"), g2.index("if (rcas_flags2) {"))
+        # every DCB builder zeroes t2[0..10] (slot 0x980..0x9D7; 0x9C0..0x9FF was free)
+        self.assertEqual(MAIN_C.count("for (int i = 0; i < 11; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;"), 3)
+        self.assertNotIn("for (int i = 0; i < 8; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;", MAIN_C)
+
+    def test_log_line_keeps_the_old_prefix(self):
+        self.assertIn('"PASSES split ms: warp8 %.2f rcas8+osd %.2f pcopy8 %.2f (frames %u) | rcas8 %.2f rest %.2f | "', MAIN_C)
+        self.assertIn('"G2 frames %u: osd+wait %.2f phase8+warp8 %.2f rcas8+osd %.2f\\n"', MAIN_C)
+        line = "PASSES split ms: warp8 1.13 rcas8+osd 0.78 pcopy8 0.00 (frames 89) | rcas8 0.78 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00"
+        old = re.compile(r"^PASSES split ms: warp8 ([-0-9.]+) rcas8\+osd ([-0-9.]+) pcopy8 ([-0-9.]+) \(frames (\d+)\)")
+        self.assertIsNotNone(old.match(line))
 
 
 if __name__ == "__main__":
