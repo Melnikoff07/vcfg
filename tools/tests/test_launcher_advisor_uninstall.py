@@ -730,6 +730,30 @@ def test_has_shave_log_matches_real_boot_and_crash_strings(h: LauncherHarness) -
         assert g.dev.rec_shave_mode == 1, f"CUSA07408 with shave=12 expected rec_shave_mode=1, got {g.dev.rec_shave_mode}"
 
 
+def test_alloc_dm_retry_recovered_is_not_oom(h: LauncherHarness) -> None:
+    # Real boot log (CUSA18723, PS4 base, 2.34-custom): the first range near the display
+    # reserve fails, the full-range retry succeeds and gpu_init completes. That is not OOM.
+    retry_lines = (
+        "8.890 [t:104643 f:120] gpu_init enter pre_gpu=0 pre_work=0\n"
+        "8.890 [t:104643 f:120] alloc_dm FAILED at allocate: len=0x20000 align=0x20000 type=0 range=0x127600000..0x127800000 r=0x80020023 largest free=0x1c0000\n"
+        "8.890 [t:104643 f:120] alloc_dm ok: len=0x20000 align=0x20000 type=0 range=0x0..0x128000000 phys=0x40000 va=881120000\n"
+        "8.891 [t:104643 f:120] alloc_dm FAILED at allocate: len=0x190000 align=0x10000 type=3 range=0x127600000..0x127800000 r=0x80020023 largest free=0x1a0000\n"
+        "8.891 [t:104643 f:120] alloc_dm ok: len=0x190000 align=0x10000 type=3 range=0x0..0x128000000 phys=0x60000 va=882200000\n"
+    )
+    with Sandbox(h) as sb:
+        g = sb.select_game("CUSA18723", experimental=True)
+        sb.write_cfg("boot-CUSA18723.txt", retry_lines + "8.891 [t:104643 f:120] gpu_init ok at 881120000 work 882200000\n")
+        h.lib.harness_refresh_dev_status(ctypes.byref(g))
+        assert g.dev.diag_kind != DIAG_OOM_BOOT, "recovered alloc_dm retry reported as OOM"
+
+    # Same lines without gpu_init ok: the allocation never recovered, so it stays OOM.
+    with Sandbox(h) as sb:
+        g = sb.select_game("CUSA18723", experimental=True)
+        sb.write_cfg("boot-CUSA18723.txt", retry_lines.split("8.890 [t:104643 f:120] alloc_dm ok")[0])
+        h.lib.harness_refresh_dev_status(ctypes.byref(g))
+        assert g.dev.diag_kind == DIAG_OOM_BOOT, g.dev.diag_kind
+
+
 def test_do_apply_advice_removes_adapt_ini_on_manual_mode(h: LauncherHarness) -> None:
     # CUSA07408 (real log 0a1690ad06:110-112): stale adapt-CUSA07408.ini has shave_mode=2, reg_mode=2,
     # while Advisor recommends manual_mode=1, shave_mode=1, reg_mode=1.
@@ -1205,6 +1229,7 @@ def main() -> int:
         test_harness_baseline(h)
         test_shave2_never_recommended_after_shave2_crash_or_failed(h)
         test_has_shave_log_matches_real_boot_and_crash_strings(h)
+        test_alloc_dm_retry_recovered_is_not_oom(h)
         test_do_apply_advice_removes_adapt_ini_on_manual_mode(h)
         test_inert_checked_before_safe_state_and_safe_no_work_mem(h)
         test_no_false_is_2b_log_on_3buf_games_with_splash_num2(h)
