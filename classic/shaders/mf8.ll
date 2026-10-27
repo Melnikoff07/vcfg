@@ -427,7 +427,7 @@ define internal i1 @qwin(i32 %q, i32 %wq, i32 %sc, i1 %lock, i32 %qmax) alwaysin
   ret i1 %res
 }
 
-define internal { i32, i32 } @mid_zinfo(i32 %tid, i32 %sub, i32 %base, <4 x i32> %vp, <4 x i32> %vc, i32 %X, i32 %Y) alwaysinline {
+define internal { i32, i32, i32, i32 } @mid_zinfo(i32 %tid, i32 %sub, i32 %base, <4 x i32> %vp, <4 x i32> %vc, i32 %X, i32 %Y) alwaysinline {
 entry:
   %r = and i32 %sub, 7
   %is_c = icmp uge i32 %sub, 8
@@ -475,26 +475,40 @@ entry:
 zloop:
   %zi = phi i32 [ 0, %entry ], [ %zi1, %zloop ]
   %zs_acc = phi i32 [ 0, %entry ], [ %zs_next, %zloop ]
-  %zt_acc = phi i32 [ 0, %entry ], [ %zt_next, %zloop ]
-  %zix = add i32 %base, %zi
-  %zpk = getelementptr [64 x i32], ptr addrspace(3) @keys, i32 0, i32 %zix
-  %zpv = getelementptr [64 x i32], ptr addrspace(3) @vecs, i32 0, i32 %zix
-  %zv_s = load i32, ptr addrspace(3) %zpk, align 4
-  %zv_t = load i32, ptr addrspace(3) %zpv, align 4
+  %ztp_acc = phi i32 [ 0, %entry ], [ %ztp_next, %zloop ]
+  %ztc_acc = phi i32 [ 0, %entry ], [ %ztc_next, %zloop ]
+  %zix_p = add i32 %base, %zi
+  %zix_c = add i32 %zix_p, 8
+  %zpk_p = getelementptr [64 x i32], ptr addrspace(3) @keys, i32 0, i32 %zix_p
+  %zpk_c = getelementptr [64 x i32], ptr addrspace(3) @keys, i32 0, i32 %zix_c
+  %zpv_p = getelementptr [64 x i32], ptr addrspace(3) @vecs, i32 0, i32 %zix_p
+  %zpv_c = getelementptr [64 x i32], ptr addrspace(3) @vecs, i32 0, i32 %zix_c
+  %zv_sp = load i32, ptr addrspace(3) %zpk_p, align 4
+  %zv_sc = load i32, ptr addrspace(3) %zpk_c, align 4
+  %zv_tp = load i32, ptr addrspace(3) %zpv_p, align 4
+  %zv_tc = load i32, ptr addrspace(3) %zpv_c, align 4
+  %zv_s = add i32 %zv_sp, %zv_sc
   %zs_next = add i32 %zs_acc, %zv_s
-  %zt_next = add i32 %zt_acc, %zv_t
+  %ztp_next = add i32 %ztp_acc, %zv_tp
+  %ztc_next = add i32 %ztc_acc, %zv_tc
   %zi1 = add i32 %zi, 1
-  %zmore = icmp ult i32 %zi1, 16
+  %zmore = icmp ult i32 %zi1, 8
   br i1 %zmore, label %zloop, label %zdone
 zdone:
   fence syncscope("workgroup") release
   call void @llvm.amdgcn.s.barrier()
   fence syncscope("workgroup") acquire
   %zsum = lshr i32 %zs_next, 1
+  %zt_next = add i32 %ztp_next, %ztc_next
   %ztex = lshr i32 %zt_next, 1
-  %zr0 = insertvalue { i32, i32 } undef, i32 %ztex, 0
-  %zr1 = insertvalue { i32, i32 } %zr0, i32 %zsum, 1
-  ret { i32, i32 } %zr1
+  %zmin = call i32 @llvm.smin.i32(i32 %ztp_next, i32 %ztc_next)
+  %zsub = sub i32 %ztp_next, %ztc_next
+  %zdiff = call i32 @llvm.abs.i32(i32 %zsub, i1 false)
+  %zr0 = insertvalue { i32, i32, i32, i32 } undef, i32 %ztex, 0
+  %zr1 = insertvalue { i32, i32, i32, i32 } %zr0, i32 %zsum, 1
+  %zr2 = insertvalue { i32, i32, i32, i32 } %zr1, i32 %zmin, 2
+  %zr3 = insertvalue { i32, i32, i32, i32 } %zr2, i32 %zdiff, 3
+  ret { i32, i32, i32, i32 } %zr3
 }
 
 define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 inreg %gy, i32 %tid) #0 {
@@ -632,13 +646,22 @@ entry:
   ; outward disocclusion/occlusion shift for camera-aligned candidates at motion boundaries
   %isgm = icmp sle i32 %scd, 3
   %hi_sm = icmp uge i32 %sm0, 16
-  %zpair = call { i32, i32 } @mid_zinfo(i32 %tid, i32 %sub, i32 %base, <4 x i32> %vp, <4 x i32> %vc, i32 %X, i32 %Y)
-  %ztex = extractvalue { i32, i32 } %zpair, 0
-  %zsum = extractvalue { i32, i32 } %zpair, 1
+  %zpair = call { i32, i32, i32, i32 } @mid_zinfo(i32 %tid, i32 %sub, i32 %base, <4 x i32> %vp, <4 x i32> %vc, i32 %X, i32 %Y)
+  %ztex = extractvalue { i32, i32, i32, i32 } %zpair, 0
+  %zsum = extractvalue { i32, i32, i32, i32 } %zpair, 1
+  %zmin = extractvalue { i32, i32, i32, i32 } %zpair, 2
+  %zdiff = extractvalue { i32, i32, i32, i32 } %zpair, 3
   %bg_c0 = and i1 %isgm, %notanc
   %bg_c1 = and i1 %bg_c0, %hi_sm
   %z_le160 = icmp sle i32 %ztex, 160
-  %bg_c = and i1 %bg_c1, %z_le160
+  %t4_le3 = icmp sle i32 %t4, 3
+  %zm_gt160 = icmp sgt i32 %zmin, 160
+  %zd2 = shl i32 %zdiff, 1
+  %zd_ok = icmp sge i32 %zd2, %ztex
+  %ga0 = and i1 %t4_le3, %zm_gt160
+  %ga1 = and i1 %ga0, %zd_ok
+  %g_ok = or i1 %z_le160, %ga1
+  %bg_c = and i1 %bg_c1, %g_ok
   %dx_t = sub i32 %t3, %t5
   %dx_t5 = mul i32 %dx_t, 5
   %dx_ts = ashr i32 %dx_t5, 3

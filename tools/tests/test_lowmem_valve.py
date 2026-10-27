@@ -16,6 +16,7 @@ Tests:
 """
 import json
 import pathlib
+import re
 import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -1173,7 +1174,7 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     source = out / "test_lowmem_valve.c"
     bitcode = out / "test_lowmem_valve.bc"
-    source.write_text(
+    full_c = (
         HARNESS_C
         + "\n"
         + HOOKS_DECLS
@@ -1190,9 +1191,13 @@ def main() -> None:
         + "\n"
         + MAIN_SAFE_ACTIVATE
         + "\n"
-        + TESTS_MAIN_C,
-        encoding="utf-8",
+        + TESTS_MAIN_C
     )
+    full_c = re.sub(r"\b(0x[0-9a-fA-F]+)L\b", r"\1LL", full_c)
+    full_c = re.sub(r"\b(\d+)L\b", r"\1LL", full_c)
+    full_c = full_c.replace("unsigned long long", "uint64_t").replace("long long", "int64_t").replace("unsigned long", "uint64_t")
+    full_c = re.sub(r"\blong\b", "int64_t", full_c)
+    source.write_text(full_c, encoding="utf-8")
     llvm = pathlib.Path(cfg["llvm_bin"])
     clang_exe = llvm / "clang.exe"
     if clang_exe.exists():

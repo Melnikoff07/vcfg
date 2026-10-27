@@ -1,6 +1,6 @@
 # Compatibility
 
-> **Current release: [v2.34](https://github.com/Melnikoff07/vcfg/releases/tag/v2.34).** The table below is a
+> **Current release: [v2.35](https://github.com/Melnikoff07/vcfg/releases/tag/v2.35).** The table below is a
 > historical log snapshot, not a live support list. The v2.34 release notes describe a built-in FG profile and
 > HDR10 handling for CUSA13323/CUSA11456, an audio fix for CUSA10249, and targeted memory/present fixes for
 > CUSA08809/CUSA03468. These changes do not prove that every update, console or output mode works. For a useful

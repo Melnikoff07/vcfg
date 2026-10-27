@@ -42,14 +42,32 @@ prefix = r'''
 extern void *memcpy(void *, const void *, size_t);
 extern void *memset(void *, int, size_t);
 extern int strcmp(const char *, const char *);
+extern char *strstr(const char *, const char *);
+#ifdef _WIN32
 extern int _snprintf(char *, size_t, const char *, ...);
-extern int printf(const char *, ...);
 #define snprintf _snprintf
+#else
+extern int snprintf(char *, size_t, const char *, ...);
+#endif
+extern int printf(const char *, ...);
 typedef void FILE;
 static unsigned writes;
+static const void *write_ptrs[256];
+static size_t write_sizes[256];
+static char write_bufs[256][2048];
 static FILE *fopen(const char *p, const char *m) { return (FILE *)1; }
 static int fscanf(FILE *f, const char *fmt, ...) { return 0; }
-static size_t fwrite(const void *p, size_t a, size_t b, FILE *f) { writes++; return b; }
+static size_t fwrite(const void *p, size_t a, size_t b, FILE *f) {
+    size_t sz = a * b;
+    if (writes < 256) {
+        write_ptrs[writes] = p;
+        write_sizes[writes] = sz;
+        memset(write_bufs[writes], 0, sizeof(write_bufs[writes]));
+        if (sz < sizeof(write_bufs[writes])) memcpy(write_bufs[writes], p, sz);
+    }
+    writes++;
+    return b;
+}
 static int fflush(FILE *f) { return 0; }
 static int fclose(FILE *f) { return 0; }
 static int rename(const char *a, const char *b) { return 0; }
@@ -58,13 +76,50 @@ static int rename(const char *a, const char *b) { return 0; }
 #define BLOG(...) ((void)0)
 typedef long off_t;
 static void klog(const char *fmt, ...) {}
-static int sceKernelOpen(const char *p, int f, int m) { return -1; }
-static long sceKernelRead(int fd, void *b, size_t n) { return 0; }
+static const char *mock_capture_cfg;
+static int mock_bench_go_present;
+static int sceKernelOpen(const char *p, int f, int m) {
+    if (mock_capture_cfg && !strcmp(p, LOG_DIR "/bench_capture")) return 10;
+    if (mock_bench_go_present && !strcmp(p, LOG_DIR "/bench_go")) return 11;
+    return -1;
+}
+static long sceKernelRead(int fd, void *b, size_t n) {
+    if (fd == 10 && mock_capture_cfg) {
+        size_t l = 0;
+        while (mock_capture_cfg[l] && l < n) { ((char *)b)[l] = mock_capture_cfg[l]; l++; }
+        return (long)l;
+    }
+    return 0;
+}
 static int sceKernelClose(int fd) { return 0; }
 static size_t sceKernelGetDirectMemorySize(void) { return 0x100000000ull; }
-static int sceKernelAllocateDirectMemory(long s, long e, size_t l, size_t a, int t, long *p) { *p = 0; return -1; }
-static int sceKernelMapDirectMemory(void **a, size_t l, int p, int f, long ph, size_t al) { return -1; }
-static int sceKernelMapFlexibleMemory(void **a, size_t l, int p, int f) { return -1; }
+static int mock_dm_fail, mock_dm_surfaces_ok_only;
+static unsigned flex_calls, dm_alloc_calls;
+static size_t last_dm_dump_bytes;
+static uint8_t gpu_mem[0x20000+64], work_mem[0x220000], raw_mem[4u*1920u*1080u*8u+0x10000u];
+static uint8_t surfaces[0x1000000];
+static int sceKernelAllocateDirectMemory(long s, long e, size_t l, size_t a, int t, long *p) {
+    dm_alloc_calls++;
+    if (mock_dm_fail) return -1;
+    if (mock_dm_surfaces_ok_only && a != 0x200000) return -1;
+    if (a != 0x200000 && l > sizeof(raw_mem)) return -1;
+    *p = (a == 0x200000) ? 0x1000000L : 0x2000000L;
+    return 0;
+}
+static int sceKernelMapDirectMemory(void **a, size_t l, int p, int f, long ph, size_t al) {
+    if (mock_dm_fail) return -1;
+    if (al == 0x200000) { *a = surfaces; return 0; }
+    if (mock_dm_surfaces_ok_only || l > sizeof(raw_mem)) return -1;
+    last_dm_dump_bytes = l;
+    *a = raw_mem;
+    return 0;
+}
+static int sceKernelMapFlexibleMemory(void **a, size_t l, int p, int f) {
+    flex_calls++;
+    if (l > sizeof(raw_mem)) return -1;
+    *a = (l == 0x1000000u) ? surfaces : raw_mem;
+    return 0;
+}
 static int sceKernelAvailableDirectMemorySize(long s, long e, size_t a, long p, size_t z) { return 0; }
 static int sceKernelAvailableFlexibleMemorySize(size_t z) { return 0; }
 extern int sscanf(const char *, const char *, ...);
@@ -89,8 +144,6 @@ static int post_mid_only(void) { return 1; }
 static unsigned waits, overlays;
 static int insert_wait_flip_done(uint32_t *p, uint32_t n, int32_t h, uint32_t i) { waits++; memset(p,0,28); return 0; }
 static void osd_build_slot(uint8_t *p, uint32_t *x, uint32_t *w, uint32_t flags) { overlays++; *w=1; }
-static uint8_t gpu_mem[0x20000+64], work_mem[0x220000], raw_mem[4u*1920u*1080u*8u+0x10000u];
-static uint8_t surfaces[0x1000000];
 static uint8_t *g_gpu=gpu_mem, *g_work=work_mem, *g_dump_mem=raw_mem;
 static uint32_t mon[4], *g_mon=mon;
 static uint32_t g_hud_packed, g_sh8_off[17], g_dump_frame, g_flips;
@@ -132,16 +185,27 @@ pieces += [define(n) for n in ['SLOT0', 'SLOT_SZ', 'STATS_OFF', 'WORK_SZ', 'DUMP
                               'PKT3', 'TS_EOP', 'TS2', 'PASS_BARRIER', 'SET_PASS']]
 pieces += [function('calc_rcas_params'), function('build_dcb_flow8'), '#include "bench_capture.h"']
 pieces += [r'''
+#ifndef BENCH_SEQ_STEP_BYTES
+#define BENCH_SEQ_STEP_BYTES 0x10000u
+#endif
+#ifndef BENCH_SEQ_ANCHOR_PLANES
+#define BENCH_SEQ_ANCHOR_PLANES 6u
+#endif
+#ifndef BENCH_SEQ_MAX_BYTES
+#define BENCH_SEQ_MAX_BYTES 0x1000000u
+#endif
 static uint32_t original[128];
 static void reset(unsigned width,unsigned sharp,unsigned enhance,unsigned bits) {
     memset(gpu_mem,0,sizeof(gpu_mem)); memset(&g_cfg,0,sizeof(g_cfg));
-    g_cfg.sharpness=sharp;g_cfg.upscale=enhance;g_cfg.hud_protect=1;
+    g_cfg.mode=8;g_cfg.sharpness=sharp;g_cfg.upscale=enhance;g_cfg.hud_protect=1;
     g_bench_profile=g_cfg;g_attr.format=bits?0x88000000u:0x80000000u;g_attr.tilingMode=0;
     g_t_dfmt=bits?9:10;
     g_bench_state=BENCH_IDLE;g_bench_started=1;g_bench_saved=0;g_bench_limit=1;g_bench_next=240;
     g_bench_attempt=0;g_bench_cookie=0;g_bench_width=width;g_bench_plane=(size_t)width*1080*8;
+    g_bench_seq=0;g_bench_wait_go=0;
     g_bench_surfaces=surfaces;g_bench_tables=(uint32_t *)(g_dump_mem+4*g_bench_plane);
     submissions=submit_error=overlays=waits=writes=0;fail_submit=0;
+    dm_alloc_calls=flex_calls=0;mock_dm_fail=0;last_dm_dump_bytes=0;
     for(unsigned i=0;i<17;i++)g_sh8_off[i]=0x8000+i*256;
     memset(original,0,sizeof(original));original[64]=0xC03E1000u;original[65]=0x68750777u;
 }
@@ -189,16 +253,146 @@ int main(void) {
     if(frame(242,166732) || g_bench_state!=BENCH_WAIT)return 16;
     *(uint64_t *)(g_gpu+DUMP_DONE_OFF)=g_bench_cookie;
     bench_io_tick();if(writes!=5 || g_bench_state!=BENCH_DONE)return 17;
-    printf("capture host checks passed (60Hz + 30Hz); max appended DCB %u / 8192 bytes\n",max_bytes);
+
+    /* Sequence capture test (BENCH_SEQ2): K=1, N=32, DirectMemory ONLY (no bench_alloc_flex),
+     * total dump allocation <= 16 MiB (0x1000000), small 64 KiB buffer per step + 2 anchor triplets (s=0, s=31),
+     * file writes ONLY after capture finishes. */
+    memcpy(g_title_id,"CUSA08519",10);g_ema_frame_us=33366;g_osd_real_fps_x10=300;
+    reset(960,40,1,0);
+    mock_capture_cfg="1 32 960 1";mock_bench_go_present=1;g_bench_enabled=0;
+    if(!bench_bootstrap() || !g_bench_enabled || g_bench_limit!=32 || !g_bench_wait_go)return 20;
+
+    /* Verify DirectMemory failure in sequence mode refuses cleanly (BENCH_STOP) without calling bench_alloc_flex */
+    g_bench_started=0;mock_dm_fail=1;flex_calls=0;
+    {
+        void *d[1]={original};uint32_t z[1]={sizeof(original)};
+        g_flips=240;expected_index=0;
+        if(bench_flip(1,d,z,NULL,NULL,1,expected_index,1,77,100000) || g_bench_state!=BENCH_STOP || flex_calls!=0)return 201;
+    }
+
+    /* Reset and verify real bench_allocate() in sequence mode accepts width=240, uses DirectMemory ONLY and <= 16 MiB */
+    reset(240,40,1,0);
+    mock_capture_cfg="1 32 240 1";mock_bench_go_present=0;g_bench_enabled=0;
+    if(!bench_bootstrap() || !g_bench_enabled || g_bench_limit!=32 || g_bench_width!=240 || !g_bench_wait_go)return 20;
+    g_bench_started=0;mock_dm_fail=0;flex_calls=0;last_dm_dump_bytes=0;
+    ((uint32_t *)work_mem)[0]=0x11111111u;
+    {
+        void *d[1]={original};uint32_t z[1]={sizeof(original)};
+        g_flips=240;expected_index=0;
+        if(bench_flip(1,d,z,NULL,NULL,1,expected_index,1,77,100000) || g_bench_state!=BENCH_IDLE || !g_bench_wait_go)return 21;
+        if(flex_calls!=0 || last_dm_dump_bytes==0 || last_dm_dump_bytes>BENCH_SEQ_MAX_BYTES)return 202;
+        if(((uint32_t *)work_mem)[0]!=0x11111111u)return 22;
+        mock_bench_go_present=1;
+        if(bench_flip(1,d,z,NULL,NULL,1,expected_index,1,77,100000) || g_bench_state!=BENCH_B || g_bench_wait_go)return 23;
+        if(((uint32_t *)work_mem)[0]!=0u)return 24;
+        ((uint32_t *)work_mem)[0]=0xCAFEBABEu;
+        ((uint32_t *)work_mem)[(W8_V3+2048)/4]=0x04030201u;
+        for(unsigned step=1;step<=32;step++) {
+            g_flips=240+step;expected_index=g_flips%2;
+            uint64_t us=100000ull+(uint64_t)step*33366ull;
+            if(bench_flip(1,d,z,NULL,NULL,1,expected_index,1,77,us))return 25;
+            if(((uint32_t *)work_mem)[0]!=0xCAFEBABEu || ((uint32_t *)work_mem)[(W8_V3+2048)/4]!=0x04030201u)return 26;
+            uint32_t *tb=(uint32_t *)(g_gpu+SLOT0+(g_flips&3u)*SLOT_SZ+0xB00);
+            if(!(tb[30]&FG8_FLAG_PYR_WARM) || tb[28]!=(step&1u))return 27;
+            if(step<32 && g_bench_state!=BENCH_B)return 28;
+            if(step==32 && g_bench_state!=BENCH_WAIT)return 29;
+            if(writes!=0)return 30;
+        }
+        if(waits || overlays || submit_error || flex_calls!=0)return 30;
+        bench_io_tick();if(writes || g_bench_state!=BENCH_WAIT)return 31;
+        *(uint64_t *)(g_gpu+DUMP_DONE_OFF)=g_bench_cookie;
+        bench_io_tick();
+        /* 32 steps * 2 files (bench_seq_XXXX.bin + .json) + 2 anchor triplets * 5 files = 74 writes */
+        if(writes!=74 || g_bench_saved!=32 || g_bench_state!=BENCH_DONE)return 32;
+        size_t seq_base=BENCH_SEQ_ANCHOR_PLANES*g_bench_plane;
+        /* Step 0 writes: seq_0000.bin, seq_0000.json, then anchor 0 (a, gt, b, mid, json) */
+        if(write_ptrs[0]!=g_dump_mem+seq_base || write_sizes[0]!=BENCH_SEQ_STEP_BYTES)return 33;
+        if(write_ptrs[2]!=g_dump_mem+0u*g_bench_plane || write_ptrs[3]!=g_dump_mem+1u*g_bench_plane)return 34;
+        if(write_ptrs[4]!=g_dump_mem+1u*g_bench_plane || write_ptrs[5]!=g_dump_mem+2u*g_bench_plane)return 35;
+        /* Intermediate steps s=1..30 write only seq_XXXX.bin + seq_XXXX.json (2 writes per step) */
+        for(unsigned s=1;s<31;s++) {
+            unsigned wi=7u+(s-1u)*2u;
+            if(write_ptrs[wi]!=g_dump_mem+seq_base+(size_t)s*BENCH_SEQ_STEP_BYTES)return 36;
+            if(write_sizes[wi]!=BENCH_SEQ_STEP_BYTES)return 36;
+        }
+        /* Final step s=31 writes seq_0031.bin, seq_0031.json, then anchor 1 (a, gt, b, mid, json) */
+        if(write_ptrs[67]!=g_dump_mem+seq_base+31u*BENCH_SEQ_STEP_BYTES || write_sizes[67]!=BENCH_SEQ_STEP_BYTES)return 37;
+        if(write_ptrs[69]!=g_dump_mem+3u*g_bench_plane || write_ptrs[70]!=g_dump_mem+4u*g_bench_plane)return 38;
+        if(write_ptrs[71]!=g_dump_mem+4u*g_bench_plane || write_ptrs[72]!=g_dump_mem+5u*g_bench_plane)return 39;
+
+        /* Sequence with one dt=39 ms step (s=5, stage=6) MUST be saved, with dt_us, timing_ok, nonuniform_steps=1 */
+        g_bench_state=BENCH_IDLE;g_bench_saved=0;g_bench_next=240;writes=0;
+        g_flips=240;expected_index=0;
+        if(bench_flip(1,d,z,NULL,NULL,1,expected_index,1,77,100000) || g_bench_state!=BENCH_B)return 40;
+        {
+            uint64_t us=100000ull;
+            for(unsigned step=1;step<=32;step++) {
+                g_flips=240+step;expected_index=g_flips%2;
+                us += (step==6) ? 39000ull : 33366ull;
+                if(bench_flip(1,d,z,NULL,NULL,1,expected_index,1,77,us))return 41;
+            }
+        }
+        *(uint64_t *)(g_gpu+DUMP_DONE_OFF)=g_bench_cookie;
+        bench_io_tick();
+        if(writes!=74 || g_bench_saved!=32 || g_bench_state!=BENCH_DONE)return 42;
+        /* write_bufs[1] is bench_seq_0000.json; write_bufs[7 + (5-1)*2 + 1] = write_bufs[16] is bench_seq_0005.json */
+        if(!strstr(write_bufs[1], "\"dt_us\":33366,\"timing_ok\":true,\"nonuniform_steps\":1"))return 43;
+        if(!strstr(write_bufs[16], "\"dt_us\":39000,\"timing_ok\":false,\"nonuniform_steps\":1"))return 44;
+
+        /* Sequence with dt=120 ms (>100 ms) MUST be discarded */
+        g_bench_state=BENCH_IDLE;g_bench_saved=0;g_bench_next=240;writes=0;
+        g_flips=240;expected_index=0;
+        if(bench_flip(1,d,z,NULL,NULL,1,expected_index,1,77,100000) || g_bench_state!=BENCH_B)return 45;
+        {
+            uint64_t us=100000ull;
+            for(unsigned step=1;step<=32;step++) {
+                g_flips=240+step;expected_index=g_flips%2;
+                us += (step==6) ? 120000ull : 33366ull;
+                if(bench_flip(1,d,z,NULL,NULL,1,expected_index,1,77,us))return 46;
+            }
+        }
+        *(uint64_t *)(g_gpu+DUMP_DONE_OFF)=g_bench_cookie;
+        bench_io_tick();
+        if(writes!=0 || g_bench_state!=BENCH_IDLE)return 47;
+
+        /* Sequence with a skipped flip (g_flips != g_bench_first + stage) MUST be discarded */
+        g_bench_state=BENCH_IDLE;g_bench_saved=0;g_bench_next=240;writes=0;
+        g_flips=240;expected_index=0;
+        if(bench_flip(1,d,z,NULL,NULL,1,expected_index,1,77,100000) || g_bench_state!=BENCH_B)return 48;
+        for(unsigned step=1;step<=32;step++) {
+            g_flips=240+step+(step>=6?1:0);expected_index=g_flips%2;
+            uint64_t us=100000ull+(uint64_t)step*33366ull;
+            if(bench_flip(1,d,z,NULL,NULL,1,expected_index,1,77,us))return 49;
+        }
+        *(uint64_t *)(g_gpu+DUMP_DONE_OFF)=g_bench_cookie;
+        bench_io_tick();
+        if(writes!=0 || g_bench_state!=BENCH_IDLE)return 50;
+    }
+    printf("capture host checks passed (60Hz + 30Hz + seq2 N=32 dm=%zu bytes); max appended DCB %u / 8192 bytes\n",
+           last_dm_dump_bytes, max_bytes);
     return 0;
 }
 ''']
 out = ROOT / 'build/verification'
+out.mkdir(parents=True, exist_ok=True)
+bench_out = ROOT / 'build/classic-bench'
+if not (bench_out / 'bench_shaders.h').exists():
+    bench_out.mkdir(parents=True, exist_ok=True)
+    subprocess.run([cfg['python'], '-I', str(ROOT / 'classic/gen_shaders.py'),
+                    cfg['llc_gfx700'], str(ROOT / 'classic/bench/shaders'),
+                    str(bench_out / 'bench_shaders.h')], check=True)
 source = out / 'capture_host.c'
 source.write_text('\n'.join(pieces), encoding='utf-8')
 llvm = pathlib.Path(cfg['llvm_bin'])
-bitcode = out / 'capture_host.bc'
-subprocess.run([str(llvm / 'clang.exe'), '--target=x86_64-pc-windows-msvc', '-O0', '-fno-builtin',
-                '-I' + str(ROOT / 'classic/source'), '-I' + str(ROOT / 'overlay'), '-I' + str(ROOT / 'build/classic-bench'),
-                '-emit-llvm', '-c', str(source), '-o', str(bitcode)], check=True)
-subprocess.run([str(llvm / 'lli.exe'), '--dlopen=msvcrt.dll', str(bitcode)], check=True)
+if (llvm / 'clang.exe').exists():
+    bitcode = out / 'capture_host.bc'
+    subprocess.run([str(llvm / 'clang.exe'), '--target=x86_64-pc-windows-msvc', '-O0', '-fno-builtin',
+                    '-I' + str(ROOT / 'classic/source'), '-I' + str(ROOT / 'overlay'), '-I' + str(ROOT / 'build/classic-bench'),
+                    '-emit-llvm', '-c', str(source), '-o', str(bitcode)], check=True)
+    subprocess.run([str(llvm / 'lli.exe'), '--dlopen=msvcrt.dll', str(bitcode)], check=True)
+else:
+    exe = out / 'capture_host'
+    subprocess.run(['cc', '-O0', '-fno-builtin',
+                    '-I' + str(ROOT / 'classic/source'), '-I' + str(ROOT / 'overlay'), '-I' + str(ROOT / 'build/classic-bench'),
+                    str(source), '-o', str(exe)], check=True)
+    subprocess.run([str(exe)], check=True)

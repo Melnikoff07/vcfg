@@ -238,6 +238,66 @@ class DisocclusionAndHudTest(unittest.TestCase):
             self.assertLessEqual(max_vgprs, 64, f"{name} exceeds 64 VGPR limit ({max_vgprs})")
             self.assertEqual(scratch_en, 0, f"{name} uses scratch memory (scratch_en={scratch_en})")
 
+    def test_5_v5b_head_boundary_flicker_suppression(self):
+        """Verify V5b suppresses cw and ws0 leaks on incoherent (!coh) fast quads and prio=0 GK anchors while keeping WARP8_NWORDS=2960."""
+        F32 = np.float32
+        H_p, W_p = 64, 128
+        nby, nbx = H_p // 16, W_p // 16
+        P = np.full((H_p, W_p, 4), 0.35, dtype=F32)
+        C = np.full((H_p, W_p, 4), 0.35, dtype=F32)
+        P[..., 3] = 1.0
+        C[..., 3] = 1.0
+        # Create a slight warped-tap disagreement (0.16 < emov < 0.24 < 0.25) while static center es == 0 (< 0.006 -> ws0_raw == 1.0)
+        yy, xx = np.meshgrid(np.arange(H_p, dtype=F32), np.arange(W_p, dtype=F32), indexing="ij")
+        wave = F32(0.045) * np.sin(xx * F32(0.4))
+        P[..., :3] = np.clip(F32(0.35) + wave[..., None], F32(0.0), F32(1.0))
+        C[..., :3] = np.clip(F32(0.35) + wave[..., None], F32(0.0), F32(1.0))
+
+        F = np.zeros((nby, nbx, 2), dtype=F32)
+        prevF = np.zeros((nby, nbx, 2), dtype=F32)
+        GK = np.zeros((nby, nbx), dtype=np.int64)
+
+        # Region A (block by=1, bx=2, px y=16..31, x=32..47): incoherent 2x2 quad (!coh) where F(1,2)=(11.5, 0)
+        # and neighbor F(1,3)=(-26.0, 0) -> spr=37.5 > coh_thr (slow: branch where vmg=0.0 in baseline),
+        # while vm_c=11.5 and vm_p=12.0 -> vmg_e >= 10.0 -> w_vel == 1.0.
+        F[1, 2, 0] = F32(11.5)
+        F[1, 3, 0] = F32(-26.0)
+        prevF[1, 2, 0] = F32(12.0)
+
+        # Region B (block by=2, bx=5, px y=32..47, x=80..95): prio=0 anchor splat in GK (0 < gk < 1048576) with slow F=(2.0, 0)
+        F[2, 5, 0] = F32(2.0)
+        GK[2, 5] = 0x00080010  # prio=0, wt=128, nonzero GK anchor
+
+        dbg = {}
+        vw.warp8(P[..., :3], C[..., :3], F, GK, 0, dbg=dbg, prevF=prevF)
+        ws_map = np.concatenate(dbg["ws"], axis=0)
+        cw_map = np.concatenate(dbg["cw"], axis=0)
+        coh_map = np.concatenate(dbg["coh"], axis=0)
+        emov_map = np.concatenate(dbg["emov"], axis=0)
+
+        # Verify pixel (y=24, x=36) in Region A is incoherent (!coh) and has emov < 0.25
+        self.assertFalse(bool(coh_map[24, 36]), "Region A test pixel must be in !coh (slow:) branch")
+        self.assertLess(float(emov_map[24, 36]), 0.25, "Region A test pixel must have mfit (emov < 0.25)")
+        self.assertEqual(float(ws_map[24, 36]), 0.0, "V5b must suppress ws0 leak on incoherent fast quad (vm_c=11.5)")
+        self.assertEqual(float(cw_map[24, 36]), 0.0, "V5b must suppress cw leak on incoherent fast quad (vm_c=11.5)")
+
+        # Verify pixel (y=40, x=88) in Region B (prio=0 GK anchor) has ws == 0.0 and cw == 0.0
+        self.assertLess(float(emov_map[40, 88]), 0.25, "Region B test pixel must have mfit (emov < 0.25)")
+        self.assertEqual(float(ws_map[40, 88]), 0.0, "V5b must include prio=0 GK anchors (gk != 0) in hasfg ws suppression")
+        self.assertEqual(float(cw_map[40, 88]), 0.0, "V5b must include prio=0 GK anchors (gk != 0) in hasfg cw suppression")
+
+        # Verify classic/shaders/warp8.ll and classic/source/shaders.h match V5b +0B aligned budget (WARP8_NWORDS == 2960)
+        warp8_ll = (ROOT / "classic" / "shaders" / "warp8.ll").read_text(encoding="utf-8")
+        self.assertIn("%hasfg = icmp ne i32 %gk, 0", warp8_ll)
+        self.assertIn("%vmg_e = call float @llvm.maxnum.f32(float %vm_c, float %vmp_k)", warp8_ll)
+        self.assertIn("%ws0_s = fmul float %ws0, %ws_keep", warp8_ll)
+        self.assertIn("%ws = call float @llvm.maxnum.f32(float %ws0_s, float %w_hud)", warp8_ll)
+
+        shaders_h = (ROOT / "classic" / "source" / "shaders.h").read_text(encoding="utf-8")
+        mw = re.search(r"#define\s+WARP8_NWORDS\s+(\d+)", shaders_h)
+        self.assertIsNotNone(mw)
+        self.assertEqual(int(mw.group(1)), 2960, "WARP8_NWORDS must remain 2960 (12,032 B aligned, 512 B free margin)")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

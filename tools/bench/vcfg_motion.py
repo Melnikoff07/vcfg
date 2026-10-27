@@ -594,7 +594,11 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
     # Midpoint (0, 0) block texture and luma sum (clamped to [0, wm8] x [0, hm8] matching @mid_zinfo / @bsad)
     p0_blk = _blocks(L1p, np.clip(X, 0, wm8), np.clip(Y, 0, hm8)[:, None] + r_idx)
     c0_blk = _blocks(L1c, np.clip(X, 0, wm8), np.clip(Y, 0, hm8)[:, None] + r_idx)
-    ztex = (_block_tex_8x8(p0_blk) + _block_tex_8x8(c0_blk)) >> 1
+    ztex_p = _block_tex_8x8(p0_blk)
+    ztex_c = _block_tex_8x8(c0_blk)
+    ztex = (ztex_p + ztex_c) >> 1
+    ztex_min = np.minimum(ztex_p, ztex_c)
+    ztex_diff = np.abs(ztex_p - ztex_c)
     zsum = (p0_blk.sum(axis=(1, 2)) + c0_blk.sum(axis=(1, 2))) >> 1
 
     def ldT(ox, oy):
@@ -634,9 +638,10 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
         sm = sm0 + np.where(nfgk, terms[4] * 3, 0)
         pen = sm << lsh
         # Outward disocclusion/occlusion shift: when evaluating a camera-aligned background candidate
-        # (sc <= 3) at a high-gradient motion boundary (sm0 >= 16) and midpoint is not textured (ztex <= 160),
-        # shift the bilateral SAD window up to 5 L1 px away from the higher-disagreement (foreground) neighbor.
-        bg_c = (sc <= 3) & notanc & (sm0 >= 16) & (ztex <= 160)
+        # (sc <= 3) at a high-gradient motion boundary (sm0 >= 16) and midpoint is either smooth (ztex <= 160)
+        # or a camera-aligned background block (terms[4] <= 3) on textured background (ztex_min > 160) with
+        # occluder boundary frame-asymmetry (ztex_diff * 2 >= ztex), shift up to 5 L1 px away from the foreground neighbor.
+        bg_c = (sc <= 3) & notanc & (sm0 >= 16) & ((ztex <= 160) | ((terms[4] <= 3) & (ztex_min > 160) & (ztex_diff * 2 >= ztex)))
         shx_d = np.clip(((terms[3] - terms[5]) * 5) >> 3, -5, 5)
         shy_d = np.clip(((terms[1] - terms[7]) * 5) >> 3, -5, 5)
         # Only shift to the CUR grid when evaluating an anchor escape candidate (so static heads reject sky escape);

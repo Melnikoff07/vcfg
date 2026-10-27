@@ -1,6 +1,6 @@
 # VCFG
 
-**Current release: [v2.34](https://github.com/Melnikoff07/vcfg/releases/tag/v2.34) (25 October 2026).** For install and update details, use the release notes for the PKG you actually installed.
+**Current release: [v2.35](https://github.com/Melnikoff07/vcfg/releases/tag/v2.35) (27 October 2026).** For install and update details, use the release notes for the PKG you actually installed.
 
 VCFG (vibe coded frame generator): optical-flow frame generation for games on PS4 consoles running the
 GoldHEN homebrew enabler, as a GoldHEN plugin. The plugin hooks the game's frame
@@ -51,7 +51,7 @@ AMDGPU target for shaders.
 copy config.example.json config.json                                   # paths and console IP
 powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1          # new engine -> build/vcfg/vcfg.prx
 sh classic/build.sh                                                    # classic engine -> build/classic/vcfg_classic.prx
-powershell -NoProfile -ExecutionPolicy Bypass -File launcher/build_pkg.ps1 -Version 2.34   # -> build/launcher/VCFG_v2.34.pkg
+powershell -NoProfile -ExecutionPolicy Bypass -File launcher/build_pkg.ps1 -Version 2.35   # -> build/launcher/VCFG_v2.35.pkg
 python -I overlay/preview.py build/preview/vov                         # overlay preview PNGs (after building the DLL, see the script)
 ```
 

@@ -1,16 +1,27 @@
-// Benchmark-only capture. One triplet in flight; no scratch surface is registered
+// Benchmark-only capture. One triplet or N=32 sequence in flight; no scratch surface is registered
 // with VideoOut. Every submission keeps the game's index, mode, argument and tail.
 #pragma once
 #define BENCH_SURFACE 0x800000u
 #define BENCH_DCB_BYTES 0x2000u
 #define BENCH_DCB_OFF 0x1000u
+#define BENCH_SEQ_MAX 32u
+#define BENCH_SEQ_ANCHOR_PLANES 6u
+#define BENCH_SEQ_STEP_BYTES 0x10000u
+#define BENCH_SEQ_DCB_OFF 0x4000u
+#define BENCH_SEQ_TABLES_BYTES 0x48000u
+#define BENCH_SEQ_MAX_BYTES 0x1000000u
 _Static_assert(BENCH_DCB_OFF + 3u * BENCH_DCB_BYTES <= 0x10000u, "bench descriptors/DCBs exceed their allocation");
+_Static_assert(BENCH_SEQ_DCB_OFF + (BENCH_SEQ_MAX + 1u) * BENCH_DCB_BYTES <= BENCH_SEQ_TABLES_BYTES, "bench seq descriptors/DCBs exceed their allocation");
 _Static_assert(DCB8_SZ + 2u * 256u + 256u + 64u < BENCH_DCB_BYTES, "bench DCB has no append margin");
 enum { BENCH_IDLE, BENCH_GT, BENCH_B, BENCH_WAIT, BENCH_WRITE, BENCH_DONE, BENCH_STOP };
 static uint32_t g_bench_state, g_bench_interval = 240, g_bench_limit = 6, g_bench_width = 1920;
 static uint32_t g_bench_saved, g_bench_attempt, g_bench_next = 240, g_bench_first, g_bench_cookie;
 static uint32_t g_bench_frames[3], g_bench_indices[3];
 static uint64_t g_bench_times[3];
+static int g_bench_seq;
+static uint32_t g_bench_seq_stage;
+static uint32_t g_bench_seq_frames[BENCH_SEQ_MAX + 1u], g_bench_seq_indices[BENCH_SEQ_MAX + 1u];
+static uint64_t g_bench_seq_times[BENCH_SEQ_MAX + 1u];
 static size_t g_bench_plane;
 static uint8_t *g_bench_surfaces;
 static uint32_t *g_bench_tables;
@@ -34,6 +45,11 @@ static int bench_is_30hz_title(void)
     return !strcmp(g_title_id, "CUSA03041") || !strcmp(g_title_id, "CUSA05571") || !strcmp(g_title_id, "CUSA08519");
 }
 
+static int bench_width_valid(uint32_t w)
+{
+    return w == 1920u || w == 960u || w == 640u || w == 480u || w == 320u || w == 240u;
+}
+
 static int bench_bootstrap(void)
 {
     if (strcmp(g_title_id, "CUSA00557") && strcmp(g_title_id, "CUSA09171") && !bench_is_30hz_title()) {
@@ -50,13 +66,19 @@ static int bench_bootstrap(void)
     if (mn < 0) mn = 0;
     mb[mn] = 0;
     int n = sscanf(mb, "%u %u %u %u", &k, &m, &w, &s);
-    if (n < 2 || k < 6 || k > 3600 || m < 1 || m > 64 || (n >= 3 && w != 960 && w != 1920) || s > 1000000u) {
-        klog("[bb_probe] BENCH inert: expected K M [width [start_flip]], K=6..3600 M=1..64 width=960/1920\n"); return 0;
+    int seq_ok = (n >= 1 && k == 1u && (n < 2 || (m >= 1u && m <= BENCH_SEQ_MAX)));
+    int tri_ok = (n >= 2 && k >= 6u && k <= 3600u && m >= 1u && m <= 64u);
+    if (seq_ok && n < 2) m = BENCH_SEQ_MAX;
+    if (seq_ok && n < 3) w = 240u;
+    if ((!seq_ok && !tri_ok) || (n >= 3 && (seq_ok ? !bench_width_valid(w) : (w != 960u && w != 1920u))) || s > 1000000u) {
+        klog("[bb_probe] BENCH inert: expected K M [width [start_flip]], K=1 (seq M=1..32 width=240..1920) or K=6..3600 M=1..64 width=960/1920\n"); return 0;
     }
-    g_bench_interval = k; g_bench_limit = m; g_bench_width = w; g_bench_next = s > 120u ? s : (k > 120 ? k : 120);
+    g_bench_seq = seq_ok ? 1 : 0;
+    g_bench_seq_stage = 0u;
+    g_bench_interval = k; g_bench_limit = m; g_bench_width = w; g_bench_next = s > 120u ? s : (k > 120u ? k : 120u);
     g_bench_wait_go = (s == 1u);
     g_bench_enabled = 1;
-    klog("[bb_probe] BENCH build=capture-v1 K=%u M=%u requested_width=%u; no generated flips\n", k, m, w);
+    klog("[bb_probe] BENCH build=capture-v1 K=%u M=%u seq=%d requested_width=%u; no generated flips\n", k, m, g_bench_seq, w);
     return 1;
 }
 
@@ -96,27 +118,35 @@ static void bench_allocate(void)
     bench_mem_report("before capture allocations");
     g_bench_surfaces = (uint8_t *)bench_alloc(2u * BENCH_SURFACE, 0x200000, 3);
     if (!g_bench_surfaces) g_bench_surfaces = (uint8_t *)bench_alloc(2u * BENCH_SURFACE, 0x200000, 0);
-    if (!g_bench_surfaces) g_bench_surfaces = (uint8_t *)bench_alloc_flex(2u * BENCH_SURFACE);
+    if (!g_bench_surfaces && !g_bench_seq) g_bench_surfaces = (uint8_t *)bench_alloc_flex(2u * BENCH_SURFACE);
     bench_mem_report("after surfaces");
-    if (!g_bench_surfaces) { bench_stop("offscreen allocation failed"); return; }
-    // the game leaves little direct memory free (33 MB for 960 wide failed with 0x80020023 on CUSA00557): narrower crops
+    if (!g_bench_surfaces) { bench_stop("offscreen direct memory allocation failed"); return; }
+    // In sequence mode (g_bench_seq), allocate ONLY DirectMemory (never bench_alloc_flex) and cap total
+    // dump buffer at BENCH_SEQ_MAX_BYTES (16 MiB): 6 anchor planes (start/end A,B,mid) + M * 64 KiB small step buffers.
+    size_t nplanes = g_bench_seq ? (size_t)BENCH_SEQ_ANCHOR_PLANES : 4u;
+    size_t seq_bytes = g_bench_seq ? (size_t)g_bench_limit * BENCH_SEQ_STEP_BYTES : 0u;
+    size_t tbl_bytes = g_bench_seq ? (size_t)BENCH_SEQ_TABLES_BYTES : (size_t)0x10000u;
     static const uint32_t widths[] = { 1920u, 960u, 640u, 480u, 320u, 240u };
     for (unsigned wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
         if (widths[wi] > g_bench_width) continue;
+        size_t plane_try = (size_t)widths[wi] * 1080u * 8u;
+        size_t bytes = (nplanes * plane_try + seq_bytes + tbl_bytes + 0xffffu) & ~(size_t)0xffffu;
+        if (g_bench_seq && bytes > BENCH_SEQ_MAX_BYTES) continue;
         g_bench_width = widths[wi];
-        g_bench_plane = (size_t)g_bench_width * 1080u * 8u;
-        size_t bytes = (4u * g_bench_plane + 0x10000u + 0xffffu) & ~(size_t)0xffffu;
+        g_bench_plane = plane_try;
         g_dump_mem = (uint8_t *)bench_alloc(bytes, 0x10000, 0);
         if (!g_dump_mem) g_dump_mem = (uint8_t *)bench_alloc(bytes, 0x10000, 3);  // onion pool exhausted: try garlic
-        if (!g_dump_mem) g_dump_mem = (uint8_t *)bench_alloc_flex(bytes);          // direct memory exhausted: flexible pool
+        if (!g_dump_mem && !g_bench_seq) g_dump_mem = (uint8_t *)bench_alloc_flex(bytes);  // never flex in seq mode
         if (g_dump_mem) {
-            g_bench_tables = (uint32_t *)(g_dump_mem + 4u * g_bench_plane);
-            BLOG("capture width settled at %u (plane 0x%zx)", g_bench_width, g_bench_plane);
-            klog("[bb_probe] BENCH allocation width=%u height=1080 rgba16le plane=%zu bytes; scratch is never scanned out\n", g_bench_width, g_bench_plane);
+            g_bench_tables = (uint32_t *)(g_dump_mem + nplanes * g_bench_plane + seq_bytes);
+            BLOG("capture width settled at %u (plane 0x%zx nplanes=%zu seq_bytes=0x%zx total=0x%zx)",
+                 g_bench_width, g_bench_plane, nplanes, seq_bytes, bytes);
+            klog("[bb_probe] BENCH allocation width=%u height=1080 rgba16le plane=%zu bytes nplanes=%zu seq_bytes=%zu total=%zu; direct memory only=%d\n",
+                 g_bench_width, g_bench_plane, nplanes, seq_bytes, bytes, g_bench_seq);
             return;
         }
     }
-    bench_stop("dump allocation failed");
+    bench_stop("dump direct memory allocation failed");
 }
 
 static uint32_t *bench_pass(uint32_t *p, uint32_t *tb, uint32_t shader, uint32_t r1, uint32_t r2, uint32_t dx, uint32_t dy)
@@ -137,9 +167,36 @@ static uint32_t *bench_pack(uint32_t *p, uint64_t surface, unsigned plane, uint3
     // Separate descriptors for A, GT, B and mid: never edit a table still on the GPU.
     uint32_t *tb = g_bench_tables + plane * 32u;
     make_t(tb, surface, 1920, 1080, 1920, tidx);
-    make_v(tb + 8, (uint64_t)(uintptr_t)(g_dump_mem + plane * g_bench_plane), (uint32_t)g_bench_plane);
-    tb[12] = g_bench_width; tb[13] = 1080;
+    make_v(tb + 8, (uint64_t)(uintptr_t)(g_dump_mem + (size_t)plane * g_bench_plane), (uint32_t)g_bench_plane);
+    tb[12] = g_bench_width; tb[13] = 1080; tb[14] = 0; tb[15] = 0;
     return bench_pass(p, tb, g_bench_pack_off, PACK16_RSRC1, PACK16_RSRC2, g_bench_width / 8u, 135);
+}
+
+static uint8_t *bench_seq_step_ptr(unsigned s)
+{
+    return g_dump_mem + (size_t)BENCH_SEQ_ANCHOR_PLANES * g_bench_plane + (size_t)s * BENCH_SEQ_STEP_BYTES;
+}
+
+static uint32_t *bench_seq_snap(uint32_t *p, uint64_t prev_surf, uint64_t cur_surf, unsigned s, uint32_t tidx, uint32_t slot)
+{
+    uint32_t *slot_tb = (uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0xB00);
+    uint32_t r = slot_tb[28] & 1u;
+    uint32_t flags = slot_tb[30];
+    uint32_t *tb = g_bench_tables + 256u + s * 32u;
+    memset(tb, 0, 32u * sizeof(uint32_t));
+    make_t(tb + 0, prev_surf, 1920, 1080, 1920, tidx);
+    make_v(tb + 8, (uint64_t)(uintptr_t)bench_seq_step_ptr(s), BENCH_SEQ_STEP_BYTES);
+    tb[12] = 120u;
+    tb[13] = 68u;
+    tb[14] = flags;
+    tb[15] = (r ? W8_FB : W8_FA) - W8_V3;
+    make_t(tb + 16, cur_surf, 1920, 1080, 1920, tidx);
+    make_v(tb + 24, (uint64_t)(uintptr_t)(g_work + W8_V3), W8_FT - W8_V3);
+    tb[28] = 2u | (2u << 3) | (2u << 6) | (1u << 15);
+    tb[29] = 0u;
+    tb[30] = (1u << 20) | (1u << 22);
+    tb[31] = 0u;
+    return bench_pass(p, tb, g_bench_pack_off, PACK16_RSRC1, PACK16_RSRC2, 15u, 9u);
 }
 
 static int bench_write(const char *path, const void *data, size_t size)
@@ -160,9 +217,86 @@ static void bench_io_tick(void)
     if (!__atomic_compare_exchange_n(&g_bench_state, &expected, BENCH_WRITE, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
     if (!g_bench_timing) {
         lg("BENCH discard attempt=%u: nonuniform/native-60 timing\n", g_bench_attempt);
+        g_bench_seq_stage = 0u;
         __atomic_store_n(&g_bench_state, BENCH_IDLE, __ATOMIC_RELEASE); return;
     }
     static const char *part[4] = { "a", "gt", "b", "mid" };
+    if (g_bench_seq) {
+        int is_30hz = bench_is_30hz_title();
+        uint64_t dt_min = is_30hz ? 28000u : 15000u, dt_max = is_30hz ? 38333u : 18500u;
+        uint64_t diff_max = is_30hz ? 5000u : 1500u, sum_min = is_30hz ? 54000u : 32000u, sum_max = is_30hz ? 95000u : 35000u;
+        uint8_t step_ok[BENCH_SEQ_MAX];
+        unsigned nonuniform_steps = 0u;
+        for (unsigned s = 0; s < g_bench_limit; s++) {
+            uint64_t dt_us = g_bench_seq_times[s + 1u] - g_bench_seq_times[s];
+            int ok = (dt_us >= dt_min && dt_us <= dt_max);
+            if (ok && s > 0u && step_ok[s - 1u]) {
+                uint64_t d1 = g_bench_seq_times[s] - g_bench_seq_times[s - 1u];
+                if ((d1 > dt_us ? d1 - dt_us : dt_us - d1) > diff_max || d1 + dt_us < sum_min || d1 + dt_us > sum_max) ok = 0;
+            }
+            step_ok[s] = (uint8_t)ok;
+            if (!ok) nonuniform_steps++;
+        }
+        for (unsigned s = 0; s < g_bench_limit; s++) {
+            uint32_t f0 = g_bench_seq_frames[s], f1 = g_bench_seq_frames[s + 1u], f2 = f1 + 1u;
+            uint32_t b0 = g_bench_seq_indices[s], b1 = g_bench_seq_indices[s + 1u], b2 = b1;
+            uint64_t t0 = g_bench_seq_times[s], t1 = g_bench_seq_times[s + 1u];
+            uint64_t t2 = (s + 2u <= g_bench_limit) ? g_bench_seq_times[s + 2u] : (2ull * t1 - t0);
+            uint64_t dt_us = t1 - t0;
+            int is_anchor = (s == 0u || s + 1u == g_bench_limit);
+            char spath[256], sjson[2048];
+            snprintf(spath, sizeof(spath), "%s/bench_seq_%04u.bin", g_bench_dir, s);
+            if (!bench_write(spath, bench_seq_step_ptr(s), BENCH_SEQ_STEP_BYTES)) {
+                bench_stop("seq step binary write failed"); return;
+            }
+            int sn = snprintf(sjson, sizeof(sjson),
+                "{\n\"schema\":2,\"mode\":\"seq_small\",\"build\":\"capture-v1\",\"source_hash\":\"%s\",\"title\":\"%s\",\n"
+                "\"step\":%u,\"seq_limit\":%u,\"flip\":%u,\"frames\":[%u,%u,%u],\"buffers\":[%u,%u,%u],\n"
+                "\"submit_us\":[%llu,%llu,%llu],\"dt_us\":%llu,\"timing_ok\":%s,\"nonuniform_steps\":%u,\n"
+                "\"step_bytes\":%u,\"anchor_triplet\":%s,\n"
+                "\"layout\":{\"v3_off\":0,\"v3_bytes\":2040,\"anchor_hist_off\":2048,\"anchor_hist_bytes\":2040,"
+                "\"v2_off\":4096,\"v2_bytes\":8160,\"misc_off\":12256,\"misc_bytes\":32,"
+                "\"gk_off\":12288,\"gk_bytes\":32640,\"fgmask_off\":44928,\"fgmask_bytes\":8160,"
+                "\"f_head_crop_off\":53088,\"f_head_crop_bytes\":8064,\"f_head_crop_box\":[13,41,42,78]}\n}\n",
+                VCFG_BENCH_SOURCE_HASH, g_title_id, s, g_bench_limit, f0, f0, f1, f2, b0, b1, b2,
+                (unsigned long long)t0, (unsigned long long)t1, (unsigned long long)t2,
+                (unsigned long long)dt_us, step_ok[s] ? "true" : "false", nonuniform_steps,
+                (unsigned)BENCH_SEQ_STEP_BYTES, is_anchor ? "true" : "false");
+            if (sn <= 0 || (size_t)sn >= sizeof(sjson)) { bench_stop("seq metadata overflow"); return; }
+            snprintf(spath, sizeof(spath), "%s/bench_seq_%04u.json", g_bench_dir, s);
+            if (!bench_write(spath, sjson, (size_t)sn)) { bench_stop("seq metadata write failed"); return; }
+
+            if (is_anchor) {
+                unsigned base_p = (s == 0u) ? 0u : 3u;
+                unsigned p_idx[4] = { base_p + 0u, base_p + 1u, base_p + 1u, base_p + 2u };
+                for (unsigned i = 0; i < 4; i++) {
+                    char p[256]; snprintf(p, sizeof(p), "%s/bench_%04u_%s.rgba", g_bench_dir, s, part[i]);
+                    if (!bench_write(p, g_dump_mem + (size_t)p_idx[i] * g_bench_plane, g_bench_plane)) {
+                        bench_stop("raw file write failed"); return;
+                    }
+                }
+                char json[2048], path[256];
+                int n = snprintf(json, sizeof(json),
+                    "{\n\"schema\":1,\"build\":\"capture-v1\",\"source_hash\":\"%s\",\"title\":\"%s\",\"sample\":%u,\n"
+                    "\"width\":%u,\"height\":1080,\"source_width\":1920,\"source_height\":1080,\"crop_x\":0,\"crop_y\":0,\n"
+                    "\"encoding\":\"rgba16le\",\"format\":%u,\"tiling\":%u,\"pitch\":1920,\"plane_bytes\":%zu,\n"
+                    "\"frames\":[%u,%u,%u],\"buffers\":[%u,%u,%u],\"submit_us\":[%llu,%llu,%llu],\n"
+                    "\"timing_valid\":true,\"timing_domain\":\"cpu_submit_proxy\",\"history\":\"cold\",\"phase_q16\":32768,\"generated_flipped\":false,\n"
+                    "\"profile\":{\"preset\":0,\"sharpness\":%d,\"enhance\":%d,\"hud_protect\":%d,\"hud_rect_packed\":%u}\n}\n",
+                    VCFG_BENCH_SOURCE_HASH, g_title_id, s, g_bench_width, g_bench_attr.format, g_bench_attr.tilingMode, g_bench_plane,
+                    f0, f1, f2, b0, b1, b2,
+                    (unsigned long long)t0, (unsigned long long)t1, (unsigned long long)t2,
+                    g_bench_profile.sharpness, g_bench_profile.upscale, g_bench_profile.hud_protect, g_bench_hud);
+                if (n <= 0 || (size_t)n >= sizeof(json)) { bench_stop("metadata overflow"); return; }
+                snprintf(path, sizeof(path), "%s/bench_%04u.json", g_bench_dir, s);
+                if (!bench_write(path, json, (size_t)n)) { bench_stop("metadata write failed"); return; }
+            }
+            g_bench_saved = s + 1u;
+        }
+        lg("BENCH seq saved %u/%u nonuniform_steps=%u dir=%s\n", g_bench_saved, g_bench_limit, nonuniform_steps, g_bench_dir);
+        __atomic_store_n(&g_bench_state, BENCH_DONE, __ATOMIC_RELEASE);
+        return;
+    }
     for (unsigned i = 0; i < 4; i++) {
         char p[256]; snprintf(p, sizeof(p), "%s/bench_%04u_%s.rgba", g_bench_dir, g_bench_saved, part[i]);
         if (!bench_write(p, g_dump_mem + i * g_bench_plane, g_bench_plane)) { bench_stop("raw file write failed"); return; }
@@ -253,6 +387,96 @@ static int32_t bench_flip(uint32_t count, void **dcb, uint32_t *sizes, void **cc
         bench_stop("unknown flip tail / flip-only CCB"); goto native;
     }
     uint32_t slot = g_flips & 3u, tidx = g_attr.tilingMode == 0 ? 10u : 8u;
+    if (g_bench_seq) {
+        unsigned stage = (state == BENCH_IDLE) ? 0u : g_bench_seq_stage;
+        if (stage > g_bench_limit) { bench_stop("invalid seq stage"); goto native; }
+        uint32_t *mine = (uint32_t *)((uint8_t *)g_bench_tables + BENCH_SEQ_DCB_OFF + stage * BENCH_DCB_BYTES), *p = mine;
+        uint64_t current = g_buf[index], saved_a = (uint64_t)(uintptr_t)g_bench_surfaces;
+        uint64_t mid = saved_a + BENCH_SURFACE;
+        if (state == BENCH_IDLE) {
+            // Clear g_work ONCE at sequence start; never cleared between frames 1..N.
+            memset(g_work, 0, WORK_SZ);
+            g_bench_first = g_flips; g_bench_attempt++; g_bench_cookie = g_bench_attempt;
+            g_bench_next = g_flips + g_bench_limit + 1u;
+            *(volatile uint64_t *)(g_gpu + DUMP_DONE_OFF) = 0;
+            g_bench_timing = 1;
+            g_bench_attr = g_attr; g_bench_hud = g_hud_packed;
+        }
+        g_bench_seq_frames[stage] = g_flips; g_bench_seq_indices[stage] = index; g_bench_seq_times[stage] = now;
+        if (stage) {
+            uint64_t dt = now - g_bench_seq_times[stage - 1u];
+            if (g_flips != g_bench_first + stage || dt < 15000u || dt > 100000u) g_bench_timing = 0;
+        }
+        *p++ = PKT3(0x46, 1, 0); *p++ = 0x0000002E;
+        *p++ = PKT3(0x46, 1, 0); *p++ = 0x00000407;
+        *p++ = PKT3(0x58, 6, 0); *p++ = 0x82003FC0; *p++ = 1920u * 1088u * 4u / 256u;
+        *p++ = 0; *p++ = (uint32_t)(current >> 8); *p++ = (uint32_t)(current >> 40); *p++ = 0x0A;
+        if (!stage) {
+            p = bench_pack(p, current, 0u, tidx);
+            uint32_t *tb = g_bench_tables + 1536u;
+            memset(tb, 0, 32u * sizeof(uint32_t));
+            make_t(tb + 8, current, 1920, 1080, 1920, tidx);
+            make_t(tb + 16, saved_a, 1920, 1080, 1920, tidx);
+            p = bench_pass(p, tb, g_sh8_off[16], PCOPY8_RSRC1, PCOPY8_RSRC2, 240, 135);
+            uint32_t *py = g_bench_tables + 3200u;
+            memset(py, 0, 140u * sizeof(uint32_t));
+            fill_table8(py, saved_a, saved_a, mid, 1920, tidx, 0, 0, FG8_FLAG_PYR_WARM, g_work, g_mon, NULL);
+            p = bench_pass(p, py, g_sh8_off[0], PYR8_RSRC1, PYR8_RSRC2, 30, 68);
+            g_pyr_last_cur_base = saved_a; g_pyr_last_w = 1920; g_pyr_last_h = 1080; g_pyr_parity = 0;
+        } else {
+            unsigned s = stage - 1u;
+            int is_first = (s == 0u);
+            int is_last = (stage == g_bench_limit && s > 0u);
+            if (is_first) {
+                p = bench_pack(p, current, 1u, tidx);
+            } else if (is_last) {
+                p = bench_pack(p, saved_a, 3u, tidx);
+                p = bench_pack(p, current, 4u, tidx);
+            }
+            g_bench_offscreen = 1;
+            uint32_t n = build_dcb_flow8(p, saved_a, current, mid, mid, 1920, tidx, 1920u * 1088u * 4u,
+                                         slot, stage, tail, (int32_t)handle, 0, 0, 32768, 0, 0, 0, 0, 0);
+            g_bench_offscreen = 0;
+            if (n < 64u || n * 4u > DCB8_SZ) { bench_stop("core DCB exceeded its budget"); goto native; }
+            p += n - 64u;
+            if (is_first) {
+                p = bench_pack(p, mid, 2u, tidx);
+            } else if (is_last) {
+                p = bench_pack(p, mid, 5u, tidx);
+            }
+            p = bench_seq_snap(p, saved_a, current, s, tidx, slot);
+            if (stage < g_bench_limit) {
+                uint32_t *tb = g_bench_tables + 1536u + stage * 32u;
+                memset(tb, 0, 32u * sizeof(uint32_t));
+                make_t(tb + 8, current, 1920, 1080, 1920, tidx);
+                make_t(tb + 16, saved_a, 1920, 1080, 1920, tidx);
+                p = bench_pass(p, tb, g_sh8_off[16], PCOPY8_RSRC1, PCOPY8_RSRC2, 240, 135);
+                g_pyr_last_cur_base = saved_a;
+            } else {
+                uint64_t done = (uint64_t)(uintptr_t)(g_gpu + DUMP_DONE_OFF);
+                *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)done;
+                *p++ = 0x40000000u | ((uint32_t)(done >> 32) & 0xffffu); *p++ = g_bench_cookie; *p++ = 0;
+            }
+        }
+        memcpy(p, tail, 256); p += 64;
+        uint32_t bytes = (uint32_t)(p - mine) * 4u;
+        if (bytes > BENCH_DCB_BYTES) { bench_stop("DCB capacity exceeded"); goto native; }
+        void *ds[7], *cs[7]; uint32_t dz[7], cz[7];
+        for (uint32_t i = 0; i < count; i++) { ds[i] = dcb[i]; dz[i] = sizes[i]; cs[i] = ccb ? ccb[i] : NULL; cz[i] = csizes ? csizes[i] : 0; }
+        uint32_t ncount = count;
+        if (nd == 64) { ds[last] = mine; dz[last] = bytes; }
+        else { dz[last] -= 256; ds[count] = mine; dz[count] = bytes; cs[count] = NULL; cz[count] = 0; ncount++; }
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        int32_t r = HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
+            int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),
+            ncount, ds, dz, ccb ? cs : NULL, csizes ? cz : NULL, handle, index, mode, arg);
+        if (r) bench_stop("native submission failed; no buffer reuse");
+        else {
+            g_bench_seq_stage = stage + 1u;
+            __atomic_store_n(&g_bench_state, stage < g_bench_limit ? BENCH_B : BENCH_WAIT, __ATOMIC_RELEASE);
+        }
+        return r;
+    }
     unsigned stage = state == BENCH_IDLE ? 0u : state == BENCH_GT ? 1u : 2u;
     // Three private 8 KiB DCBs live after the export tables. They are never
     // reused while a triplet is on the GPU or owned by the IO worker.
@@ -314,8 +538,6 @@ static int32_t bench_flip(uint32_t count, void **dcb, uint32_t *sizes, void **cc
     uint32_t ncount = count;
     if (nd == 64) { ds[last] = mine; dz[last] = bytes; }
     else { dz[last] -= 256; ds[count] = mine; dz[count] = bytes; cs[count] = NULL; cz[count] = 0; ncount++; }
-    // Drain the CPU's WC clear of motion history and publish descriptors/DCBs
-    // before handing them to the GPU. This does not wait for GPU execution.
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     int32_t r = HOOK_CONTINUE(sceGnmSubmitAndFlipCommandBuffers,
         int32_t (*)(uint32_t, void **, uint32_t *, void **, uint32_t *, uint32_t, uint32_t, uint32_t, int64_t),

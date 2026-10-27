@@ -148,14 +148,18 @@ def mlp_cw(x0, x1, x2, x3, x4, x5, x6):
             h3 * F32(-0.40481237) + h4 * F32(-0.08111887) + h5 * F32(0.29362506))
 
 
-def _taps(tp, tc, u, v, vx, vy, t, sp, sc, es, str_en, quad, csh=0.5, use_cr=False, return_hl=False):
+def _taps(tp, tc, u, v, vx, vy, t, sp, sc, es, str_en, quad, csh=0.5, use_cr=False, return_hl=False, return_spen=False):
     """one candidate vector (vx, vy): returns (a2, b2, e) as @taps / @tapsq (no overlay rectangle)"""
     tc1 = F32(1.0) - F32(t)
     up, vp = u + vx * F32(t), v + vy * F32(t)
     uc, vc = u - vx * tc1, v - vy * tc1
     Wd, Hd = F32(tp.shape[1]), F32(tp.shape[0])
-    oobp = (up < F32(0.5)) | (up > Wd - F32(0.5)) | (vp < F32(0.5)) | (vp > Hd - F32(0.5))
-    oobc = (uc < F32(0.5)) | (uc > Wd - F32(0.5)) | (vc < F32(0.5)) | (vc > Hd - F32(0.5))
+    dp = np.maximum(np.maximum(F32(0.5) - up, up - (Wd - F32(0.5))),
+                    np.maximum(F32(0.5) - vp, vp - (Hd - F32(0.5))))
+    dc = np.maximum(np.maximum(F32(0.5) - uc, uc - (Wd - F32(0.5))),
+                    np.maximum(F32(0.5) - vc, vc - (Hd - F32(0.5))))
+    oobp = dp > F32(0.0)
+    oobc = dc > F32(0.0)
     if quad or use_cr:
         csh_b = np.where(oobp | oobc, F32(0.0), F32(csh))
         a, hla = cr(tp, up, vp, csh_b, return_hl=True)
@@ -165,8 +169,13 @@ def _taps(tp, tc, u, v, vx, vy, t, sp, sc, es, str_en, quad, csh=0.5, use_cr=Fal
         hla = hlb = np.zeros(u.shape, F32)
     onlyp, onlyc = oobp & ~oobc, oobc & ~oobp
     one = onlyp | onlyc
-    a2 = np.where(onlyp[..., None], b, a)
-    b2 = np.where(onlyc[..., None], a, b)
+    d_one = np.where(onlyp, dp, dc)
+    w_sat = sat(d_one * F32(0.125))
+    w_one = np.where(one, w_sat, F32(0.0))
+    wp = np.where(onlyp, w_sat, F32(0.0))
+    wc = np.where(onlyc, w_sat, F32(0.0))
+    a2 = a + (b - a) * wp[..., None]
+    b2 = b + (a - b) * wc[..., None]
     hla2 = np.where(onlyp, hlb, hla)
     hlb2 = np.where(onlyc, hla, hlb)
     e0_r = diff3_k(a2, b2)
@@ -177,18 +186,21 @@ def _taps(tp, tc, u, v, vx, vy, t, sp, sc, es, str_en, quad, csh=0.5, use_cr=Fal
         hlb_c = np.where(hlb2 >= F32(4.0), hlb2 - F32(4.0), hlb2)
         hl_mx = np.maximum(hla_c, hlb_c)
         e0 = e0_r / (F32(1.0) + hl_mx * F32(4.0))
-        eb = np.where(one, F32(0.02), e0)
+        eb = e0 + F32(0.02) * w_one
         hl_tag = np.where(both_w, hl_mx + F32(4.0), hl_mx)
         if return_hl:
             return a2, b2, eb, hl_tag
         return a2, b2, eb
-    eb = np.where(one, F32(0.02), e0_r)
+    eb = e0_r + F32(0.02) * w_one
     both = ~oobp & ~oobc
     fastc = (np.abs(vx) + np.abs(vy)) > 16
     st_on = str_en & both & fastc
     eac, ebp = diff3(a2, sc), diff3(b2, sp)
     ed = np.maximum(np.minimum(eac, ebp) - es - F32(0.375), F32(0.0))
-    return a2, b2, eb + np.where(st_on, ed, F32(0.0))
+    spen = np.where(st_on, ed, F32(0.0))
+    if return_spen:
+        return a2, b2, eb, spen
+    return a2, b2, eb + spen
 
 
 def _eval_sub_corner(raw_x0y0, raw_x1y0, raw_x0y1, raw_x1y1, qx, qy):
@@ -242,13 +254,13 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         # fractional phase advection (zero at t == 0.5) + second-order quadratic trajectory offset
         cbx, cby = np.minimum(X.astype(np.int64) // block, nbx - 1), np.minimum(Y.astype(np.int64) // block, nby - 1)
         fcx, fcy = F[cby, cbx, 0], F[cby, cbx, 1]
+        vm_c = np.abs(fcx) + np.abs(fcy)
         if prevF is not None:
             up_bx = np.clip(((u + fcx) * F32(1.0 / block)).astype(np.int64), 0, nbx - 1)
             up_by = np.clip(((v + fcy) * F32(1.0 / block)).astype(np.int64), 0, nby - 1)
             fpx, fpy = prevF[up_by, up_bx, 0], prevF[up_by, up_bx, 1]
             ax_q, ay_q = fcx - fpx, fcy - fpy
             dot_v = fcx * fpx + fcy * fpy
-            vm_c = np.abs(fcx) + np.abs(fcy)
             vm_p = np.abs(fpx) + np.abs(fpy)
             am_q = np.abs(ax_q) + np.abs(ay_q)
             vmin_cp = np.minimum(vm_c, vm_p)
@@ -257,6 +269,7 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
             dqx = np.where(q_ok, np.clip(ax_q * q_s, F32(-4.0), F32(4.0)), F32(0.0)).astype(F32)
             dqy = np.where(q_ok, np.clip(ay_q * q_s, F32(-4.0), F32(4.0)), F32(0.0)).astype(F32)
         else:
+            vm_p = np.zeros_like(vm_c)
             dqx = np.zeros_like(u)
             dqy = np.zeros_like(v)
         dt05 = F32(t) - F32(0.5)
@@ -358,9 +371,7 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
             em = None
             ranked = []
             for fv, w, u2 in ((f00, w00, u00), (f10, w10, u10), (f01, w01, u01), (f11, w11, u11)):
-                a2, b2, e_raw = _taps(tp, tc, u, v, fv[..., 0], fv[..., 1], t, sp, sc, es, str_en, False, csh=wp.get("csh", 0.5), use_cr=bool(wp.get("slow_cr", False)))
-                eb = diff3_k(a2, b2)
-                spen = e_raw - eb
+                a2, b2, eb, spen = _taps(tp, tc, u, v, fv[..., 0], fv[..., 1], t, sp, sc, es, str_en, False, csh=wp.get("csh", 0.5), use_cr=bool(wp.get("slow_cr", False)), return_spen=True)
                 vmag = np.abs(fv[..., 0]) + np.abs(fv[..., 1])
                 v_ex = np.maximum(vmag - vmn, F32(0.0))
                 dv_g = sat(F32(1.0) - v_ex * F32(0.25))
@@ -426,7 +437,7 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         dk_spot = (mv_act & (emov < F32(0.015)) & (dl_s < F32(-0.48))) | hl_act
         ws0 = np.where(dk_spot, F32(0.0), ws0_raw)
         gk = GK[np.clip(gby, 0, gny - 1), np.clip(gbx, 0, gnx - 1)]
-        hasfg = gk >= (1 << 20)
+        hasfg = gk != 0
         hud_kill = hasfg | (mv_act & is_wire_fol)
         nfgk = ~hud_kill
         w_hv = sat((vmg + spr) * F32(2.0))
@@ -434,11 +445,15 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         w_hc = sat(pos_c * F32(64.0))
         w_nd = sat((dl_s - F32(0.05)) * F32(25.0))
         w_hud = np.where(nfgk, w_hv * w_he * w_hc * w_nd, F32(0.0))
-        ws0_h = np.maximum(ws0, w_hud)
+        vmg_e = np.maximum(vm_c, F32(0.94000000) * vm_p)
+        w_vel = sat((vmg_e - F32(4.0)) * F32(0.16666667))
+        w_mov = np.where(hasfg, F32(1.0), w_vel)
         mov_obj = hasfg | (vmg > F32(8.0))
-        fgkill_ws = hasfg & (emov < 0.25) & ((flags & 16) == 0)
-        fgkill = (mov_obj & (emov < 0.25) & ((flags & 16) == 0)) | hl_act
-        ws = np.where(fgkill_ws, F32(0.0), ws0_h)
+        mfit_ok = (emov < 0.25) & ((flags & 16) == 0)
+        w_fgk = np.where(mfit_ok, w_mov, F32(0.0))
+        ws_keep = F32(1.0) - w_fgk
+        ws0_s = ws0 * ws_keep
+        ws = np.maximum(ws0_s, w_hud)
         if flags & 4096:
             ws = ws * F32(0.0)
         dmp = diff3_k(mov, sp)
@@ -472,7 +487,8 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
             tc_pm = np.abs(fg_px) + np.abs(fg_py)
             tc_w = sat(tc_pm - F32(2.0)) * sat((F32(2.0) - tc_err) * F32(0.5)) * sat((F32(0.35) - emov) * F32(4.0))
             cw3_1 = cw3_1 * (F32(1.0) - F32(0.30) * tc_w)
-        cw3 = np.where(fgkill, F32(0.0), cw3_1)
+        cw3_s = cw3_1 * ws_keep
+        cw3 = np.where(hl_act, F32(0.0), cw3_s)
         cw = np.where(np.bool_((flags & 8) != 0), F32(0.0), cw3)
         if wp.get("vis_fill"):   # cloud-report idea: fill from the visible side (the real frame that matches the warp) instead of a blend
             dmsc, dmsp = diff3(mov, sc), diff3(mov, sp)
