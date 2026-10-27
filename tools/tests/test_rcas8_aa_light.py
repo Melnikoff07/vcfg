@@ -115,8 +115,8 @@ class Rcas8AaLight(unittest.TestCase):
         fn = MAIN_C.split("static uint32_t rcas_static_flag(uint32_t rcas_flags)", 1)[1].split("\n}\n", 1)[0]
         self.assertIn("if (gv_warp_active()) return rcas_flags;", fn)
         self.assertIn("if ((rcas_flags & 3u) == 1u) return rcas_flags | 16u;", fn)
-        # flags 3 get bits 4 + 5 only under real_aa_default() (test_rcas8_real_s1 runs every case)
-        self.assertIn("if ((rcas_flags & 3u) == 3u && real_aa_default()) return rcas_flags | 48u;", fn)
+        # flags 3 get bits 4 + 5 only under real_aa_on() (post_mid = 3) (test_rcas8_real_s1 runs every case)
+        self.assertIn("if ((rcas_flags & 3u) == 3u && real_aa_on()) return rcas_flags | 48u;", fn)
         self.assertIn("rcas_flags1 = rcas_static_flag(rcas_flags1);", MAIN_C)
         self.assertIn("rcas_flags2 = rcas_static_flag(rcas_flags2);", MAIN_C)
         self.assertEqual(MAIN_C.count("rcas_static_flag("), 3)       # definition + the two mid tables

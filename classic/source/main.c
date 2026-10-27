@@ -63,7 +63,8 @@ typedef struct {
     int pace_order;      // 0 = auto (!pcopy -> pre-submit), 1 = force pre-submit, 2 = force post-submit, 3 = timer pacing
     int shave_mode;      // 0 = auto (Valve+Shave), 1 = Valve only (no Shave), 2 = Late alloc (no early alloc at boot)
     int reg_mode;        // 0 = auto (inline extend + auto-reloc), 1 = separate group at top (16-N), 2 = deferred (frame 120)
-    int post_mid;        // 0 = auto, 1 = generated mid frames only, 2 = generated + real frames
+    int post_mid;        // 0 = auto, 1 = generated mid frames only, 2 = generated + real frames,
+                         //     3 = AA Light on the real frame too, with the static handling (Sharpness 0 only)
     int manual_mode;     // 0 = auto (algorithm), 1 = manual dev overrides active in config-<TITLE>.ini
     int vout_path;       // 0 = auto, 1 = decoupled sceVideoOutSubmitFlip path learned at runtime
     int gv_conv;         // -1 = auto/uncalibrated, 0..15 = learned motion-vector convention
@@ -1239,17 +1240,18 @@ static void calc_rcas_params(uint32_t target_mask, uint32_t *con_bits_out, uint3
     *flags_out = rcas_flags;
 }
 
-// Default for every title (post_mid = 0, first measured on CUSA18723): with Enhance AA on and Sharpness 0, the real
-// frame gets the same AA as the generated one (rcas8 flags 3 in one dispatch, plus the static handling of bit 5 below),
-// so edges are smoothed the same way in both frames. Sharpness > 0 keeps the generated-frame-only post-process
-// (sharpening the real frame in place was measured worse, see post_mid_only); Enhance AA off or post_mid = 1 / 2 in a
-// manual profile turn it off or override it. P must be the game's own 8-bit buffer (the 3-buffer ring without the
+// Option post_mid = 3 (first measured on CUSA18723): with Enhance AA on and Sharpness 0, the real frame gets the same
+// AA as the generated one (rcas8 flags 3 in one dispatch, plus the static handling of bit 5 below), so edges are
+// smoothed the same way in both frames. Not the default: the real frame is the next pair's P, so a moving edge is
+// smoothed in P and again in the generated frame (corpus, Sharpness 0: moving-edge PSNR -0.32 dB training, -0.74 dB
+// validation against v2.35). Sharpness > 0 keeps the generated-frame-only post-process (sharpening the real frame in
+// place was measured worse, see post_mid_only). P must be the game's own 8-bit buffer (the 3-buffer ring without the
 // history copy, or a full-size copy): with the 16-bpp history copy the write-back test of bit 5 cannot match, so it
 // stays mid-only. Game vectors (warp8g) keep the game's alpha, so the static bits 4 and 5 below are never set and the
 // real frame would get the AA on its static pixels too (offline: HUD -1.9 dB, still areas -3.2 dB): mid-only there.
-static int real_aa_default(void)
+static int real_aa_on(void)
 {
-    return g_cfg.post_mid == 0 && g_cfg.upscale > 0 && g_cfg.sharpness == 0 && !g_t_prev_half16 && !gv_warp_active();
+    return g_cfg.post_mid == 3 && g_cfg.upscale > 0 && g_cfg.sharpness == 0 && !g_t_prev_half16 && !gv_warp_active();
 }
 
 // rcas8 flag bit 4: warp8 writes the mid's alpha as a static-pixel flag (1.0 where P == C in RGB, 254/255 elsewhere)
@@ -1259,7 +1261,7 @@ static int real_aa_default(void)
 // only when the real frame is not post-processed in the same dispatch (bit 1, post_mid = 2): then both frames get the
 // AA and a static pixel must get it in the mid too.
 //
-// Bit 5 (with bits 0, 1 and 4, real_aa_default() only): the real frame gets the AA too, in place, and it is the next
+// Bit 5 (with bits 0, 1 and 4, real_aa_on() only): the real frame gets the AA too, in place, and it is the next
 // pair's P. AA on the static pixels of P made warp8 stop seeing them as static (offline: HUD -1.9 dB, still areas
 // -3.2 dB, HUD flicker +18 % against the mid-only AA), so the cur pass skips the AA where the mid pass found the static
 // flag, and writes the pixel back raw where its AA result equals P's stored code (static, but P holds last frame's AA
@@ -1268,7 +1270,7 @@ static uint32_t rcas_static_flag(uint32_t rcas_flags)
 {
     if (gv_warp_active()) return rcas_flags;
     if ((rcas_flags & 3u) == 1u) return rcas_flags | 16u;
-    if ((rcas_flags & 3u) == 3u && real_aa_default()) return rcas_flags | 48u;
+    if ((rcas_flags & 3u) == 3u && real_aa_on()) return rcas_flags | 48u;
     return rcas_flags;
 }
 
@@ -1361,7 +1363,7 @@ static int post_mid_only(void)
 {
     if (g_cfg.post_mid == 1) return 1;
     if (g_cfg.post_mid == 2) return 0;
-    if (real_aa_default()) return 0;
+    if (real_aa_on()) return 0;
     if (g_mid_only < 0) {
         g_mid_only = 1;
         lg("post-process target: generated frames only (default, keeps real C/P unmodified)\n");
@@ -1724,7 +1726,7 @@ static int parse_ini_file_ex(const char *path, fg_config_t *c, uint32_t *hash_io
                 else if (strcmp(key, "pace_order") == 0) raw_pace = val < 0 ? 0 : (val > 3 ? 3 : val);
                 else if (strcmp(key, "shave_mode") == 0) raw_shave = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "reg_mode") == 0) raw_reg = val < 0 ? 0 : (val > 2 ? 2 : val);
-                else if (strcmp(key, "post_mid") == 0) raw_post = val < 0 ? 0 : (val > 2 ? 2 : val);
+                else if (strcmp(key, "post_mid") == 0) raw_post = val < 0 ? 0 : (val > 3 ? 3 : val);
                 else if (strcmp(key, "adapt_ver") == 0) raw_adapt_ver = val;
                 else if (strcmp(key, "shave2_failed") == 0) raw_shave2_failed = (val != 0);
                 else if (strcmp(key, "early_crashes") == 0) raw_early_crashes = val < 0 ? 0 : (val > 99 ? 99 : val);

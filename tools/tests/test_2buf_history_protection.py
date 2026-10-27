@@ -112,7 +112,7 @@ DEFINES = "\n".join(
 
 FN_SAFE_STRIDE = extract_function(MAIN_C, "safe_surface_stride")
 FN_CALC_RCAS = extract_function(MAIN_C, "calc_rcas_params")
-FN_REAL_AA = extract_function(MAIN_C, "real_aa_default")   # called by rcas_static_flag (bit 5)
+FN_REAL_AA = extract_function(MAIN_C, "real_aa_on")   # called by rcas_static_flag (bit 5)
 FN_RCAS_STATIC = extract_function(MAIN_C, "rcas_static_flag")
 FN_BUILD_FLOW8 = extract_function(MAIN_C, "build_dcb_flow8")
 

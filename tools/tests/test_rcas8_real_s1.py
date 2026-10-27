@@ -1,4 +1,5 @@
-"""AA Light on the real frame too, for every title (post_mid = 0, Enhance on, Sharpness 0), with the static handling.
+"""AA Light on the real frame too, by option for any title (post_mid = 3, Enhance on, Sharpness 0), with the static
+handling. Off by default: post_mid = 0 keeps the generated-frame-only post-process.
 
 The real frame is post-processed in place and is the next pair's P (3-buffer ring, no history copy). AA on its static
 pixels made warp8 stop seeing them as static, so rcas8 flag bit 5 makes the cur pass:
@@ -11,8 +12,9 @@ Without b), every edge that once moved stays AA'd in P and never compares static
    AA'd forever with a) alone; moving edges still get the AA.
 2. IR (classic/shaders/rcas8.ll): bit 5 parse, the mid's static flag carried to the cur pass, the write-back test
    against T#prev (+0x00) on the packed RGB codes, the store skipped when it matches.
-3. main.c, compiled and executed: real_aa_default(), post_mid_only() and rcas_static_flag() extracted literally;
-   any title (the CUSA18723 family and an unrelated CUSA00001) with post_mid 0, Enhance > 0, Sharpness 0, warp8 and P
+3. main.c, compiled and executed: real_aa_on(), post_mid_only() and rcas_static_flag() extracted literally;
+   post_mid 0 (the default) keeps the generated-frame-only post-process at Sharpness 0; any title (the CUSA18723
+   family and an unrelated CUSA00001) with post_mid 3, Enhance > 0, Sharpness 0, warp8 and P
    in the game's buffer gets flags 3 + 48; Sharpness > 0, Enhance off, post_mid 1, game vectors (warp8g, no static
    flag) and the 16-bpp history keep the generated-frame-only post-process, and post_mid 2 keeps its explicit
    both-frames AA without bit 5, whatever the title.
@@ -132,30 +134,33 @@ static void row(const char *name, const char *title, int post, int up, int sharp
 }
 int main(void)
 {
-    row("on", "CUSA18723", 0, 1, 0, 0, 0);
-    row("on_region", "CUSA18742", 0, 1, 0, 0, 0);
-    row("strong", "CUSA18723", 0, 2, 0, 0, 0);
-    row("other", "CUSA00001", 0, 1, 0, 0, 0);
-    row("sharp", "CUSA18723", 0, 1, 35, 0, 0);
-    row("enh_off", "CUSA18723", 0, 0, 0, 0, 0);
+    row("on", "CUSA18723", 3, 1, 0, 0, 0);
+    row("on_region", "CUSA18742", 3, 1, 0, 0, 0);
+    row("strong", "CUSA18723", 3, 2, 0, 0, 0);
+    row("other", "CUSA00001", 3, 1, 0, 0, 0);
+    row("sharp", "CUSA18723", 3, 1, 35, 0, 0);
+    row("enh_off", "CUSA18723", 3, 0, 0, 0, 0);
     row("pm1", "CUSA18723", 1, 1, 0, 0, 0);
     row("pm2", "CUSA18723", 2, 1, 0, 0, 0);
-    row("gv", "CUSA18723", 0, 1, 0, 1, 0);
-    row("half16", "CUSA18723", 0, 1, 0, 0, 1);
-    row("other_strong", "CUSA00001", 0, 2, 0, 0, 0);
-    row("other_sharp", "CUSA00001", 0, 1, 35, 0, 0);
-    row("other_enh_off", "CUSA00001", 0, 0, 0, 0, 0);
+    row("gv", "CUSA18723", 3, 1, 0, 1, 0);
+    row("half16", "CUSA18723", 3, 1, 0, 0, 1);
+    row("other_strong", "CUSA00001", 3, 2, 0, 0, 0);
+    row("other_sharp", "CUSA00001", 3, 1, 35, 0, 0);
+    row("other_enh_off", "CUSA00001", 3, 0, 0, 0, 0);
     row("other_pm1", "CUSA00001", 1, 1, 0, 0, 0);
     row("other_pm2", "CUSA00001", 2, 1, 0, 0, 0);
-    row("other_gv", "CUSA00001", 0, 1, 0, 1, 0);
-    row("other_half16", "CUSA00001", 0, 1, 0, 0, 1);
+    row("other_gv", "CUSA00001", 3, 1, 0, 1, 0);
+    row("other_half16", "CUSA00001", 3, 1, 0, 0, 1);
+    row("default", "CUSA18723", 0, 1, 0, 0, 0);
+    row("other_default", "CUSA00001", 0, 2, 0, 0, 0);
+    row("pm3_sharp", "CUSA18723", 3, 1, 35, 0, 0);
     return 0;
 }
 """
 
 
 def run_harness():
-    fns = "\n".join(extract_function(MAIN_C, n) for n in ("real_aa_default", "rcas_static_flag", "post_mid_only"))
+    fns = "\n".join(extract_function(MAIN_C, n) for n in ("real_aa_on", "rcas_static_flag", "post_mid_only"))
     src = HARNESS.replace("__FNS__", fns)
     inc = ["-I" + str(ROOT / "classic" / "source"), "-I" + str(ROOT / "overlay")]
     flags = ["-O0", "-Wall", "-Wno-unused-variable", "-Wno-unused-function"]
@@ -189,6 +194,11 @@ class MainRealS1(unittest.TestCase):
         for k, enh in (("on", 4), ("on_region", 4), ("strong", 8), ("other", 4), ("other_strong", 8)):
             self.assertEqual(self.r[k], {"mid_only": "0", "f1": str(1 | enh | 16), "f3": str(3 | enh | 48)}, k)
 
+    def test_off_by_default(self):
+        # post_mid 0 at Sharpness 0: the generated frame only, flags 3 without bit 5 (v2.35's post-process target)
+        self.assertEqual(self.r["default"], {"mid_only": "1", "f1": "21", "f3": "7"})
+        self.assertEqual(self.r["other_default"], {"mid_only": "1", "f1": "25", "f3": "11"})
+
     def test_everything_else_unchanged(self):
         for pre in ("", "other_"):
             self.assertEqual(self.r[pre + "sharp"], {"mid_only": "1", "f1": "21", "f3": "7"}, pre + "sharp")
@@ -199,6 +209,8 @@ class MainRealS1(unittest.TestCase):
             # warp8g keeps the game's alpha: no static flag, so no real-frame AA (mid-only, as before 2.38)
             self.assertEqual(self.r[pre + "gv"], {"mid_only": "1", "f1": "5", "f3": "7"}, pre + "gv")
             self.assertEqual(self.r[pre + "half16"], {"mid_only": "1", "f1": "21", "f3": "7"}, pre + "half16")
+        # post_mid 3 with Sharpness > 0: the generated frame only, as without the option
+        self.assertEqual(self.r["pm3_sharp"], {"mid_only": "1", "f1": "21", "f3": "7"})
 
 
 if __name__ == "__main__":

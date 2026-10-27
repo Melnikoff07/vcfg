@@ -80,8 +80,8 @@ class RcasStillLanes(unittest.TestCase):
     def test_main_sets_bit4_only_where_the_real_frame_is_raw_or_aa_without_sharpening(self):
         f = MAIN_C.split("static uint32_t rcas_static_flag(uint32_t rcas_flags)", 1)[1].split("\n}", 1)[0]
         self.assertIn("if ((rcas_flags & 3u) == 1u) return rcas_flags | 16u;", f)
-        self.assertIn("if ((rcas_flags & 3u) == 3u && real_aa_default()) return rcas_flags | 48u;", f)
-        self.assertIn("g_cfg.sharpness == 0", MAIN_C.split("static int real_aa_default(void)", 1)[1].split("\n}", 1)[0])
+        self.assertIn("if ((rcas_flags & 3u) == 3u && real_aa_on()) return rcas_flags | 48u;", f)
+        self.assertIn("g_cfg.sharpness == 0", MAIN_C.split("static int real_aa_on(void)", 1)[1].split("\n}", 1)[0])
 
 
 class Warp8AccumOneExp(unittest.TestCase):

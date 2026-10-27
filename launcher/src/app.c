@@ -82,8 +82,8 @@ static const char *pace_name(int v)
 }
 static const char *post_name(int v)
 {
-    static const char *n[3] = { "AUTO", "MID ONLY", "MID + REAL" };
-    return (v >= 0 && v <= 2) ? n[v] : n[0];
+    static const char *n[4] = { "AUTO", "MID ONLY", "MID + REAL", "MID + REAL AA" };
+    return (v >= 0 && v <= 3) ? n[v] : n[0];
 }
 static const char *fps_lock_name(int v)
 {
@@ -903,7 +903,7 @@ int app_input(App *a, uint32_t b)
             else if (a->row == 2) step(&d->shave_mode, dir, 0, 2, 1);
             else if (a->row == 3) step(&d->reg_mode, dir, 0, 2, 1);
             else if (a->row == 4) step(&d->pace_order, dir, 0, 3, 1);
-            else if (a->row == 5) step(&d->post_mid, dir, 0, 2, 1);
+            else if (a->row == 5) step(&d->post_mid, dir, 0, 3, 1);
             else if (a->row == 6) step(&d->fps_lock, dir, 0, 3, 1);
             else if (a->row == 7) step(&d->tile_mode, dir, 0, 6, 1);
             a->dirty = 1; a->status[0] = 0; cat(a->status, "CUSTOM OVERRIDE (PRESS CROSS TO SAVE)");
