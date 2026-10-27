@@ -1,0 +1,4 @@
+#!/bin/sh
+# Drops --dlopen=msvcrt.dll (no msvcrt on Linux); everything else unchanged.
+for a; do shift; [ "$a" = "--dlopen=msvcrt.dll" ] || set -- "$@" "$a"; done
+exec lli "$@"
