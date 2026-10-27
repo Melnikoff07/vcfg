@@ -66,7 +66,7 @@ static volatile uint32_t *g_done = NULL;
 static volatile uint32_t g_last_seq = 0;
 static volatile uint32_t g_gpu_drain_waits = 0;
 
-// ---- audio_fix deferred tail & helper state (CUSA10249 first, now the CUSA04529 family; see cusa04529_audio_fix) ----
+// ---- audio_fix deferred tail & helper state (the Variant C deferred tail is CUSA10249 only; see handle_game_map_inner) ----
 static int g_c10249_tail_pending = 0;
 static int g_c10249_first_reg_done = 0;
 static void *g_c10249_tail_va = NULL;
@@ -83,7 +83,7 @@ static inline __attribute__((unused)) int cusa10249_audio_fix(void)
     return (strcmp(g_title_id, "CUSA10249") == 0 && (g_cfg.audio_fix == 1 || g_cfg.audio_fix == 2)) ? g_cfg.audio_fix : 0;
 }
 
-// ---- CUSA04529-family audio_fix (arena pre-shave, deferred tail, no flex-backed audio chunk) ----
+// ---- CUSA04529-family audio_fix (arena pre-shave, no flex-backed audio chunk; Variant C tail deferred on CUSA10249 only) ----
 // The CUSA04529-family traces in tools/tests/real_traces.json (CUSA00341, CUSA00917, CUSA00918, CUSA07737, CUSA07820,
 // CUSA10249) share one boot layout: a >= 1 GB type 0 main arena, a second type 0 arena, a >= 1 GB type 3 arena and a
 // second type 3 arena, followed by the 0x600000 type 0 audio allocation (Alloc 5). Without the fix, Alloc 5 lands on the tail-only synthetic chunk backed by FlexibleMemory
@@ -1528,7 +1528,10 @@ static int32_t handle_game_map_inner(void **addr, size_t len, int type, int prot
                 int32_t r = call_orig_map(addr, real_part, type, prot, flags, dmStart, maxPageSize, name, map_kind);
                 if (r == 0 && addr && *addr) {
                     void *want_va = (uint8_t *)(*addr) + real_part;
-                    if (cusa04529_audio_fix() == 1 && !g_c10249_first_reg_done) {
+                    // Variant C defers the FlexibleMemory tail to RegisterBuffers #1 on CUSA10249 only. Elsewhere in the
+                    // family the game can touch the tail VA before that (CUSA00917 base PS4: SIGSEGV on the unmapped
+                    // tail_va in NdJobWorkerThread, no RegisterBuffers yet), so there the tail is mapped below, right away.
+                    if (cusa10249_audio_fix() == 1 && !g_c10249_first_reg_done) {
                         g_c10249_tail_va = want_va;
                         g_c10249_tail_len = tail_part;
                         g_c10249_tail_shave_cut = shave_cut;

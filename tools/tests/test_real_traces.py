@@ -794,6 +794,17 @@ static int sim_audio_kind(long p)
     return 0;
 }
 
+/* Is [va, va + len) inside one simulated FlexibleMemory mapping (e.g. the shaved arena tail)? */
+static int sim_flex_covers(const void *va, size_t len)
+{
+    uintptr_t s = (uintptr_t)va, e = s + len;
+    for (int i = 0; i < MAX_FLEX_BLOCKS; i++) {
+        if (g_sim_flex[i].in_use && g_sim_flex[i].is_flex && s >= g_sim_flex[i].va && e <= g_sim_flex[i].va + g_sim_flex[i].len)
+            return 1;
+    }
+    return 0;
+}
+
 static void replay_register_buffers(int start_idx, int num_buf, uint32_t bw, uint32_t bh, uint32_t pitch)
 {
     cusa10249_apply_deferred_tail_if_needed();
@@ -908,7 +919,9 @@ def generate_family_audio_c(traces: list[dict]) -> list[str]:
     at the end when the trace stops before it), under the per-title default on base PS4, audio_fix=2, the audio_fix=0
     override and the PS4 Pro default; the console boots also with the audio allocation before the first RegisterBuffers
     (boot-CUSA00341.prev.txt order). With the fix the audio allocation must be real DirectMemory (never the tail-only
-    synthetic chunk or a FlexibleMemory tail), mapped without FlexibleMemory, and the 8 MB display buffer must survive."""
+    synthetic chunk or a FlexibleMemory tail), mapped without FlexibleMemory, and the 8 MB display buffer must survive.
+    The Variant C arena tail is deferred to the first RegisterBuffers on CUSA10249 only; on every other family title it
+    is mapped (FlexibleMemory) by the arena map itself, so it never depends on a RegisterBuffers."""
     lines: list[str] = ["    int family_audio_passed = 0;"]
     for tr in traces:
         tid = tr["title_id"]
@@ -941,6 +954,10 @@ def generate_family_audio_c(traces: list[dict]) -> list[str]:
             if tkey == "CUSA10249_0x137200000":
                 lines.append("        g_sim_flex_avail = 0xE00000u;")
             lines.append("        int flex_calls_boot = g_sim_map_flex_calls, flex_calls_pre_reg = -1;")
+            lines.append("        size_t flex_avail_boot = g_sim_flex_avail, flex_avail_pre_reg = 0;")
+            lines.append(
+                "        void *arena_tail_va = NULL; int tail_pending_at_arena = -1, tail_flex_at_arena = -1, n_tail_unmapped_at_arena = 0;"
+            )
             lines.append("        int n_audio = 0, n_audio_real = 0, n_audio_syn = 0, n_audio_flex_map = 0, n_audio_failed = 0;")
             lines.append("        long audio_p_last = -1;")
             lines.append("        long id_phys[256]; size_t id_len[256];")
@@ -955,7 +972,9 @@ def generate_family_audio_c(traces: list[dict]) -> list[str]:
                             f"        if (id_len[{rid}] > 0) {{ sceKernelReleaseDirectMemory(id_phys[{rid}], id_len[{rid}]); id_len[{rid}] = 0; }}"
                         )
                 elif op == "reg_buffers":
-                    lines.append("        if (flex_calls_pre_reg < 0) flex_calls_pre_reg = g_sim_map_flex_calls;")
+                    lines.append(
+                        "        if (flex_calls_pre_reg < 0) { flex_calls_pre_reg = g_sim_map_flex_calls; flex_avail_pre_reg = g_sim_flex_avail; }"
+                    )
                     lines.append(
                         f"        replay_register_buffers({ev['start']}, {ev['num']}, {ev['w']}u, {ev['h']}u, {ev['pitch']}u);"
                     )
@@ -997,6 +1016,18 @@ def generate_family_audio_c(traces: list[dict]) -> list[str]:
                         lines.append(f'            ASSERT_MSG(mr == 0 && va != NULL, "{tag}", {step_i}, {elen}ULL);')
                         if 0 < aid < 256:
                             lines.append(f"            id_phys[{aid}] = p; id_len[{aid}] = {elen}ULL;")
+                        # An audio pre-shaved arena (the traces that release and reallocate it get a new pre-shave): state
+                        # of its 0x600000 tail right after the game maps it; first map and every map.
+                        lines.append(
+                            f"            if (g_af_preshave_len == {elen}ULL && g_shave_n >= 1 && g_shaves[0].orig_len == {elen}ULL && g_shaves[0].phys == p) {{"
+                        )
+                        lines.append(f"                arena_tail_va = (uint8_t *)va + ({elen}ULL - AUDIO_FIX_TAIL);")
+                        lines.append("                int tail_flex = sim_flex_covers(arena_tail_va, AUDIO_FIX_TAIL);")
+                        lines.append(
+                            "                if (tail_pending_at_arena < 0) { tail_pending_at_arena = g_c10249_tail_pending; tail_flex_at_arena = tail_flex; }"
+                        )
+                        lines.append("                if (g_c10249_tail_pending || !tail_flex) n_tail_unmapped_at_arena++;")
+                        lines.append("            }")
                     else:
                         lines.append("            long p = 0;")
                         lines.append(
@@ -1022,10 +1053,30 @@ def generate_family_audio_c(traces: list[dict]) -> list[str]:
                     lines.append(
                         f'        ASSERT_MSG(g_pre_mem != NULL && g_pre_size >= 0x800000ULL && sim_dm_is_allocated_range(g_pre_mem_phys, g_pre_size), "{tag}", 902, g_pre_size);'
                     )
+                tail_at_arena = variant == 1 and engaged and tid != "CUSA10249"
+                if variant == 1 and engaged:
+                    if tail_at_arena:
+                        # Not CUSA10249: every pre-shaved arena map itself maps the FlexibleMemory tail (no deferred tail
+                        # pending, no RegisterBuffers needed), and the last one stays mapped up to the end of the replay.
+                        lines.append(
+                            f'        ASSERT_MSG(arena_tail_va != NULL && tail_pending_at_arena == 0 && tail_flex_at_arena == 1 && n_tail_unmapped_at_arena == 0 && g_c10249_tail_pending == 0 && sim_flex_covers(arena_tail_va, AUDIO_FIX_TAIL), "{tag}", 913, n_tail_unmapped_at_arena);'
+                        )
+                    else:
+                        # CUSA10249 keeps the Variant C deferral: after the arena map the tail is pending and unmapped.
+                        lines.append(
+                            f'        ASSERT_MSG(arena_tail_va != NULL && tail_pending_at_arena == 1 && tail_flex_at_arena == 0, "{tag}", 912, tail_pending_at_arena);'
+                        )
                 if has_reg:
                     lines.append(f'        ASSERT_MSG(g_mbuf_state == 1 && IS_MID(g_mbase), "{tag}", 903, g_mbuf_state);')
-                    # No FlexibleMemory is mapped before the first RegisterBuffers (the Variant C tail is deferred to it).
-                    lines.append(f'        ASSERT_MSG(flex_calls_pre_reg == flex_calls_boot, "{tag}", 904, flex_calls_pre_reg);')
+                    if tail_at_arena:
+                        # The arena tail (AUDIO_FIX_TAIL) is the only FlexibleMemory mapped before the first RegisterBuffers.
+                        lines.append(
+                            f'        ASSERT_MSG(flex_avail_boot - flex_avail_pre_reg == AUDIO_FIX_TAIL, "{tag}", 904, flex_avail_boot - flex_avail_pre_reg);'
+                        )
+                    else:
+                        # No FlexibleMemory is mapped before the first RegisterBuffers (CUSA10249: the Variant C tail is
+                        # deferred to it).
+                        lines.append(f'        ASSERT_MSG(flex_calls_pre_reg == flex_calls_boot, "{tag}", 904, flex_calls_pre_reg);')
                     lines.append(f'        ASSERT_MSG(g_c10249_first_reg_done == 1 && g_c10249_tail_pending == 0, "{tag}", 905, g_c10249_tail_pending);')
                 if engaged:
                     lines.append(
@@ -1044,12 +1095,84 @@ def generate_family_audio_c(traces: list[dict]) -> list[str]:
                     audio_ev = next(ev for ev in events if ev["op"] == "alloc" and int(ev["len"], 16) == AUDIO_LEN and ev["type"] == 0)
                     lines.append(f'        ASSERT_MSG(n_audio == 1 && n_audio_syn == 1 && audio_p_last == {audio_ev["orig_phys"]}LL, "{tag}", 911, audio_p_last);')
             lines.append(f'        ASSERT_MSG(on_sub() >= 0, "{tag}", 1000, 0);')
+            lines.append("        (void)flex_avail_boot; (void)flex_avail_pre_reg; (void)arena_tail_va; (void)tail_pending_at_arena; (void)tail_flex_at_arena; (void)n_tail_unmapped_at_arena;")
             lines.append("        (void)flex_calls_boot; (void)flex_calls_pre_reg; (void)n_audio; (void)n_audio_real; (void)n_audio_syn; (void)n_audio_flex_map; (void)n_audio_failed; (void)audio_p_last;")
             lines.append("        family_audio_passed++;")
             lines.append("    }")
     lines.append(
         '    printf("CUSA04529 family audio_fix replay: %d/%d cases passed (audio allocation in real DirectMemory, display buffer kept)\\n", family_audio_passed, family_audio_passed);'
     )
+    return lines
+
+
+# CUSA00917 base PS4 (dm 0x120000000), plugin 2.34 with 84666e5: the boot order of boot-CUSA00917.txt (27/10). The four
+# arenas are mapped at the game's fixed VAs (flags 0x90), then VideoOutOpen (123.123 s) and the audio allocation
+# (126.470 s, phys 0x11f200000, mapped prot 0x2), with NO RegisterBuffers before the crash at 129.663 s: a SIGSEGV on the
+# arena 2 tail at 0x1107800000, left unmapped by the Variant C deferral.
+CUSA00917_CRASH_ARENAS = [  # (len, type, va, console phys)
+    (0x7BE00000, 0, 0x1000000000, 0x200000),
+    (0x7E00000, 0, 0x1100000000, 0x7C000000),
+    (0x6C600000, 3, 0x1200000000, 0x83800000),
+    (0x2F400000, 3, 0x1300000000, 0xEFE00000),
+]
+CUSA00917_CRASH_TAIL_VA = 0x1107800000
+
+
+def generate_cusa00917_crash_order_c() -> list[str]:
+    """Replay of the boot-CUSA00917.txt order (arenas, VideoOutOpen, audio allocation, no RegisterBuffers): the arena 2
+    tail must be FlexibleMemory-mapped from the arena map on (no pending deferred tail), and the audio allocation real
+    DirectMemory right below the 8 MB display buffer. The FlexibleMemory budget starts at the 0xf00000 the console
+    reported at the audio allocation (tail unmapped), and the replay prints what is left at the audio allocation."""
+    tag = "CUSA00917_0x120000000_v2.34_crash_order"
+    lines = [
+        f"    /* {tag}: boot-CUSA00917.txt order, no RegisterBuffers */",
+        "    {",
+        "        g_sim_neo = 0;",
+        '        apply_title_defaults_sim("CUSA00917");',
+        "        setup_plugin_load_early(0x120000000ULL, 0x20000LL);",
+        "        g_sim_flex_avail = 0xF00000u;",
+        "        size_t flex_boot = g_sim_flex_avail;",
+        f'        ASSERT_MSG(cusa04529_audio_fix() == 1, "{tag}", 1, g_cfg.audio_fix);',
+    ]
+    for i, (ln, ty, va, phys) in enumerate(CUSA00917_CRASH_ARENAS, 2):
+        lines += [
+            "        {",
+            f"            long p = 0; void *va = (void *)(uintptr_t){hex(va)}ULL;",
+            f"            int32_t r = sceKernelAllocateDirectMemory(0LL, 0x120000000LL, {hex(ln)}ULL, 0x200000ULL, {ty}, &p);",
+            f'            ASSERT_MSG(r == 0 && p == {hex(phys)}LL, "{tag}", {i}, p);',
+            f"            int32_t mr = sceKernelMapDirectMemory(&va, {hex(ln)}ULL, 0x33, 0x90, p, 0x200000ULL);",
+            f'            ASSERT_MSG(mr == 0 && va == (void *)(uintptr_t){hex(va)}ULL, "{tag}", {i}, (uintptr_t)va);',
+            "        }",
+        ]
+        if i == 3:
+            # Right after the arena 2 map: pre-shaved by AUDIO_FIX_TAIL and its tail already mapped at tail_va.
+            lines.append(
+                f'        ASSERT_MSG(g_shave_n == 1 && g_shaves[0].phys == 0x7c000000LL && g_shaves[0].orig_len == 0x7e00000ULL && g_shaves[0].real_len == 0x7800000ULL, "{tag}", 10, g_shaves[0].real_len);'
+            )
+            lines.append(
+                f'        ASSERT_MSG(g_c10249_tail_pending == 0 && g_shave_tail_mapped == 1 && sim_flex_covers((void *)(uintptr_t){hex(CUSA00917_CRASH_TAIL_VA)}ULL, AUDIO_FIX_TAIL), "{tag}", 11, g_c10249_tail_pending);'
+            )
+    lines += [
+        "        sceVideoOutOpen_hook(255, 0, 0, NULL);",
+        "        size_t flex_at_audio = 0;",
+        "        {",
+        "            long p = 0; void *va = NULL;",
+        "            int32_t r = sceKernelAllocateDirectMemory(0LL, 0x120000000LL, 0x600000ULL, 0x200000ULL, 0, &p);",
+        f'            ASSERT_MSG(r == 0 && p == 0x11f200000LL && sim_audio_kind(p) == 0, "{tag}", 20, p);',
+        "            flex_at_audio = g_sim_flex_avail;",
+        "            int fc = g_sim_map_flex_calls;",
+        "            int32_t mr = sceKernelMapDirectMemory(&va, 0x600000ULL, 0x2, 0, p, 0x200000ULL);",
+        f'            ASSERT_MSG(mr == 0 && va != NULL && g_sim_map_flex_calls == fc, "{tag}", 21, g_sim_map_flex_calls - fc);',
+        "        }",
+        # No RegisterBuffers ran, and the tail never was pending: it is mapped up to the end.
+        f'        ASSERT_MSG(g_c10249_first_reg_done == 0 && g_c10249_tail_pending == 0 && sim_flex_covers((void *)(uintptr_t){hex(CUSA00917_CRASH_TAIL_VA)}ULL, AUDIO_FIX_TAIL), "{tag}", 22, g_c10249_tail_pending);',
+        f'        ASSERT_MSG(g_pre_mem != NULL && g_pre_mem_phys == 0x11f800000LL && g_pre_size == 0x800000ULL && sim_dm_is_allocated_range(g_pre_mem_phys, g_pre_size), "{tag}", 23, g_pre_mem_phys);',
+        f'        ASSERT_MSG(flex_boot - flex_at_audio == AUDIO_FIX_TAIL, "{tag}", 24, flex_boot - flex_at_audio);',
+        f'        ASSERT_MSG(on_sub() >= 0, "{tag}", 1000, 0);',
+        '        printf("CUSA00917 crash-order replay (no RegisterBuffers): arena 2 tail mapped at the arena map (va=0x%llx), audio phys=0x11f200000 real, flex at the audio allocation 0x%zx of 0x%zx (tail 0x%zx)\\n",',
+        f"               (unsigned long long){hex(CUSA00917_CRASH_TAIL_VA)}ULL, flex_at_audio, flex_boot, (size_t)AUDIO_FIX_TAIL);",
+        "    }",
+    ]
     return lines
 
 
@@ -1351,7 +1474,7 @@ def generate_trace_c(traces: list[dict]) -> str:
                     lines.append(f"            if (r == 0) sceKernelReleaseDirectMemory(p, {elen}ULL);")
                     lines.append("        }")
         if tid in ("CUSA07820", "CUSA00341", "CUSA07737"):
-            # Only tail-only (synthetic) shaves, except the audio_fix pre-shave (exactly AUDIO_FIX_TAIL, its tail deferred).
+            # Only tail-only (synthetic) shaves, except the audio_fix pre-shave (exactly AUDIO_FIX_TAIL).
             lines.append(
                 f'        for (int si = 0; si < g_shave_n; si++) ASSERT_MSG(g_shaves[si].real_len == 0 || (cusa04529_audio_fix() != 0 && g_shaves[si].orig_len == g_af_preshave_len && g_shaves[si].orig_len - g_shaves[si].real_len == AUDIO_FIX_TAIL), "{tkey}", 999, g_shaves[si].orig_len);'
             )
@@ -1450,6 +1573,8 @@ def generate_trace_c(traces: list[dict]) -> str:
                 lines.append(f'        ASSERT_MSG(on_sub() >= 0, "{tkey}_af{extra_af}", 1000, 0);')
                 lines.append("    }")
     lines.extend(generate_family_audio_c(traces))
+    if HAS_FAMILY_AUDIO_FIX:
+        lines.extend(generate_cusa00917_crash_order_c())
     lines.append('    printf("real hardware traces replay: %d/%d CUSAxxxxx boot traces passed 100%%\\n", passed, passed);')
     lines.append("    return 0;")
     lines.append("}")
