@@ -26,7 +26,7 @@ typedef struct {
     char title[40];       // game name (ASCII; anything else is skipped)
     unsigned out_fps_x10, game_fps_x10;
     int nrows, sel;
-    VovRow rows[10];
+    VovRow rows[12];
     char status[40];      // small line under the big number (inert reason, toast); may be empty
     char hints[48];       // footer, e.g. "↕ ← →   × APPLY   ○ CLOSE"
 } VovMenu;

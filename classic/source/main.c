@@ -42,7 +42,7 @@ static volatile int g_opt_nocf = 0;  // inject letter k: confidence fallback off
 #define INJECT 1
 #define FG8_PAD 0   /* inline hooks on libScePad stay OFF (crash at ~frame 27-30); GOT patch + poll thread used */
 #define INJECT_AFTER_FLIPS 120
-#define MENU_NROWS 9
+#define MENU_NROWS 11
 
 typedef struct {
     int framegen;        // 0 = off, 1 = on
@@ -1148,7 +1148,7 @@ static char g_vov_title[48];
 static int vov_ready(void)
 {
     if (g_vov_state) return g_vov_state > 0;
-    const size_t min_full_vsz = (VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu; // 0x60000 (384 KB): full 720 px height (fits all 9 rows)
+    const size_t min_full_vsz = (VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu; // 0x60000 (384 KB): full 720 px height (fits all 11 rows)
     const size_t dbl_full_vsz = (2u * VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu;
     size_t vsz = ((g_mem_tight ? dbl_full_vsz : VOV_MEM_SZ) + 0xFFFFu) & ~(size_t)0xFFFFu;
     void *mem = alloc_flex_gpu(vsz, 0x10000);
@@ -1231,6 +1231,8 @@ static void osd_build_slot(uint8_t *osd_mem, uint32_t *xy_out, uint32_t *wh_out,
         vov_row(&m, "HUD protection", VOV_TEXT, 0, 0, c.hud_protect <= 0 ? "Off" : (c.hud_protect == 1 ? "Conservative" : "Aggressive"));
         char lock[16]; if (c.fps_lock <= 0) vov_cpy(lock, "Auto", sizeof(lock)); else snprintf(lock, sizeof(lock), "%d", c.fps_lock);
         vov_row(&m, "FPS lock", VOV_TEXT, 0, 0, lock);
+        vov_row(&m, "Below 30 FPS", VOV_TOGGLE, c.below30, 0, "");
+        vov_row(&m, "Low latency", VOV_TOGGLE, c.shallow_queue, 0, "");
         vov_row(&m, "Opacity", VOV_SEGMENTS, 0, c.menu_opacity, "");
         vov_cpy(m.hints, "\xe2\x86\x95 \xe2\x86\x90 \xe2\x86\x92  \xc3\x97 APPLY  \xe2\x96\xa1 RESET  \xe2\x96\xb3 SAVE  \xe2\x97\x8b", sizeof(m.hints));
     }
@@ -4790,7 +4792,9 @@ static void menu_adjust_row(fg_config_t *c, int row, int dir)
         c->fps_lock = locks[idx];
         break;
     }
-    case 8: c->menu_opacity += dir * 5; if (c->menu_opacity < 20) c->menu_opacity = 20; if (c->menu_opacity > 100) c->menu_opacity = 100; break;
+    case 8: c->below30 = !c->below30; break;
+    case 9: c->shallow_queue = !c->shallow_queue; break;
+    case 10: c->menu_opacity += dir * 5; if (c->menu_opacity < 20) c->menu_opacity = 20; if (c->menu_opacity > 100) c->menu_opacity = 100; break;
     default: break;
     }
 }
