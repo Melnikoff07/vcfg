@@ -2540,7 +2540,7 @@ static void s14_decide(int mode)
         : !g_cfg.below30 ? "below30=0"
         : (g_cfg.present_copy == 2 || (g_cfg.present_copy != 1 && g_cfg.two_buffer != 1))
           ? "no history buffer to give back (two_buffer=0), the game would lose 8 MiB of FlexibleMemory"
-        : cusa10249_audio_fix() ? "audio_fix"
+        : cusa04529_audio_fix() ? "audio_fix"   // the audio pre-shave owns the arena tail (CUSA04529 family)
         : NULL;
     g_s14_on = why == NULL;
     g_s14_opt = opt;

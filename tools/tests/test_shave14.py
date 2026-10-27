@@ -10,11 +10,16 @@ family, opt-in by LOG_DIR/shave14_<TITLE> for other titles).
    - with shave14: 16 MiB reserve, arena shaved by 0xE00000, two generated-frame buffers (g_nmid 2, extended to 5), no
      history buffer, and the FlexibleMemory left at the end equal to the run without shave14; every game allocation and
      map succeeds and the free DirectMemory is the same;
-   - with shave14 but less FlexibleMemory than tail + S14_FLEX_FLOOR: exactly the run without shave14.
+   - with shave14 but less FlexibleMemory than tail + S14_FLEX_FLOOR: exactly the run without shave14;
+   - with audio_fix forced to 1 or 2 (config.ini): exactly the same boot, with and without shave14 (the CUSA04529
+     audio pre-shave never acts on a CUSA18723 boot).
 2. s14_decide compiled with stubs and the real title family table: the CUSA18723 family is a candidate without the
    file once below30 is on, any other title only with the file; not a candidate means off and no log line; each
    disqualifying setting keeps it off.
-3. main.c / debug_hooks.h call sites: the decision runs in plugin_load before the early display reserve, the boot valve
+3. shave14 and the CUSA04529-family audio_fix never run in the same boot: s14_decide and the real
+   cusa04529_audio_fix() of debug_hooks.h over every title of overlay/title_families.h and every combination of the
+   settings s14_decide reads plus audio_fix; both still turn on where they should (non-vacuous).
+4. main.c / debug_hooks.h call sites: the decision runs in plugin_load before the early display reserve, the boot valve
    step 3 keeps S14_KEEP, the shave budget falls back to step 5, every reserve shrink reports, RegisterBuffers reports
    in both registration paths, the below-30 regime treats the two shave14 buffers as not tight, and the BELOW30 line
    names the buffer.
@@ -73,10 +78,11 @@ def _replay_source() -> str:
         "          ASSERT_MSG(mr == 0 && va != NULL, tag, %d, 0x%xULL); }"
         % (s, e, n, a, t, i, n, n, a, i, n) for i, (s, e, n, a, t) in enumerate(BOOT_ALLOCS))
     main = r"""
-static void run(const char *tag, int s14_on, size_t flex)
+static void run_af(const char *tag, int s14_on, size_t flex, int af)
 {
     apply_title_defaults_sim("CUSA18723");
     g_cfg.two_buffer = 1;                    /* the console profile: the history buffer is taken today */
+    if (af >= 0) g_cfg.audio_fix = af;       /* audio_fix=<af> in config.ini */
     g_s14_on = s14_on; g_s14_state = 0; g_s14_tail_extra = 0; g_s14_flex_before = 0; g_s14_pbuf_logged = 0;
     setup_plugin_load_early(0x128000000ULL, 0x10000LL);
     g_sim_flex_avail = flex;
@@ -94,10 +100,14 @@ __ALLOCS__
            g_pbuf ? g_pbuf_sz : (size_t)0, g_sim_flex_avail, dm_avail(0x10000u), dm_avail(0x200000u),
            g_dbg_alloc_fail, g_shave_tail_mapped, (int)g_pcopy_on, pace_pcopy());
 }
+static void run(const char *tag, int s14_on, size_t flex) { run_af(tag, s14_on, flex, -1); }
 int main(void)
 {
     run("off", 0, 0x4C00000u);               /* 70 MiB free at RegisterBuffers on the console + the 6 MiB tail */
     run("on", 1, 0x4C00000u);
+    run_af("off_af1", 0, 0x4C00000u, 1);     /* audio_fix forced on a CUSA18723 boot: no audio pre-shave */
+    run_af("on_af1", 1, 0x4C00000u, 1);
+    run_af("on_af2", 1, 0x4C00000u, 2);
     run("short_off", 0, 0x1500000u);         /* 21 MiB: < tail 14 MiB + floor 16 MiB */
     run("short_on", 1, 0x1500000u);
     run("big_off", 0, 0x40000000u);
@@ -145,7 +155,7 @@ static char g_title_id[16] = "CUSA18723";
 static int g_bench_enabled, g_safe_never, g_file, g_lines, g_af;
 static int g_s14_on, g_s14_opt;
 static const char *g_s14_why;
-static int cusa10249_audio_fix(void) { return g_af; }
+static int cusa04529_audio_fix(void) { return g_af; }
 static int sceKernelOpen(const char *p, int f, int m)
 {
     char w[64]; snprintf(w, sizeof(w), "/shave14_%s", g_title_id); (void)f; (void)m;
@@ -228,6 +238,113 @@ class Shave14BootReplay(unittest.TestCase):
         for k in ("shave_n", "shaved", "pre", "nmid", "nbuf", "extra", "pbuf", "flex", "free64", "free2m", "fails"):
             self.assertEqual(sn[k], so[k], k)
         self.assertEqual((so["shaved"], so["pre"], so["nmid"]), ("0x600000", "0x800000", "1"))
+
+    def test_audio_fix_forced_does_not_touch_the_boot(self):
+        # The audio pre-shave is CUSA04529-family only: audio_fix=1/2 in config.ini on a CUSA18723 boot changes no
+        # allocation, shave, map or buffer, with or without shave14.
+        for af, base in (("off_af1", "off"), ("on_af1", "on"), ("on_af2", "on")):
+            self.assertEqual(self.r[af], self.r[base], af)
+
+
+AUDIO_EXCLUSIVE = r"""
+#include <stdio.h>
+#include <string.h>
+#define LOG_DIR "/data/bb_probe"
+typedef struct { int shave_mode, below30, present_copy, two_buffer, audio_fix; } Cfg;
+static Cfg g_cfg;
+__FAMILIES__
+static char g_title_id[16] = "UNKNOWN";
+static int g_bench_enabled, g_safe_never, g_file;
+static int g_s14_on, g_s14_opt;
+static const char *g_s14_why;
+__AUDIO__
+static int sceKernelOpen(const char *p, int f, int m)
+{
+    char w[64]; snprintf(w, sizeof(w), "/shave14_%s", g_title_id); (void)f; (void)m;
+    return g_file && strstr(p, w) ? 3 : -1;
+}
+static int sceKernelClose(int fd) { (void)fd; return 0; }
+#define STAGE(...) ((void)0)
+static void lg(const char *f, ...) { (void)f; }
+__DECIDE__
+static int decide(const char *id, int file, int b30, int pc, int tb, int af, int mode, int shave, int *audio)
+{
+    strcpy(g_title_id, id);
+    g_file = file; g_bench_enabled = 0; g_safe_never = 0;
+    g_cfg.below30 = b30; g_cfg.present_copy = pc; g_cfg.two_buffer = tb; g_cfg.audio_fix = af; g_cfg.shave_mode = shave;
+    s14_decide(mode);
+    *audio = cusa04529_audio_fix();
+    return g_s14_on;
+}
+int main(void)
+{
+    static const char *extra[] = { "UNKNOWN", "CUSA00000" };
+    const int n = (int)(sizeof(k_vcfg_title_aliases) / sizeof(k_vcfg_title_aliases[0]));
+    static const int modes[] = { 4, 8 };
+    long combos = 0, s14 = 0, audio = 0, both = 0, audio_in_18723 = 0;
+    for (int i = 0; i < n + 2; i++) {
+        const char *id = i < n ? k_vcfg_title_aliases[i].id : extra[i - n];
+        for (int file = 0; file < 2; file++) for (int b30 = 0; b30 < 2; b30++) for (int pc = 0; pc < 3; pc++)
+        for (int tb = 0; tb < 2; tb++) for (int af = 0; af < 3; af++) for (int mi = 0; mi < 2; mi++)
+        for (int shave = 0; shave < 3; shave++) {
+            int a = 0, on = decide(id, file, b30, pc, tb, af, modes[mi], shave, &a);
+            combos++; s14 += on; audio += a != 0;
+            if (a && vcfg_in_family(id, "CUSA18723")) audio_in_18723++;
+            if (on && a) {
+                both++;
+                printf("BOTH %s file=%d b30=%d pc=%d tb=%d af=%d mode=%d shave=%d\n", id, file, b30, pc, tb, af, modes[mi], shave);
+            }
+        }
+    }
+    printf("total combos=%ld s14=%ld audio=%ld both=%ld audio_in_18723=%ld\n", combos, s14, audio, both, audio_in_18723);
+    int a = 0, on;
+    /* the shave14 opt-in file on CUSA04529-family titles, console profile (two_buffer=1, below30=1, mode 8) */
+    on = decide("CUSA00341", 1, 1, 0, 1, 1, 8, 0, &a); printf("c00341_af1 on=%d audio=%d why=%s\n", on, a, g_s14_why ? g_s14_why : "-");
+    on = decide("CUSA00917", 1, 1, 0, 1, 1, 8, 0, &a); printf("c00917_af1 on=%d audio=%d why=%s\n", on, a, g_s14_why ? g_s14_why : "-");
+    on = decide("CUSA10249", 1, 1, 0, 1, 1, 8, 0, &a); printf("c10249_af1 on=%d audio=%d why=%s\n", on, a, g_s14_why ? g_s14_why : "-");
+    on = decide("CUSA00341", 1, 1, 0, 1, 2, 8, 0, &a); printf("c00341_af2 on=%d audio=%d why=%s\n", on, a, g_s14_why ? g_s14_why : "-");
+    on = decide("CUSA00341", 1, 1, 0, 1, 0, 8, 0, &a); printf("c00341_af0 on=%d audio=%d why=%s\n", on, a, g_s14_why ? g_s14_why : "-");
+    /* CUSA18723 with audio_fix forced in config.ini: shave14 stays on, the audio fix does not apply */
+    on = decide("CUSA18723", 0, 1, 0, 1, 1, 8, 0, &a); printf("c18723_af1 on=%d audio=%d why=%s\n", on, a, g_s14_why ? g_s14_why : "-");
+    return 0;
+}
+"""
+
+
+class Shave14AudioFixExclusive(unittest.TestCase):
+    """shave14 (2nd buffer from a 16 MiB display reserve, longer arena tail) and the CUSA04529-family audio_fix (arena
+    tail pre-shaved for the audio allocation, no FlexibleMemory history buffer) both decide where the arena's last
+    MiBs and the display-adjacent DirectMemory go; they must never run in the same boot."""
+
+    @classmethod
+    def setUpClass(cls):
+        fam = (ROOT / "overlay" / "title_families.h").read_text(encoding="utf-8").replace("#pragma once", "")
+        audio = "\n".join(extract_function(HOOKS_H, "static inline __attribute__((unused)) int %s(" % f)
+                          for f in ("cusa04529_audio_title", "cusa04529_audio_fix"))
+        src = (AUDIO_EXCLUSIVE.replace("__DECIDE__", extract_function(MAIN_C, "static void s14_decide("))
+               .replace("__FAMILIES__", fam).replace("__AUDIO__", audio))
+        cls.out = compile_and_run(src)
+        cls.r = _rows("\n".join(ln for ln in cls.out.splitlines() if not ln.startswith("BOTH ")))
+
+    def test_never_both_in_one_boot(self):
+        self.assertNotIn("BOTH ", self.out)
+        t = self.r["total"]
+        self.assertEqual(t["both"], "0")
+        self.assertEqual(t["audio_in_18723"], "0")
+        # non-vacuous: each one still turns on somewhere in the same enumeration
+        self.assertGreater(int(t["s14"]), 0)
+        self.assertGreater(int(t["audio"]), 0)
+        self.assertGreater(int(t["combos"]), 10000)
+
+    def test_cusa04529_family_with_the_opt_in_file(self):
+        for k in ("c00341_af1", "c00917_af1", "c10249_af1", "c00341_af2"):
+            self.assertEqual((self.r[k]["on"], self.r[k]["why"]), ("0", "audio_fix"), k)
+            self.assertNotEqual(self.r[k]["audio"], "0", k)
+        # audio_fix=0 (the PS4 Pro default for the family): the opt-in file still turns shave14 on
+        self.assertEqual((self.r["c00341_af0"]["on"], self.r["c00341_af0"]["audio"]), ("1", "0"))
+
+    def test_cusa18723_ignores_audio_fix(self):
+        self.assertEqual((self.r["c18723_af1"]["on"], self.r["c18723_af1"]["audio"]), ("1", "0"))
 
 
 class Shave14Decide(unittest.TestCase):
