@@ -58,20 +58,23 @@ static inline int shq_step(ShallowQueue *s, uint32_t cpu_ema_us)
 // ---- FTRACE: one record of 3 x 32 bits per real frame ----
 //  [0] hand-over time (hook entry), low 32 bits of the process time in us
 //  [1] submit - hand-over in us (bits 0..15, saturated) | the game's own time release -> hand-over in us (bits 16..31)
-//  [2] on screen - hand-over in us (bits 0..23, 0 = not seen yet) | vblanks the real stayed (24..27) | vblanks the
-//      generated frame before it stayed (28..31)
+//  [2] on screen - hand-over in us (bits 0..21, saturated at 4.19 s, 0 = not seen yet) | generated frames the real
+//      had before it (22..23: 0 = none or a repeat, 1, 2 = a 3-slot pair) | vblanks the real stayed (24..27) | vblanks
+//      the generated frames before it stayed (28..31)
 #define FT_N 128u
 static inline uint32_t ft_sat16(uint64_t v) { return v > 0xFFFFu ? 0xFFFFu : (uint32_t)v; }
 static inline uint32_t ft_pack_sub(uint64_t dsub_us, uint64_t own_us) { return ft_sat16(dsub_us) | (ft_sat16(own_us) << 16); }
 static inline uint32_t ft_with_screen(uint32_t w, uint64_t dscr_us)
 {
-    uint32_t v = dscr_us > 0xFFFFFFu ? 0xFFFFFFu : (uint32_t)dscr_us;
-    return (w & 0xFF000000u) | (v ? v : 1u);
+    uint32_t v = dscr_us > 0x3FFFFFu ? 0x3FFFFFu : (uint32_t)dscr_us;
+    return (w & 0xFFC00000u) | (v ? v : 1u);
 }
+static inline uint32_t ft_with_ngen(uint32_t w, uint32_t ng) { return (w & ~0x00C00000u) | ((ng > 3u ? 3u : ng) << 22); }
 static inline uint32_t ft_with_real_vb(uint32_t w, uint32_t nv) { return (w & ~0x0F000000u) | ((nv > 15u ? 15u : nv) << 24); }
 static inline uint32_t ft_with_mid_vb(uint32_t w, uint32_t nv) { return (w & ~0xF0000000u) | ((nv > 15u ? 15u : nv) << 28); }
-// Formats records [0, n) as "FTRACE <base_us> | dh,dsub,dscr,rv/mv,own;..." where dh is the hand-over interval to the
-// record before (the first one uses prev_handover_us). Returns the number of records written (stops before overflow).
+// Formats records [0, n) as "FTRACE <base_us> | dh,dsub,dscr,rv/mv,own,ng;..." where dh is the hand-over interval to
+// the record before (the first one uses prev_handover_us) and ng the generated frames of that real. Returns the number
+// of records written (stops before overflow).
 static inline uint32_t ft_format(char *out, size_t cap, const uint32_t (*rec)[3], uint32_t n, uint32_t prev_handover_us)
 {
     if (!cap) return 0;
@@ -82,8 +85,8 @@ static inline uint32_t ft_format(char *out, size_t cap, const uint32_t (*rec)[3]
     for (uint32_t i = 0; i < n; i++) {
         uint32_t h = rec[i][0], s = rec[i][1], c = rec[i][2];
         char item[64];
-        int m = snprintf(item, sizeof(item), " %u,%u,%u,%u/%u,%u;", prev ? h - prev : 0u, s & 0xFFFFu, c & 0xFFFFFFu,
-                         (c >> 24) & 15u, c >> 28, s >> 16);
+        int m = snprintf(item, sizeof(item), " %u,%u,%u,%u/%u,%u,%u;", prev ? h - prev : 0u, s & 0xFFFFu, c & 0x3FFFFFu,
+                         (c >> 24) & 15u, c >> 28, s >> 16, (c >> 22) & 3u);
         if (m < 0 || pos + (size_t)m + 2u > cap) break;
         for (int j = 0; j < m; j++) out[pos++] = item[j];
         prev = h;
@@ -100,4 +103,126 @@ static inline uint32_t ft_format(char *out, size_t cap, const uint32_t (*rec)[3]
 static inline int fg_auto_reenable_allowed(int fps_lock)
 {
     return fps_lock != 60;
+}
+
+// ---- below-30 regime: 3-slot pairs (strategy a') ----
+// A game whose own time per frame (release -> submit, g_cpu_ema_us) needs more than 2 refreshes used to show 1
+// generated frame and then repeat its real frame (4 to 20 repeats per second at 20-28 fps). In this regime the pair
+// P -> C whose real is predicted to take 3 refreshes shows two generated frames (t ~ 1/3 and 2/3) and then the real.
+// Entry and exit use the median of the last B30_RING own times in refreshes (enter above B30_ENTER_Q8, leave below
+// B30_EXIT_Q8). Inside, FG Fast's accumulator decides 2 or 3 slots per pair, fed by the game's own time: the hand-over
+// interval is stretched by the pacer itself and would lock the regime on. A late real repeats the real (the generated
+// frames are flipped before it, never held), and a flip queue more than B30_QCUT_Q8 refreshes ahead at the decision
+// drops the second generated frame. Thresholds tuned in the q-below30 simulator (sweep_b30, tune_b30): 2.10 made the
+// regime toggle 14 times a minute at a steady 30 fps; a 1.25-refresh cut dropped 26-28 % of the 3-slot pairs at
+// 20-25 fps and brought back 4.8 repeats/s at 20 fps.
+#define B30_RING      8u
+#define B30_ENTER_Q8  550u    // 2.15 refreshes (35.9 ms at 59.94 Hz)
+#define B30_EXIT_Q8   517u    // 2.02 refreshes (33.7 ms)
+#define B30_QCUT_Q8   640u    // 2.5 refreshes of pending flips ahead of the decision
+#define B30_OWN_MIN_US 25000u // accumulator input clamp, as FG Fast (40 .. 20 fps)
+#define B30_OWN_MAX_US 50000u
+// The pacer period stays 2 refreshes in the regime: following the slots (3 refreshes after a 3-slot pair) held the game
+// back and cost real frames in the simulator (28 fps: 27.70 against 27.81 real/s, 0.90 against 0.65 repeats/s, pacing
+// rms 5.99 against 5.68 ms). Set to 1 to pace each pair by its own slot count (pace_pair_ex nvb = m_out).
+#define B30_PACE_FOLLOWS_SLOTS 0
+typedef struct {
+    uint32_t ring[B30_RING];
+    uint32_t n, pos, on, enters;
+    int32_t acc_q16;
+} Below30;
+
+static inline void b30_reset(Below30 *s)
+{
+    for (uint32_t i = 0; i < B30_RING; i++) s->ring[i] = 0;
+    s->n = s->pos = s->on = 0;
+    s->acc_q16 = 0;
+}
+// Own time in refreshes, Q8 (256 = 1 refresh), from microseconds and the refresh period in Q24.8 us.
+static inline uint32_t b30_slots_q8(uint32_t own_us, uint32_t period_q8)
+{
+    if (!period_q8) return 0u;
+    uint64_t q = ((uint64_t)own_us << 16) / period_q8;
+    return q > 0xFFFFu ? 0xFFFFu : (uint32_t)q;
+}
+static inline uint32_t b30_median_q8(const Below30 *s)
+{
+    uint32_t v[B30_RING];
+    uint32_t n = s->n < B30_RING ? s->n : B30_RING;
+    if (!n) return 0u;
+    for (uint32_t i = 0; i < n; i++) v[i] = s->ring[i];
+    for (uint32_t i = 1; i < n; i++) {
+        uint32_t x = v[i], j = i;
+        while (j && v[j - 1] > x) { v[j] = v[j - 1]; j--; }
+        v[j] = x;
+    }
+    return (n & 1u) ? v[n / 2u] : (v[n / 2u - 1u] + v[n / 2u] + 1u) / 2u;
+}
+// One real frame: feeds its own time (0 = not eligible: resets) and returns whether the regime is on.
+static inline int b30_regime_step(Below30 *s, uint32_t own_us, uint32_t period_q8)
+{
+    if (!own_us || !period_q8) { b30_reset(s); return 0; }
+    s->ring[s->pos] = b30_slots_q8(own_us, period_q8);
+    s->pos = (s->pos + 1u) % B30_RING;
+    if (s->n < B30_RING) s->n++;
+    if (s->n < B30_RING) return (int)s->on;
+    uint32_t med = b30_median_q8(s);
+    if (!s->on && med > B30_ENTER_Q8) { s->on = 1; s->acc_q16 = 0; s->enters++; }
+    else if (s->on && med < B30_EXIT_Q8) { s->on = 0; s->acc_q16 = 0; }
+    return (int)s->on;
+}
+// Refreshes of flips still ahead at the decision, Q8: pending flips, the first of which latches at the next vblank.
+static inline uint32_t b30_queue_ahead_q8(uint32_t pending, uint32_t to_next_vb_us, uint32_t period_q8)
+{
+    if (!pending || !period_q8) return 0u;
+    uint64_t ahead_q8us = (uint64_t)(pending - 1u) * period_q8 + ((uint64_t)to_next_vb_us << 8);
+    return (uint32_t)((ahead_q8us << 8) / period_q8);
+}
+// Slots of this pair (2 or 3) from the own-time EMA; *cut is set when the queue dropped a 3 to 2.
+static inline uint32_t b30_slots(Below30 *s, uint32_t own_ema_us, uint32_t period_q8, uint32_t queue_ahead_q8, int *cut)
+{
+    if (cut) *cut = 0;
+    if (!s->on || !period_q8) { s->acc_q16 = 0; return 2u; }
+    uint32_t x = own_ema_us < B30_OWN_MIN_US ? B30_OWN_MIN_US : (own_ema_us > B30_OWN_MAX_US ? B30_OWN_MAX_US : own_ema_us);
+    int32_t r_q16 = (int32_t)(((uint64_t)x << 24) / period_q8);
+    int32_t acc_new = s->acc_q16 + r_q16;
+    int32_t m = (acc_new + 32768) >> 16;
+    if (m < 2) m = 2;
+    if (m > 3) m = 3;
+    if (m == 3 && queue_ahead_q8 > B30_QCUT_Q8) { m = 2; if (cut) *cut = 1; }
+    acc_new -= m << 16;
+    if (acc_new < -49152) acc_new = -49152;
+    if (acc_new > 49152) acc_new = 49152;
+    s->acc_q16 = acc_new;
+    return (uint32_t)m;
+}
+// Refreshes per pair for the timer pacer.
+static inline uint32_t b30_pace_nvb(uint32_t m_out)
+{
+    return (B30_PACE_FOLLOWS_SLOTS && m_out == 3u) ? 3u : 2u;
+}
+// Display phases of the generated frames, Q16, from the PLL's slot prediction: the previous real stays vb_p_to_m
+// refreshes before the first generated frame, which is followed by vb_m_to_c refreshes until the real (1 for a 2-slot
+// pair, 2 for a 3-slot pair). t1 keeps the monitor clamp [1/3, 2/3] of the 2-slot pair (bit-identical result for
+// vb_m_to_c = 1); t2 = t1 + one refresh, inside phase8's override clamp (<= 0.75) and never below t1.
+static inline void pll_slot_phases_q16(uint32_t vb_p_to_m, uint32_t vb_m_to_c, uint32_t *t1_q16, uint32_t *t2_q16)
+{
+    if (vb_p_to_m < 1u) vb_p_to_m = 1u;
+    if (vb_m_to_c < 1u) vb_m_to_c = 1u;
+    uint32_t vb_p_to_c = vb_p_to_m + vb_m_to_c;
+    uint32_t t1 = ((vb_p_to_m << 16) + (vb_p_to_c >> 1)) / vb_p_to_c;
+    if (t1 < 21845u) t1 = 21845u;
+    if (t1 > 43691u) t1 = 43691u;
+    uint32_t t2 = (((vb_p_to_m + 1u) << 16) + (vb_p_to_c >> 1)) / vb_p_to_c;
+    if (t2 > 49152u) t2 = 49152u;
+    if (t2 < t1) t2 = t1;
+    if (t1_q16) *t1_q16 = t1;
+    if (t2_q16) *t2_q16 = t2;
+}
+// The regime may run only where the second generated-frame buffer already exists (allocated by the mode-8 code, never
+// for this mode: g_nmid >= 2), memory is not tight (no valve/shave), the player left it on, FG Quality on the timer
+// pacer without fps_lock = 20, and no present copy runs (its buffers take the real's place).
+static inline int b30_available(int cfg_on, int nmid, int mem_tight, int preset, int fg_off, int pace_timer, int fps_lock)
+{
+    return cfg_on && nmid >= 2 && !mem_tight && preset != 1 && !fg_off && pace_timer && fps_lock != 20;
 }

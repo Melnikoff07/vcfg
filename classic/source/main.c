@@ -69,13 +69,16 @@ typedef struct {
     int vout_path;       // 0 = auto, 1 = decoupled sceVideoOutSubmitFlip path learned at runtime
     int gv_conv;         // -1 = auto/uncalibrated, 0..15 = learned motion-vector convention
     int audio_fix;       // CUSA10249 audio DirectMemory variant: 0 = c87af66, 1 = Variant C (default for CUSA10249), 2 = Variant D
+    int below30;         // 0 = off (default), 1 = on: below 30 fps a pair predicted to take 3 refreshes shows 2 generated
+                         //     frames; it only runs where the 2nd generated-frame buffer already exists (off otherwise)
+    int shallow_queue;   // 0 = off (the game is handed back with 3-4 flips pending, as before), 1 = on (default)
 } fg_config_t;
 
 static char g_title_id[16] = "UNKNOWN";
 static int g_known_game = 0;
 static int g_is_game_proc = 1;
-static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0 };
-static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0 };
+static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 1 };
+static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 1 };
 static volatile uint32_t g_mem_hibernate_count = 0;
 static volatile uint32_t g_vout_fg_inited = 0;
 static volatile uint32_t g_injects = 0;
@@ -1711,6 +1714,8 @@ static void cfg_defaults(fg_config_t *c)
     c->vout_path      = 0;
     c->gv_conv        = -1;
     c->audio_fix      = 0;
+    c->below30        = 0;
+    c->shallow_queue  = 1;
     cfg_apply_title_defaults(c);
 }
 
@@ -1764,6 +1769,8 @@ static int parse_ini_file_ex(const char *path, fg_config_t *c, uint32_t *hash_io
                 else if (strcmp(key, "tile_sweep") == 0) g_tile_sweep = val ? 1 : 0;
                 else if (strcmp(key, "t6_bit") == 0) g_t6_bit_override = val < 0 ? -1 : (val > 31 ? 31 : val);
                 else if (strcmp(key, "fps_lock") == 0) c->fps_lock = (val == 20 || val == 30 || val == 60) ? val : 0;
+                else if (strcmp(key, "below30") == 0) c->below30 = (val != 0);
+                else if (strcmp(key, "shallow_queue") == 0) c->shallow_queue = (val != 0);
                 else if (strcmp(key, "menu_hold_ms") == 0) c->menu_hold_ms = val < 500 ? 500 : (val > 10000 ? 10000 : val);
                 else if (strcmp(key, "menu_opacity") == 0) c->menu_opacity = val < 20 ? 20 : (val > 100 ? 100 : val);
                 else if (strcmp(key, "overlay") == 0) c->overlay = val < 0 ? 0 : (val > 8 ? 8 : val);
@@ -1935,9 +1942,9 @@ static void cfg_apply_live(const fg_config_t *c, const char *reason)
     else if (!(g_gv_letters_base & GVL_ON)) gl &= ~GVL_ON;
     gv_set_letters(gl);
     if (reason) {
-        lg("config (%s): framegen=%d mode=%d preset=%d sharpness=%d enhance=%d hud_protect=%d game_vectors=%d fps_lock=%d overlay=%d opacity=%d%%\n",
+        lg("config (%s): framegen=%d mode=%d preset=%d sharpness=%d enhance=%d hud_protect=%d game_vectors=%d fps_lock=%d overlay=%d opacity=%d%% below30=%d shallow_queue=%d\n",
            reason, c->framegen, c->mode, c->preset, c->sharpness, c->upscale,
-           c->hud_protect, c->game_vectors, c->fps_lock, c->overlay, c->menu_opacity);
+           c->hud_protect, c->game_vectors, c->fps_lock, c->overlay, c->menu_opacity, c->below30, c->shallow_queue);
     }
 }
 
@@ -2092,6 +2099,8 @@ static void load_early_adapt_cfg(void)
     g_cfg.vout_path    = c.vout_path;
     g_cfg.gv_conv      = c.gv_conv;
     g_cfg.audio_fix    = c.audio_fix;
+    g_cfg.below30      = c.below30;
+    g_cfg.shallow_queue = c.shallow_queue;
     g_fg_off           = !c.framegen;
 }
 
@@ -2480,6 +2489,10 @@ static volatile uint64_t g_pll_vb_cnt = 0;
 static volatile uint32_t g_pll_period_q8 = (16683u << 8) | 85u; // 16683.33 us (59.94 Hz) in Q24.8
 static volatile uint64_t g_pll_last_real_vb_us = 0;
 static volatile uint32_t g_pll_t_interp_q16 = 32768u;
+static volatile uint32_t g_pll_t2_q16 = 43690u;   // phase of the 2nd generated frame of a 3-slot pair (below-30 regime)
+static volatile uint32_t g_pair_slots = 2u;       // refreshes of the pair being submitted: 2, or 3 in the below-30 regime
+static uint32_t b30_win_frames, b30_win_on, b30_win_on_vb, b30_win_three, b30_win_cut;   // BELOW30 log line, per HOOK window
+static Below30 g_b30;                             // below-30 regime state (pace_policy.h), game thread only
 static volatile uint32_t g_pll_t_permille = 500u;
 static volatile uint32_t g_pll_lock = 0;
 static uint64_t g_last_submit_enter_t = 0;
@@ -2634,6 +2647,8 @@ static void cfg_save_game_ini(void)
     fprintf(f, "hud_protect = %d\n", c.hud_protect);
     fprintf(f, "game_vectors = %d\n", c.game_vectors);
     fprintf(f, "fps_lock = %d\n", c.fps_lock);
+    fprintf(f, "below30 = %d\n", c.below30);
+    fprintf(f, "shallow_queue = %d\n", c.shallow_queue);
     fprintf(f, "menu_hold_ms = %d\n", c.menu_hold_ms);
     fprintf(f, "menu_opacity = %d\n", c.menu_opacity);
     fprintf(f, "overlay = %d\n", c.overlay);
@@ -2750,7 +2765,7 @@ static void *mon_thread(void *arg)
                     if (nv < 1) nv = 1;
                     if (nv > 4) nv = 4;
                     g_hist[IS_MID(last_buf) ? 0 : 1][nv - 1]++;
-                    if (IS_MID(last_buf)) ft_mid_nv = nv;
+                    if (IS_MID(last_buf)) ft_mid_nv += nv;   // both generated frames of a 3-slot pair
                     else if (ft_real_rec && g_log && __atomic_load_n(&g_ft_w, __ATOMIC_ACQUIRE) - (ft_real_rec - 1u) < FT_N) {
                         uint32_t *fr = &g_ft[(ft_real_rec - 1u) % FT_N][2];
                         __atomic_store_n(fr, ft_with_real_vb(__atomic_load_n(fr, __ATOMIC_RELAXED), nv), __ATOMIC_RELAXED);
@@ -2776,7 +2791,7 @@ static void *mon_thread(void *arg)
                     g_mon_gaps++;
                 } else {
                     if (fs.currentBuffer >= 0 && !IS_MID(fs.currentBuffer) && last_buf >= 0 && IS_MID(last_buf)) g_reals_shown++;
-                    if (IS_MID(fs.currentBuffer) && last_buf >= 0 && !IS_MID(last_buf)) g_mids_shown++;
+                    if (IS_MID(fs.currentBuffer) && last_buf >= 0 && (!IS_MID(last_buf) || fs.currentBuffer != last_buf)) g_mids_shown++;
                 }
             }
             if (fs.currentBuffer >= 0 && !IS_MID(fs.currentBuffer) && fs.currentBuffer < 16 && fs.currentBuffer != last_buf) {
@@ -2967,7 +2982,7 @@ static uint32_t pll_predict_t_interp_q16(int32_t handle, uint64_t now_us, uint64
     }
 
     uint32_t extra_mid_vb = (hold_mid_us > (vb_us >> 1)) ? ((hold_mid_us + (vb_us >> 1)) / vb_us) : 0u;
-    uint32_t vb_m_to_c = 1u + extra_mid_vb;
+    uint32_t vb_m_to_c = (__atomic_load_n(&g_pair_slots, __ATOMIC_ACQUIRE) == 3u ? 2u : 1u) + extra_mid_vb;
 
     uint32_t vb_p_to_m = 1u;
     if (v_p_us > 0 && v_m_us > v_p_us && (v_m_us - v_p_us) <= (uint64_t)vb_us * 6ull) {
@@ -2984,9 +2999,9 @@ static uint32_t pll_predict_t_interp_q16(int32_t handle, uint64_t now_us, uint64
     }
 
     uint32_t vb_p_to_c = vb_p_to_m + vb_m_to_c;
-    uint32_t t_q16 = ((vb_p_to_m << 16) + (vb_p_to_c >> 1)) / vb_p_to_c;
-    if (t_q16 < 21845u) t_q16 = 21845u;
-    if (t_q16 > 43691u) t_q16 = 43691u;
+    uint32_t t_q16 = 32768u, t2_q16 = 43690u;
+    pll_slot_phases_q16(vb_p_to_m, vb_m_to_c, &t_q16, &t2_q16);
+    __atomic_store_n(&g_pll_t2_q16, t2_q16, __ATOMIC_RELEASE);
 
     uint32_t t_permille = (vb_p_to_m * 1000u + (vb_p_to_c >> 1)) / vb_p_to_c;
     if (t_permille < 333u) t_permille = 333u;
@@ -3008,7 +3023,8 @@ static void pll_commit_frame_vblank(int32_t handle, uint64_t submit_us, uint32_t
         v_m_us = prev_vp + (uint64_t)vb_us;
     }
     uint32_t extra_mid_vb = (hold_mid_us > (vb_us >> 1)) ? ((hold_mid_us + (vb_us >> 1)) / vb_us) : 0u;
-    uint64_t v_c_us = v_m_us + (uint64_t)(1u + extra_mid_vb) * (uint64_t)vb_us;
+    uint32_t vb_m_to_c = (__atomic_load_n(&g_pair_slots, __ATOMIC_ACQUIRE) == 3u ? 2u : 1u) + extra_mid_vb;
+    uint64_t v_c_us = v_m_us + (uint64_t)vb_m_to_c * (uint64_t)vb_us;
     __atomic_store_n(&g_pll_last_real_vb_us, v_c_us, __ATOMIC_RELEASE);
 }
 
@@ -3108,10 +3124,11 @@ static void pace_vblank(int prev2_real, int prev_real, int cur_real)
 // 4-deep flip queue and ran at 24-25 fps. +2 ms on the next release while 3+ flips are pending (drift).
 static int g_pace_timer = -1;
 static uint64_t g_pair_next;
-static void pace_pair_ex(int32_t handle, uint64_t dt_enter_us, int pace_pre)
+static void pace_pair_ex(int32_t handle, uint64_t dt_enter_us, int pace_pre, uint32_t nvb)
 {
     if (!g_freq) return;
-    uint64_t period = vb_ticks(g_freq, refresh_period_q8(), 2u);   // 2 refreshes at the measured period
+    if (nvb < 2u || nvb > 3u) nvb = 2u;
+    uint64_t period = vb_ticks(g_freq, refresh_period_q8(), nvb);   // nvb refreshes (2, or 3 for a 3-slot pair) at the measured period
     uint64_t now = sceKernelGetProcessTimeCounter();
     if (!g_pair_next || now > g_pair_next + period * 3) { g_pair_next = now + period; g_rel_t = sceKernelGetProcessTime(); return; }
     if (now < g_pair_next) {
@@ -3142,7 +3159,7 @@ static void pace_pair_ex(int32_t handle, uint64_t dt_enter_us, int pace_pre)
     if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= drain_thr) g_pair_next += g_freq / 500u;   // drain: +2 ms
     g_rel_t = sceKernelGetProcessTime();
 }
-static void pace_pair(void) { pace_pair_ex(g_handle, 0ull, 0); }
+static void pace_pair(void) { pace_pair_ex(g_handle, 0ull, 0, 2u); }
 static int pace_timer_on(void)
 {
     if (g_cfg.pace_order == 3) return 1;
@@ -3570,6 +3587,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     uint32_t t1_q16 = 32768u, t2_q16 = 43690u;
                     int two_mids = 0;
                     int force_repeat = (raw_dt_us > 66667ull) ? 1 : 0; // >66.7 ms (<15 fps hitch) -> repeat frame
+                    __atomic_store_n(&g_pair_slots, 2u, __ATOMIC_RELEASE);
 
                     if ((g_cfg.preset == 1 || tb_fast) && !g_fg_off) {
                         // 1.1 FG Fast (aggressive 60 Hz output target for 20..40 fps):
@@ -3614,15 +3632,43 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             }
                         }
                     } else if (!g_fg_off) {
-                        // 1.1 FG Quality (strict 2x): 1 mid frame per real frame, VBlank-PLL display-slot phase
+                        // 1.1 FG Quality (strict 2x): 1 mid frame per real frame, VBlank-PLL display-slot phase.
+                        // Below-30 regime (pace_policy.h b30_*): a pair predicted to take 3 refreshes shows 2 generated
+                        // frames (t ~ 1/3, 2/3) in the 2nd buffer the mode-8 allocation already gave, then the real.
                         g_q2x_hold_acc = 0;
+                        uint32_t pq8 = refresh_period_q8();
+                        int b30_ok = b30_available(g_cfg.below30, g_nmid, g_mem_tight, g_cfg.preset, g_fg_off, pace_timer_on(), g_cfg.fps_lock);
+                        int b30_on = b30_regime_step(&g_b30, (b30_ok && !force_repeat) ? (uint32_t)(ft_own_us < 1000000ull ? ft_own_us : 0ull) : 0u, pq8);
+                        b30_win_frames++;
+                        if (b30_on) b30_win_on++;
                         if (force_repeat) {
                             t1_q16 = 0u;
                         } else {
+                            if (b30_on) {
+                                uint32_t vbu = 16683u;
+                                uint32_t to_vb = vblank_to_next_edge_us((int32_t)handle, sceKernelGetProcessTime(), &vbu);
+                                int cut = 0;
+                                uint32_t m_out = b30_slots(&g_b30, g_cpu_ema_us, pq8,
+                                                           b30_queue_ahead_q8(__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE), to_vb, pq8), &cut);
+                                if (cut) b30_win_cut++;
+                                if (m_out == 3u && g_nmid >= 2 && mi1 != mi2) {
+                                    two_mids = 1;
+                                    mid2_flip_idx = mi2;
+                                    third_flip = 1;
+                                    __atomic_store_n(&g_pair_slots, 3u, __ATOMIC_RELEASE);
+                                }
+                                b30_win_on_vb += third_flip ? 3u : 2u;
+                            }
                             t1_q16 = pll_predict_t_interp_q16((int32_t)handle, sceKernelGetProcessTime(), dt_enter_us, hold_mid_us);
+                            t2_q16 = __atomic_load_n(&g_pll_t2_q16, __ATOMIC_ACQUIRE);
                         }
                     }
 
+                    // 3-slot pair of the below-30 regime (FG Quality): the present-copy block below drops the 2nd generated
+                    // frame whenever a copy is possible; it comes back when the copy did not run (pcopy cleared: one copy
+                    // buffer or none, e.g. a 3-buffer game with g_pcopy_k = 1), because then no buffer takes the real's place.
+                    int b30_two = two_mids && g_cfg.preset != 1 && !tb_fast;
+                    uint32_t b30_mid2 = mid2_flip_idx;
                     on_flip_2buf_track(index);
                     int two_buf_now = (g_cfg.two_buffer || g_runtime_2buf || g_ngame == 2 || g_cfg.present_copy == 1);
                     if (!pcopy && two_buf_now && g_pbuf && g_cfg.present_copy != 2) pcopy = 1;
@@ -3645,6 +3691,11 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             lg("PULLDOWN dt_us=%u mids=%d mi1=%u mi2=%u copy=%u pending=%u\n", g_ema_frame_us,
                                two_mids ? 2 : 1, mi1, mi2, ci, __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE));
                     }
+                    if (b30_two && !two_mids) {
+                        if (!pcopy) { two_mids = 1; third_flip = 1; mid2_flip_idx = b30_mid2; }
+                        else { t2_q16 = 43690u; __atomic_store_n(&g_pair_slots, 2u, __ATOMIC_RELEASE); }   // the copy runs
+                    }
+                    if (third_flip && g_cfg.preset != 1 && !tb_fast) b30_win_three++;
                     n = build_dcb_flow8(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi1], g_buf[mi2], g_pitch,
                                         tidx, px * 4, slot, g_flips, tail64, (int32_t)handle, mi1, mi2,
                                         t1_q16, t2_q16, two_mids, force_repeat, pcopy ? g_buf[ci] : 0ull, ci);
@@ -3759,6 +3810,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         if (to_vb + 1500u < hold_mid_us) { hold_mid_us = to_vb + 1500u; g_pll_shortened++; }
                     }
                 }
+                if (third_flip) hold_mid_us = 0;   // 3-slot pair: mid1, mid2, real flipped back to back; a late real repeats the real
                 // Shallow flip queue (pace_policy.h): FG pairs on the timer pacer, the game's own time well below 2 refreshes
                 // for ~4 s -> the frame enters the queue only when at most one flip is still pending (raw status, not the
                 // virtual one the game sees). Before the pre-submit pacer, or before the submit with post-submit pacing.
@@ -3766,6 +3818,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 static uint32_t s_shq_frames, s_shq_on_frames, s_shq_timeouts;
                 static uint64_t s_shq_wait_sum, s_shq_wait_max;
                 int shq_ok = g_inject_on == 8 && second_flip && !third_flip && g_cfg.fps_lock != 20 && pace_timer_on();
+                if (!g_cfg.shallow_queue || g_b30.on) shq_ok = 0;   // player setting; never in the below-30 regime (resets the dwell)
                 int shq_on = shq_step(&s_shq, shq_ok ? g_cpu_ema_us : 0u);
                 uint64_t t_shq0 = sceKernelGetProcessTime();
                 if (shq_on) {
@@ -3786,7 +3839,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 if (pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
-                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex((int32_t)handle, dt_enter_us, 1);
+                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex((int32_t)handle, dt_enter_us, 1, b30_pace_nvb(g_pair_slots));
                     else if (g_inject_on >= 7 && second_flip) {
                         int shown = (int)show_idx, pp1 = show_idx != index ? last_show : pace_p1;
                         pace_vblank_ex(show_idx != index ? -1 : pace_p2, pp1, shown, (int32_t)handle, dt_enter_us, 1);
@@ -3806,6 +3859,11 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         uint32_t t_pll_q16 = pll_predict_t_interp_q16((int32_t)handle, t_s1, dt_enter_us, hold_mid_us);
                         uint32_t *tb_slot = (uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0xB00);
                         tb_slot[29] = (tb_slot[29] & 0xFFFFu) | ((t_pll_q16 & 0xFFFFu) << 16);
+                        if (third_flip) {   // 2nd generated frame of a 3-slot pair (its table in the tb2 region of the slot)
+                            uint32_t *tb2_slot = (uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + SLOT_TB2_OFF);
+                            uint32_t t2n = __atomic_load_n(&g_pll_t2_q16, __ATOMIC_ACQUIRE);
+                            tb2_slot[29] = (tb2_slot[29] & 0xFFFFu) | ((t2n & 0xFFFFu) << 16);
+                        }
                         if (g_mon) g_mon[3] = t_pll_q16;
                     }
                     pll_commit_frame_vblank((int32_t)handle, t_s1, hold_mid_us);
@@ -3815,7 +3873,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     uint32_t fw = __atomic_load_n(&g_ft_w, __ATOMIC_RELAXED), fi = fw % FT_N;
                     __atomic_store_n(&g_ft[fi][0], (uint32_t)t_hook_in, __ATOMIC_RELAXED);
                     __atomic_store_n(&g_ft[fi][1], ft_pack_sub(t_s1 - t_hook_in, ft_own_us), __ATOMIC_RELAXED);
-                    __atomic_store_n(&g_ft[fi][2], 0u, __ATOMIC_RELAXED);
+                    __atomic_store_n(&g_ft[fi][2], ft_with_ngen(0u, (second_flip && can_fg8 && want_fg && !g_fg_off && raw_dt_us <= 66667ull) ? (third_flip ? 2u : 1u) : 0u), __ATOMIC_RELAXED);
                     __atomic_store_n(&g_ft_slot[show_idx], fw + 1u, __ATOMIC_RELEASE);
                     __atomic_store_n(&g_ft_w, fw + 1u, __ATOMIC_RELEASE);
                 }
@@ -3850,7 +3908,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 if (!pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
-                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex((int32_t)handle, dt_enter_us, 0);
+                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex((int32_t)handle, dt_enter_us, 0, b30_pace_nvb(g_pair_slots));
                     else if (g_inject_on >= 7 && second_flip) {
                         int shown = (int)show_idx, pp1 = show_idx != index ? last_show : pace_p1;
                         pace_vblank_ex(show_idx != index ? -1 : pace_p2, pp1, shown, (int32_t)handle, dt_enter_us, 0);
@@ -3878,6 +3936,15 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                s_shq_on_frames ? (double)s_shq_wait_sum / 1000.0 / s_shq_on_frames : 0.0, (double)s_shq_wait_max / 1000.0,
                                s_shq_timeouts, SHQ_ENTER_US / 1000.0, SHQ_DWELL, SHQ_EXIT_US / 1000.0);
                         s_shq_frames = s_shq_on_frames = s_shq_timeouts = 0; s_shq_wait_sum = s_shq_wait_max = 0;
+                        if (g_cfg.below30 && b30_win_frames) {   // separate line, as QUEUE
+                            uint32_t pq = refresh_period_q8();
+                            lg("BELOW30 %s: regime %u of %u frames (%.1f s), 3-slot pairs %u, 2nd generated dropped by the queue %u, "
+                               "median own %.2f refreshes (on above %.2f, off below %.2f)%s\n",
+                               g_b30.on ? "on" : "off", b30_win_on, b30_win_frames, (double)b30_win_on_vb * pq / 256.0 / 1e6,
+                               b30_win_three, b30_win_cut, b30_median_q8(&g_b30) / 256.0, B30_ENTER_Q8 / 256.0, B30_EXIT_Q8 / 256.0,
+                               (g_nmid < 2 || g_mem_tight) ? " | unavailable: one generated-frame buffer (memory tight)" : "");
+                        }
+                        b30_win_frames = b30_win_on = b30_win_on_vb = b30_win_three = b30_win_cut = 0;
                     }
                 }
                 return rc;
@@ -4135,6 +4202,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                 g_inert_reason[0] = 0;
                 uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
                 uint32_t tidx = tile_idx_now();
+                __atomic_store_n(&g_pair_slots, 2u, __ATOMIC_RELEASE);   // the below-30 regime runs on the gnm path only
                 int pcopy = g_pcopy_avail && g_cfg.present_copy != 2;
                 g_pcopy_on = pcopy;
                 uint32_t mi1 = (pcopy && g_pcopy_k >= 2) ? (uint32_t)g_mbase + (vf % (uint32_t)g_pcopy_k)
@@ -4225,7 +4293,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                 if (pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
-                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex(handle, dt_enter_us, 1);
+                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex(handle, dt_enter_us, 1, 2u);
                     else if (g_inject_on >= 7 && second_flip) {
                         int shown = (int)show_idx, pp1 = show_idx != u_idx ? vo_last_show : pace_p1;
                         pace_vblank_ex(show_idx != u_idx ? -1 : pace_p2, pp1, shown, handle, dt_enter_us, 1);
@@ -4273,7 +4341,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                 if (!pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
-                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex(handle, dt_enter_us, 0);
+                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex(handle, dt_enter_us, 0, 2u);
                     else if (g_inject_on >= 7 && second_flip) {
                         int shown = (int)show_idx, pp1 = show_idx != u_idx ? vo_last_show : pace_p1;
                         pace_vblank_ex(show_idx != u_idx ? -1 : pace_p2, pp1, shown, handle, dt_enter_us, 0);

@@ -120,7 +120,7 @@ class TestRefreshPeriod(unittest.TestCase):
         mon = extract_function(MAIN_C, "static void *mon_thread(")
         self.assertIn("vb_period_q8_from_window(vs.count - win_vb, vs.processTime - win_t)", mon)
         self.assertRegex(extract_function(MAIN_C, "static void pace_pair_ex("),
-                         r"vb_ticks\(g_freq, refresh_period_q8\(\), 2u\)")
+                         r"vb_ticks\(g_freq, refresh_period_q8\(\), nvb\)")   # nvb: 2 refreshes, 3 for a 3-slot pair (test_below30.py)
 
 
 SHQ_HARNESS = r"""
@@ -180,7 +180,7 @@ class TestShallowQueue(unittest.TestCase):
         self.assertIn("int shq_ok = g_inject_on == 8 && second_flip && !third_flip && g_cfg.fps_lock != 20 && pace_timer_on();", fn)
         wait = fn.index("qs.flipPendingNum <= SHQ_MAX_PENDING", gate)
         self.assertIn("read_flip_status((int32_t)handle, &qs)", fn[gate:wait])   # raw status, not the virtual queue
-        self.assertLess(wait, fn.index("pace_pair_ex((int32_t)handle, dt_enter_us, 1)"), "before the pre-submit pacer")
+        self.assertLess(wait, fn.index("pace_pair_ex((int32_t)handle, dt_enter_us, 1, "), "before the pre-submit pacer")
         self.assertLess(wait, fn.index("gnm_submit_and_flip_raw(has_wl, workload, ncount, d2, s2"), "before the submit")
         self.assertIn("sceKernelGetProcessTime() - t_shq0 > 40000ull", fn, "bounded wait")
 
@@ -227,7 +227,7 @@ class TestFtrace(unittest.TestCase):
         for item in body.strip().split(";"):
             if not item.strip():
                 continue
-            dh, dsub, dscr, vb, own = item.strip().split(",")
+            dh, dsub, dscr, vb, own = item.strip().split(",")[:5]   # 6th field (generated frames): test_below30.py
             rv, mv = vb.split("/")
             out.append((int(dh), int(dsub), int(dscr), int(rv), int(mv), int(own)))
         return int(head.split()[1]), out
