@@ -198,7 +198,8 @@ class TestBelow30MainC(unittest.TestCase):
     def test_quality_branch_uses_the_existing_second_buffer_only(self) -> None:
         fn = self.FLIP
         q = fn[fn.index("// 1.1 FG Quality (strict 2x)"):fn.index("on_flip_2buf_track(index);")]
-        self.assertIn("b30_available(g_cfg.below30, g_nmid, g_mem_tight, g_cfg.preset, g_fg_off, pace_timer_on(), g_cfg.fps_lock)", q)
+        # memory tight, except the two buffers of the shave14 reserve (opt-in, test_shave14.py)
+        self.assertIn("b30_available(g_cfg.below30, g_nmid, g_mem_tight && g_s14_state != 2, g_cfg.preset, g_fg_off, pace_timer_on(), g_cfg.fps_lock)", q)
         self.assertIn("b30_regime_step(&g_b30, (b30_ok && !force_repeat)", q)
         self.assertIn("uint32_t m_out = b30_slots(&g_b30, g_cpu_ema_us, pq8,", q, "accumulator on the game's own time")
         self.assertIn("if (m_out == 3u && g_nmid >= 2 && mi1 != mi2) {", q)

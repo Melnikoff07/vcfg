@@ -481,6 +481,29 @@ static uint64_t g_pbuf_prev_va = 0;
 static uint32_t g_flip_ring_hist[8] __attribute__((unused));
 static uint32_t g_flip_ring_cnt __attribute__((unused)) = 0;
 #endif
+// shave14, on with below30 for the CUSA18723 family, opt-in by file for any other title (LOG_DIR/shave14_<TITLE>),
+// decided once in plugin_load by s14_decide. A 3-buffer game whose
+// boot valve shrinks the display reserve to 8 MiB (one generated-frame buffer) keeps S14_KEEP instead: two buffers, both
+// DirectMemory, which VideoOut requires (it refuses FlexibleMemory, 0x80290013). The game allocation that is then short
+// takes those 8 MiB as a longer FlexibleMemory tail (Arena Shaving, the mechanism that already backs 6 MiB today), and the
+// history buffer g_pbuf (8 MiB of FlexibleMemory, idle in a 3-buffer ring) is not allocated, so the game ends its boot
+// with the FlexibleMemory it has today. g_s14_state: 0 unused, 1 reserve kept at S14_KEEP, 2 two buffers registered,
+// -1 back to today's single buffer (logged). g_s14_tail_extra > 0: the arena tail took that much more FlexibleMemory than
+// it would with an 8 MiB reserve, so g_pbuf stays unallocated for the whole boot (alloc_pbuf_history).
+#define S14_KEEP       0x1000000u   // 2 x (1920 x 1088 x 4 = 0x7F8000 rounded to 64 KiB) = 2 x 0x800000, on the valve's 2 MiB grid
+#define S14_EXTRA      (S14_KEEP - 0x800000u)
+#define S14_FLEX_FLOOR 0x1000000u   // shave_game_alloc: FlexibleMemory left after the tail, see the budget there
+static int g_s14_on __attribute__((unused)) = 0;
+static int g_s14_pbuf_logged __attribute__((unused)) = 0;
+static volatile int g_s14_state __attribute__((unused)) = 0;
+static size_t g_s14_tail_extra __attribute__((unused)) = 0, g_s14_flex_before __attribute__((unused)) = 0;
+// Every path that shrinks or drops the display reserve reports here: below S14_KEEP shave14 is back to one buffer.
+static void s14_reserve_now(size_t sz, const char *why)
+{
+    if (g_s14_state != 1 || sz >= S14_KEEP) return;
+    g_s14_state = -1;
+    STAGE("shave14: display reserve now 0x%zx (%s) -> one generated-frame buffer, as without shave14", sz, why);
+}
 
 static void free_dm_block(void **va, long *phys, size_t *sz, const char *tag)
 {
@@ -543,6 +566,7 @@ static void release_early_dump(void)
 static void release_early_mem(void)
 {
     free_dm_block(&g_pre_mem, &g_pre_mem_phys, &g_pre_size, "display");
+    s14_reserve_now(0, "released");
     if (g_mbuf_state == 1) g_mbuf_state = -1;
     pyr_cache_invalidate();
 }
@@ -695,6 +719,16 @@ static void *alloc_pbuf_history(size_t surf_sz)
     if (g_pbuf && g_pbuf_sz > 0) return g_pbuf;
     if (!surf_sz) surf_sz = 0x800000u;
     size_t full_sz = (surf_sz + 0xFFFFu) & ~(size_t)0xFFFFu;
+    if (g_s14_tail_extra) {   // shave14: its FlexibleMemory backs the longer arena tail (see S14_KEEP)
+        if (!g_s14_pbuf_logged) {
+            size_t fa = 0;
+            ((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&fa);
+            g_s14_pbuf_logged = 1;
+            STAGE("shave14: history buffer not allocated (0x%zx of FlexibleMemory stays with the game; the arena tail took "
+                  "0x%zx more), flex_av=0x%zx", full_sz, g_s14_tail_extra, fa);
+        }
+        return NULL;
+    }
     size_t half_sz = ((surf_sz >> 1) + 0x3FFFFu) & ~(size_t)0xFFFFu;
     if (half_sz < 0x440000u && full_sz >= 0x7E9000u) half_sz = 0x440000u;
     size_t flex_av = 0;
@@ -2474,6 +2508,78 @@ static void pace_hz(uint32_t hz)
     }
     g_pace_next += period;
 }
+// ---- shave14: 2nd generated-frame buffer from a 16 MiB display reserve (S14_KEEP) ----
+// Decided once in plugin_load, before the game's first allocation. Candidates: the CUSA18723 family (where it was
+// validated on the console) with below30 on, and any title with LOG_DIR/shave14_<TITLE>. It needs the configuration
+// where today the plugin takes the 8 MiB history buffer that shave14 gives back to the game (two_buffer or present_copy
+// forced), FG mode 8 with below30 on, and arena shaving available; otherwise the boot is exactly as without shave14.
+// Any other title keeps today's boot: the below-30 regime then runs only where the mode-8 allocation already has a
+// 2nd generated-frame buffer.
+// Runs inside plugin_load: STAGE (raw kernel I/O) only. lg() opens probe.log with stdio, and stdio inside plugin_load
+// faults in libSceLibcInternal (boot_stage.h); the probe.log line is written later, at RegisterBuffers (s14_log_decision).
+static int g_s14_opt = 0;   // 0 not a candidate (no line), 1 LOG_DIR/shave14_<TITLE>, 2 CUSA18723 family default
+static const char *g_s14_why = NULL;
+static void s14_decide(int mode)
+{
+    char p[64];
+    snprintf(p, sizeof(p), LOG_DIR "/shave14_%s", g_title_id);
+    int fd = sceKernelOpen(p, 0, 0666);
+    int opt = fd >= 0 ? 1 : (vcfg_in_family(g_title_id, "CUSA18723") && g_cfg.below30) ? 2 : 0;
+    if (fd >= 0) sceKernelClose(fd);
+    const char *why = !opt ? "no file"
+        : g_bench_enabled ? "bench"
+        : mode != 8 ? "FG mode is not 8"
+        : g_safe_never ? "safe mode only observes this title"
+        : g_cfg.shave_mode != 0 ? "shave_mode is not 0 (no boot valve or no arena shaving)"
+        : !g_cfg.below30 ? "below30=0"
+        : (g_cfg.present_copy == 2 || (g_cfg.present_copy != 1 && g_cfg.two_buffer != 1))
+          ? "no history buffer to give back (two_buffer=0), the game would lose 8 MiB of FlexibleMemory"
+        : cusa10249_audio_fix() ? "audio_fix"
+        : NULL;
+    g_s14_on = why == NULL;
+    g_s14_opt = opt;
+    g_s14_why = why;
+    if (!opt) return;   // not a candidate: no line, the boot log stays as it is
+    STAGE("shave14: %s (%s)%s%s", g_s14_on ? "on" : "off", opt == 1 ? p : "CUSA18723 family default", why ? ": " : "",
+          why ? why : "");
+}
+// The decision in probe.log, once, from the game's RegisterBuffers (stdio is safe there; plugin_load is not).
+static void s14_log_decision(void)
+{
+    static int done;
+    if (done || !g_s14_opt) return;
+    done = 1;
+    if (g_s14_opt == 1)
+        lg("shave14: %s (" LOG_DIR "/shave14_%s)%s%s\n", g_s14_on ? "on" : "off", g_title_id, g_s14_why ? ": " : "",
+           g_s14_why ? g_s14_why : "");
+    else
+        lg("shave14: %s (CUSA18723 family default)%s%s\n", g_s14_on ? "on" : "off", g_s14_why ? ": " : "",
+           g_s14_why ? g_s14_why : "");
+}
+// RegisterBuffers (reg_mode 0 and 1) after our nm display buffers of `one` bytes at m are registered: with the reserve
+// kept at S14_KEEP (trimmed to what nm buffers need below 1080p) the 2nd one is the 2nd generated-frame buffer (g_nmid = 2,
+// b30_available), otherwise back to one.
+static void s14_after_register(int nm, size_t one, const uint8_t *m, int idx2)
+{
+    s14_log_decision();
+    if (g_s14_state != 1) return;
+    size_t fa = 0;
+    ((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&fa);
+    if (nm >= 2 && m && g_pre_mem == (const void *)m) {
+        g_s14_state = 2;
+        STAGE("shave14: 2nd generated-frame buffer at %p (phys=0x%lx, DirectMemory, display index %d), reserve 0x%zx, "
+              "flex_av=0x%zx (before the arena tail 0x%zx)", (const void *)(m + one), g_pre_mem_phys + (long)one, idx2,
+              g_pre_size, fa, g_s14_flex_before);
+        lg("shave14: 2 generated-frame buffers of 0x%zx in DirectMemory (2nd at %p, index %d), arena tail +0x%zx, "
+           "flex_av 0x%zx -> 0x%zx\n", one, (const void *)(m + one), idx2, g_s14_tail_extra, g_s14_flex_before, fa);
+    } else {
+        g_s14_state = -1;
+        STAGE("shave14: %d display buffer(s) of 0x%zx from reserve 0x%zx -> one generated-frame buffer, as without shave14",
+              nm, one, g_pre_size);
+        lg("shave14: back to one generated-frame buffer (%d of 0x%zx from 0x%zx)\n", nm, one, g_pre_size);
+    }
+}
+
 static void pace_30(void) { pace_hz(30); }
 
 // ---- flip cadence monitor ----
@@ -3639,7 +3745,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         // frames (t ~ 1/3, 2/3) in the 2nd buffer the mode-8 allocation already gave, then the real.
                         g_q2x_hold_acc = 0;
                         uint32_t pq8 = refresh_period_q8();
-                        int b30_ok = b30_available(g_cfg.below30, g_nmid, g_mem_tight, g_cfg.preset, g_fg_off, pace_timer_on(), g_cfg.fps_lock);
+                        int b30_ok = b30_available(g_cfg.below30, g_nmid, g_mem_tight && g_s14_state != 2, g_cfg.preset, g_fg_off, pace_timer_on(), g_cfg.fps_lock);
                         int b30_on = b30_regime_step(&g_b30, (b30_ok && !force_repeat) ? (uint32_t)(ft_own_us < 1000000ull ? ft_own_us : 0ull) : 0u, pq8);
                         b30_win_frames++;
                         if (b30_on) b30_win_on++;
@@ -3944,7 +4050,8 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                "median own %.2f refreshes (on above %.2f, off below %.2f)%s\n",
                                g_b30.on ? "on" : "off", b30_win_on, b30_win_frames, (double)b30_win_on_vb * pq / 256.0 / 1e6,
                                b30_win_three, b30_win_cut, b30_median_q8(&g_b30) / 256.0, B30_ENTER_Q8 / 256.0, B30_EXIT_Q8 / 256.0,
-                               (g_nmid < 2 || g_mem_tight) ? " | unavailable: one generated-frame buffer (memory tight)" : "");
+                               g_s14_state == 2 ? " | 2nd buffer: shave14 DirectMemory reserve"
+                               : (g_nmid < 2 || g_mem_tight) ? " | unavailable: one generated-frame buffer (memory tight)" : "");
                         }
                         b30_win_frames = b30_win_on = b30_win_on_vb = b30_win_three = b30_win_cut = 0;
                     }
@@ -4662,6 +4769,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                         for (int i = 0; i < nm; i++) g_buf[base + i] = (uint64_t)(uintptr_t)ext[g_ngame + i];
                         g_nbuf = base + nm;
                         g_mbuf_state = 1;
+                        s14_after_register(nm, one, m, base + 1);
                         if (g_flips >= INJECT_AFTER_FLIPS) {
                             gv_set_display(g_buf, g_nbuf, g_bw, g_bh);
                             if (g_fmt_supported && fg_res_supported(g_bw, g_bh) &&
@@ -4688,6 +4796,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                     for (int i = 0; i < nm; i++) g_buf[g_ngame + i] = (uint64_t)(uintptr_t)ext[g_ngame + i];
                     g_nbuf = g_ngame + nm;
                     g_mbuf_state = 1;
+                    s14_after_register(nm, one, m, g_ngame + 1);
                     if (g_flips >= INJECT_AFTER_FLIPS) {
                         gv_set_display(g_buf, g_nbuf, g_bw, g_bh);
                         if (g_fmt_supported && fg_res_supported(g_bw, g_bh) &&
@@ -5139,6 +5248,7 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         }
         int late_alloc = (!g_bench_enabled &&
                           (g_cfg.shave_mode == 2 || (g_cfg.shave_mode == 1 && g_cfg.reg_mode == 2)));
+        s14_decide(m);
         if (late_alloc) {
             STAGE("dev override: late_alloc active (shave_mode=%d reg_mode=%d) -> skipping all early DirectMemory allocations in plugin_load",
                   g_cfg.shave_mode, g_cfg.reg_mode);
