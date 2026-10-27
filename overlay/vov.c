@@ -242,10 +242,10 @@ int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigne
 {
     if (!g_mem) return 0;
     const int W = (int)VOV_W, PAD = 24, HEAD = m->status[0] ? 168 : 152, FOOT = 56;
-    int nrows = m->nrows > 10 ? 10 : m->nrows, ROW = 58;
-    if (nrows && HEAD + nrows * ROW + FOOT > (int)g_max_h) {   // small overlay memory: shorter rows (min 44 px)
+    int nrows = m->nrows > 12 ? 12 : m->nrows, ROW = 58;
+    if (nrows && HEAD + nrows * ROW + FOOT > (int)g_max_h) {   // 11 rows, or small overlay memory: shorter rows (min 40 px)
         ROW = ((int)g_max_h - HEAD - FOOT) / nrows;
-        if (ROW < 44) { ROW = 44; nrows = ((int)g_max_h - HEAD - FOOT) / ROW; }
+        if (ROW < 40) { ROW = 40; nrows = ((int)g_max_h - HEAD - FOOT) / ROW; }
     }
     unsigned H = (unsigned)(HEAD + nrows * ROW + FOOT);
     H = (H + 15u) & ~15u; if (H > g_max_h) H = g_max_h;
