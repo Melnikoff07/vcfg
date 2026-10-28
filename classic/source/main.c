@@ -1438,6 +1438,35 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     else { SET_PASS(g_sh8_off[5], WARP8_RSRC1, WARP8_RSRC2); }
     DISPATCH(D.wx, D.wy);
     PASS_BARRIER(); TS2(5);
+#define EMIT_PCOPY8() do { \
+        uint32_t *tb3 = (uint32_t *)(slotb + OSD_SLOT_OFF);   /* old text-grid OSD area, unused since the bitmap overlay */ \
+        uint64_t tbl3 = (uint64_t)(uintptr_t)tb3; \
+        fill_pcopy8_table(tb3, C, copy_dst, g_bw, g_bh, pitch, tidx, g_pcopy_dst_half16, g_pcopy_ycocg_mode); \
+        if (copy_idx != 0xFFFFu) { \
+            int32_t fr3 = insert_wait_flip_done(p, 7, vo_handle, copy_idx); \
+            if (fr3 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; } \
+            p += 7; \
+        } \
+        PASS_BARRIER(); \
+        *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; /* inv scalar cache */ \
+        *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl3; *p++ = (uint32_t)(tbl3 >> 32); \
+        SET_PASS(g_sh8_off[16], PCOPY8_RSRC1, PCOPY8_RSRC2); DISPATCH(D.wx, D.wy); \
+        PASS_BARRIER(); \
+    } while (0)
+    // History copy before the real frame is post-processed: when Sharpness / Enhance AA also run on the real frame
+    // (post_mid = 2), copying C after that pass made the next P an already filtered frame, and the generated frame,
+    // filtered again, came out filtered twice on its P side against once on the real frames around it. The history
+    // buffer (copy_idx 0xFFFF, read only by the next warp) now takes C right after this warp read P from it; a present
+    // copy that goes to the screen (copy_idx != 0xFFFF) and the 3-slot pair (its second warp still reads P) keep the
+    // copy at the end. CUSA02299 only for now (the title it was measured on).
+    const int pcopy_early = copy_dst && g_sh8_off[16] && copy_idx == 0xFFFFu && !two_mids && rcas_flags1 &&
+                            !g_bench_offscreen && !post_mid_only() && vcfg_in_family(g_title_id, "CUSA02299");
+    if (pcopy_early) {
+        EMIT_PCOPY8();
+        uint64_t tbl0 = (uint64_t)(uintptr_t)tb;   // back to this slot's table for the passes below
+        *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+        *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl0; *p++ = (uint32_t)(tbl0 >> 32);
+    }
     if (rcas_flags1) {
         SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy);
         PASS_BARRIER();
@@ -1518,23 +1547,12 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         g_dump_req = 0;
         g_dump_frame = seq;
     }
-    if (copy_dst && g_sh8_off[16]) {   // present copy: finished real frame -> own display or history buffer (see g_pcopy_avail / g_pbuf)
-        uint32_t *tb3 = (uint32_t *)(slotb + OSD_SLOT_OFF);   // old text-grid OSD area, unused since the bitmap overlay
-        uint64_t tbl3 = (uint64_t)(uintptr_t)tb3;
-        fill_pcopy8_table(tb3, C, copy_dst, g_bw, g_bh, pitch, tidx, g_pcopy_dst_half16, g_pcopy_ycocg_mode);
-        if (copy_idx != 0xFFFFu) {
-            int32_t fr3 = insert_wait_flip_done(p, 7, vo_handle, copy_idx);
-            if (fr3 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
-            p += 7;
-        }
-        PASS_BARRIER();
-        *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; // inv scalar cache
-        *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl3; *p++ = (uint32_t)(tbl3 >> 32);
-        SET_PASS(g_sh8_off[16], PCOPY8_RSRC1, PCOPY8_RSRC2); DISPATCH(D.wx, D.wy);
-        PASS_BARRIER();
+    if (copy_dst && g_sh8_off[16] && !pcopy_early) {   // present copy: finished real frame -> own display or history buffer (see g_pcopy_avail / g_pbuf)
+        EMIT_PCOPY8();
     }
     TS2(6);
     TS_EOP(4);
+#undef EMIT_PCOPY8
 #undef DISPATCH
     *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)lbl; *p++ = 0x40000000u | ((uint32_t)(lbl >> 32) & 0xFFFFu); *p++ = seq; *p++ = 0;
     *p++ = PKT3(0x3C, 6, 0); *p++ = 0x13; *p++ = (uint32_t)lbl; *p++ = (uint32_t)(lbl >> 32); *p++ = seq; *p++ = 0xFFFFFFFFu; *p++ = 0x0A;
