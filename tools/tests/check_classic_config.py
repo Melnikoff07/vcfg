@@ -38,6 +38,7 @@ extern size_t strlen(const char *);
 extern void *memcpy(void *, const void *, size_t);
 ''' + families_h + '''
 static int g_known_game, g_detected_60fps, g_tile_override = -1, g_tile_sweep, g_t6_bit_override = -1, g_adapt_early_crashes = 0;
+static int g_is_neo = 0;
 static char g_title_id[16] = "CUSA00000";
 static char g_family_id[16] = "CUSA00000";
 static void tile_load(int idx) { (void)idx; }
@@ -102,6 +103,24 @@ int main(void) {
     if (c.audio_fix != 2) return 17;
     input="audio_fix=0\\n"; parse_ini_file("title", &c, 0);
     if (c.audio_fix != 0) return 18;
+    // The rest of the CUSA04529 family: audio_fix=1 on base PS4, 0 on PS4 Pro (CUSA10249 stays 1 on both);
+    // the per-title key still overrides it.
+    set_title("CUSA00341"); cfg_defaults(&c);
+    if (c.audio_fix != 1) return 19;
+    set_title("CUSA07737"); cfg_defaults(&c);
+    if (c.audio_fix != 1) return 20;
+    input="audio_fix=0\\n"; parse_ini_file("title", &c, 0);
+    if (c.audio_fix != 0) return 21;
+    g_is_neo = 1;
+    set_title("CUSA00341"); cfg_defaults(&c);
+    if (c.audio_fix != 0) return 22;
+    input="audio_fix=1\\n"; parse_ini_file("title", &c, 0);
+    if (c.audio_fix != 1) return 23;
+    set_title("CUSA10249"); cfg_defaults(&c);
+    if (c.audio_fix != 1) return 24;
+    set_title("CUSA07408"); cfg_defaults(&c);
+    if (c.audio_fix != 0) return 25;
+    g_is_neo = 0;
     return 0;
 }
 ''', encoding='utf-8')

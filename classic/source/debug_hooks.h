@@ -66,7 +66,7 @@ static volatile uint32_t *g_done = NULL;
 static volatile uint32_t g_last_seq = 0;
 static volatile uint32_t g_gpu_drain_waits = 0;
 
-// ---- CUSA10249 audio_fix deferred tail & helper state ----
+// ---- audio_fix deferred tail & helper state (the Variant C deferred tail is CUSA10249 only; see handle_game_map_inner) ----
 static int g_c10249_tail_pending = 0;
 static int g_c10249_first_reg_done = 0;
 static void *g_c10249_tail_va = NULL;
@@ -78,9 +78,47 @@ static uintptr_t g_c10249_arena_vs = 0;
 static uintptr_t g_c10249_arena_ve = 0;
 static long g_c10249_arena_phys = 0;
 
-static inline int cusa10249_audio_fix(void)
+static inline __attribute__((unused)) int cusa10249_audio_fix(void)
 {
     return (strcmp(g_title_id, "CUSA10249") == 0 && (g_cfg.audio_fix == 1 || g_cfg.audio_fix == 2)) ? g_cfg.audio_fix : 0;
+}
+
+// ---- CUSA04529-family audio_fix (arena pre-shave, no flex-backed audio chunk; Variant C tail deferred on CUSA10249 only) ----
+// The CUSA04529-family traces in tools/tests/real_traces.json (CUSA00341, CUSA00917, CUSA00918, CUSA07737, CUSA07820,
+// CUSA10249) share one boot layout: a >= 1 GB type 0 main arena, a second type 0 arena, a >= 1 GB type 3 arena and a
+// second type 3 arena, followed by the 0x600000 type 0 audio allocation (Alloc 5). Without the fix, Alloc 5 lands on the tail-only synthetic chunk backed by FlexibleMemory
+// (CUSA00341 / CUSA07737 base PS4: game runs, no sound). The boot-budget extras above (cusa10249_audio_fix) stay
+// CUSA10249 only. cfg_apply_title_defaults turns audio_fix on for CUSA10249 and, on base PS4, the rest of the family.
+#define AUDIO_FIX_TAIL      0x600000u    // Alloc 5 length
+#define AUDIO_FIX_C_MIN     0x4000000u   // Variant C, second type 0 arena: 0x8000000 .. 0x15800000 in real_traces.json
+#define AUDIO_FIX_C_MAX     0x20000000u
+#define AUDIO_FIX_D_MIN     0x10000000u  // Variant D, second type 3 arena: 0x2a000000 .. 0x2f600000 at dm 0x120000000 /
+#define AUDIO_FIX_D_MAX     0x3fe00000u  // 0x137200000; 0x43c00000 / 0x50c00000 (dm 0x140000000 / 0x15f200000) stay out,
+                                         // as the CUSA10249 exact-length match left 0x50c00000 out
+#define AUDIO_FIX_ARENA_MIN 0x40000000u  // main type 0 arena / first type 3 arena
+static size_t g_af_main_t0_len = 0;      // largest type 0 game arena allocated at boot
+static int g_af_t3_arenas = 0;           // >= 1 GB type 3 game arenas allocated at boot
+static size_t g_af_preshave_len = 0;     // game length of the last audio pre-shaved arena
+
+static inline __attribute__((unused)) int cusa04529_audio_title(void)
+{
+    return strcmp(g_title_id, "CUSA10249") == 0 || vcfg_in_family(g_title_id, "CUSA04529");
+}
+
+static inline __attribute__((unused)) int cusa04529_audio_fix(void)
+{
+    return (cusa04529_audio_title() && (g_cfg.audio_fix == 1 || g_cfg.audio_fix == 2)) ? g_cfg.audio_fix : 0;
+}
+
+// The boot arena whose tail is pre-shaved by AUDIO_FIX_TAIL, matched by role and a size window (arena sizes differ by
+// title version and console): Variant C the second type 0 arena, Variant D the second type 3 arena.
+static inline __attribute__((unused)) int audio_fix_preshave_arena(int af, size_t len, int type)
+{
+    if (af == 1)
+        return type == 0 && len >= AUDIO_FIX_C_MIN && len <= AUDIO_FIX_C_MAX && g_af_main_t0_len > len;
+    if (af == 2)
+        return type == 3 && len >= AUDIO_FIX_D_MIN && len <= AUDIO_FIX_D_MAX && g_af_t3_arenas > 0;
+    return 0;
 }
 
 // ---- Lock-free API flight ring buffer (dumped on crash) ----
@@ -606,14 +644,14 @@ static size_t dm_avail_range(long s, long e, size_t align, off_t *start_out)
 
 static void a10249_log_budget(const char *tag)
 {
-    if (strcmp(g_title_id, "CUSA10249") != 0) return;
+    if (!cusa04529_audio_title()) return;
     size_t flex_av = 0;
     ((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av);
     size_t dm_sz = sceKernelGetDirectMemorySize();
     size_t free_dm_2m = dm_avail_range(0, (long)dm_sz, 0x200000u, NULL);
     size_t free_dm_64k = dm_avail_range(0, (long)dm_sz, 0x10000u, NULL);
-    STAGE("A10249 audio_fix=%d [%s]: flex_av=0x%zx free_dm_2m=0x%zx free_dm_64k=0x%zx pre_mem=%p(0x%zx@0x%lx) pre_gpu=%p(@0x%lx) pre_work=%p(0x%zx@0x%lx)",
-          g_cfg.audio_fix, tag, flex_av, free_dm_2m, free_dm_64k,
+    STAGE("A%s audio_fix=%d [%s]: flex_av=0x%zx free_dm_2m=0x%zx free_dm_64k=0x%zx pre_mem=%p(0x%zx@0x%lx) pre_gpu=%p(@0x%lx) pre_work=%p(0x%zx@0x%lx)",
+          g_title_id + 4, g_cfg.audio_fix, tag, flex_av, free_dm_2m, free_dm_64k,
           g_pre_mem, g_pre_size, g_pre_mem_phys, g_pre_gpu, g_pre_gpu_phys, g_pre_work, g_pre_work_sz, g_pre_work_phys);
 }
 
@@ -995,7 +1033,7 @@ static int32_t shave_game_alloc(long s, long e, size_t len, size_t align, int ty
                       len, shave_av, *phys, len - shave_av, reserve);
                 return 0;
             }
-        } else if (shave_av == 0 && !cusa10249_audio_fix() && (g_pre_mem || g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) &&
+        } else if (shave_av == 0 && !cusa04529_audio_fix() && (g_pre_mem || g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) &&
                    ((g_pre_mem && len <= g_pre_size && already_shaved + len <= g_pre_size) ||
                     ((g_mbuf_state == 1 || !boot_phase || has_large_arena_shave) && len <= 0x1000000u && already_shaved + len <= max_total_shave)) &&
                    (!is_desc_probe || len <= 0x400000u)) {
@@ -1025,6 +1063,31 @@ static int32_t shave_game_alloc(long s, long e, size_t len, size_t align, int ty
     return (int32_t)0x80020023u;
 }
 
+// Release our DirectMemory-backed g_pbuf, g_pre_work and g_pre_gpu when they overlap [s, e), EXCEPT g_pre_work /
+// g_pre_gpu sitting completely inside the sub-2MB region [0, g_low_sub2mb_end) for a >= 2 MB aligned request (where the
+// kernel can never place it anyway). Returns 1 when anything was released.
+static int yield_early_dm_in_range(long s, long e, size_t eff_align)
+{
+    int rel_any = 0;
+    g_own_alloc++;
+    if (g_pbuf && g_pbuf_phys > 0 && g_pbuf_phys < e && g_pbuf_phys + (long)g_pbuf_sz > s) {
+        release_pbuf();
+        rel_any = 1;
+    }
+    if (g_pre_work && g_pre_work_phys > 0 && g_pre_work_phys < e && g_pre_work_phys + (long)g_pre_work_sz > s &&
+        !(eff_align >= 0x200000u && g_pre_work_phys + (long)g_pre_work_sz <= g_low_sub2mb_end)) {
+        release_early_work();
+        rel_any = 1;
+    }
+    if (g_pre_gpu && g_pre_gpu_phys > 0 && g_pre_gpu_phys < e && g_pre_gpu_phys + (long)g_gpu_sz > s &&
+        !(eff_align >= 0x200000u && g_pre_gpu_phys + (long)g_gpu_sz <= g_low_sub2mb_end)) {
+        release_early_gpu();
+        rel_any = 1;
+    }
+    g_own_alloc--;
+    return rel_any;
+}
+
 int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t align, int type, long *phys)
 {
     if (!g_own_alloc) flush_map_run();
@@ -1050,33 +1113,40 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
         }
     }
 
-    // CUSA10249 audio_fix=1 (Variant C) & audio_fix=2 (Variant D):
-    // Pre-shave Arena 2 (0x15800000 -> 0x15200000, type==0, Variant C) or Arena 4 (0x2a000000 -> 0x29a00000, type==3, Variant D)
-    // by 0x600000 so 6 MB of real DirectMemory (0x136400000..0x136a00000) remains free for Alloc 5 (audio engine 0x600000, type==0).
+    // CUSA04529-family audio_fix=1 (Variant C) & audio_fix=2 (Variant D):
+    // Pre-shave Arena 2 (second type 0 arena, e.g. CUSA10249 0x15800000 -> 0x15200000, Variant C) or Arena 4 (second
+    // type 3 arena, e.g. CUSA10249 0x2a000000 -> 0x29a00000, Variant D) by 0x600000 so 6 MB of real DirectMemory
+    // (CUSA10249 0x136400000..0x136a00000, CUSA00341 base PS4 0x11f200000..0x11f800000) remains free for Alloc 5
+    // (audio engine 0x600000, type==0) while the 8 MB display buffer stays in real DirectMemory.
+    int af_pre = cusa04529_audio_fix();
     if (!g_own_alloc && !g_safe_never && !g_fg_off &&
         g_cfg.shave_mode != 1 && g_cfg.shave_mode != 3 &&
         g_flips == 0 && g_gpu_state == 0 && g_shave_n == 0 &&
-        cusa10249_audio_fix() != 0 &&
-        ((cusa10249_audio_fix() == 1 && len == 0x15800000u && type == 0) ||
-         (cusa10249_audio_fix() == 2 && len == 0x2a000000u && type == 3)) &&
+        af_pre != 0 && audio_fix_preshave_arena(af_pre, len, type) &&
         e > s && (size_t)(e - s) >= len) {
-        size_t need_tail = 0x600000u;
+        size_t need_tail = AUDIO_FIX_TAIL;
         size_t real_len = len - need_tail;
         if (g_pre_mem && g_pre_size > 0x800000u)
             shrink_early_mem_to(0x800000u);
         int32_t sr = HOOK_CONTINUE(sceKernelAllocateDirectMemory,
                                    int32_t (*)(long, long, size_t, size_t, int, long *),
                                    s, e, real_len, align, type, phys);
+        // Variant D on a boot whose g_pre_gpu / g_pre_work hold the 2 MB page below the display: yield them as Step 1
+        // would, so the pre-shave still leaves AUDIO_FIX_TAIL free instead of falling back to the unshaved arena.
+        if ((uint32_t)sr == 0x80020023u && yield_early_dm_in_range(s, e, eff_align))
+            sr = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
+                               s, e, real_len, align, type, phys);
         if (sr == 0 && phys) {
             record_shave_entry(*phys, real_len, len, type);
+            g_af_preshave_len = len;
             g_mem_tight = 1;
             uint32_t acnt = __atomic_add_fetch(&g_dbg_allocs, 1u, __ATOMIC_RELAXED);
             (void)acnt;
             void *caller = __builtin_return_address(0);
             api_ring_push("AllocDM(pre-shave-af%d len=0x%zx real=0x%zx al=0x%zx ty=%d) = 0 phys=0x%lx c=%p",
                           g_cfg.audio_fix, len, real_len, align, type, *phys, caller);
-            STAGE("A10249 audio_fix=%d (%s) arena pre-shave #1 OK: game asked len=0x%zx, allocated 0x%zx at phys=0x%lx (shaved 0x%zx for audio DirectMemory)",
-                  g_cfg.audio_fix, (g_cfg.audio_fix == 1) ? "C" : "D", len, real_len, *phys, need_tail);
+            STAGE("A%s audio_fix=%d (%s) arena pre-shave #1 OK: game asked len=0x%zx, allocated 0x%zx at phys=0x%lx (shaved 0x%zx for audio DirectMemory)",
+                  g_title_id + 4, g_cfg.audio_fix, (g_cfg.audio_fix == 1) ? "C" : "D", len, real_len, *phys, need_tail);
             STAGE("game AllocateDirectMemory(len=0x%zx align=0x%zx type=%d range=0x%lx..0x%lx) = 0x00000000 phys=0x%lx caller=%p",
                   len, align, type, s, e, *phys, caller);
             return 0;
@@ -1103,24 +1173,7 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
         // command buffer (*g_done == g_last_seq, up to 25 ms) before releasing g_work_phys.
         if (pre_gpu_phase && (uint32_t)r == 0x80020023u &&
             ((g_pre_work && g_pre_work_phys > 0) || (g_pre_gpu && g_pre_gpu_phys > 0) || (g_pbuf && g_pbuf_phys > 0))) {
-            int rel_any = 0;
-            g_own_alloc++;
-            if (g_pbuf && g_pbuf_phys > 0 && g_pbuf_phys < e && g_pbuf_phys + (long)g_pbuf_sz > s) {
-                release_pbuf();
-                rel_any = 1;
-            }
-            if (g_pre_work && g_pre_work_phys > 0 && g_pre_work_phys < e && g_pre_work_phys + (long)g_pre_work_sz > s &&
-                !(eff_align >= 0x200000u && g_pre_work_phys + (long)g_pre_work_sz <= g_low_sub2mb_end)) {
-                release_early_work();
-                rel_any = 1;
-            }
-            if (g_pre_gpu && g_pre_gpu_phys > 0 && g_pre_gpu_phys < e && g_pre_gpu_phys + (long)g_gpu_sz > s &&
-                !(eff_align >= 0x200000u && g_pre_gpu_phys + (long)g_gpu_sz <= g_low_sub2mb_end)) {
-                release_early_gpu();
-                rel_any = 1;
-            }
-            g_own_alloc--;
-            if (rel_any) {
+            if (yield_early_dm_in_range(s, e, eff_align)) {
                 r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                                   s, e, len, align, type, phys);
             }
@@ -1234,18 +1287,26 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
         if (r != 0 || (early_boot && (len >= 0x100000u || acnt <= 48u)))
             STAGE("game AllocateDirectMemory(len=0x%zx align=0x%zx type=%d range=0x%lx..0x%lx) = 0x%08x phys=0x%lx caller=%p",
                   len, align, type, s, e, (unsigned)r, (r == 0 && phys) ? *phys : 0L, caller);
-        if (strcmp(g_title_id, "CUSA10249") == 0 && len == 0x600000u && type == 0) {
+        if (r == 0 && g_flips == 0 && g_gpu_state == 0 && cusa04529_audio_fix()) {
+            // Arena roles for audio_fix_preshave_arena (the pre-shaved arena itself returned above).
+            if (type == 0 && len >= AUDIO_FIX_ARENA_MIN && len > g_af_main_t0_len) g_af_main_t0_len = len;
+            if (type == 3 && len >= AUDIO_FIX_ARENA_MIN) g_af_t3_arenas++;
+        }
+        if (cusa04529_audio_title() && len == AUDIO_FIX_TAIL && type == 0) {
             long got_phys = (r == 0 && phys) ? *phys : 0L;
-            int is_syn = 0;
+            int is_syn = 0, is_partial = 0;
             for (int si = 0; si < g_shave_n; si++) {
                 if (g_shaves[si].orig_len > 0 && g_shaves[si].real_len == 0 &&
                     got_phys >= g_shaves[si].phys && got_phys < g_shaves[si].phys + (long)g_shaves[si].orig_len) {
                     is_syn = 1;
                     break;
                 }
+                if (g_shaves[si].phys == got_phys && g_shaves[si].orig_len == len && g_shaves[si].real_len < len)
+                    is_partial = 1;
             }
-            STAGE("A10249 Alloc 5 result (audio_fix=%d): r=0x%08x phys=0x%lx kind=%s caller=%p",
-                  g_cfg.audio_fix, (unsigned)r, got_phys, (r == 0) ? (is_syn ? "synthetic" : "real") : "failed", caller);
+            STAGE("A%s Alloc 5 result (audio_fix=%d): r=0x%08x phys=0x%lx kind=%s caller=%p",
+                  g_title_id + 4, g_cfg.audio_fix, (unsigned)r, got_phys,
+                  (r == 0) ? (is_syn ? "synthetic" : (is_partial ? "partial-flex" : "real")) : "failed", caller);
             a10249_log_budget("alloc5");
         }
     }
@@ -1371,7 +1432,7 @@ static int32_t map_shaved_flex_tail(void *want_va, size_t tail_part, long shave_
 static void cusa10249_apply_deferred_tail_if_needed(void) __attribute__((unused));
 static void cusa10249_apply_deferred_tail_if_needed(void)
 {
-    if (strcmp(g_title_id, "CUSA10249") != 0) return;
+    if (!cusa04529_audio_title()) return;
     g_c10249_first_reg_done = 1;
     if (!g_c10249_tail_pending) return;
     g_c10249_tail_pending = 0;
@@ -1467,6 +1528,9 @@ static int32_t handle_game_map_inner(void **addr, size_t len, int type, int prot
                 int32_t r = call_orig_map(addr, real_part, type, prot, flags, dmStart, maxPageSize, name, map_kind);
                 if (r == 0 && addr && *addr) {
                     void *want_va = (uint8_t *)(*addr) + real_part;
+                    // Variant C defers the FlexibleMemory tail to RegisterBuffers #1 on CUSA10249 only. Elsewhere in the
+                    // family the game can touch the tail VA before that (CUSA00917 base PS4: SIGSEGV on the unmapped
+                    // tail_va in NdJobWorkerThread, no RegisterBuffers yet), so there the tail is mapped below, right away.
                     if (cusa10249_audio_fix() == 1 && !g_c10249_first_reg_done) {
                         g_c10249_tail_va = want_va;
                         g_c10249_tail_len = tail_part;
@@ -1479,20 +1543,20 @@ static int32_t handle_game_map_inner(void **addr, size_t len, int type, int prot
                         g_c10249_tail_pending = 1;
                         api_ring_push("%s(shave-defer-C phys=0x%lx len=0x%zx real=0x%zx) = 0 va=%p c=%p",
                                       mname, dmStart, len, real_part, *addr, caller);
-                        STAGE("A10249 audio_fix=1 (C) arena shave map OK (tail deferred until RegisterBuffers #1): va=%p real=0x%zx deferred_tail=0x%zx tail_va=%p prot=0x%x",
-                              *addr, real_part, tail_part, want_va, prot);
+                        STAGE("A%s audio_fix=1 (C) arena shave map OK (tail deferred until RegisterBuffers #1): va=%p real=0x%zx deferred_tail=0x%zx tail_va=%p prot=0x%x",
+                              g_title_id + 4, *addr, real_part, tail_part, want_va, prot);
                         STAGE("game %s(phys=0x%lx len=0x%zx prot=0x%x flags=0x%x align=0x%zx in=%p) = 0x00000000 va=%p (shaved-defer-C) caller=%p",
                               mname, dmStart, len, prot, flags, maxPageSize, orig_addr_in, *addr, caller);
                         return 0;
                     }
-                    if (cusa10249_audio_fix() == 2) {
+                    if (cusa04529_audio_fix() == 2) {
                         api_ring_push("%s(shave-unmapped-D phys=0x%lx len=0x%zx real=0x%zx) = 0 va=%p c=%p",
                                       mname, dmStart, len, real_part, *addr, caller);
-                        STAGE("A10249 audio_fix=2 (D) arena shave map OK (tail unmapped, 0 flex bytes): va=%p real=0x%zx unmapped_tail=0x%zx",
-                              *addr, real_part, tail_part);
+                        STAGE("A%s audio_fix=2 (D) arena shave map OK (tail unmapped, 0 flex bytes): va=%p real=0x%zx unmapped_tail=0x%zx",
+                              g_title_id + 4, *addr, real_part, tail_part);
                         STAGE("game %s(phys=0x%lx len=0x%zx prot=0x%x flags=0x%x align=0x%zx in=%p) = 0x00000000 va=%p (shaved-D) caller=%p",
                               mname, dmStart, len, prot, flags, maxPageSize, orig_addr_in, *addr, caller);
-                        if (len == 0x2a000000u)
+                        if (len == g_af_preshave_len)
                             a10249_log_budget("after_arenas");
                         return 0;
                     }
@@ -1710,7 +1774,7 @@ int32_t sceKernelReleaseDirectMemory_hook(off_t start, size_t len)
             if (rel_s <= se->phys && rel_e >= se_end) {
                 size_t real_len = se->real_len;
                 long real_phys = se->phys;
-                if (se->orig_len == 0x15800000u) g_c10249_tail_pending = 0;
+                if (g_af_preshave_len && se->orig_len == g_af_preshave_len) g_c10249_tail_pending = 0;
                 unmap_shave_flex_vmaps(shave_cut, se_end);
                 se->orig_len = 0;
                 se->real_len = 0;
@@ -1727,7 +1791,8 @@ int32_t sceKernelReleaseDirectMemory_hook(off_t start, size_t len)
             }
             // Case B: Sub-range release completely inside the shaved tail [shave_cut, se_end)
             // (e.g. CUSA10213 / CUSA11260 / CUSA12607 releasing tail pages): never pass to kernel!
-            if (!cusa10249_audio_fix() && rel_s >= shave_cut && rel_e <= se_end) {
+            // Not with audio_fix: the pre-shaved tail phys belongs to the next arena, which the kernel placed there.
+            if (!cusa04529_audio_fix() && rel_s >= shave_cut && rel_e <= se_end) {
                 unmap_shave_flex_vmaps(rel_s, rel_e);
                 if (rel_e == se_end) {
                     se->orig_len = (size_t)(rel_s - se->phys);

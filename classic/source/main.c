@@ -67,7 +67,7 @@ typedef struct {
     int manual_mode;     // 0 = auto (algorithm), 1 = manual dev overrides active in config-<TITLE>.ini
     int vout_path;       // 0 = auto, 1 = decoupled sceVideoOutSubmitFlip path learned at runtime
     int gv_conv;         // -1 = auto/uncalibrated, 0..15 = learned motion-vector convention
-    int audio_fix;       // CUSA10249 audio DirectMemory variant: 0 = c87af66, 1 = Variant C (default for CUSA10249), 2 = Variant D
+    int audio_fix;       // CUSA04529-family audio DirectMemory variant: 0 = c87af66, 1 = Variant C (default for CUSA10249 and base-PS4 family titles), 2 = Variant D
 } fg_config_t;
 
 static char g_title_id[16] = "UNKNOWN";
@@ -668,7 +668,7 @@ static void *alloc_gv_dm(size_t len, size_t align, int type)
 static void *alloc_pbuf_history(size_t surf_sz) __attribute__((unused));
 static void *alloc_pbuf_history(size_t surf_sz)
 {
-    if (cusa10249_audio_fix()) return NULL;
+    if (cusa04529_audio_fix()) return NULL;
     if (g_pbuf && g_pbuf_sz > 0) return g_pbuf;
     if (!surf_sz) surf_sz = 0x800000u;
     size_t full_sz = (surf_sz + 0xFFFFu) & ~(size_t)0xFFFFu;
@@ -1567,6 +1567,12 @@ static void cfg_apply_title_defaults(fg_config_t *c)
 {
     if (!g_title_id[0]) return;
     if (strcmp(g_title_id, "CUSA10249") == 0) {
+        c->audio_fix = 1;
+    } else if (vcfg_in_family(g_title_id, "CUSA04529") && g_is_neo == 0) {
+        // Base PS4 (CUSA00341 / CUSA07737 boots, dm=0x120000000): the arenas leave only the 8 MB display buffer free, so
+        // without the pre-shave the 0x600000 audio allocation gets a FlexibleMemory-backed chunk and the game is silent.
+        // PS4 Pro stays at 0 (audio_fix=1 still opts in): no Pro boot of these titles has been verified with the fix, and the
+        // upstream v2.35 notes report a startup crash with the CUSA10249 fix on PS4 Pro.
         c->audio_fix = 1;
     }
     if (vcfg_in_family(g_title_id, "CUSA11456")) {
@@ -3273,7 +3279,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
             }
         }
         if (dcb_valid && g_gpu_state == 0) gpu_init();
-        if (strcmp(g_title_id, "CUSA10249") == 0 && (g_flips == INJECT_AFTER_FLIPS || g_flips == 600u))
+        if (cusa04529_audio_title() && (g_flips == INJECT_AFTER_FLIPS || g_flips == 600u))
             a10249_log_budget(g_flips == INJECT_AFTER_FLIPS ? "f:120" : "f:600");
         if (dcb_valid && g_gpu_state == 1) {
             uint32_t last = count - 1;
@@ -4824,7 +4830,7 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
     STAGE("plugin_load enter: title=%s (family=%s) version=" VCFG_TRACE_VERSION " engine=classic neo=%d dm=0x%zx shave_mode=%d reg_mode=%d pace_order=%d post_mid=%d",
           g_title_id, vcfg_title_family(g_title_id), (int)g_is_neo, (size_t)sceKernelGetDirectMemorySize(),
           g_cfg.shave_mode, g_cfg.reg_mode, g_cfg.pace_order, g_cfg.post_mid);
-    if (strcmp(g_title_id, "CUSA10249") == 0) {
+    if (cusa04529_audio_title()) {
         STAGE("audio_fix=%d", g_cfg.audio_fix);
     }
 #if VCFG_BENCH
