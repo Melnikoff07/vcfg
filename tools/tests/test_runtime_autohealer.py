@@ -133,6 +133,7 @@ static int snprintf(char *buf, size_t sz, const char *fmt, ...)
 
 static char g_title_id[16] = "CUSA00552";
 static int g_known_game = 1, g_detected_60fps = 0;
+static int g_is_neo = 0;
 static int g_tile_override = -1, g_tile_sweep = 0, g_t6_bit_override = -1;
 static volatile fg_config_t g_cfg = {{ 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0, 0, -1 }};
 static volatile int g_fg_off = 0;
