@@ -2282,6 +2282,180 @@ static int g_ext_nm = 0;
 static int g_ext_attr_slot = -1;
 static VoAttr g_ext_attr;
 
+// One display group (CUSA02299). With reg_mode = 2 the late activation at frame 120 registered our buffer as a group of
+// its own at the top index; the game's group carries the output format the game set on it (HDR10 PQ, 0x88740000, set
+// at gameplay entry), ours did not, and the TV alternated a PQ and a non-PQ frame every refresh. Here our buffer joins
+// the game's group, the layout the early start uses. VideoOut refuses to drop a group whose buffer is on screen
+// (0x80290009), so the game's buffer goes off the screen first, with our buffer already allocated:
+//   1. our buffer gets a copy of the game's buffer on screen and is registered alone at the top index (temporary group);
+//   2. a CPU flip shows it, and the wait ends once VideoOut reports it on screen with no flip pending;
+//   3. the game's group is dropped; 4. the game's buffers, at the same indices 0..ngame-1, and ours are registered as
+//   one group; 5. a flip brings the game's buffer back from the one group; 6. the temporary group is dropped (retried
+//   on the next flips while it is still on screen).
+// When the copy cannot be made, steps 1-2 show the blank screen (index -1) instead. When the one group is refused (the
+// temporary group holds our buffer at another index), the blank screen replaces the temporary group and the one group
+// is tried once more. Any other failure ends in the separate group: the game's group back alone, ours alone at the top.
+// Every step's return code goes to the boot log. Other titles keep the separate group.
+static int g_og2 = -1;                   // -1 until the activation decides: 1 on CUSA02299, 0 elsewhere
+static int32_t g_game_attr_slot = 0;     // attribute slot VideoOut returned for the game's buffers at index 0
+static int32_t g_og2_pend_slot = -1;     // temporary group still to drop
+static int og2_copy(void *dst, const void *src, size_t n);   // CPU copy when both are mapped for the CPU; 1 = copied
+
+static int32_t og2_flip(int32_t handle, int idx, int64_t arg)
+{
+    return HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t), handle, idx, 1u /*VSYNC*/, arg);
+}
+
+// Waits up to max_ms for a flip past count0 with nothing pending and idx on screen (any buffer for the blank, -1).
+static int og2_wait(int32_t handle, int idx, uint64_t count0, int max_ms, VoFlipStatus *fs, int *waited)
+{
+    for (*waited = 0;; (*waited)++) {
+        memset(fs, 0, sizeof(*fs));
+        if (read_flip_status(handle, fs) != 0) return 0;
+        if (fs->flipPendingNum <= 0 && fs->count > count0 && (idx < 0 || fs->currentBuffer == idx)) return 1;
+        if (*waited >= max_ms) return 0;
+        sceKernelUsleep(1000);
+    }
+}
+
+// Returns 1: one group at 0..ngame+nm-1 (*slot); 2: ours alone at base, registered here (*slot); 0: nothing of ours
+// registered here (other title, or stopped before any change, or the game's group put back), the caller goes on as before.
+static int safe_one_group(uint32_t handle, void *const *ext, int nm, int base, int32_t *slot)
+{
+    if (g_og2 < 0) g_og2 = vcfg_in_family(g_title_id, "CUSA02299") ? 1 : 0;
+    if (!g_og2) return 0;
+    int32_t h = (int32_t)handle;
+    int n = g_ngame + nm;
+    const char *why = NULL;
+    STAGE("onegroup: try at frame %u: handle=%u ngame=%d nm=%d base=%d game slot=%d", g_flips, handle, g_ngame, nm, base,
+          (int)g_game_attr_slot);
+    if (g_ngame < 1 || nm < 1 || n > 8) why = "buffer count";
+    for (int i = 0; !why && i < g_ngame; i++) if (!g_buf[i]) why = "a game buffer address is unknown";
+    for (int i = g_ngame; !why && i < n; i++) if (g_buf[i]) why = "index in use";
+    if (!why && g_game_idx_hi > g_ngame) why = "the game uses indices above its group";
+    if (!why && (base < n || base + nm > 16)) why = "temporary indices overlap the one group";
+    VoFlipStatus fs;
+    int waited = 0, pend = -1, gcq = -1;
+    while (!why) {
+        memset(&fs, 0, sizeof(fs));
+        if (read_flip_status(h, &fs) != 0) { why = "GetFlipStatus failed"; break; }
+        pend = fs.flipPendingNum; gcq = fs.gcQueueNum;
+        if (pend <= 0 && gcq <= 0) break;
+        if (waited >= 100) { why = "flips still pending after 100 ms"; break; }
+        sceKernelUsleep(1000);
+        waited++;
+    }
+    if (why) {
+        STAGE("onegroup: not tried (%s; pending=%d gcQueue=%d after %d ms)", why, pend, gcq, waited);
+        lg("onegroup: not tried (%s)\n", why);
+        return 0;
+    }
+    int cur = fs.currentBuffer;
+    int64_t arg = fs.flipArg;
+    uint64_t c0 = fs.count;
+    size_t bytes = (size_t)g_pitch * (size_t)g_bh * 4u;
+    int copied = 0;
+    if (cur >= 0 && cur < g_ngame) {
+        copied = 1;
+        for (int i = 0; i < nm; i++) copied &= og2_copy(ext[i], (const void *)(uintptr_t)g_buf[cur], bytes);
+    }
+    STAGE("onegroup: on screen buf %d (flip count %llu, arg %lld), copy into ours (%zu bytes) = %d -> %s", cur,
+          (unsigned long long)c0, (long long)arg, bytes, copied, copied ? "temporary group" : "blank screen");
+    int32_t t = -1, fr, ur, r, ut;
+    int ok;
+    if (copied) {
+        t = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                          h, base, ext, nm, &g_attr);
+        STAGE("onegroup: step 1 register(temporary group, ours at %d) = 0x%08x", base, (unsigned)t);
+        if (t < 0) return 0;
+        fr = og2_flip(h, base, arg);
+        ok = fr == 0 && og2_wait(h, base, c0, 100, &fs, &waited);
+        STAGE("onegroup: step 2 flip(ours %d) = 0x%08x, on screen=%d after %d ms (current %d, pending %d)", base, (unsigned)fr, ok,
+              waited, (int)fs.currentBuffer, (int)fs.flipPendingNum);
+        if (!ok) {
+            *slot = t;
+            STAGE("onegroup: kept the separate group (slot %d, ours at %d)", (int)t, base);
+            return 2;
+        }
+    } else {
+        fr = og2_flip(h, -1, arg);
+        ok = fr == 0 && og2_wait(h, -1, c0, 100, &fs, &waited);
+        STAGE("onegroup: step 2 flip(blank) = 0x%08x, done=%d after %d ms (current %d, pending %d)", (unsigned)fr, ok, waited,
+              (int)fs.currentBuffer, (int)fs.flipPendingNum);
+        if (!ok) {
+            STAGE("onegroup: kept the separate group (the blank flip did not complete)");
+            return 0;
+        }
+    }
+    c0 = fs.count;
+    ur = sceVideoOutUnregisterBuffers(h, g_game_attr_slot);
+    STAGE("onegroup: step 3 unregister(game slot %d) = 0x%08x", (int)g_game_attr_slot, (unsigned)ur);
+    if (ur != 0) {
+        if (t >= 0) { *slot = t; return 2; }
+        return 0;
+    }
+    void *all[8];
+    for (int i = 0; i < g_ngame; i++) all[i] = (void *)(uintptr_t)g_buf[i];
+    for (int i = 0; i < nm; i++) all[g_ngame + i] = ext[i];
+    r = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                      h, 0, all, n, &g_attr);
+    STAGE("onegroup: step 4 register(0..%d, %d game + %d ours) = 0x%08x", n - 1, g_ngame, nm, (unsigned)r);
+    if (r < 0 && t >= 0) {
+        fr = og2_flip(h, -1, arg);
+        ok = fr == 0 && og2_wait(h, -1, c0, 100, &fs, &waited);
+        ut = ok ? sceVideoOutUnregisterBuffers(h, t) : -1;
+        STAGE("onegroup: step 4b flip(blank) = 0x%08x done=%d, unregister(temporary slot %d) = 0x%08x", (unsigned)fr, ok, (int)t,
+              (unsigned)ut);
+        if (ut == 0) {
+            t = -1;
+            c0 = fs.count;
+            r = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                              h, 0, all, n, &g_attr);
+            STAGE("onegroup: step 4c register(0..%d) again = 0x%08x", n - 1, (unsigned)r);
+        }
+    }
+    if (r < 0) {
+        int32_t rr = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                                   h, 0, all, g_ngame, &g_attr);
+        if (rr >= 0) g_game_attr_slot = rr;
+        STAGE("onegroup: one group refused, the game's group back alone = 0x%08x", (unsigned)rr);
+        lg("onegroup: one group refused (0x%08x), the game's group back alone = 0x%08x\n", (unsigned)r, (unsigned)rr);
+        if (t >= 0) { *slot = t; return 2; }
+        return 0;
+    }
+    g_game_attr_slot = r;
+    *slot = r;
+    int show = (cur >= 0 && cur < g_ngame) ? cur : -1;
+    if (show >= 0) {
+        fr = og2_flip(h, show, arg);
+        ok = fr == 0 && og2_wait(h, show, c0, 100, &fs, &waited);
+        STAGE("onegroup: step 5 flip(game buf %d in the one group) = 0x%08x, on screen=%d after %d ms", show, (unsigned)fr, ok,
+              waited);
+    }
+    if (t >= 0) {
+        ut = sceVideoOutUnregisterBuffers(h, t);
+        STAGE("onegroup: step 6 unregister(temporary slot %d) = 0x%08x%s", (int)t, (unsigned)ut,
+              ut ? " (retried on the next flips)" : "");
+        if (ut != 0) g_og2_pend_slot = t;
+    }
+    STAGE("onegroup: one group, slot %d, indices 0..%d (ours from %d)", (int)r, n - 1, g_ngame);
+    lg("onegroup: one group, slot %d, indices 0..%d (ours from %d)\n", (int)r, n - 1, g_ngame);
+    return 1;
+}
+
+// On the game's flips after the activation: drops the temporary group once it is off the screen (up to 600 tries).
+static void og2_tick(int32_t handle)
+{
+    if (g_og2_pend_slot < 0) return;
+    static int tries = 0;
+    int32_t ut = sceVideoOutUnregisterBuffers(handle, g_og2_pend_slot);
+    tries++;
+    if (ut == 0 || tries >= 600) {
+        STAGE("onegroup: unregister(temporary slot %d) = 0x%08x after %d more tries", (int)g_og2_pend_slot, (unsigned)ut, tries);
+        g_og2_pend_slot = -1;
+    }
+}
+
 // Called once on the game's flip thread at frame INJECT_AFTER_FLIPS, after the config was read.
 static void safe_try_activate(uint32_t handle)
 {
@@ -2381,16 +2555,25 @@ static void safe_try_activate(uint32_t handle)
     if (base < free_base) { safe_refuse("NO INDICES"); return; }
     void *ext[8];
     for (int i = 0; i < nm; i++) ext[i] = m + (size_t)i * one;
-    int32_t r1 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
-                               (int32_t)handle, base, ext, nm, &g_attr);
-    if (r1 == (int32_t)0x80290010) {
-        for (int sl = 1; sl < 4; sl++) sceVideoOutUnregisterBuffers((int32_t)handle, sl);
+    int32_t r1 = -1;
+    int og = safe_one_group(handle, ext, nm, base, &r1);   // 0: separate group below, 1: one group, 2: ours at base already
+    int one_grp = (og == 1);
+    if (one_grp) {
+        base = g_ngame;
+    } else if (og == 2) {
+        STAGE("safe mode RegisterBuffers (late group at %d, %d x 0x%zx, by onegroup) = 0x%08x", base, nm, one, (unsigned)r1);
+    } else {
         r1 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
                            (int32_t)handle, base, ext, nm, &g_attr);
+        if (r1 == (int32_t)0x80290010) {
+            for (int sl = 1; sl < 4; sl++) sceVideoOutUnregisterBuffers((int32_t)handle, sl);
+            r1 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                               (int32_t)handle, base, ext, nm, &g_attr);
+        }
+        STAGE("safe mode RegisterBuffers (late group at %d, %d x 0x%zx) = 0x%08x", base, nm, one, (unsigned)r1);
     }
-    STAGE("safe mode RegisterBuffers (late group at %d, %d x 0x%zx) = 0x%08x", base, nm, one, (unsigned)r1);
     if (r1 < 0) { safe_refuse("REGISTER FAILED"); return; }
-    g_ext_attr_slot = r1;
+    g_ext_attr_slot = one_grp ? -1 : r1;   // -1: ours share the game's group (never unregistered on their own)
     g_ext_nm = nm <= 8 ? nm : 8;
     for (int i = 0; i < g_ext_nm; i++) g_ext_va[i] = ext[i];
     g_ext_attr = g_attr;
@@ -3195,6 +3378,30 @@ static int dcb_mem_ok(uintptr_t a, size_t n)
     return 1;
 }
 
+static int og2_cpu_writable(uintptr_t a, size_t n)
+{
+    uintptr_t end = a + n, cur = a;
+    if (!a || !n || end < a) return 0;
+    while (cur < end) {
+        void *s = NULL, *en = NULL;
+        int32_t prot = 0;
+        if (sceKernelQueryMemoryProtection((void *)cur, &s, &en, &prot) != 0) return 0;
+        if ((uintptr_t)s > cur || (uintptr_t)en <= cur || (prot & 0x02 /*PROT_CPU_WRITE*/) == 0) return 0;
+        cur = (uintptr_t)en;
+    }
+    return 1;
+}
+
+// One display group: the game's buffer on screen into ours. Our buffer is write-combined: the copy is drained with
+// sfence before VideoOut is asked to show it.
+static int og2_copy(void *dst, const void *src, size_t n)
+{
+    if (!dcb_mem_ok((uintptr_t)src, n) || !og2_cpu_writable((uintptr_t)dst, n)) return 0;
+    memcpy(dst, src, n);
+    __asm__ volatile("sfence" ::: "memory");
+    return 1;
+}
+
 #if VCFG_BENCH
 #include "bench_capture.h"
 #endif
@@ -3292,6 +3499,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             g_cpu_ema_us = g_cpu_ema_us ? (g_cpu_ema_us * 7u + (uint32_t)us) / 8u : (uint32_t)us; }
     }
     tick(g_flips, handle, index, flipMode);
+    if (g_flips > INJECT_AFTER_FLIPS) og2_tick((int32_t)handle);   // one display group: a temporary group still to drop
     uint64_t raw_dt_us = (prev_flip_t && g_freq) ? ((g_last - prev_flip_t) * 1000000ull / g_freq) : 33366ull;
 #if VCFG_BENCH
     if (g_bench_enabled) return bench_flip(count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg, t_hook_in);
@@ -4505,6 +4713,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
     }
     int32_t rn = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
                                handle, startIndex, addresses, bufferNum, attr);
+    if (rn >= 0 && startIndex == 0) g_game_attr_slot = rn;
     if (rn >= 0 && need_rereg_ext_fmt && attr && g_mbuf_state == 1 && g_ext_nm >= 1) {
         if (g_ext_attr_slot > 0) {
             sceVideoOutUnregisterBuffers(handle, g_ext_attr_slot);
