@@ -933,7 +933,8 @@ static void load_settings(App *a)
     size_t n; char path[96];
     unsigned char *l = read_all(CFGDIR "/vcfg_launcher.ini", &n);
     const char *t = l ? (const char *)l : "";
-    a->defaults = (Settings){ ini_int(t, "fg", 1), ini_int(t, "preset", 0), ini_int(t, "sharp", 40), ini_int(t, "enhance", 1), ini_int(t, "overlay", 0) };
+    a->defaults = (Settings){ ini_int(t, "fg", 1), ini_int(t, "preset", 0), ini_int(t, "sharp", 40), ini_int(t, "enhance", 1), ini_int(t, "overlay", 0),
+                              ini_int(t, "below30", 0) != 0, ini_int(t, "shallow_queue", 1) != 0 };
     a->overlay_pos = ini_int(t, "overlay_pos", 4); a->overlay_opacity = ini_int(t, "overlay_opacity", 80);
     a->menu_combo = menu_combo_sanitize((uint32_t)ini_int(t, "menu_combo", (int)MENU_COMBO_DEFAULT));   // preset or recorded mask, else L3 + R3
     a->dark_theme = ini_int(t, "dark_theme", 1);
@@ -995,7 +996,7 @@ static void load_settings(App *a)
             unsigned char *b = read_all(CFGDIR "/vcfg.ini", &n);
             if (b) {
                 const char *s = (const char *)b;
-                g->s = (Settings){ ini_int(s, "enabled", 1), ini_int(s, "preset", 0), ini_int(s, "sharp", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
+                g->s = (Settings){ ini_int(s, "enabled", 1), ini_int(s, "preset", 0), ini_int(s, "sharp", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0), 0, 1 };
                 free(b);
             }
         } else {
@@ -1003,7 +1004,8 @@ static void load_settings(App *a)
             unsigned char *b = read_all(path, &n);
             if (b) {
                 const char *s = (const char *)b;
-                g->s = (Settings){ ini_int(s, "framegen", g->experimental ? 0 : 1), ini_int(s, "preset", 0), ini_int(s, "sharpness", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
+                g->s = (Settings){ ini_int(s, "framegen", g->experimental ? 0 : 1), ini_int(s, "preset", 0), ini_int(s, "sharpness", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0),
+                                   ini_int(s, "below30", 0) != 0, ini_int(s, "shallow_queue", 1) != 0 };   // absent = plugin default
                 int mm = ini_int(s, "manual_mode", 0);
                 if (mm > 0) g->dev.manual_mode = 1;
                 if (g->dev.manual_mode) {
@@ -1036,9 +1038,11 @@ static void save_settings(App *a)
     sceKernelMkdir(CFGDIR, 0777);
     const unsigned combo = menu_combo_sanitize(a->menu_combo);   // validated mask, written to every file the plugins read
     snprintf(buf, sizeof(buf),
-             "fg=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\noverlay_pos=%d\noverlay_opacity=%d\nmenu_combo=%u\n"
+             "fg=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\nbelow30=%d\nshallow_queue=%d\n"
+             "overlay_pos=%d\noverlay_opacity=%d\nmenu_combo=%u\n"
              "dark_theme=%d\nauto_send=%d\ntelemetry_host=%s\ntelemetry_port=%d\n",
              a->defaults.fg, a->defaults.preset, a->defaults.sharp, a->defaults.enhance, a->defaults.overlay,
+             a->defaults.b30, a->defaults.shq,
              a->overlay_pos, a->overlay_opacity, combo, a->dark_theme,
              a->net_telemetry, a->telemetry_host, a->telemetry_port > 0 ? a->telemetry_port : 8765);
     write_all(CFGDIR "/vcfg_launcher.ini", buf, strlen(buf));
@@ -1081,9 +1085,10 @@ static void save_settings(App *a)
             snprintf(path, sizeof(path), CFGDIR "/config-%s.ini", g->id);
             snprintf(buf, sizeof(buf),
                      "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\nmenu_combo=%u\n"
-                     "manual_mode=%d\ntwo_buffer=%d\npresent_copy=%d\nshave_mode=%d\nreg_mode=%d\npace_order=%d\npost_mid=%d\nfps_lock=%d\ntile_idx=%d\n",
+                     "manual_mode=%d\ntwo_buffer=%d\npresent_copy=%d\nshave_mode=%d\nreg_mode=%d\npace_order=%d\npost_mid=%d\nfps_lock=%d\ntile_idx=%d\n"
+                     "below30=%d\nshallow_queue=%d\n",
                      s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo,
-                     d->manual_mode, bmode == BUF_2BUF, pcopy, sm, rm, po, pm, lk, ti);
+                     d->manual_mode, bmode == BUF_2BUF, pcopy, sm, rm, po, pm, lk, ti, s->b30, s->shq);
             write_all(path, buf, strlen(buf));
             snprintf(path, sizeof(path), CFGDIR "/tile_%s", g->id);
             if (ti >= 0) { char tb[16]; snprintf(tb, sizeof(tb), "%d\n", ti); write_all(path, tb, strlen(tb)); }
@@ -1402,7 +1407,7 @@ static void do_clean(App *a)
     a->turned_off = 1;
     snprintf(a->status, sizeof(a->status), "VCFG IS TURNED OFF - PRESS CROSS ON 04 PLUGIN TO ENABLE");
     a->debug_log = 0;
-    a->defaults = (Settings){ 1, 0, 40, 1, 0 };
+    a->defaults = SETTINGS_DEFAULT;
     a->overlay_pos = 4;
     a->overlay_opacity = 80;
     a->menu_combo = MENU_COMBO_DEFAULT;

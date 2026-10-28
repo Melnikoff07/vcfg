@@ -225,6 +225,106 @@
     ]
   },
   {
+    "trace_key": "CUSA00341_0x120000000_v2.34",
+    "title_id": "CUSA00341",
+    "log_version": "2.34",
+    "dm_size": "0x120000000",
+    "pre_occupied_low": "0x20000",
+    "neo": 0,
+    "events": [
+      {
+        "op": "alloc",
+        "id": 1,
+        "flips": 0,
+        "s": "0x0",
+        "e": "0x120000000",
+        "len": "0x7bc00000",
+        "align": "0x200000",
+        "type": 0,
+        "orig_ret": "0x0",
+        "orig_phys": "0x200000"
+      },
+      {
+        "op": "alloc",
+        "id": 2,
+        "flips": 0,
+        "s": "0x0",
+        "e": "0x120000000",
+        "len": "0x8000000",
+        "align": "0x200000",
+        "type": 0,
+        "orig_ret": "0x0",
+        "orig_phys": "0x7be00000"
+      },
+      {
+        "op": "alloc",
+        "id": 3,
+        "flips": 0,
+        "s": "0x0",
+        "e": "0x120000000",
+        "len": "0x6c600000",
+        "align": "0x200000",
+        "type": 3,
+        "orig_ret": "0x0",
+        "orig_phys": "0x83e00000"
+      },
+      {
+        "op": "alloc",
+        "id": 4,
+        "flips": 0,
+        "s": "0x0",
+        "e": "0x120000000",
+        "len": "0x2f400000",
+        "align": "0x200000",
+        "type": 3,
+        "orig_ret": "0x0",
+        "orig_phys": "0xf0400000"
+      },
+      {
+        "op": "reg_buffers",
+        "flips": 0,
+        "start": 0,
+        "num": 2,
+        "w": 1920,
+        "h": 1080,
+        "pitch": 1920,
+        "fmt": "0x80002200"
+      },
+      {
+        "op": "alloc",
+        "id": 5,
+        "flips": 0,
+        "s": "0x0",
+        "e": "0x120000000",
+        "len": "0x600000",
+        "align": "0x200000",
+        "type": 0,
+        "orig_ret": "0x0",
+        "orig_phys": "0x11f800000"
+      },
+      {
+        "op": "reg_buffers",
+        "flips": 0,
+        "start": 0,
+        "num": 3,
+        "w": 1920,
+        "h": 1080,
+        "pitch": 1920,
+        "fmt": "0x88000000"
+      },
+      {
+        "op": "reg_buffers",
+        "flips": 86,
+        "start": 0,
+        "num": 3,
+        "w": 1920,
+        "h": 1080,
+        "pitch": 1920,
+        "fmt": "0x88740000"
+      }
+    ]
+  },
+  {
     "trace_key": "CUSA00375_0x120000000",
     "title_id": "CUSA00375",
     "log_version": "2.28",
@@ -3392,6 +3492,106 @@
         "h": 1080,
         "pitch": 1920,
         "fmt": "0x80002200"
+      }
+    ]
+  },
+  {
+    "trace_key": "CUSA07737_0x120000000_v2.34",
+    "title_id": "CUSA07737",
+    "log_version": "2.34",
+    "dm_size": "0x120000000",
+    "pre_occupied_low": "0x20000",
+    "neo": 0,
+    "events": [
+      {
+        "op": "alloc",
+        "id": 1,
+        "flips": 0,
+        "s": "0x0",
+        "e": "0x120000000",
+        "len": "0x87800000",
+        "align": "0x200000",
+        "type": 0,
+        "orig_ret": "0x0",
+        "orig_phys": "0x200000"
+      },
+      {
+        "op": "alloc",
+        "id": 2,
+        "flips": 0,
+        "s": "0x0",
+        "e": "0x120000000",
+        "len": "0x8200000",
+        "align": "0x200000",
+        "type": 0,
+        "orig_ret": "0x0",
+        "orig_phys": "0x87a00000"
+      },
+      {
+        "op": "alloc",
+        "id": 3,
+        "flips": 0,
+        "s": "0x0",
+        "e": "0x120000000",
+        "len": "0x60800000",
+        "align": "0x200000",
+        "type": 3,
+        "orig_ret": "0x0",
+        "orig_phys": "0x8fc00000"
+      },
+      {
+        "op": "alloc",
+        "id": 4,
+        "flips": 0,
+        "s": "0x0",
+        "e": "0x120000000",
+        "len": "0x2f400000",
+        "align": "0x200000",
+        "type": 3,
+        "orig_ret": "0x0",
+        "orig_phys": "0xf0400000"
+      },
+      {
+        "op": "reg_buffers",
+        "flips": 0,
+        "start": 0,
+        "num": 2,
+        "w": 1920,
+        "h": 1080,
+        "pitch": 1920,
+        "fmt": "0x80002200"
+      },
+      {
+        "op": "alloc",
+        "id": 5,
+        "flips": 0,
+        "s": "0x0",
+        "e": "0x120000000",
+        "len": "0x600000",
+        "align": "0x200000",
+        "type": 0,
+        "orig_ret": "0x0",
+        "orig_phys": "0x11f800000"
+      },
+      {
+        "op": "reg_buffers",
+        "flips": 0,
+        "start": 0,
+        "num": 3,
+        "w": 1920,
+        "h": 1080,
+        "pitch": 1920,
+        "fmt": "0x88000000"
+      },
+      {
+        "op": "reg_buffers",
+        "flips": 40,
+        "start": 0,
+        "num": 3,
+        "w": 1920,
+        "h": 1080,
+        "pitch": 1920,
+        "fmt": "0x88740000"
       }
     ]
   },

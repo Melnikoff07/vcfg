@@ -19,7 +19,7 @@ __declspec(dllexport) int vcfg_preview(uint32_t *px, int w, int h, const uint8_t
         !face_init(&g_fonts.big, logo, 150, &g_arena)) return -1;
     ui_memset(&g_app, 0, sizeof(g_app));
     App *a = &g_app; a->f = &g_fonts;
-    a->defaults = (Settings){ 1, 0, 40, 1, 0 };
+    a->defaults = SETTINGS_DEFAULT;
     a->overlay_pos = 4; a->overlay_opacity = 80; a->plugin_state = 1;
     for (int i = 0; i < ngames && i < 24; i++) {
         Game *g = &a->games[i];
@@ -27,7 +27,7 @@ __declspec(dllexport) int vcfg_preview(uint32_t *px, int w, int h, const uint8_t
         for (int k = 0; ids[i][k] && k < 11; k++) g->id[k] = ids[i][k];
         g->engine = i == 0 ? ENGINE_NEW : ENGINE_CLASSIC; g->installed = i < 4; g->testing = i == 3;
         g->icon = icons[i]; g->iw = iw[i]; g->ih = ih[i];
-        g->s = (Settings){ i != 3, i == 1, 40, 1, 0 };
+        g->s = (Settings){ i != 3, i == 1, 40, 1, 0, 0, 1 };
     }
     a->ngames = ngames;
     ui_memcpy(a->version, "2.26", 5);
