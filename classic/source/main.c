@@ -687,6 +687,14 @@ static void *alloc_pbuf_history(size_t surf_sz)
     }
     g_pbuf_skip_logged = 0;
     int prefer_half = (fq == 0 && flex_av > 0 && (flex_av < 0x1800000u || flex_av < full_sz + 0x1000000u));
+    // CUSA02299 (2_10_10_10 display, 18 MB of FlexibleMemory at frame 120): the 16-bit history costs the generated
+    // frame precision against the real frames around it, so keep the full 8-bit history whenever 8 MB of FlexibleMemory
+    // still stays with the game after it. Below that it takes the 16-bit history (or none) like every other title.
+    if (prefer_half && fq == 0 && vcfg_in_family(g_title_id, "CUSA02299") && flex_av >= full_sz + 0x800000u) {
+        prefer_half = 0;
+        STAGE("alloc_pbuf_history: CUSA02299 keeps the 8-bit history (full_sz=0x%zx, flex_av=0x%zx, 0x%zx stays with the game)",
+              full_sz, flex_av, flex_av - full_sz);
+    }
     if (!prefer_half) {
         void *fl = alloc_flex_gpu(full_sz, 0x10000u);
         if (fl) {
@@ -1583,7 +1591,19 @@ static void cfg_apply_title_defaults(fg_config_t *c)
         c->reg_mode = 1;
         c->pace_order = 2;
     } else if (vcfg_in_family(g_title_id, "CUSA02299")) {
-        c->reg_mode = 1;
+        // CUSA02299 (base PS4 boots, dm=0x13b400000, 2.34 and 2.35): after RegisterBuffers the game asks for a 0x10000000
+        // type 0 pool (BatchMap at 1900000000) when only 0xe600000 is free next to our 32 MB display reserve. With the
+        // early group registered (g_mbuf_state == 1) the valve may not shrink that reserve, the arena shave needs a
+        // 0x1a00000 FlexibleMemory tail, the request fails and the game never leaves the loading screen. Late activation
+        // (reg_mode=2) keeps g_mbuf_state=0 during boot: nothing of ours is registered with VideoOut or submitted to the
+        // GPU before frame 120, so the valve shrinks the reserve to 8 MB and shaves an 8 MB tail, or gives the reserve
+        // back when FlexibleMemory is short (FG then stays off at frame 120: NO DISPLAY MEM). When the pool does not
+        // need it, frame 120 registers the same 4 buffers at the top as reg_mode=1.
+        c->reg_mode = 2;
+        // Its display buffers are 2_10_10_10 and the generated frame alternates with the real one every refresh: with
+        // Sharpness / Enhance AA on the generated frame only, the two differ and smooth areas (sky) flicker. Post-process
+        // both frames (post_mid = 2).
+        c->post_mid = 2;
     } else if (vcfg_in_family(g_title_id, "CUSA09311") ||
                vcfg_in_family(g_title_id, "CUSA18534") ||
                vcfg_in_family(g_title_id, "CUSA10123")) {
