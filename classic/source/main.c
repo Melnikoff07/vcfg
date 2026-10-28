@@ -1245,6 +1245,16 @@ static void calc_rcas_params(uint32_t target_mask, uint32_t *con_bits_out, uint3
     *flags_out = rcas_flags;
 }
 
+// bit 6: rcas8 adds back the part of the centre texel its 8-bit LDS tile drops (texel - unpack(pack(texel))), so a
+// 2_10_10_10 surface keeps all 10 bits where the pass leaves the pixel unchanged. Without it every lane of a non
+// 8_8_8_8 surface is stored as the 8-bit LDS value: the 2 low bits of the mid and of the real frame are lost, and a
+// 1-code mid/real difference becomes a 4-code step. On 8_8_8_8 the residual is 0 (the round trip is exact).
+static uint32_t rcas_precise_flag(uint32_t rcas_flags)
+{
+    if (rcas_flags && g_t_dfmt != 10u && vcfg_in_family(g_title_id, "CUSA02299")) return rcas_flags | 64u;
+    return rcas_flags;
+}
+
 // 1.4: Native post-processing pass on T#cur only (when FrameGen is OFF or inert due to resolution / 60fps / no mbuf).
 // Keeps L3+R3 menu, corner FPS overlay, and Enhance AA + RCAS working in ANY game without locking to 30 fps!
 static uint32_t build_dcb_post8(uint32_t *p0, uint64_t C, uint32_t w, uint32_t h, uint32_t pitch, uint32_t tidx,
@@ -1379,6 +1389,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     if (!g_mem_tight || g_cfg.upscale > 0)
         calc_rcas_params((post_mid_only() || g_bench_offscreen) ? 1u /*mid1 only*/ : mask1, &rcas_con_bits, &rcas_flags1);
     if (g_sh8_off[15] && !g_bench_offscreen) osd_build_slot(slotb + OSD_SLOT_OFF, &osd_xy, &osd_wh1, mask1);
+    rcas_flags1 = rcas_precise_flag(rcas_flags1);
     fill_table8_ext(tb, g_gpu, slotb, rcas_con_bits, rcas_flags1, osd_xy, osd_wh1);
 
     *(volatile uint64_t *)(slotb + 0x900) = 0;
@@ -1509,6 +1520,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         tb2[29] = (mid2_idx & 0x7FFFu) | 0x8000u /*skip_st*/ | ((t2_q16 & 0xFFFFu) << 16);
         uint32_t rcas_con2 = 0, rcas_flags2 = 0, osd_wh2 = (osd_wh1 & 0x00FFFFFFu) | (3u << 24);
         calc_rcas_params(post_mid_only() ? 1u /*mid2 only*/ : 3u /*mid2 + cur*/, &rcas_con2, &rcas_flags2);
+        rcas_flags2 = rcas_precise_flag(rcas_flags2);
         fill_table8_ext(tb2, g_gpu, slotb, rcas_con2, rcas_flags2, osd_xy, osd_wh1 ? osd_wh2 : 0u);
 
         int32_t fr2 = insert_wait_flip_done(p, 7, vo_handle, mid2_idx);

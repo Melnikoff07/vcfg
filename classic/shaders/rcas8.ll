@@ -6,10 +6,13 @@
 ; packed RGBA8 + float luma = 1152 B of LDS) and barrier-synchronising the wave before any computation or store.
 ; Supports dynamic screen resolutions (reads width-1 and height-1 directly from T# dword 2).
 ; table: +0x20 T#cur (real frame), +0x40 T#out (generated mid frame),
-;        +0x220 {rcas_con (float bits), rcas_flags (bit 0 = mid, bit 1 = cur, bits 2..3 = enhance mode 0/1/2)}.
+;        +0x220 {rcas_con (float bits), rcas_flags (bit 0 = mid, bit 1 = cur, bits 2..3 = enhance mode 0/1/2,
+;        bit 6 = before each store, add back the centre texel's residual against the 8-bit LDS copy
+;        (texel - unpack(pack(texel))): a non 8_8_8_8 surface (2_10_10_10) keeps its low bits; 0 on 8_8_8_8)}.
 target triple = "amdgcn--"
 declare <4 x float> @llvm.amdgcn.image.load.2d.v4f32.i32(i32 immarg, i32, i32, <8 x i32>, i32 immarg, i32 immarg)
 declare void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float>, i32 immarg, i32, i32, <8 x i32>, i32 immarg, i32 immarg)
+declare <4 x float> @llvm.floor.v4f32(<4 x float>)
 declare void @llvm.amdgcn.s.barrier()
 declare i32 @llvm.smax.i32(i32, i32)
 declare i32 @llvm.smin.i32(i32, i32)
@@ -98,6 +101,22 @@ define internal <4 x float> @unpack_rgb(i32 %pk) alwaysinline {
   %v3 = insertelement <4 x float> %v2, float %af0, i32 3
   %res = call <4 x float> @scale4(<4 x float> %v3, float 0x3F70101020000000) ; 1.0 / 255.0
   ret <4 x float> %res
+}
+
+; bit 6: full-precision centre minus its 8-bit LDS copy, RGB only. Same value as unpack_rgb(pack_rgba(f)): a unorm load is
+; already in [0, 1] (q8's sat is the identity), floor(f * 255 + 0.5) is the integer q8 truncates to, and the product
+; with the same 1/255 constant is unpack's. The lane's own texel is written only by this lane, so loading it here
+; returns what lds_put read.
+define internal <4 x float> @resid8(<8 x i32> %t, i32 %x, i32 %y) alwaysinline {
+  %f = call <4 x float> @llvm.amdgcn.image.load.2d.v4f32.i32(i32 15, i32 %x, i32 %y, <8 x i32> %t, i32 0, i32 0)
+  %s = fmul <4 x float> %f, <float 255.0, float 255.0, float 255.0, float 255.0>
+  %r = fadd <4 x float> %s, <float 0.5, float 0.5, float 0.5, float 0.5>
+  %i = call <4 x float> @llvm.floor.v4f32(<4 x float> %r)
+  %q = fmul <4 x float> %i, <float 0x3F70101020000000, float 0x3F70101020000000, float 0x3F70101020000000, float 0x3F70101020000000>
+  %d = fsub <4 x float> %f, %q
+  ; alpha: 2_10_10_10 keeps 2 bits, which the 8-bit copy holds exactly (k / 3 -> 85 k / 255), so its residual is 0
+  %d3 = insertelement <4 x float> %d, float 0.0, i32 3
+  ret <4 x float> %d3
 }
 
 define internal void @lds_put(<8 x i32> %t, i32 %bx0, i32 %by0, i32 %wm1, i32 %hm1, i32 %idx) alwaysinline {
@@ -519,11 +538,20 @@ entry:
   %do_mid = icmp ne i32 %do_mid0, 0
   %em0 = lshr i32 %rfl, 2
   %emode = and i32 %em0, 3
+  %prb = and i32 %rfl, 64
+  %prec = icmp ne i32 %prb, 0
   br i1 %do_mid, label %pass_mid, label %check_cur
 pass_mid:
   %pto = getelementptr i8, ptr addrspace(4) %tbl, i64 64
   %to = load <8 x i32>, ptr addrspace(4) %pto, align 32, !invariant.load !0
-  %om = call <4 x float> @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode)
+  %om0 = call <4 x float> @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode)
+  br i1 %prec, label %mid_prec, label %mid_sel
+mid_prec:
+  %mres = call <4 x float> @resid8(<8 x i32> %to, i32 %x, i32 %y)
+  %omp = fadd <4 x float> %om0, %mres
+  br label %mid_sel
+mid_sel:
+  %om = phi <4 x float> [ %omp, %mid_prec ], [ %om0, %pass_mid ]
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %om, i32 15, i32 %x, i32 %y, <8 x i32> %to, i32 0, i32 0)
   call void @bar()
   br label %check_cur
@@ -534,7 +562,14 @@ check_cur:
 pass_cur:
   %ptc = getelementptr i8, ptr addrspace(4) %tbl, i64 32
   %tc = load <8 x i32>, ptr addrspace(4) %ptc, align 32, !invariant.load !0
-  %oc = call <4 x float> @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode)
+  %oc0 = call <4 x float> @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode)
+  br i1 %prec, label %cur_prec, label %cur_sel
+cur_prec:
+  %cres = call <4 x float> @resid8(<8 x i32> %tc, i32 %x, i32 %y)
+  %ocp = fadd <4 x float> %oc0, %cres
+  br label %cur_sel
+cur_sel:
+  %oc = phi <4 x float> [ %ocp, %cur_prec ], [ %oc0, %pass_cur ]
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %oc, i32 15, i32 %x, i32 %y, <8 x i32> %tc, i32 0, i32 0)
   br label %done
 done:
