@@ -141,30 +141,43 @@ static void safe_refuse(const char *why)
 static int fg_res_supported(uint32_t w, uint32_t h) { return w >= 640 && h >= 360; }
 static int vcfg_in_family(const char *tid, const char *fam) { (void)tid; (void)fam; return 0; }
 static int gv_armed(void) { return 0; }
-// VideoOut calls of safe_try_activate, recorded in order: {1 = RegisterBuffers, start, count, addresses[count - 1] >> 20},
-// {2 = UnregisterBuffers, slot, 0, 0} or {3 = SubmitFlip, index, 0, 0}. g_vo_fail_count: a RegisterBuffers of that many
-// buffers is refused.
-static int32_t g_vo_log[16][4];
-static int g_vo_log_n = 0, g_vo_fail_count = 0;
+// VideoOut calls of safe_try_activate, recorded in order: {1 = RegisterBuffers, start, count, addresses[count - 1] >> 20,
+// returned slot or error}, {2 = UnregisterBuffers, slot, 0, 0, rc} or {3 = SubmitFlip, index, 0, 0, 0}.
+// Attribute slots are handed out like VideoOut does, lowest free first (g_vo_slots: bit = slot in use; the game's own
+// group holds slot 0). g_vo_fail_count: a RegisterBuffers of that many buffers is refused; g_vo_fail2_left: the next
+// RegisterBuffers of 2 buffers are refused that many times; g_vo_force_n3: a RegisterBuffers of 3 buffers gets that slot;
+// g_vo_unreg_fail_slot: UnregisterBuffers of that slot is refused (busy).
+static int32_t g_vo_log[16][5];
+static int g_vo_log_n = 0, g_vo_fail_count = 0, g_vo_fail2_left = 0, g_vo_force_n3 = -1, g_vo_unreg_fail_slot = -1;
+static uint32_t g_vo_slots = 1u;
+static void vo_log(int k, int32_t a, int32_t b, int32_t c, int32_t rc)
+{
+    if (g_vo_log_n < 16) {
+        g_vo_log[g_vo_log_n][0] = k; g_vo_log[g_vo_log_n][1] = a; g_vo_log[g_vo_log_n][2] = b; g_vo_log[g_vo_log_n][3] = c;
+        g_vo_log[g_vo_log_n][4] = rc;
+        g_vo_log_n++;
+    }
+}
 static int32_t raw_sceVideoOutRegisterBuffers(int32_t h, int32_t s, void *const *a, int32_t n, const VoAttr *attr)
 {
     (void)h; (void)attr;
-    if (g_vo_log_n < 16) {
-        g_vo_log[g_vo_log_n][0] = 1; g_vo_log[g_vo_log_n][1] = s; g_vo_log[g_vo_log_n][2] = n;
-        g_vo_log[g_vo_log_n][3] = (a && n > 0) ? (int32_t)((uintptr_t)a[n - 1] >> 20) : 0;
-        g_vo_log_n++;
-    }
-    if (g_vo_fail_count && n == g_vo_fail_count) return (int32_t)0x80290001;
-    return 1;
+    int32_t c = (a && n > 0) ? (int32_t)((uintptr_t)a[n - 1] >> 20) : 0;
+    int32_t rc = -1;
+    if (g_vo_fail_count && n == g_vo_fail_count) rc = (int32_t)0x80290001;
+    else if (n == 2 && g_vo_fail2_left > 0) { g_vo_fail2_left--; rc = (int32_t)0x80290001; }
+    else if (n == 3 && g_vo_force_n3 >= 0) rc = g_vo_force_n3;
+    else for (int sl = 0; sl < 4 && rc < 0; sl++) if (!(g_vo_slots & (1u << sl))) rc = sl;
+    if (rc >= 0) g_vo_slots |= 1u << rc;
+    vo_log(1, s, n, c, rc);
+    return rc;
 }
 static int32_t sceVideoOutUnregisterBuffers(int32_t h, int32_t idx)
 {
     (void)h;
-    if (g_vo_log_n < 16) {
-        g_vo_log[g_vo_log_n][0] = 2; g_vo_log[g_vo_log_n][1] = idx; g_vo_log[g_vo_log_n][2] = 0; g_vo_log[g_vo_log_n][3] = 0;
-        g_vo_log_n++;
-    }
-    return 0;
+    int32_t rc = (idx == g_vo_unreg_fail_slot) ? (int32_t)0x80290009 : 0;
+    if (rc == 0 && idx >= 0 && idx < 32) g_vo_slots &= ~(1u << idx);
+    vo_log(2, idx, 0, 0, rc);
+    return rc;
 }
 typedef struct {
     uint64_t count, processTime, tsc;
@@ -191,10 +204,7 @@ static int g_sf_stall = 0;
 static int32_t raw_sceVideoOutSubmitFlip(int32_t h, int32_t idx, uint32_t mode, int64_t arg)
 {
     (void)h; (void)mode; (void)arg;
-    if (g_vo_log_n < 16) {
-        g_vo_log[g_vo_log_n][0] = 3; g_vo_log[g_vo_log_n][1] = idx; g_vo_log[g_vo_log_n][2] = 0; g_vo_log[g_vo_log_n][3] = 0;
-        g_vo_log_n++;
-    }
+    vo_log(3, idx, 0, 0, 0);
     if (!g_sf_stall) { g_fs_cur = idx; g_fs_count++; }
     return 0;
 }
@@ -1131,7 +1141,15 @@ static void test_runtime_streaming_and_batchmap_guards(void)
     //     sc 3: the temporary flip never completes: the temporary group stays as our separate group, nothing dropped.
     //     sc 4: flips still pending after 100 ms: nothing tried, ours alone at 15 in one call.
     //     sc 5: another title (g_og2 0): exactly the single call of the separate group, no flip-status read.
-    for (int sc = 0; sc < 6; sc++) {
+    //     sc 6: the copy cannot be made and the blank flip never completes: nothing dropped, ours alone at 15.
+    //     sc 7: the game's group cannot be dropped (step 3 refused): the temporary group stays as our separate group.
+    //     sc 8: the one group is refused twice and the game's group back alone once: the retry puts it back, ours at 15.
+    //     sc 9: the one group gets slot 2, not the game's slot 0: undone (slot 2 dropped, the game's group back alone at
+    //           slot 0), the temporary group stays as our separate group.
+    //     sc 10: as sc 8 with the game's group refused twice: both tries logged, ours still alone at 15.
+    //     sc 11: one group, then the game drops its slot and registers 0..1 again: ours registered alone at 15.
+    //     sc 12: as sc 11 with ours refused: frame generation stops (g_mbuf_state -1), no index past the game's.
+    for (int sc = 0; sc < 13; sc++) {
         sim_reset(0x40000000u);
         reset_shave_state();
         g_cfg.shave_mode = 2;
@@ -1152,32 +1170,59 @@ static void test_runtime_streaming_and_batchmap_guards(void)
         g_sim_flex_avail = 0x400000u;
         uintptr_t mid_va = (uintptr_t)g_pre_mem;
         g_og2 = (sc == 5) ? 0 : 1;
-        g_og2_copy_ok = (sc != 2);
+        g_og2_active = 0;
+        g_og2_copy_ok = (sc != 2 && sc != 6);
         g_og2_copies = 0;
         g_og2_pend_slot = -1;
-        g_sf_stall = (sc == 3);
+        g_sf_stall = (sc == 3 || sc == 6);
         g_game_attr_slot = 0;
-        g_vo_fail_count = (sc == 1) ? 3 : 0;
+        g_vo_slots = 1u;   // the game's group holds slot 0
+        g_vo_fail_count = (sc == 1 || sc == 8 || sc == 10) ? 3 : 0;
+        g_vo_fail2_left = (sc == 8) ? 1 : (sc == 10) ? 2 : 0;
+        g_vo_force_n3 = (sc == 9) ? 2 : -1;
+        g_vo_unreg_fail_slot = (sc == 7) ? 0 : -1;
         g_fs_pending_polls = (sc == 4) ? 1000 : 0; g_fs_polls = 0; g_fs_cur = 1; g_fs_count = 100;
         g_vo_log_n = 0;
         safe_try_activate(1u);
         ASSERT(g_safe_active == 1 && g_mbuf_state == 1 && g_nbuf - g_mbase == 1 && g_buf[g_mbase] == (uint64_t)mid_va);
-        ASSERT(g_og2_copies == (sc >= 4 ? 0 : 1));   // the game's buffer on screen (1) copied into ours once
-        if (sc == 0) {
+        ASSERT(g_og2_copies == ((sc == 4 || sc == 5) ? 0 : 1));   // the game's buffer on screen (1) copied into ours once
+        if (sc == 0 || sc == 11 || sc == 12) {
             ASSERT(g_vo_log_n == 6);
             ASSERT(g_vo_log[0][0] == 1 && g_vo_log[0][1] == 15 && g_vo_log[0][2] == 1 && g_vo_log[0][3] == (int32_t)(mid_va >> 20));
             ASSERT(g_vo_log[1][0] == 3 && g_vo_log[1][1] == 15);
             ASSERT(g_vo_log[2][0] == 2 && g_vo_log[2][1] == 0);
             ASSERT(g_vo_log[3][0] == 1 && g_vo_log[3][1] == 0 && g_vo_log[3][2] == 3 && g_vo_log[3][3] == (int32_t)(mid_va >> 20));
             ASSERT(g_vo_log[4][0] == 3 && g_vo_log[4][1] == 1);
+            ASSERT(g_vo_log[0][4] == 1 && g_vo_log[3][4] == 0);   // temporary group slot 1, one group the game's slot 0
             ASSERT(g_vo_log[5][0] == 2 && g_vo_log[5][1] == 1);   // the temporary slot (1), after the game's buffer is back
             ASSERT(g_mbase == 2 && g_nbuf == 3 && g_ext_attr_slot == -1 && g_og2_pend_slot == -1);
-            g_og2_pend_slot = 1;            // a temporary group that was still on screen: dropped on a later flip
-            g_vo_log_n = 0;
-            og2_tick(1);
-            ASSERT(g_og2_pend_slot == -1 && g_vo_log_n == 1 && g_vo_log[0][0] == 2 && g_vo_log[0][1] == 1);
-            og2_tick(1);                    // nothing pending: no call
-            ASSERT(g_vo_log_n == 1);
+            ASSERT(g_og2_active == 1 && g_game_attr_slot == 0 && g_vo_slots == 1u);
+            if (sc == 0) {
+                g_og2_pend_slot = 1;            // a temporary group that was still on screen: dropped on a later flip
+                g_vo_log_n = 0;
+                og2_tick(1);
+                ASSERT(g_og2_pend_slot == -1 && g_vo_log_n == 1 && g_vo_log[0][0] == 2 && g_vo_log[0][1] == 1);
+                og2_tick(1);                    // nothing pending: no call
+                ASSERT(g_vo_log_n == 1);
+            } else {
+                // the game drops its slot (ours go with it) and registers 0..1 again; the hook restored g_buf[2]
+                g_vo_log_n = 0;
+                ASSERT(sceVideoOutUnregisterBuffers(1, 0) == 0);
+                void *game2[2] = { (void *)(uintptr_t)g_buf[0], (void *)(uintptr_t)g_buf[1] };
+                ASSERT(raw_sceVideoOutRegisterBuffers(1, 0, game2, 2, &g_attr) == 0);
+                g_buf[2] = (uint64_t)mid_va; g_nbuf = 3;
+                g_vo_fail_count = (sc == 12) ? 1 : 0;
+                int rg = og2_game_reregistered(1, NULL, 2);
+                ASSERT(g_vo_log_n == 3 && g_vo_log[2][0] == 1 && g_vo_log[2][1] == 15 && g_vo_log[2][2] == 1);
+                ASSERT(g_og2_active == 0 && g_buf[2] == 0);
+                if (sc == 11) {
+                    ASSERT(rg == 1 && g_vo_log[2][4] == 1 && g_mbase == 15 && g_nbuf == 16 && g_buf[15] == (uint64_t)mid_va);
+                    ASSERT(g_ext_attr_slot == 1 && g_mbuf_state == 1);
+                } else {
+                    ASSERT(rg == 0 && g_mbuf_state == -1 && g_nbuf == 2 && g_ext_attr_slot == -1);
+                }
+                ASSERT(og2_game_reregistered(1, NULL, 2) == 0 && g_vo_log_n == 3);   // once only
+            }
         } else if (sc == 1) {
             ASSERT(g_vo_log_n == 9);
             ASSERT(g_vo_log[0][0] == 1 && g_vo_log[0][1] == 15);
@@ -1202,6 +1247,36 @@ static void test_runtime_streaming_and_batchmap_guards(void)
             ASSERT(g_vo_log[0][0] == 1 && g_vo_log[0][1] == 15 && g_vo_log[0][2] == 1);
             ASSERT(g_vo_log[1][0] == 3 && g_vo_log[1][1] == 15);
             ASSERT(g_mbase == 15 && g_nbuf == 16 && g_ext_attr_slot == 1);
+        } else if (sc == 6) {
+            ASSERT(g_vo_log_n == 2);
+            ASSERT(g_vo_log[0][0] == 3 && g_vo_log[0][1] == -1);
+            ASSERT(g_vo_log[1][0] == 1 && g_vo_log[1][1] == 15 && g_vo_log[1][2] == 1 && g_vo_log[1][4] == 1);
+            ASSERT(g_mbase == 15 && g_nbuf == 16 && g_ext_attr_slot == 1 && g_og2_active == 0);
+        } else if (sc == 7) {
+            ASSERT(g_vo_log_n == 3);
+            ASSERT(g_vo_log[0][0] == 1 && g_vo_log[0][1] == 15 && g_vo_log[0][4] == 1);
+            ASSERT(g_vo_log[1][0] == 3 && g_vo_log[1][1] == 15);
+            ASSERT(g_vo_log[2][0] == 2 && g_vo_log[2][1] == 0 && g_vo_log[2][4] != 0);
+            ASSERT(g_mbase == 15 && g_nbuf == 16 && g_ext_attr_slot == 1 && g_og2_active == 0 && g_vo_slots == 3u);
+        } else if (sc == 8 || sc == 10) {
+            ASSERT(g_vo_log_n == 10);
+            ASSERT(g_vo_log[3][0] == 1 && g_vo_log[3][2] == 3 && g_vo_log[3][4] < 0);
+            ASSERT(g_vo_log[4][0] == 3 && g_vo_log[4][1] == -1);
+            ASSERT(g_vo_log[5][0] == 2 && g_vo_log[5][1] == 1);
+            ASSERT(g_vo_log[6][0] == 1 && g_vo_log[6][2] == 3 && g_vo_log[6][4] < 0);
+            ASSERT(g_vo_log[7][0] == 1 && g_vo_log[7][1] == 0 && g_vo_log[7][2] == 2 && g_vo_log[7][4] < 0);
+            ASSERT(g_vo_log[8][0] == 1 && g_vo_log[8][1] == 0 && g_vo_log[8][2] == 2);
+            ASSERT(g_vo_log[9][0] == 1 && g_vo_log[9][1] == 15 && g_vo_log[9][2] == 1);
+            if (sc == 8) ASSERT(g_vo_log[8][4] == 0 && g_game_attr_slot == 0 && g_vo_log[9][4] == 1);
+            else ASSERT(g_vo_log[8][4] < 0 && g_vo_log[9][4] == 0);   // the game has no group: ours took slot 0
+            ASSERT(g_mbase == 15 && g_nbuf == 16 && g_og2_active == 0);
+        } else if (sc == 9) {
+            ASSERT(g_vo_log_n == 6);
+            ASSERT(g_vo_log[3][0] == 1 && g_vo_log[3][1] == 0 && g_vo_log[3][2] == 3 && g_vo_log[3][4] == 2);
+            ASSERT(g_vo_log[4][0] == 2 && g_vo_log[4][1] == 2 && g_vo_log[4][4] == 0);
+            ASSERT(g_vo_log[5][0] == 1 && g_vo_log[5][1] == 0 && g_vo_log[5][2] == 2 && g_vo_log[5][4] == 0);
+            ASSERT(g_mbase == 15 && g_nbuf == 16 && g_ext_attr_slot == 1 && g_game_attr_slot == 0 && g_og2_active == 0);
+            ASSERT(g_vo_slots == 3u);   // the game's group at 0, ours (the temporary group) at 1
         } else {                // sc 4 and 5: the separate group in one call, our buffer alone at index 15
             ASSERT(g_fs_polls == (sc == 4 ? 101 : 0));
             ASSERT(g_vo_log_n == 1);
@@ -1211,7 +1286,8 @@ static void test_runtime_streaming_and_batchmap_guards(void)
         g_cfg.shave_mode = 0;
         g_sim_flex_avail = 0x10000000u;
     }
-    g_og2 = 0; g_sf_stall = 0; g_og2_copy_ok = 1; g_fs_cur = 0; g_vo_fail_count = 0; g_fs_pending_polls = 0;
+    g_og2 = 0; g_og2_active = 0; g_sf_stall = 0; g_og2_copy_ok = 1; g_fs_cur = 0; g_vo_fail_count = 0; g_fs_pending_polls = 0;
+    g_vo_fail2_left = 0; g_vo_force_n3 = -1; g_vo_unreg_fail_slot = -1; g_vo_slots = 1u;
 
     // 10. CUSA12605 (9ca764c82f) / CUSA10213 (784c644c00) partial top-tail ReleaseDirectMemory + VirtualQuery q_va < ave:
     //     When the game releases a sub-range at the top end of a shaved tail (Case B) and later queries VirtualQuery(q_va)

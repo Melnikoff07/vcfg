@@ -48,6 +48,31 @@ class OneGroup(unittest.TestCase):
         fn = MAIN.split("static int32_t flip_inner_ex(", 1)[1]
         self.assertIn("if (g_flips > INJECT_AFTER_FLIPS) og2_tick((int32_t)handle);", fn)
         self.assertEqual(MAIN.count("og2_tick((int32_t)handle);"), 1)
+        # the activation also runs from the VideoOut flip path (from_vout): drop the temporary group there too
+        vo = MAIN.split("int32_t sceVideoOutSubmitFlip_hook(", 1)[1].split("\n}\n", 1)[0]
+        self.assertRegex(vo, r"tb_on_game_submit\(\);\n\s+og2_tick\(handle\);")
+        self.assertIn("if (g_og2_pend_slot < 0) return;", body("static void og2_tick(int32_t handle)"))
+
+    def test_game_registering_again_moves_ours_to_the_top(self):
+        hook = MAIN.split("int32_t sceVideoOutRegisterBuffers_hook(", 1)[1]
+        i_slot = hook.index("if (rn >= 0 && startIndex == 0) g_game_attr_slot = rn;")
+        i_re = hook.index("if (rn >= 0 && startIndex == 0 && g_og2_active &&\n        og2_game_reregistered(handle, attr, ")
+        i_fmt = hook.index("if (rn >= 0 && need_rereg_ext_fmt && attr && g_mbuf_state == 1 && g_ext_nm >= 1) {")
+        self.assertLess(i_slot, i_re)
+        self.assertLess(i_re, i_fmt)
+        self.assertEqual(MAIN.count("og2_game_reregistered(handle"), 1)
+        g = body("static int og2_game_reregistered(int32_t handle, const VoAttr *attr, int game_hi)")
+        self.assertIn("int old = g_mbase, base = 16 - g_ext_nm;", g)
+        self.assertIn("g_mbuf_state = -1;", g)
+
+    def test_one_group_keeps_the_games_slot_and_copy_size(self):
+        g = body("static int safe_one_group(")
+        self.assertIn("const int32_t game_slot = g_game_attr_slot;", g)
+        self.assertIn("if (r >= 0 && r != game_slot) {", g)
+        self.assertIn("int32_t rr = og2_game_back(h, all, game_slot);", g)
+        self.assertIn("size_t bytes = (size_t)g_pitch * (size_t)((g_bh + 63u) & ~63u) * 4u;", g)
+        self.assertIn("if (one && bytes > one) bytes = one;", g)
+        self.assertIn("for (int k = 0; k < 2 && rr < 0; k++) {", body("static int32_t og2_game_back("))
 
     def test_copy_checked_and_drained(self):
         cp = body("static int og2_copy(void *dst, const void *src, size_t n)")

@@ -2295,8 +2295,13 @@ static VoAttr g_ext_attr;
 // When the copy cannot be made, steps 1-2 show the blank screen (index -1) instead. When the one group is refused (the
 // temporary group holds our buffer at another index), the blank screen replaces the temporary group and the one group
 // is tried once more. Any other failure ends in the separate group: the game's group back alone, ours alone at the top.
-// Every step's return code goes to the boot log. Other titles keep the separate group.
+// VideoOut must give the one group the slot the game already knows (it keeps using that slot for its own attribute
+// changes and unregister); any other slot undoes the one group the same way. Putting the game's group back is retried
+// once. Every step's return code goes to the boot log. Other titles keep the separate group.
+// Later, when the game registers its buffers at index 0 again (it dropped its slot, ours went with it), ours is
+// registered again as a separate group at the top index (og2_game_reregistered).
 static int g_og2 = -1;                   // -1 until the activation decides: 1 on CUSA02299, 0 elsewhere
+static int g_og2_active = 0;             // 1 while our buffers live in the game's group
 static int32_t g_game_attr_slot = 0;     // attribute slot VideoOut returned for the game's buffers at index 0
 static int32_t g_og2_pend_slot = -1;     // temporary group still to drop
 static int og2_copy(void *dst, const void *src, size_t n);   // CPU copy when both are mapped for the CPU; 1 = copied
@@ -2316,6 +2321,20 @@ static int og2_wait(int32_t handle, int idx, uint64_t count0, int max_ms, VoFlip
         if (*waited >= max_ms) return 0;
         sceKernelUsleep(1000);
     }
+}
+
+// Puts the game's buffers back as their own group at 0..ngame-1 after its group was dropped, one retry; logs both tries.
+static int32_t og2_game_back(int32_t h, void *const *all, int32_t game_slot)
+{
+    int32_t rr = -1;
+    for (int k = 0; k < 2 && rr < 0; k++) {
+        rr = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                           h, 0, all, g_ngame, &g_attr);
+        STAGE("onegroup: the game's group back alone (try %d) = 0x%08x (the game knows slot %d)", k + 1, (unsigned)rr, (int)game_slot);
+    }
+    if (rr >= 0) g_game_attr_slot = rr;
+    else lg("onegroup: the game's group could not be registered again (0x%08x): its flips will fail\n", (unsigned)rr);
+    return rr;
 }
 
 // Returns 1: one group at 0..ngame+nm-1 (*slot); 2: ours alone at base, registered here (*slot); 0: nothing of ours
@@ -2353,7 +2372,10 @@ static int safe_one_group(uint32_t handle, void *const *ext, int nm, int base, i
     int cur = fs.currentBuffer;
     int64_t arg = fs.flipArg;
     uint64_t c0 = fs.count;
-    size_t bytes = (size_t)g_pitch * (size_t)g_bh * 4u;
+    // the surface as allocated: a tiled surface spans align64(height) rows (safe_surface_stride), never past one buffer
+    size_t bytes = (size_t)g_pitch * (size_t)((g_bh + 63u) & ~63u) * 4u;
+    size_t one = safe_surface_stride();
+    if (one && bytes > one) bytes = one;
     int copied = 0;
     if (cur >= 0 && cur < g_ngame) {
         copied = 1;
@@ -2388,7 +2410,8 @@ static int safe_one_group(uint32_t handle, void *const *ext, int nm, int base, i
         }
     }
     c0 = fs.count;
-    ur = sceVideoOutUnregisterBuffers(h, g_game_attr_slot);
+    const int32_t game_slot = g_game_attr_slot;   // the slot the game keeps using after this
+    ur = sceVideoOutUnregisterBuffers(h, game_slot);
     STAGE("onegroup: step 3 unregister(game slot %d) = 0x%08x", (int)g_game_attr_slot, (unsigned)ur);
     if (ur != 0) {
         if (t >= 0) { *slot = t; return 2; }
@@ -2414,16 +2437,23 @@ static int safe_one_group(uint32_t handle, void *const *ext, int nm, int base, i
             STAGE("onegroup: step 4c register(0..%d) again = 0x%08x", n - 1, (unsigned)r);
         }
     }
+    if (r >= 0 && r != game_slot) {
+        // the game would keep addressing its old slot: undo the one group
+        int32_t ur2 = sceVideoOutUnregisterBuffers(h, r);
+        STAGE("onegroup: one group got slot %d, the game knows slot %d: unregister(%d) = 0x%08x", (int)r, (int)game_slot, (int)r,
+              (unsigned)ur2);
+        lg("onegroup: one group got slot %d, the game knows slot %d: unregister(%d) = 0x%08x\n", (int)r, (int)game_slot, (int)r,
+           (unsigned)ur2);
+        if (ur2 == 0) r = -1;
+    }
     if (r < 0) {
-        int32_t rr = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
-                                   h, 0, all, g_ngame, &g_attr);
-        if (rr >= 0) g_game_attr_slot = rr;
-        STAGE("onegroup: one group refused, the game's group back alone = 0x%08x", (unsigned)rr);
-        lg("onegroup: one group refused (0x%08x), the game's group back alone = 0x%08x\n", (unsigned)r, (unsigned)rr);
+        int32_t rr = og2_game_back(h, all, game_slot);
+        lg("onegroup: one group not kept, the game's group back alone = 0x%08x\n", (unsigned)rr);
         if (t >= 0) { *slot = t; return 2; }
         return 0;
     }
     g_game_attr_slot = r;
+    g_og2_active = 1;
     *slot = r;
     int show = (cur >= 0 && cur < g_ngame) ? cur : -1;
     if (show >= 0) {
@@ -2454,6 +2484,40 @@ static void og2_tick(int32_t handle)
         STAGE("onegroup: unregister(temporary slot %d) = 0x%08x after %d more tries", (int)g_og2_pend_slot, (unsigned)ut, tries);
         g_og2_pend_slot = -1;
     }
+}
+
+// The game registered its buffers at index 0 again while ours were in its group: VideoOut dropped ours with the group it
+// unregistered, so they are registered again alone at the top index, as the separate group of the late activation.
+// attr: the game's new attributes (NULL keeps ours). Returns 1 when ours are registered again, 0 when frame generation
+// stops (g_mbuf_state = -1, frames stay native). game_hi: the game's highest index + 1.
+static int og2_game_reregistered(int32_t handle, const VoAttr *attr, int game_hi)
+{
+    if (!g_og2_active) return 0;
+    g_og2_active = 0;
+    int old = g_mbase, base = 16 - g_ext_nm;
+    for (int i = 0; i < g_ext_nm && old + i < 16; i++)
+        if (old + i >= game_hi && g_buf[old + i] == (uint64_t)(uintptr_t)g_ext_va[i]) g_buf[old + i] = 0;
+    int32_t r1 = -1;
+    if (g_ext_nm >= 1 && base >= game_hi) {
+        if (attr) g_ext_attr = *attr;
+        r1 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                           handle, base, g_ext_va, g_ext_nm, &g_ext_attr);
+    }
+    STAGE("onegroup: the game registered 0..%d again, ours (were at %d) registered alone at %d = 0x%08x", game_hi - 1, old, base,
+          (unsigned)r1);
+    lg("onegroup: the game registered 0..%d again, ours (were at %d) registered alone at %d = 0x%08x\n", game_hi - 1, old, base,
+       (unsigned)r1);
+    if (r1 < 0) {
+        g_mbuf_state = -1;
+        g_ext_attr_slot = -1;
+        if (g_nbuf > game_hi) g_nbuf = game_hi;
+        return 0;
+    }
+    g_ext_attr_slot = r1;
+    g_mbase = base;
+    for (int i = 0; i < g_ext_nm; i++) g_buf[base + i] = (uint64_t)(uintptr_t)g_ext_va[i];
+    g_nbuf = base + g_ext_nm;
+    return 1;
 }
 
 // Called once on the game's flip thread at frame INJECT_AFTER_FLIPS, after the config was read.
@@ -4156,6 +4220,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
     uint64_t prev_flip_t = g_last;
     uint32_t vf = ++g_vo_submit_flips;
     tb_on_game_submit();
+    og2_tick(handle);   // one display group: a temporary group still to drop (returns at once otherwise)
 
     if (vf == 1) {
         uint32_t sw = __atomic_load_n(&g_vo_sub_w, __ATOMIC_ACQUIRE);
@@ -4714,6 +4779,9 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
     int32_t rn = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
                                handle, startIndex, addresses, bufferNum, attr);
     if (rn >= 0 && startIndex == 0) g_game_attr_slot = rn;
+    if (rn >= 0 && startIndex == 0 && g_og2_active &&
+        og2_game_reregistered(handle, attr, g_game_idx_hi > bufferNum ? g_game_idx_hi : bufferNum))
+        need_rereg_ext_fmt = 0;   // ours were just registered again with the new attributes
     if (rn >= 0 && need_rereg_ext_fmt && attr && g_mbuf_state == 1 && g_ext_nm >= 1) {
         if (g_ext_attr_slot > 0) {
             sceVideoOutUnregisterBuffers(handle, g_ext_attr_slot);
