@@ -92,7 +92,7 @@ define internal <4 x float> @curwarp(<8 x i32> %tc, i32 %x, i32 %y, i32 %pk, i32
   ret <4 x float> %b
 }
 
-define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 inreg %gy, i32 %tid) {
+define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 inreg %gy, i32 %tid) #0 {
   %tp = load <8 x i32>, ptr addrspace(4) %tbl, align 32, !invariant.load !0
   %pc = getelementptr i8, ptr addrspace(4) %tbl, i64 32
   %tc = load <8 x i32>, ptr addrspace(4) %pc, align 32, !invariant.load !0
@@ -250,3 +250,5 @@ define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 inre
 }
 
 !0 = !{}
+
+attributes #0 = { "denormal-fp-math-f32"="preserve-sign,preserve-sign" }

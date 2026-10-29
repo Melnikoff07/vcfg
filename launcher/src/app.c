@@ -82,8 +82,8 @@ static const char *pace_name(int v)
 }
 static const char *post_name(int v)
 {
-    static const char *n[3] = { "AUTO", "MID ONLY", "MID + REAL" };
-    return (v >= 0 && v <= 2) ? n[v] : n[0];
+    static const char *n[4] = { "AUTO", "MID ONLY", "MID + REAL", "MID + REAL AA" };
+    return (v >= 0 && v <= 3) ? n[v] : n[0];
 }
 static const char *fps_lock_name(int v)
 {
@@ -327,12 +327,12 @@ static void draw_rows(Canvas *c, App *a, int x, int y, int w, const char *head, 
     Theme th = theme_of(a);
     Fonts *f = a->f;
     int hh = n > 7 ? 214 : (n > 6 ? 236 : 250);
-    int rh = n > 7 ? 64  : (n > 6 ? 70  : (n > 5 ? 80 : 92));
-    int ty_off = rh <= 64 ? 45 : (rh <= 72 ? 50 : 60);
-    int pill_y = rh <= 64 ? 11 : (rh <= 72 ? 15 : 26);
+    int rh = n > 8 ? 56  : (n > 7 ? 64  : (n > 6 ? 70  : (n > 5 ? 80 : 92)));
+    int ty_off = rh <= 56 ? 41 : (rh <= 64 ? 45 : (rh <= 72 ? 50 : 60));
+    int pill_y = rh <= 56 ? 7 : (rh <= 64 ? 11 : (rh <= 72 ? 15 : 26));
     int pill_h = rh <= 64 ? 42 : 48;
     int pill_ty = rh <= 64 ? 30 : 34;
-    int blk_y  = rh <= 64 ? 21 : (rh <= 72 ? 26 : 36);
+    int blk_y  = rh <= 56 ? 17 : (rh <= 64 ? 21 : (rh <= 72 ? 26 : 36));
     fill_round(c, x, y, w, hh + rh * n + 30, 22, th.panel);
     fill_round(c, x, y, w, hh + 22, 22, th.head_bg);
     fill_rect(c, x, y + hh, w, 22, th.panel);
@@ -372,7 +372,23 @@ static int settings_rows(Settings *s, Row *r)
     r[2] = (Row){ "Sharpness", "", 2, s->sharp / 10 };
     r[3] = (Row){ "Anti-aliasing", "", 0, 0 }; cat(r[3].value, aa_name(s->enhance));
     r[4] = (Row){ "Performance overlay", "", 0, 0 }; cat(r[4].value, corner_name(s->overlay));
-    return 5;
+    r[5] = (Row){ "Below 30 FPS", "", 1, s->b30 }; cat(r[5].value, s->b30 ? "ON" : "OFF");
+    r[6] = (Row){ "Low latency", "", 1, s->shq }; cat(r[6].value, s->shq ? "ON" : "OFF");
+    return 7;
+}
+// one-line help for the selected row of the settings panel (game detail and defaults)
+static const char *settings_row_guide(int row, int game)
+{
+    switch (row) {
+    case 0: return "FRAME GENERATION: a generated frame between game frames, 30 FPS shown at 60 Hz.";
+    case 1: return "MODE: QUALITY for the best image; FAST is a fixed 60 Hz pulldown.";
+    case 2: return "SHARPNESS: sharpens the generated frame. 0 = off.";
+    case 3: return "ANTI-ALIASING: smooths jagged edges. OFF, LIGHT or STRONG.";
+    case 4: return "PERFORMANCE OVERLAY: FPS counter and its corner.";
+    case 5: return "BELOW 30 FPS: two generated frames when the game drops under 30 FPS (needs spare memory).";
+    case 6: return "LOW LATENCY: a shorter frame queue while the game has spare time.";
+    default: return game ? "PIPELINE CONTROL: AUTO, or your CUSTOM 05 DEV profile (Triangle opens it)." : "THEME: dark or light app theme.";
+    }
 }
 static void draw_detail(Canvas *c, App *a, int top, Game *g, Settings *s, const char *head)
 {
@@ -398,7 +414,7 @@ static void draw_detail(Canvas *c, App *a, int top, Game *g, Settings *s, const 
             if (g->dev.diag_advice[0]) draw_text_clip(c, &f->mono, M, ty + 72, left - 60, g->dev.diag_advice, a->dark_theme ? YEL : RED, 0);
         }
     }
-    Row r[7]; int n = settings_rows(s, r);
+    Row r[10]; int n = settings_rows(s, r);
     if (g) {   // clear separation: 01 GAMES has visual settings + master Pipeline Control indicator (TRIANGLE opens 05 DEV)
         r[n] = (Row){ "Pipeline control", "", 1, g->dev.manual_mode };
         cat(r[n].value, g->dev.manual_mode ? "CUSTOM (05 DEV)" : "AUTO (ALGORITHM)");
@@ -409,6 +425,8 @@ static void draw_detail(Canvas *c, App *a, int top, Game *g, Settings *s, const 
         n++;
     }
     draw_rows(c, a, M + left, y, c->w - 2 * M - left, head, s->fg ? "60" : "30", s->fg ? "FROM 30" : "NATIVE", r, n);
+    int crash = g && (g->dev.has_crash || g->dev.safe_state > 0 || g->dev.diag_kind >= DIAG_OOM_BOOT);   // its lines use that space
+    if (!crash) draw_wrapped(c, &f->mono, M, c->h - FOOT - 156, 34, left - 60, 4, settings_row_guide(a->row, g != 0), th.dim, 0);
 }
 
 // ---- install tab ----
@@ -812,6 +830,8 @@ static void change(Settings *s, int row, int dir)
     case 2: step(&s->sharp, dir * 10, 0, 100, 0); break;
     case 3: step(&s->enhance, dir, 0, 2, 1); break;
     case 4: step(&s->overlay, dir, 0, 8, 1); break;
+    case 5: s->b30 = !s->b30; break;
+    case 6: s->shq = !s->shq; break;
     }
 }
 static void set_msg(App *a, const char *s) { a->rec_msg[0] = 0; cat(a->rec_msg, s); }
@@ -854,7 +874,7 @@ int app_input(App *a, uint32_t b)
         return ACT_NONE;
     }
     Settings *s = a->tab == TAB_GAMES ? &a->games[a->sel].s : &a->defaults;
-    int rows = a->tab == TAB_OVERLAY ? 4 : (a->tab == TAB_DEV ? 8 : 6);
+    int rows = a->tab == TAB_OVERLAY ? 4 : 8;
     if (a->tab == TAB_INSTALL) {
         if (b & PAD_R2) {
             if (armed) { a->status[0] = 0; return ACT_CLEAN; }
@@ -903,7 +923,7 @@ int app_input(App *a, uint32_t b)
             else if (a->row == 2) step(&d->shave_mode, dir, 0, 2, 1);
             else if (a->row == 3) step(&d->reg_mode, dir, 0, 2, 1);
             else if (a->row == 4) step(&d->pace_order, dir, 0, 3, 1);
-            else if (a->row == 5) step(&d->post_mid, dir, 0, 2, 1);
+            else if (a->row == 5) step(&d->post_mid, dir, 0, 3, 1);
             else if (a->row == 6) step(&d->fps_lock, dir, 0, 3, 1);
             else if (a->row == 7) step(&d->tile_mode, dir, 0, 6, 1);
             a->dirty = 1; a->status[0] = 0; cat(a->status, "CUSTOM OVERRIDE (PRESS CROSS TO SAVE)");
@@ -926,12 +946,12 @@ int app_input(App *a, uint32_t b)
                 int i = menu_combo_index(a->menu_combo); if (i < 0) i = dir > 0 ? -1 : MENU_COMBO_COUNT;
                 step(&i, dir, 0, MENU_COMBO_COUNT - 1, 1); a->menu_combo = menu_combo_from_index(i); set_msg(a, "");
             }
-        } else if (a->tab == TAB_GAMES && a->row == 5) {
+        } else if (a->tab == TAB_GAMES && a->row == 7) {
             Game *g = &a->games[a->sel];
             g->dev.manual_mode = !g->dev.manual_mode;
             if (!g->dev.manual_mode) return ACT_RESET_DEV;
         }
-        else if (a->tab == TAB_DEFAULTS && a->row == 5) a->dark_theme = !a->dark_theme;
+        else if (a->tab == TAB_DEFAULTS && a->row == 7) a->dark_theme = !a->dark_theme;
         else change(s, a->row, dir);
         a->dirty = 1;
     }
