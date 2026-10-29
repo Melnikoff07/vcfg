@@ -238,6 +238,15 @@ static void upper(char *d, const char *s, size_t cap)
     d[i] = 0;
 }
 
+// Left edge of a row's value (pill, squares or right-aligned text), as drawn by vov_menu.
+static int row_value_x(const VovRow *r, int W, int PAD)
+{
+    if (r->kind == VOV_TOGGLE) return W - PAD - (text_w(&vov_mono20, r->on ? "ON" : "OFF", 1) + 28);
+    if (r->kind == VOV_SEGMENTS) return W - PAD - (6 * 16 + 5 * 4);
+    char v[28]; upper(v, r->value, sizeof(v));
+    return W - PAD - text_w(&vov_mono20, v, 1);
+}
+
 int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigned *w, unsigned *h)
 {
     if (!g_mem) return 0;
@@ -275,7 +284,16 @@ int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigne
             if (sel) rect(&c, 0, y, 6, ROW, C_INK);
             int ty = y + ROW / 2 + 9;
             int bx = text(&c, &vov_text25, PAD, ty, sel ? "› " : "", C_INK, bg, 0, 0);
-            text(&c, &vov_text25, bx, ty, r->label, C_INK, bg, 0, W / 2 + 40);
+            int lmax = W / 2 + 40;
+            if (r->tag > VOV_TAG_NONE && r->tag <= VOV_TAG_LIMITED) {   // state word, right-aligned 12 px left of the value
+                static const char *const words[5] = { "", "ACTIVE", "READY", "INERT", "LIMITED" };
+                static const int cols[5] = { C_INK, C_BLUE, C_INK, C_RED, C_RED };
+                const char *w = words[r->tag];
+                int tx = row_value_x(r, W, PAD) - 12 - text_w(&vov_mono20, w, 1);
+                text(&c, &vov_mono20, tx, ty - 1, w, cols[r->tag], bg, 1, 0);
+                lmax = tx - 8;
+            }
+            text(&c, &vov_text25, bx, ty, r->label, C_INK, bg, 0, lmax);
             if (r->kind == VOV_TOGGLE) {
                 const char *v = r->on ? "ON" : "OFF";
                 int tw = text_w(&vov_mono20, v, 1), pw = tw + 28, px = W - PAD - pw, py = y + (ROW - 30) / 2;

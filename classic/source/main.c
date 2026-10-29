@@ -476,6 +476,17 @@ static long g_pre_gpu_phys = 0, g_pre_work_phys = 0, g_pre_mem_phys = 0, g_dump_
 
 #include "two_buffer_test.h"
 #include "pace_policy.h"
+#include "opt_status.h"
+_Static_assert(MENU_NROWS == OPT_ROW_N, "in-game menu rows and opt_status.h rows");
+
+// Option status (opt_status.h): copies of what the flip hooks already decided, read by the menu and the
+// "options effective:" log line. Written once per real frame, never read back by a decision.
+static volatile int g_st_fg_path = 0;        // last real frame: 0 not generated, 1 SubmitAndFlip path, 2 VideoOutSubmitFlip path
+static volatile int g_st_shq_on = 0, g_st_pace_timer = 0;
+static volatile uint32_t g_st_gv_frames = 0, g_st_gv_hits = 0;   // real frames / of them with warp8g (game vectors applied)
+static volatile int g_st_gv_active = 0;      // more than half of the last ~0.25 s window (io thread)
+static void opt_state_now(const fg_config_t *c, OptState *s);
+static void opt_log_effective(const char *why);
 
 // FTRACE (pace_policy.h): one 3 x 32-bit record per real frame, only while the debug log is on. The hook writes the
 // hand-over / submit / own time, the monitor adds the time on screen and the vblanks held, the io thread prints them.
@@ -1289,20 +1300,33 @@ static void osd_build_slot(uint8_t *osd_mem, uint32_t *xy_out, uint32_t *wh_out,
     if (toast) {
         vov_cpy(m.status, g_osd_toast, sizeof(m.status));
     } else {
-        m.sel = g_menu_sel;
+        m.sel = g_menu_sel;   // index among the visible rows (opt_menu_rows)
         if (g_inert_reason[0]) vov_cpy(m.status, g_inert_reason, sizeof(m.status));
+        // A row whose setting cannot act under the other settings is hidden (opt_row_visible); a shown row that can be
+        // inert gets its live state (ACTIVE / READY / INERT / LIMITED) and, when selected, its reason in the header line.
+        OptState os; opt_state_now(&c, &os);
+        int vis[OPT_ROW_N], nvis = opt_menu_rows(c.framegen, c.preset, c.fps_lock, vis);
+        if (m.sel >= nvis) m.sel = nvis ? nvis - 1 : 0;
+#define VIS(r) (opt_menu_index_of(vis, nvis, (r)) >= 0)
         vov_row(&m, "Frame generation", VOV_TOGGLE, c.framegen, 0, "");
-        vov_row(&m, "Mode", VOV_TEXT, 0, 0, c.preset == 1 ? "Fast" : (c.preset == 2 ? "Sharp" : "Quality"));
+        if (VIS(OPT_ROW_MODE)) vov_row(&m, "Mode", VOV_TEXT, 0, 0, c.preset == 1 ? "Fast" : (c.preset == 2 ? "Sharp" : "Quality"));
         vov_row(&m, "Sharpness", VOV_SEGMENTS, 0, c.sharpness, "");
         vov_row(&m, "Anti-aliasing", VOV_TEXT, 0, 0, c.upscale <= 0 ? "Off" : (c.upscale == 1 ? "Light" : "Strong"));
         vov_row(&m, "FPS counter", VOV_TEXT, 0, 0, overlay_label(c.overlay));
-        vov_row(&m, "Game vectors", VOV_TOGGLE, c.game_vectors, 0, "");
-        vov_row(&m, "HUD protection", VOV_TEXT, 0, 0, c.hud_protect <= 0 ? "Off" : (c.hud_protect == 1 ? "Conservative" : "Aggressive"));
+        if (VIS(OPT_ROW_GV)) vov_row(&m, "Game vectors", VOV_TOGGLE, c.game_vectors, 0, "");
+        if (VIS(OPT_ROW_HUD)) vov_row(&m, "HUD protection", VOV_TEXT, 0, 0, c.hud_protect <= 0 ? "Off" : (c.hud_protect == 1 ? "Conservative" : "Aggressive"));
         char lock[16]; if (c.fps_lock <= 0) vov_cpy(lock, "Auto", sizeof(lock)); else snprintf(lock, sizeof(lock), "%d", c.fps_lock);
         vov_row(&m, "FPS lock", VOV_TEXT, 0, 0, lock);
-        vov_row(&m, "Below 30 FPS", VOV_TOGGLE, c.below30, 0, "");
-        vov_row(&m, "Low latency", VOV_TOGGLE, c.shallow_queue, 0, "");
+        if (VIS(OPT_ROW_B30)) vov_row(&m, "Below 30 FPS", VOV_TOGGLE, c.below30, 0, "");
+        if (VIS(OPT_ROW_SHQ)) vov_row(&m, "Low latency", VOV_TOGGLE, c.shallow_queue, 0, "");
         vov_row(&m, "Opacity", VOV_SEGMENTS, 0, c.menu_opacity, "");
+#undef VIS
+        for (int i = 0; i < m.nrows && i < nvis; i++) {
+            OptStat t = opt_row_stat(&os, vis[i]);
+            m.rows[i].tag = t.st;   // OPT_ACTIVE / READY / INERT / LIMITED == VOV_TAG_ACTIVE / READY / INERT / LIMITED
+            char d[48];
+            if (i == m.sel && opt_row_detail(d, sizeof(d), vis[i], t)) vov_cpy(m.status, d, sizeof(m.status));
+        }
         vov_cpy(m.hints, "\xe2\x86\x95 \xe2\x86\x90 \xe2\x86\x92  \xc3\x97 APPLY  \xe2\x96\xa1 RESET  \xe2\x96\xb3 SAVE  \xe2\x97\x8b", sizeof(m.hints));
     }
     if (!vov_menu(&m, &g_vov_pal, &g_vov_pix, &w, &h)) return;
@@ -2019,6 +2043,7 @@ static void cfg_apply_live(const fg_config_t *c, const char *reason)
         lg("config (%s): framegen=%d mode=%d preset=%d sharpness=%d enhance=%d hud_protect=%d game_vectors=%d fps_lock=%d overlay=%d opacity=%d%% below30=%d shallow_queue=%d\n",
            reason, c->framegen, c->mode, c->preset, c->sharpness, c->upscale,
            c->hud_protect, c->game_vectors, c->fps_lock, c->overlay, c->menu_opacity, c->below30, c->shallow_queue);
+        opt_log_effective(reason);
     }
 }
 
@@ -2924,6 +2949,88 @@ static int file_flags_ex(uint32_t *hash_io)
 }
 static int file_flags(void) { return file_flags_ex(NULL); }
 
+// Option status (opt_status.h) from the settings c and the state the flip hooks copied (g_st_*) or keep anyway.
+static void opt_state_now(const fg_config_t *c, OptState *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->framegen = c->framegen; s->preset = c->preset; s->sharpness = c->sharpness; s->upscale = c->upscale;
+    s->hud_protect = c->hud_protect; s->game_vectors = c->game_vectors; s->fps_lock = c->fps_lock; s->below30 = c->below30;
+    s->shallow_queue = c->shallow_queue; s->post_mid = g_cfg.post_mid; s->present_copy = g_cfg.present_copy;
+    s->started = g_flips >= INJECT_AFTER_FLIPS || g_vo_submit_flips >= INJECT_AFTER_FLIPS;
+    s->fg_path = __atomic_load_n(&g_st_fg_path, __ATOMIC_RELAXED);
+    char why[sizeof(g_inert_reason)];
+    memcpy(why, g_inert_reason, sizeof(why)); why[sizeof(why) - 1] = 0;
+    opt_norm_reason(s->fg_why, sizeof(s->fg_why), why);
+    s->detected_60fps = g_detected_60fps;
+    s->mode8 = g_inject_on == 8;
+    s->nmid = g_nmid;
+    s->mem_tight_b30 = g_mem_tight && g_s14_state != 2;   // as the b30_available call in the flip hook
+    s->mem_tight = g_mem_tight;                           // as the rcas gate of build_dcb_flow8
+    s->pace_timer = __atomic_load_n(&g_st_pace_timer, __ATOMIC_RELAXED);
+    s->b30_on = (int)g_b30.on;
+    s->shq_on = __atomic_load_n(&g_st_shq_on, __ATOMIC_RELAXED);
+    s->rcas_shader = g_sh8_off[14] != 0;
+    s->real_aa = real_aa_on();
+    s->mid_only = g_cfg.post_mid == 1 || (g_cfg.post_mid != 2 && !s->real_aa);   // post_mid_only() without its log line
+    s->gv_active = __atomic_load_n(&g_st_gv_active, __ATOMIC_RELAXED);
+    s->hud_rect = g_hud_file_packed != 0;
+    s->pcopy_on = g_pcopy_on;
+    s->mid_lru = (c->below30 || c->preset == 1) && !(g_pcopy_on && g_pcopy_k >= 2) && g_nmid >= 2 && (uint32_t)g_nmid <= MID_LRU_MAX;
+    s->fast_pace = g_fast_pace;
+    // The 2nd generated-frame buffer of the CUSA18723 family comes from shave14, decided at start from the below30 then
+    // in effect (s14_decide: no LOG_DIR/shave14_<TITLE> file and below30 = 0 -> not even a candidate).
+    int fam = vcfg_in_family(g_title_id, "CUSA18723");
+    s->buf2_boot = (!g_s14_opt && !fam) ? OPT_BUF2_NA
+                 : g_s14_state == 2 ? OPT_BUF2_ON
+                 : ((!g_s14_opt && fam) || (g_s14_why && strcmp(g_s14_why, "below30=0") == 0)) ? OPT_BUF2_OFF_B30
+                 : OPT_BUF2_OFF_OTHER;
+}
+// One "options effective:" line: the effective state of every option, not only the value asked for. why: what caused it
+// (init, hot-reload, menu-apply, ..., or the runtime states that changed).
+static OptState g_opt_last;
+static volatile uint32_t g_opt_last_sig = 0;
+static volatile uint64_t g_opt_last_t = 0;
+static void opt_log_line(const OptState *s, const char *why)
+{
+    char tail[112], b[384];   // one log slot is 384 bytes: the tokens get what the prefix and the cause leave
+    int tl = snprintf(tail, sizeof(tail), " | %s", why ? why : "");
+    if (tl < 0) tl = 0;
+    if (tl >= (int)sizeof(tail)) tl = (int)sizeof(tail) - 1;
+    opt_format(b, sizeof(b) - (sizeof("options effective: ") - 1u) - (size_t)tl - 2u, s);
+    lg("options effective: %s%s\n", b, tail);
+    g_opt_last = *s;
+    __atomic_store_n(&g_opt_last_sig, opt_signature(s), __ATOMIC_RELEASE);
+    __atomic_store_n(&g_opt_last_t, sceKernelGetProcessTime(), __ATOMIC_RELEASE);
+}
+static void opt_log_effective(const char *why)
+{
+    OptState s;
+    fg_config_t c = g_cfg;
+    opt_state_now(&c, &s);
+    opt_log_line(&s, why);
+}
+// io thread, every ~250 ms: a new line when a state or a setting changed, at most one per 2 s (a state that flips back
+// within that time writes nothing). Also closes the game-vectors window (more than half the frames with warp8g).
+#define OPT_TICK_US     250000ull
+#define OPT_MIN_GAP_US 2000000ull
+static void opt_status_tick(uint64_t now)
+{
+    static uint64_t last_tick;
+    if (now - last_tick < OPT_TICK_US) return;
+    last_tick = now;
+    uint32_t fr = __atomic_exchange_n(&g_st_gv_frames, 0u, __ATOMIC_RELAXED), hit = __atomic_exchange_n(&g_st_gv_hits, 0u, __ATOMIC_RELAXED);
+    if (fr) __atomic_store_n(&g_st_gv_active, hit * 2u > fr, __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&g_opt_last_t, __ATOMIC_ACQUIRE)) return;   // nothing logged yet: the init line comes first
+    if (now - __atomic_load_n(&g_opt_last_t, __ATOMIC_ACQUIRE) < OPT_MIN_GAP_US) return;
+    OptState s;
+    fg_config_t c = g_cfg;
+    opt_state_now(&c, &s);
+    if (opt_signature(&s) == __atomic_load_n(&g_opt_last_sig, __ATOMIC_ACQUIRE)) return;
+    char ch[80] = "runtime: ";
+    if (!opt_changes(ch + 9, sizeof(ch) - 9u, &g_opt_last, &s)) snprintf(ch, sizeof(ch), "change");
+    opt_log_line(&s, ch);
+}
+
 static uint32_t g_last_disk_hash = 0;
 static void cfg_reload_from_disk(int force)
 {
@@ -3040,6 +3147,7 @@ static void *io_thread(void *arg)
         }
         bench_io_tick();
         if (__atomic_exchange_n(&g_cfg_save_req, 0, __ATOMIC_ACQ_REL)) cfg_save_game_ini();
+        opt_status_tick(sceKernelGetProcessTime());
         if (g_inject_on == 8) gv_io_tick();
         poll_n++;
         uint64_t io_now = sceKernelGetProcessTime();
@@ -3990,6 +4098,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                fg_res_supported(g_bw, g_bh) && g_prev_idx < game_idx_end() && mbufs_ready(handle));
                 int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);
 
+                __atomic_store_n(&g_st_fg_path, (can_fg8 && want_fg) ? 1 : 0, __ATOMIC_RELAXED);   // status copy (opt_status.h)
                 if (!(can_fg8 && want_fg)) {
                     pyr_cache_invalidate();
                 }
@@ -4251,6 +4360,9 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 int shq_ok = g_inject_on == 8 && second_flip && !third_flip && g_cfg.fps_lock != 20 && pace_timer_on();
                 if (!g_cfg.shallow_queue || g_b30.on) shq_ok = 0;   // player setting; never in the below-30 regime (resets the dwell)
                 int shq_on = shq_step(&s_shq, shq_ok ? g_cpu_ema_us : 0u);
+                __atomic_store_n(&g_st_shq_on, shq_on, __ATOMIC_RELAXED);              // status copies (opt_status.h)
+                __atomic_store_n(&g_st_pace_timer, pace_timer_on(), __ATOMIC_RELAXED);
+                if (can_fg8 && want_fg) { g_st_gv_frames++; if (gv_warp_active()) g_st_gv_hits++; }
                 uint64_t t_shq0 = sceKernelGetProcessTime();
                 if (shq_on) {
                     for (;;) {
@@ -4643,6 +4755,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
             int can_fg8 = (g_inject_on == 8 && g_work && g_sh8_ok && g_fmt_supported &&
                            fg_res_supported(g_bw, g_bh) && g_prev_idx < game_idx_end() && mbufs_ready((uint32_t)handle));
             int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);
+            __atomic_store_n(&g_st_fg_path, (can_fg8 && want_fg) ? 2 : 0, __ATOMIC_RELAXED);   // status copy (opt_status.h)
 
             if (can_fg8 && want_fg) {
                 g_inert_reason[0] = 0;
@@ -5315,16 +5428,24 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
         g_combo_t = now;
         g_pad_swallow_until = now + 300000ull;
         snprintf(g_osd_toast, sizeof(g_osd_toast), "FG:%s AA:%d RCAS:%d%%",
-                 g_cfg.framegen ? (g_cfg.preset == 1 ? "F60" : "2X") : "OFF", g_cfg.upscale, g_cfg.sharpness);
+                 g_cfg.framegen ? (g_cfg.preset == 1 ? "F60" : g_cfg.preset == 2 ? "SHARP" : "2X") : "OFF", g_cfg.upscale, g_cfg.sharpness);
         g_osd_toast_until = now + 1500000ull;
         lg("menu closed (pad wrapper calls: state %u read %u stateExt %u readExt %u)\n", g_pad_calls[0], g_pad_calls[1], g_pad_calls[2], g_pad_calls[3]);
         return;
     }
-    if (edge & PAD_UP)   g_menu_sel = (g_menu_sel + MENU_NROWS - 1) % MENU_NROWS;
-    if (edge & PAD_DOWN) g_menu_sel = (g_menu_sel + 1) % MENU_NROWS;
+    // g_menu_sel walks the visible rows only (opt_menu_rows: of the MENU_NROWS rows, those that apply to the current
+    // settings); Left/Right change the row it points at, and the selection stays on that row when others appear or hide.
+    int vis[OPT_ROW_N], nvis = opt_menu_rows(g_menu_edit.framegen, g_menu_edit.preset, g_menu_edit.fps_lock, vis);
+    if (g_menu_sel >= nvis) g_menu_sel = nvis ? nvis - 1 : 0;
+    if (edge & PAD_UP)   g_menu_sel = (g_menu_sel + nvis - 1) % nvis;
+    if (edge & PAD_DOWN) g_menu_sel = (g_menu_sel + 1) % nvis;
     if (edge & (PAD_LEFT | PAD_RIGHT)) {
         int dir = (edge & PAD_RIGHT) ? 1 : -1;
-        menu_adjust_row(&g_menu_edit, g_menu_sel, dir);
+        int row = vis[g_menu_sel];
+        menu_adjust_row(&g_menu_edit, row, dir);
+        nvis = opt_menu_rows(g_menu_edit.framegen, g_menu_edit.preset, g_menu_edit.fps_lock, vis);
+        int at = opt_menu_index_of(vis, nvis, row);
+        if (at >= 0) g_menu_sel = at; else if (g_menu_sel >= nvis) g_menu_sel = nvis - 1;
         cfg_apply_live(&g_menu_edit, NULL);
         snprintf(g_osd_toast, sizeof(g_osd_toast), "LIVE ([/\\] SAVE)");
     }
@@ -5338,6 +5459,8 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
         g_menu_edit.menu_combo = g_cfg.menu_combo;   // the hotkey is not a visible setting: defaults must not change it
         g_menu_edit.present_copy = present_copy;  // profile-only option is not reset by the overlay
         cfg_apply_live(&g_menu_edit, "menu-defaults");
+        nvis = opt_menu_rows(g_menu_edit.framegen, g_menu_edit.preset, g_menu_edit.fps_lock, vis);
+        if (g_menu_sel >= nvis) g_menu_sel = nvis - 1;
         snprintf(g_osd_toast, sizeof(g_osd_toast), "DEFAULTS LOADED");
     }
     if (edge & PAD_TRIANGLE) {

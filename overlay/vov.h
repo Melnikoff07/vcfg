@@ -15,11 +15,14 @@
 #define VOV_MEM_SZ   (VOV_NBUF * VOV_BUF_SZ)
 
 enum { VOV_TEXT, VOV_TOGGLE, VOV_SEGMENTS };   // value kinds: plain text, ON/OFF pill, 0..100 as six squares
+// live state word drawn left of the value: what the option does right now (classic/source/opt_status.h OPT_*)
+enum { VOV_TAG_NONE, VOV_TAG_ACTIVE, VOV_TAG_READY, VOV_TAG_INERT, VOV_TAG_LIMITED };
 
 typedef struct {
     char label[28];
     char value[24];       // VOV_TEXT
     int kind, on, pct;    // VOV_TOGGLE uses on, VOV_SEGMENTS uses pct
+    int tag;              // VOV_TAG_*: ACTIVE (blue), READY (ink), INERT and LIMITED (red); NONE draws nothing
 } VovRow;
 
 typedef struct {
