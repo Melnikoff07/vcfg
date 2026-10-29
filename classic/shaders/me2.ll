@@ -10,6 +10,7 @@
 ; Writes V2[by, bx] (packed (dx, dy)) and S2[by, bx] = bsad | (zsad << 16) (winner SAD and zero-vector SAD, for gm8 and fgs8).
 ; table: +0xA0 V#L2cur, +0xB0 V#L2prev, +0xE0 V#V3 in, +0xF0 V#V2 out, +0x110 V#Fprev, +0x140 V#S2 out
 target triple = "amdgcn--"
+declare i32 @llvm.amdgcn.ds.swizzle(i32, i32 immarg)
 declare <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32>, i32, i32, i32 immarg)
 declare i32 @llvm.amdgcn.raw.buffer.load.i32(<4 x i32>, i32, i32, i32 immarg)
 declare <2 x float> @llvm.amdgcn.raw.buffer.load.v2f32(<4 x i32>, i32, i32, i32 immarg)
@@ -290,22 +291,21 @@ entry:
   fence syncscope("workgroup") release
   call void @llvm.amdgcn.s.barrier()
   fence syncscope("workgroup") acquire
-  br label %loop
-loop:
-  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]
-  %m = phi i32 [ -1, %entry ], [ %m1, %loop ]
-  %ix = add i32 %base, %i
-  %q = getelementptr [64 x i32], ptr addrspace(3) @keys, i32 0, i32 %ix
-  %k = load i32, ptr addrspace(3) %q, align 4
-  %m1 = call i32 @llvm.umin.i32(i32 %m, i32 %k)
-  %i1 = add i32 %i, 1
-  %more = icmp ult i32 %i1, %n
-  br i1 %more, label %loop, label %done
+  ; butterfly over the lane's aligned group of 16 (ds_swizzle bit mode: and 0x1f, xor 1 / 2 / 4 / 8)
+  %s1 = call i32 @llvm.amdgcn.ds.swizzle(i32 %key, i32 1055)
+  %r1 = call i32 @llvm.umin.i32(i32 %key, i32 %s1)
+  %s2 = call i32 @llvm.amdgcn.ds.swizzle(i32 %r1, i32 2079)
+  %r2 = call i32 @llvm.umin.i32(i32 %r1, i32 %s2)
+  %s4 = call i32 @llvm.amdgcn.ds.swizzle(i32 %r2, i32 4127)
+  %r4 = call i32 @llvm.umin.i32(i32 %r2, i32 %s4)
+  %s8 = call i32 @llvm.amdgcn.ds.swizzle(i32 %r4, i32 8223)
+  %r8 = call i32 @llvm.umin.i32(i32 %r4, i32 %s8)
+  br label %done
 done:
   fence syncscope("workgroup") release
   call void @llvm.amdgcn.s.barrier()
   fence syncscope("workgroup") acquire
-  ret i32 %m1
+  ret i32 %r8
 }
 
 ; packed vector published by lane `src` (all lanes read it)
@@ -561,7 +561,7 @@ define internal i32 @cost5(<4 x i32> %vp, <4 x i32> %vc, i32 %X, i32 %Y, i32 %cx
   ret i32 %key
 }
 
-attributes #0 = { "amdgpu-flat-work-group-size"="64,64" }
+attributes #0 = { "amdgpu-flat-work-group-size"="64,64" "denormal-fp-math-f32"="preserve-sign,preserve-sign" }
 !0 = !{}
 
 ; lower-middle of 4 values: min(max(min(a,b), min(c,d)), min(max(a,b), max(c,d))) (a value between the 2nd and 3rd)

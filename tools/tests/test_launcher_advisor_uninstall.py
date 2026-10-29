@@ -77,6 +77,8 @@ class Settings(ctypes.Structure):
         ("sharp", ctypes.c_int),
         ("enhance", ctypes.c_int),
         ("overlay", ctypes.c_int),
+        ("b30", ctypes.c_int),
+        ("shq", ctypes.c_int),
     ]
 
 
@@ -416,7 +418,7 @@ const char *harness_outside_removed(void)
 void harness_init_app(App *a)
 {{
     memset(a, 0, sizeof(*a));
-    a->defaults = (Settings){{ 1, 0, 40, 1, 0 }};
+    a->defaults = SETTINGS_DEFAULT;
     a->overlay_pos = 4;
     a->overlay_opacity = 80;
     a->menu_combo = MENU_COMBO_DEFAULT;
