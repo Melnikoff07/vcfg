@@ -73,11 +73,13 @@ int main(void) {
     }
     // post pass targets and memory: sharpness / AA / game vectors / HUD / fps lock
     for (int run = 0; run < 2; run++) for (int mt = 0; mt < 2; mt++) for (int up = 0; up < 3; up++) for (int pm = 0; pm < 4; pm++)
-    for (int raa = 0; raa < 2; raa++) for (int sh = 0; sh < 2; sh++) {
+    for (int raa = 0; raa < 2; raa++) for (int sh = 0; sh < 2; sh++) for (int fast = 0; fast < 2; fast++) for (int nm = 1; nm <= 2; nm++)
+    for (int on = 0; on < 2; on++) {
         OptState s; memset(&s, 0, sizeof(s));
         s.framegen = 1; s.started = 1; s.fg_path = run; s.mode8 = 1; s.rcas_shader = sh; s.mem_tight = mt; s.upscale = up;
         s.sharpness = 40; s.post_mid = pm; s.real_aa = raa; s.mid_only = pm == 1 || (pm != 2 && !raa);
-        printf("P run=%d mt=%d up=%d pm=%d raa=%d sh=%d", run, mt, up, pm, raa, sh);
+        s.preset = fast; s.nmid = nm; s.b30_on = on;
+        printf("P run=%d mt=%d up=%d pm=%d raa=%d sh=%d fast=%d nm=%d on=%d", run, mt, up, pm, raa, sh, fast, nm, on);
         pr("S", opt_sharp(&s)); pr("A", opt_aa(&s)); printf("\n");
     }
     return 0;
@@ -219,8 +221,9 @@ class TestAvailability(unittest.TestCase):
                 continue
             if not c["run"]:
                 self.assertEqual(s, (1, "real"))           # FG not generating: the native post pass, real frames
-            elif c["mt"] and c["up"] == 0:
-                self.assertEqual(s, (3, "memory, needs aa"))   # build_dcb_flow8: !g_mem_tight || upscale > 0
+            elif c["mt"] and c["up"] == 0:   # build_dcb_flow8: !g_mem_tight || upscale > 0 for mid1; mid2 of a 3-slot pair ungated
+                three = (c["fast"] and c["nm"] >= 2) or c["on"]
+                self.assertEqual(s, (4, "memory: 2nd gen frame only") if three else (3, "memory, needs aa"))
             else:
                 mid_only = c["pm"] == 1 or (c["pm"] != 2 and not c["raa"])
                 self.assertEqual(s, (1, "generated" if mid_only else "generated+real"))

@@ -139,13 +139,16 @@ static inline const char *opt_post_target(const OptState *s, int aa)
     return s->mid_only ? "generated" : "generated+real";
 }
 // Sharpness (rcas8 contrast). With frame generation on and memory tight, the first generated frame is sharpened only
-// when Anti-aliasing is on (build_dcb_flow8: !g_mem_tight || upscale > 0).
+// when Anti-aliasing is on (build_dcb_flow8: !g_mem_tight || upscale > 0); the 2nd generated frame of a 3-slot pair
+// (Fast with 2 buffers, the below-30 regime) has no such gate and is sharpened anyway.
 static inline OptStat opt_sharp(const OptState *s)
 {
     if (s->sharpness <= 0) return opt_stat(OPT_OFF, "");
     if (!s->rcas_shader) return opt_stat(OPT_INERT, "no post shader");
     if (!opt_fg_running(s)) return opt_stat(OPT_ACTIVE, "real");
-    if (s->mem_tight && s->upscale <= 0) return opt_stat(OPT_INERT, "memory, needs aa");
+    if (s->mem_tight && s->upscale <= 0)
+        return ((s->preset == 1 && s->nmid >= 2) || s->b30_on) ? opt_stat(OPT_LIMITED, "memory: 2nd gen frame only")
+                                                                : opt_stat(OPT_INERT, "memory, needs aa");
     return opt_stat(OPT_ACTIVE, opt_post_target(s, 0));
 }
 static inline OptStat opt_aa(const OptState *s)
