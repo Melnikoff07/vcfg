@@ -480,5 +480,6 @@ define internal i32 @costf(<4 x i32> %vp, <4 x i32> %vc, i32 %X, i32 %Y, i32 %cx
   ret i32 %key
 }
 
-attributes #0 = { "amdgpu-flat-work-group-size"="64,64" "denormal-fp-math-f32"="preserve-sign,preserve-sign" }
+; 5 waves per SIMD (<= 48 VGPRs) instead of 4: register allocation and scheduling only, same machine IR before scheduling (tools/tests/test_motion_wave_reduce.py)
+attributes #0 = { "amdgpu-flat-work-group-size"="64,64" "denormal-fp-math-f32"="preserve-sign,preserve-sign" "amdgpu-waves-per-eu"="5,10" "amdgpu-sched-strategy"="iterative-maxocc" }
 !0 = !{}

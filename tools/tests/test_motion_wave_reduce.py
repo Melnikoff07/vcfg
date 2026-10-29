@@ -95,6 +95,17 @@ class TestMotionWaveReduce(unittest.TestCase):
         self.assertIn("%sacc1 = add i32 %sh0, %sh1", src)
         self.assertIn("call i32 @llvm.amdgcn.raw.buffer.atomic.add.i32(i32 %sacc1,", src)
 
+    def test_me1_me3_five_waves(self):
+        # me1 and me3 ask the backend for 5 waves per SIMD (<= 48 VGPRs, no scratch): same IR, only allocation and
+        # scheduling change. The header must carry the granule that gives it.
+        hdr = (ROOT / "classic" / "source" / "shaders.h").read_text(encoding="utf-8")
+        for name in ("me1", "me3"):
+            self.assertIn('"amdgpu-waves-per-eu"="5,10"', (SH / f"{name}.ll").read_text(encoding="utf-8"), name)
+            r1 = int(re.search(r"#define %s_RSRC1 0x([0-9A-F]+)" % name.upper(), hdr).group(1), 16)
+            r2 = int(re.search(r"#define %s_RSRC2 0x([0-9A-F]+)" % name.upper(), hdr).group(1), 16)
+            self.assertLessEqual(((r1 & 0x3F) + 1) * 4, 48, name)
+            self.assertEqual(r2 & 1, 0, name)   # no scratch
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -855,5 +855,6 @@ define internal float @equi(float %m, float %c, float %p) alwaysinline {
   ret float %o2
 }
 
-attributes #0 = { "amdgpu-flat-work-group-size"="64,64" }
+; 5 waves per SIMD (<= 48 VGPRs) instead of 4: register allocation and scheduling only, same machine IR before scheduling (tools/tests/test_motion_wave_reduce.py)
+attributes #0 = { "amdgpu-flat-work-group-size"="64,64" "amdgpu-waves-per-eu"="5,10" }
 !0 = !{}
