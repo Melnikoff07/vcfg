@@ -782,10 +782,10 @@ class TestShaderSafetyAudit(unittest.TestCase):
         # warp8 by 512 B and rcas8 by 256 B; rcas8's guarded stores of unchanged lanes added 256 B back, its bit-5
         # real-frame static handling another 256 B; pyr8's still-pixel counter update 512 B; phase8's scene-cut history
         # reset 256 B; counting dump8 (placed) instead of ui8 (never placed) 256 B back; gen_shaders.py padding to a
-        # multiple of 64 words instead of ceil64 + 16 words, 2560 B back over 10 of the 17 shaders); the budget is the
-        # assertLessEqual against DCB8_OFF below
-        self.assertEqual(total_aligned, 0x13400)
-        self.assertEqual(end_off, 0x1B400)
+        # multiple of 64 words instead of ceil64 + 16 words, 2560 B back over 10 of the 17 shaders; warp8's v_mad_f32
+        # through llvm.amdgcn.fmad.ftz 256 B back); the budget is the assertLessEqual against DCB8_OFF below
+        self.assertEqual(total_aligned, 0x13300)
+        self.assertEqual(end_off, 0x1B300)
         self.assertLessEqual(
             end_off,
             dcb8_off,
