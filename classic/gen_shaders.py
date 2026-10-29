@@ -123,15 +123,18 @@ def build(llc,sdir,out):
         nv=stat(asm,'NumVgprs'); ns=stat(asm,'TotalNumSgprs','NumSgprs')
         scratch=stat(asm,'ScratchSize'); lds=stat(asm,'LDSByteSize')
         r1,r2=resources(nv,ns,int(m[1]),lds,scratch,has_y)
-        words=text_words(obj);words += [0xBF810000]*((-len(words))%64+16)
+        # At least 16 s_endpgm words after the code, total a multiple of 64 words: the 256 B step main.c places the
+        # shaders on adds nothing past it (the old ceil64(n)+16 cost a whole extra 256 B per shader in the region).
+        words=text_words(obj);words += [0xBF810000]*((-(len(words)+16))%64+16)
         sizes[name]=len(words)
         up=name.upper()
         lines += [f'#define {up}_RSRC1 0x{r1:08X}',f'#define {up}_RSRC2 0x{r2:08X}',f'#define {up}_NWORDS {len(words)}',f'static const uint32_t {name}_code[{len(words)}] = {{']
         lines += ['    '+', '.join(f'0x{w:08X}' for w in words[i:i+8])+',' for i in range(0,len(words),8)]
         lines += ['};','']
         print(f'{name}: {len(words)} words, vgprs={nv} sgprs={ns} user={int(m[1])} lds={lds} scratch={scratch} rsrc1={r1:08X} rsrc2={r2:08X}')
-    # Build-time region check: the mode-8 + velocity + rcas8/osd8 shaders start at 0x8000 (256 B aligned) and must end below DCB8_OFF (0x1C000)
-    used=[n for n in ('pyr8','me3','me2','me1','mf8','gm8','fgs8','phase8','warp8','warp8g','rcas8','gv8','gvc8','gvz8','ui8','osd8','pcopy8') if n in sizes]
+    # Build-time region check: the mode-8 + velocity + rcas8/osd8 shaders start at 0x8000 (256 B aligned) and must end below DCB8_OFF (0x1C000).
+    # The set main.c gpu_init copies there (code[17]): dump8 is always placed, ui8 never is.
+    used=[n for n in ('pyr8','me3','me2','me1','phase8','warp8','dump8','gm8','fgs8','mf8','gv8','gvc8','warp8g','gvz8','rcas8','osd8','pcopy8') if n in sizes]
     if 'pyr8' in used:
         aligned=sum(((sizes[n]*4+255)&~255) for n in used)
         print(f'shader region: 0x8000 + 0x{aligned:x} = 0x{0x8000+aligned:x} (limit 0x1C000)')

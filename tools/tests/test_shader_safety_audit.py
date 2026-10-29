@@ -757,12 +757,19 @@ class TestShaderSafetyAudit(unittest.TestCase):
             self.assertEqual(tgid_x_en, 1, f"Shader {name} TGID_X_EN != 1")
             self.assertGreater(nw, 0)
 
-        # Verify the 17 Mode 8 shaders copied into [0x8000, DCB8_OFF = 0x1C000) in main.c
+        # Verify the 17 Mode 8 shaders copied into [0x8000, DCB8_OFF = 0x1C000) in main.c (gpu_init's code[17]: dump8 is
+        # always placed, ui8 never is)
         mode8_region_shaders = [
-            "pyr8", "me3", "me2", "me1", "mf8", "gm8", "fgs8", "phase8",
-            "warp8", "warp8g", "rcas8", "gv8", "gvc8", "gvz8", "ui8", "osd8",
+            "pyr8", "me3", "me2", "me1", "phase8", "warp8", "dump8", "gm8",
+            "fgs8", "mf8", "gv8", "gvc8", "warp8g", "gvz8", "rcas8", "osd8",
             "pcopy8",
         ]
+        m_code = re.search(r"const uint32_t \*code\[17\] = \{([^}]*)\}", self.main_c)
+        self.assertIsNotNone(m_code)
+        self.assertEqual([x.strip()[:-len("_code")] for x in m_code.group(1).split(",") if x.strip()], mode8_region_shaders)
+        for s in mode8_region_shaders:
+            # gen_shaders.py pads every shader to a multiple of 64 words with >= 16 s_endpgm words after the code
+            self.assertEqual(nwords_map[s] % 64, 0, f"{s}: NWORDS not a multiple of 64")
         total_aligned = 0
         for s in mode8_region_shaders:
             code_bytes = nwords_map[s] * 4
@@ -774,9 +781,11 @@ class TestShaderSafetyAudit(unittest.TestCase):
         # layout snapshot of the current shaders.h (fp32 preserve-sign denormal attribute: mad/mac fusion shrank
         # warp8 by 512 B and rcas8 by 256 B; rcas8's guarded stores of unchanged lanes added 256 B back, its bit-5
         # real-frame static handling another 256 B; pyr8's still-pixel counter update 512 B; phase8's scene-cut history
-        # reset 256 B); the budget is the assertLessEqual against DCB8_OFF below
-        self.assertEqual(total_aligned, 0x13F00)
-        self.assertEqual(end_off, 0x1BF00)
+        # reset 256 B; counting dump8 (placed) instead of ui8 (never placed) 256 B back; gen_shaders.py padding to a
+        # multiple of 64 words instead of ceil64 + 16 words, 2560 B back over 10 of the 17 shaders); the budget is the
+        # assertLessEqual against DCB8_OFF below
+        self.assertEqual(total_aligned, 0x13400)
+        self.assertEqual(end_off, 0x1B400)
         self.assertLessEqual(
             end_off,
             dcb8_off,
@@ -792,6 +801,7 @@ class TestShaderSafetyAudit(unittest.TestCase):
             listed_in_gen,
             "Expected gen_shaders.py to include pcopy8 (R19-BUG-04 fixed)",
         )
+        self.assertEqual(listed_in_gen, mode8_region_shaders, "gen_shaders.py must check the set main.c places")
 
     def test_4b_fg8_table_descriptor_offsets_match_llvm_ir_geps(self):
         """

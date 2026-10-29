@@ -296,7 +296,8 @@ class DisocclusionAndHudTest(unittest.TestCase):
         shaders_h = (ROOT / "classic" / "source" / "shaders.h").read_text(encoding="utf-8")
         mw = re.search(r"#define\s+WARP8_NWORDS\s+(\d+)", shaders_h)
         self.assertIsNotNone(mw)
-        self.assertEqual(int(mw.group(1)), 2960, "WARP8_NWORDS must remain 2960 (12,032 B aligned, 512 B free margin)")
+        # 2960 with gen_shaders.py's old ceil64 + 16 padding; the same code padded to a multiple of 64 words is 2944
+        self.assertEqual(int(mw.group(1)), 2944, "WARP8_NWORDS must remain 2944 (11,776 B, 256 B aligned)")
 
 
 if __name__ == "__main__":
