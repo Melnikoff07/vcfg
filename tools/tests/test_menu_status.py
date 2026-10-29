@@ -284,7 +284,7 @@ class TestMainMenu(unittest.TestCase):
             self.assertIn(line, MAIN)
         self.assertEqual(MAIN.count("int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);"), 2)
         # status globals are written by the hooks and read only by the status code
-        for g in ("g_st_fg_path", "g_st_shq_on", "g_st_pace_timer", "g_st_gv_active"):
+        for g in ("g_st_fg_path", "g_st_shq_on", "g_st_pace_timer", "g_st_gv_active", "g_st_fg_on"):
             for m in re.finditer(re.escape(g), MAIN):
                 ctx = MAIN[MAIN.rfind("\n", 0, m.start()):MAIN.find("\n", m.end())]
                 self.assertTrue("__atomic_store_n(&" + g in ctx or "__atomic_load_n(&" + g in ctx

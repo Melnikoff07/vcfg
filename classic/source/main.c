@@ -481,7 +481,9 @@ _Static_assert(MENU_NROWS == OPT_ROW_N, "in-game menu rows and opt_status.h rows
 
 // Option status (opt_status.h): copies of what the flip hooks already decided, read by the menu and the
 // "options effective:" log line. Written once per real frame, never read back by a decision.
-static volatile int g_st_fg_path = 0;        // last real frame: 0 not generated, 1 SubmitAndFlip path, 2 VideoOutSubmitFlip path
+static volatile int g_st_fg_path = 0;        // path of the last generated frame: 1 SubmitAndFlip, 2 VideoOutSubmitFlip
+static volatile uint32_t g_st_fg_frames = 0, g_st_fg_hits = 0;   // real frames / of them through frame generation
+static volatile int g_st_fg_on = 0;          // more than half of the last ~0.25 s window (io thread): no flapping state
 static volatile int g_st_shq_on = 0, g_st_pace_timer = 0;
 static volatile uint32_t g_st_gv_frames = 0, g_st_gv_hits = 0;   // real frames / of them with warp8g (game vectors applied)
 static volatile int g_st_gv_active = 0;      // more than half of the last ~0.25 s window (io thread)
@@ -2957,7 +2959,7 @@ static void opt_state_now(const fg_config_t *c, OptState *s)
     s->hud_protect = c->hud_protect; s->game_vectors = c->game_vectors; s->fps_lock = c->fps_lock; s->below30 = c->below30;
     s->shallow_queue = c->shallow_queue; s->post_mid = g_cfg.post_mid; s->present_copy = g_cfg.present_copy;
     s->started = g_flips >= INJECT_AFTER_FLIPS || g_vo_submit_flips >= INJECT_AFTER_FLIPS;
-    s->fg_path = __atomic_load_n(&g_st_fg_path, __ATOMIC_RELAXED);
+    s->fg_path = __atomic_load_n(&g_st_fg_on, __ATOMIC_RELAXED) ? __atomic_load_n(&g_st_fg_path, __ATOMIC_RELAXED) : 0;
     char why[sizeof(g_inert_reason)];
     memcpy(why, g_inert_reason, sizeof(why)); why[sizeof(why) - 1] = 0;
     opt_norm_reason(s->fg_why, sizeof(s->fg_why), why);
@@ -3010,7 +3012,8 @@ static void opt_log_effective(const char *why)
     opt_log_line(&s, why);
 }
 // io thread, every ~250 ms: a new line when a state or a setting changed, at most one per 2 s (a state that flips back
-// within that time writes nothing). Also closes the game-vectors window (more than half the frames with warp8g).
+// within that time writes nothing). Also closes the windows of frame generation and game vectors (on when more than
+// half the real frames of the window had it), so a state that changes frame by frame does not make lines.
 #define OPT_TICK_US     250000ull
 #define OPT_MIN_GAP_US 2000000ull
 static void opt_status_tick(uint64_t now)
@@ -3020,6 +3023,8 @@ static void opt_status_tick(uint64_t now)
     last_tick = now;
     uint32_t fr = __atomic_exchange_n(&g_st_gv_frames, 0u, __ATOMIC_RELAXED), hit = __atomic_exchange_n(&g_st_gv_hits, 0u, __ATOMIC_RELAXED);
     if (fr) __atomic_store_n(&g_st_gv_active, hit * 2u > fr, __ATOMIC_RELAXED);
+    uint32_t ff = __atomic_exchange_n(&g_st_fg_frames, 0u, __ATOMIC_RELAXED), fh = __atomic_exchange_n(&g_st_fg_hits, 0u, __ATOMIC_RELAXED);
+    if (ff) __atomic_store_n(&g_st_fg_on, fh * 2u > ff, __ATOMIC_RELAXED);
     if (!__atomic_load_n(&g_opt_last_t, __ATOMIC_ACQUIRE)) return;   // nothing logged yet: the init line comes first
     if (now - __atomic_load_n(&g_opt_last_t, __ATOMIC_ACQUIRE) < OPT_MIN_GAP_US) return;
     OptState s;
@@ -4098,7 +4103,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                fg_res_supported(g_bw, g_bh) && g_prev_idx < game_idx_end() && mbufs_ready(handle));
                 int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);
 
-                __atomic_store_n(&g_st_fg_path, (can_fg8 && want_fg) ? 1 : 0, __ATOMIC_RELAXED);   // status copy (opt_status.h)
+                g_st_fg_frames++; if (can_fg8 && want_fg) { g_st_fg_hits++; __atomic_store_n(&g_st_fg_path, 1, __ATOMIC_RELAXED); }   // status copy
                 if (!(can_fg8 && want_fg)) {
                     pyr_cache_invalidate();
                 }
@@ -4755,7 +4760,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
             int can_fg8 = (g_inject_on == 8 && g_work && g_sh8_ok && g_fmt_supported &&
                            fg_res_supported(g_bw, g_bh) && g_prev_idx < game_idx_end() && mbufs_ready((uint32_t)handle));
             int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);
-            __atomic_store_n(&g_st_fg_path, (can_fg8 && want_fg) ? 2 : 0, __ATOMIC_RELAXED);   // status copy (opt_status.h)
+            g_st_fg_frames++; if (can_fg8 && want_fg) { g_st_fg_hits++; __atomic_store_n(&g_st_fg_path, 2, __ATOMIC_RELAXED); }   // status copy
 
             if (can_fg8 && want_fg) {
                 g_inert_reason[0] = 0;
