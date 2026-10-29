@@ -3999,9 +3999,12 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     uint32_t mi1 = (pcopy && g_pcopy_k >= 2) ? (uint32_t)g_mbase + (g_flips % (uint32_t)g_pcopy_k) : (uint32_t)g_mbase + (g_flips % (uint32_t)g_nmid);
                     uint32_t mi2 = (uint32_t)g_mbase + ((g_flips + 1u) % (uint32_t)g_nmid);
                     b30cost_init();
-                    // below30: the 1st generated frame goes into the buffer flipped longest ago, the 2nd into the next one
-                    // (pace_policy.h mid_lru); with 2-slot pairs only this is the round robin above. below30 off: as v2.35.
-                    int mid_lru_on = g_cfg.below30 && !(pcopy && g_pcopy_k >= 2) && g_nmid >= 2 && (uint32_t)g_nmid <= MID_LRU_MAX;
+                    // below30 and FG Fast (the two that emit 3-slot pairs): the 1st generated frame goes into the buffer
+                    // flipped longest ago, the 2nd into the next one (pace_policy.h mid_lru); with 2-slot pairs only this is
+                    // the round robin above. Fast with the round robin waited ~5-11 ms per 3-slot pair in WaitFlipDone with
+                    // our DCB on the game's ring ("fence wait" 0.5-1.7 ms per pair, CUSA18723 29/10). Quality / Sharp
+                    // without below30: as v2.35.
+                    int mid_lru_on = (g_cfg.below30 || g_cfg.preset == 1) && !(pcopy && g_pcopy_k >= 2) && g_nmid >= 2 && (uint32_t)g_nmid <= MID_LRU_MAX;
                     if (mid_lru_on) {
                         if (g_mid_lru.n != (uint32_t)g_nmid) mid_lru_reset(&g_mid_lru, (uint32_t)g_nmid);
                         mi1 = (uint32_t)g_mbase + mid_lru_pick(&g_mid_lru, 0u);

@@ -200,10 +200,10 @@ class TestB30CostMainC(unittest.TestCase):
         self.assertIn("b30_regime_step(&g_b30, (b30_ok && !force_repeat) ? b30_feed(ft_own_us) : 0u, pq8);", self.FLIP)
         self.assertIn("uint32_t m_out = b30_slots(&g_b30, b30_feed(g_cpu_ema_us), pq8,", self.FLIP)
 
-    def test_buffer_order_only_with_below30(self):
+    def test_buffer_order_with_below30_or_fast(self):
         f = self.FLIP
-        self.assertIn("int mid_lru_on = g_cfg.below30 && !(pcopy && g_pcopy_k >= 2) && g_nmid >= 2 && (uint32_t)g_nmid <= MID_LRU_MAX;", f)
-        # below30 off, or one generated-frame buffer: v2.35's order
+        self.assertIn("int mid_lru_on = (g_cfg.below30 || g_cfg.preset == 1) && !(pcopy && g_pcopy_k >= 2) && g_nmid >= 2 && (uint32_t)g_nmid <= MID_LRU_MAX;", f)
+        # Quality / Sharp with below30 off, or one generated-frame buffer: v2.35's order
         self.assertIn("(uint32_t)g_mbase + (g_flips % (uint32_t)g_nmid);", f[:f.index("int mid_lru_on =")])
         i = f.index("int mid_lru_on =")
         self.assertIn("mi1 = (uint32_t)g_mbase + mid_lru_pick(&g_mid_lru, 0u);", f[i:i + 900])
@@ -231,13 +231,14 @@ static int g_nmid, g_mem_tight, g_s14_state, g_fg_off, g_pcopy_k;
 static int pace_timer_on(void) { return 1; }
 int main(void)
 {
+    for (int preset = 0; preset <= 2; preset++)
     for (int b30 = 0; b30 <= 1; b30++)
         for (g_nmid = 1; g_nmid <= 2; g_nmid++)
             for (int pcopy = 0; pcopy <= 1; pcopy++) {
-                g_cfg.below30 = b30; g_cfg.preset = 0; g_cfg.fps_lock = 30; g_pcopy_k = pcopy ? 2 : 0;
+                g_cfg.below30 = b30; g_cfg.preset = preset; g_cfg.fps_lock = 30; g_pcopy_k = pcopy ? 2 : 0;
                 __MID_LRU_ON__
                 __B30_OK__
-                printf("b%d_n%d_p%d %d %d\n", b30, g_nmid, pcopy, mid_lru_on, b30_ok);
+                printf("%sb%d_n%d_p%d %d %d\n", preset == 0 ? "" : preset == 1 ? "fast_" : "sharp_", b30, g_nmid, pcopy, mid_lru_on, b30_ok);
             }
     return 0;
 }
@@ -261,6 +262,14 @@ class TestB30OneBuffer(unittest.TestCase):
         # the same title with a 2nd generated-frame buffer and below30 on does get the regime and the order
         self.assertEqual(r["b1_n2_p0"], ["1", "1"])
         self.assertEqual(r["b1_n2_p1"], ["0", "1"])   # a running present copy keeps its own buffer order
+        # FG Fast (3-slot pairs without below30) takes the order with 2 buffers, never the below30 regime
+        for b30 in (0, 1):
+            self.assertEqual(r["fast_b%d_n2_p0" % b30], ["1", "0"])
+            self.assertEqual(r["fast_b%d_n2_p1" % b30], ["0", "0"])
+            self.assertEqual(r["fast_b%d_n1_p0" % b30], ["0", "0"])
+        # Sharp is Quality's pacing: v2.35's order with below30 off
+        self.assertEqual(r["sharp_b0_n2_p0"], ["0", "0"])
+        self.assertEqual(r["sharp_b1_n2_p0"], ["1", "1"])
 
 if __name__ == "__main__":
     unittest.main()
