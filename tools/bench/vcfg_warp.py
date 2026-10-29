@@ -53,14 +53,17 @@ def sat(x):
 
 
 def crw(f, c):
-    f2 = f * f
-    f3 = f2 * f
-    w0 = (f2 * F32(2.0) - f - f3) * F32(c)
-    w1 = f2 * (F32(c) - F32(3.0)) + f3 * (F32(2.0) - F32(c)) + F32(1.0)
-    w2 = f * F32(c) + f2 * (F32(3.0) - F32(2.0) * F32(c)) + f3 * (F32(c) - F32(2.0))
-    w3 = (f3 - f2) * F32(c)
-    w12 = w1 + w2
-    return w0, w12, w3, w2 / w12
+    """weights of the B = 0 cubic (C = c) for the 5-tap resample, factored as warp8.ll @crw evaluates them: with
+    g = 1 - f and cfg = c f g, w0 = -cfg g, w3 = -cfg f, w1 + w2 = 1 + cfg, w2 = f^2 (3 - 2 f) + cfg g.
+    Returns (w0, w1 + w2, w3, w2 / (w1 + w2))."""
+    c = F32(c) if np.ndim(c) == 0 else np.asarray(c, F32)
+    g = F32(1.0) - f
+    cfg = c * (f * g)
+    w0n = cfg * g
+    w3n = cfg * f
+    w12 = cfg + F32(1.0)
+    w2 = (f * f) * (f * F32(-2.0) + F32(3.0)) + w0n
+    return -w0n, w12, -w3n, w2 / w12
 
 
 def cr(img, u, v, csh, return_hl=False):

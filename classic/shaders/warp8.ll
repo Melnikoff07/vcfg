@@ -221,31 +221,17 @@ define internal { <4 x float>, <4 x float>, float } @tapsq(<8 x i32> %tp, <8 x i
 }
 
 define internal <4 x float> @crw(float %f, float %c) alwaysinline {
+  %g = fsub float 1.0, %f
+  %fg = fmul float %f, %g
+  %cfg = fmul float %c, %fg
+  %w0n = fmul float %cfg, %g
+  %w0 = fneg float %w0n
+  %w3n = fmul float %cfg, %f
+  %w3a = fneg float %w3n
+  %w12 = fadd float %cfg, 1.0
   %f2 = fmul float %f, %f
-  %f3 = fmul float %f2, %f
-
-  %mz.n6 = fneg float %f
-  %a1 = call float @llvm.amdgcn.fmad.ftz.f32(float %f2, float 2.0, float %mz.n6)
-  %a2 = fsub float %a1, %f3
-  %w0 = fmul float %a2, %c
-  %c3 = fsub float %c, 3.0
-  %c2 = fsub float 2.0, %c
-
-  %b2 = fmul float %f3, %c2
-  %b3 = call float @llvm.amdgcn.fmad.ftz.f32(float %f2, float %c3, float %b2)
-  %w1 = fadd float %b3, 1.0
-
-
-  %mz.n7 = fneg float %c
-  %d2c = call float @llvm.amdgcn.fmad.ftz.f32(float %mz.n7, float 2.0, float 3.0)
-  %d2 = fmul float %f2, %d2c
-  %d3c = fsub float %c, 2.0
-
-  %d12 = call float @llvm.amdgcn.fmad.ftz.f32(float %f, float %c, float %d2)
-  %w2 = call float @llvm.amdgcn.fmad.ftz.f32(float %f3, float %d3c, float %d12)
-  %e1 = fsub float %f3, %f2
-  %w3a = fmul float %e1, %c
-  %w12 = fadd float %w1, %w2
+  %h2b = call float @llvm.amdgcn.fmad.ftz.f32(float %f, float -2.0, float 3.0)
+  %w2 = call float @llvm.amdgcn.fmad.ftz.f32(float %f2, float %h2b, float %w0n)
   %o = fdiv arcp afn float %w2, %w12
   %r0 = insertelement <4 x float> undef, float %w0, i32 0
   %r1 = insertelement <4 x float> %r0, float %w12, i32 1

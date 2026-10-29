@@ -297,8 +297,8 @@ class DisocclusionAndHudTest(unittest.TestCase):
         mw = re.search(r"#define\s+WARP8_NWORDS\s+(\d+)", shaders_h)
         self.assertIsNotNone(mw)
         # 2960 with gen_shaders.py's old ceil64 + 16 padding, 2944 padded to a multiple of 64 words, 2880 with v_mad_f32
-        # through llvm.amdgcn.fmad.ftz (test_warp8_fmad_ftz.py)
-        self.assertEqual(int(mw.group(1)), 2880, "WARP8_NWORDS must remain 2880 (11,520 B, 256 B aligned)")
+        # through llvm.amdgcn.fmad.ftz (test_warp8_fmad_ftz.py), 2816 with @crw in factored form (test_warp8_crw_factored.py)
+        self.assertEqual(int(mw.group(1)), 2816, "WARP8_NWORDS must remain 2816 (11,264 B, 256 B aligned)")
 
 
 if __name__ == "__main__":
