@@ -529,8 +529,8 @@ static uint64_t g_pbuf_prev_va = 0;
 static uint32_t g_flip_ring_hist[8] __attribute__((unused));
 static uint32_t g_flip_ring_cnt __attribute__((unused)) = 0;
 #endif
-// shave14, on with below30 for the CUSA18723 family, opt-in by file for any other title (LOG_DIR/shave14_<TITLE>),
-// decided once in plugin_load by s14_decide. A 3-buffer game whose
+// shave14, on for the CUSA18723 family when the game starts in a mode that shows two generated frames per pair (Fast
+// or below30), opt-in by file for any other title (LOG_DIR/shave14_<TITLE>), decided once in plugin_load by s14_decide. A 3-buffer game whose
 // boot valve shrinks the display reserve to 8 MiB (one generated-frame buffer) keeps S14_KEEP instead: two buffers, both
 // DirectMemory, which VideoOut requires (it refuses FlexibleMemory, 0x80290013). The game allocation that is then short
 // takes those 8 MiB as a longer FlexibleMemory tail (Arena Shaving, the mechanism that already backs 6 MiB today), and the
@@ -2176,6 +2176,10 @@ static void check_title_version_upgrade(void)
     }
 }
 
+// The preset the game starts with (config.ini / config-<TITLE>.ini / adapt), for s14_decide only. g_cfg.preset itself
+// stays at its static value until the first cfg_apply_live ("init"), as in v2.35: every other reader of it before then
+// (flip hooks, boot STAGE lines) keeps today's behaviour.
+static int g_boot_preset = 0;
 static void load_early_adapt_cfg(void)
 {
     fg_config_t c;
@@ -2202,6 +2206,7 @@ static void load_early_adapt_cfg(void)
     g_cfg.audio_fix    = c.audio_fix;
     g_cfg.below30      = c.below30;
     g_cfg.shallow_queue = c.shallow_queue;
+    g_boot_preset      = c.preset;
     g_fg_off           = !c.framegen;
 }
 
@@ -2773,28 +2778,37 @@ static void pace_hz(uint32_t hz)
 }
 // ---- shave14: 2nd generated-frame buffer from a 16 MiB display reserve (S14_KEEP) ----
 // Decided once in plugin_load, before the game's first allocation. Candidates: the CUSA18723 family (where it was
-// validated on the console) with below30 on, and any title with LOG_DIR/shave14_<TITLE>. It needs the configuration
-// where today the plugin takes the 8 MiB history buffer that shave14 gives back to the game (two_buffer or present_copy
-// forced), FG mode 8 with below30 on, and arena shaving available; otherwise the boot is exactly as without shave14.
-// Any other title keeps today's boot: the below-30 regime then runs only where the mode-8 allocation already has a
-// 2nd generated-frame buffer.
+// validated on the console) when the game starts in a mode that shows two generated frames per pair (s14_two_gen:
+// preset 1 = Fast, or below30 on), and any title with LOG_DIR/shave14_<TITLE>. It needs the configuration where today
+// the plugin takes the 8 MiB history buffer that shave14 gives back to the game (two_buffer or present_copy forced),
+// FG mode 8 with Fast or below30, and arena shaving available; otherwise the boot is exactly as without shave14.
+// Quality / Sharp without below30 at start keep today's boot (one generated frame per pair needs one buffer). Any
+// other title keeps today's boot: Fast and the below-30 regime then get 2 generated frames per pair only where the
+// mode-8 allocation already has a 2nd generated-frame buffer.
 // Runs inside plugin_load: STAGE (raw kernel I/O) only. lg() opens probe.log with stdio, and stdio inside plugin_load
 // faults in libSceLibcInternal (boot_stage.h); the probe.log line is written later, at RegisterBuffers (s14_log_decision).
 static int g_s14_opt = 0;   // 0 not a candidate (no line), 1 LOG_DIR/shave14_<TITLE>, 2 CUSA18723 family default
 static const char *g_s14_why = NULL;
+static const char *g_s14_boot = "";   // the boot's mode that asks for 2 generated frames per pair ("fast", "below30", ...)
+static const char k_s14_why_one_gen[] = "neither Fast nor below30 at start";   // opt_state reads it (buf2_boot)
+// The start asks for a mode that shows two generated frames per pair: FG Fast (3-slot pairs at 20-30 fps) or below30.
+// s14_decide runs in plugin_load before the first cfg_apply_live: the preset comes from load_early_adapt_cfg
+// (g_boot_preset); g_cfg.preset is still the static default there.
+static int s14_two_gen(void) { return g_cfg.below30 || g_boot_preset == 1; }
 static void s14_decide(int mode)
 {
     char p[64];
     snprintf(p, sizeof(p), LOG_DIR "/shave14_%s", g_title_id);
     int fd = sceKernelOpen(p, 0, 0666);
-    int opt = fd >= 0 ? 1 : (vcfg_in_family(g_title_id, "CUSA18723") && g_cfg.below30) ? 2 : 0;
+    int opt = fd >= 0 ? 1 : (vcfg_in_family(g_title_id, "CUSA18723") && s14_two_gen()) ? 2 : 0;
+    g_s14_boot = g_boot_preset == 1 ? (g_cfg.below30 ? "fast, below30" : "fast") : g_cfg.below30 ? "below30" : "";
     if (fd >= 0) sceKernelClose(fd);
     const char *why = !opt ? "no file"
         : g_bench_enabled ? "bench"
         : mode != 8 ? "FG mode is not 8"
         : g_safe_never ? "safe mode only observes this title"
         : g_cfg.shave_mode != 0 ? "shave_mode is not 0 (no boot valve or no arena shaving)"
-        : !g_cfg.below30 ? "below30=0"
+        : !s14_two_gen() ? k_s14_why_one_gen
         : (g_cfg.present_copy == 2 || (g_cfg.present_copy != 1 && g_cfg.two_buffer != 1))
           ? "no history buffer to give back (two_buffer=0), the game would lose 8 MiB of FlexibleMemory"
         : cusa10249_audio_fix() ? "audio_fix"
@@ -2803,8 +2817,8 @@ static void s14_decide(int mode)
     g_s14_opt = opt;
     g_s14_why = why;
     if (!opt) return;   // not a candidate: no line, the boot log stays as it is
-    STAGE("shave14: %s (%s)%s%s", g_s14_on ? "on" : "off", opt == 1 ? p : "CUSA18723 family default", why ? ": " : "",
-          why ? why : "");
+    STAGE("shave14: %s (%s%s%s)%s%s", g_s14_on ? "on" : "off", opt == 1 ? p : "CUSA18723 family default",
+          g_s14_boot[0] ? ", start in " : "", g_s14_boot, why ? ": " : "", why ? why : "");
 }
 // The decision in probe.log, once, from the game's RegisterBuffers (stdio is safe there; plugin_load is not).
 static void s14_log_decision(void)
@@ -2813,11 +2827,11 @@ static void s14_log_decision(void)
     if (done || !g_s14_opt) return;
     done = 1;
     if (g_s14_opt == 1)
-        lg("shave14: %s (" LOG_DIR "/shave14_%s)%s%s\n", g_s14_on ? "on" : "off", g_title_id, g_s14_why ? ": " : "",
-           g_s14_why ? g_s14_why : "");
+        lg("shave14: %s (" LOG_DIR "/shave14_%s%s%s)%s%s\n", g_s14_on ? "on" : "off", g_title_id,
+           g_s14_boot[0] ? ", start in " : "", g_s14_boot, g_s14_why ? ": " : "", g_s14_why ? g_s14_why : "");
     else
-        lg("shave14: %s (CUSA18723 family default)%s%s\n", g_s14_on ? "on" : "off", g_s14_why ? ": " : "",
-           g_s14_why ? g_s14_why : "");
+        lg("shave14: %s (CUSA18723 family default, start in %s)%s%s\n", g_s14_on ? "on" : "off", g_s14_boot,
+           g_s14_why ? ": " : "", g_s14_why ? g_s14_why : "");
 }
 // RegisterBuffers (reg_mode 0 and 1) after our nm display buffers of `one` bytes at m are registered: with the reserve
 // kept at S14_KEEP (trimmed to what nm buffers need below 1080p) the 2nd one is the 2nd generated-frame buffer (g_nmid = 2,
@@ -2979,12 +2993,13 @@ static void opt_state_now(const fg_config_t *c, OptState *s)
     s->pcopy_on = g_pcopy_on;
     s->mid_lru = (c->below30 || c->preset == 1) && !(g_pcopy_on && g_pcopy_k >= 2) && g_nmid >= 2 && (uint32_t)g_nmid <= MID_LRU_MAX;
     s->fast_pace = g_fast_pace;
-    // The 2nd generated-frame buffer of the CUSA18723 family comes from shave14, decided at start from the below30 then
-    // in effect (s14_decide: no LOG_DIR/shave14_<TITLE> file and below30 = 0 -> not even a candidate).
+    // The 2nd generated-frame buffer of the CUSA18723 family comes from shave14, decided at start from the preset and
+    // below30 then in effect (s14_decide: no LOG_DIR/shave14_<TITLE> file, not Fast and below30 = 0 -> not even a
+    // candidate).
     int fam = vcfg_in_family(g_title_id, "CUSA18723");
     s->buf2_boot = (!g_s14_opt && !fam) ? OPT_BUF2_NA
                  : g_s14_state == 2 ? OPT_BUF2_ON
-                 : ((!g_s14_opt && fam) || (g_s14_why && strcmp(g_s14_why, "below30=0") == 0)) ? OPT_BUF2_OFF_B30
+                 : ((!g_s14_opt && fam) || g_s14_why == k_s14_why_one_gen) ? OPT_BUF2_OFF_B30
                  : OPT_BUF2_OFF_OTHER;
 }
 // One "options effective:" line: the effective state of every option, not only the value asked for. why: what caused it

@@ -7,7 +7,8 @@
      reason (Fast, fps_lock 20, no 2nd buffer, memory, timer pacing, restart after a below30 = 0 start);
    - Low latency is ready/active exactly where the hook's shq_ok can be true, paused by the below-30 regime;
    - Sharpness / Anti-aliasing say which frames they touch and the memory case that skips the sharpening;
-   - Fast says when it is limited to 1 generated frame per pair (no 2nd buffer, below30 = 0 at start);
+   - Fast says when it is limited to 1 generated frame per pair (no 2nd buffer, a start in neither Fast nor
+     below30, which is the only start without shave14's buffer on the CUSA18723 family);
    - row visibility: Below 30 FPS hidden with Fast, FG off or fps_lock 20; Mode / Game vectors / HUD with FG off;
    - every header detail fits the 38 characters of the overlay status line and the log line fits a log slot.
    Negative controls: the same checks run on mutated copies of opt_status.h (a dropped condition) and must fail.
@@ -144,7 +145,8 @@ def check_rules(rows):
             bad.append(("b30 inert with fps_lock 20", c, st["B"]))
         if b_st == 3 and b_why.startswith("no 2nd buf") and (c["bb"] == 2) != ("restart" in b_why):
             bad.append(("b30 says restart only after a below30=0 start", c, st["B"]))
-        if not c["b30"] and (b_st != 0 or (b_why == "save drops 2nd buffer") != (c["bb"] == 1)):
+        # a save with below30 = 0 drops the buffer at the next start only outside Fast (a Fast start asks for it too)
+        if not c["b30"] and (b_st != 0 or (b_why == "save drops 2nd buffer") != (c["bb"] == 1 and c["preset"] != 1)):
             bad.append(("b30 off, warns when a save drops the 2nd buffer", c, st["B"]))
         # Low latency: ready/active <=> shq_ok can be true (mode 8, fps_lock != 20, timer pacing, FG generating, gnm)
         shq_can = c["shq"] and c["fg"] and c["lock"] != 20 and c["m8"] and c["pt"] and fg_run and c["path"] == 1
@@ -160,7 +162,7 @@ def check_rules(rows):
         # Fast limited without the 2nd buffer
         m_st, m_why = st["M"]
         if c["preset"] == 1 and fg_run:
-            want = (1, "up to 2 generated") if c["nmid"] >= 2 else (4, "1 gen/pair: below30 off at boot" if c["bb"] == 2 else "1 gen/pair: no 2nd buffer")
+            want = (1, "up to 2 generated") if c["nmid"] >= 2 else (4, "1 gen/pair: save, restart" if c["bb"] == 2 else "1 gen/pair: no 2nd buffer")
             if (m_st, m_why) != want:
                 bad.append(("fast limited", c, st["M"]))
         elif m_st != 0:
@@ -197,7 +199,7 @@ class TestAvailability(unittest.TestCase):
         for want in [(1, "game under 30 fps"), (2, "game at 30 fps"), (3, "fast mode"), (3, "fps lock 20"), (3, "fg off"),
                      (3, "memory tight"), (3, "no 2nd buffer"), (3, "no 2nd buf, restart"), (3, "no timer pacing"),
                      (3, "videoout flip path"), (3, "fg mode not 8"), (3, "fg inert"), (2, "fg starting"),
-                     (2, "paused by below 30"), (2, "needs game < 30 ms"), (4, "1 gen/pair: below30 off at boot"),
+                     (2, "paused by below 30"), (2, "needs game < 30 ms"), (4, "1 gen/pair: save, restart"),
                      (4, "1 gen/pair: no 2nd buffer"), (1, "up to 2 generated"), (0, "save drops 2nd buffer")]:
             self.assertIn(want, seen)
 
@@ -240,6 +242,10 @@ class TestAvailability(unittest.TestCase):
             "shq not paused by the regime": ('if (s->b30_on) return opt_stat(OPT_READY, "paused by below 30");', ""),
             "fast never limited": ('return opt_stat(OPT_LIMITED,', 'return opt_stat(OPT_ACTIVE,'),
             "restart said after any start": ('s->buf2_boot == OPT_BUF2_OFF_B30 ? "no 2nd buf, restart"', '1 ? "no 2nd buf, restart"'),
+            "save warning in Fast": ('s->buf2_boot == OPT_BUF2_ON && s->preset != 1 ? "save drops 2nd buffer"',
+                                     's->buf2_boot == OPT_BUF2_ON ? "save drops 2nd buffer"'),
+            "fast limited by the start": ('s->buf2_boot == OPT_BUF2_OFF_B30 ? "1 gen/pair: save, restart"',
+                                          's->buf2_boot != OPT_BUF2_OFF_OTHER ? "1 gen/pair: save, restart"'),
         }
         for name, (old, new) in mutants.items():
             self.assertIn(old, OPT_H, name)

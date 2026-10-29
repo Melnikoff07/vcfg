@@ -9,10 +9,11 @@
 //    but cannot act in this game or state) or limited (acts, without part of what it does), with a short reason
 //    (opt_*). The menu draws the state next to the value and the reason of the selected row in the header; probe.log
 //    gets one "options effective:" line per change.
-//  * the 2nd generated-frame buffer: on the CUSA18723 family it exists only when the game started with below30 = 1
-//    (main.c s14_decide: shave14 gives it), and Fast needs it for 2 generated frames per pair. So below30 = 0 at boot
-//    limits Fast to 1 generated frame per pair, below30 turned on later stays inert until the next start, and below30
-//    turned off and saved drops the buffer at the next start. Each of these is said in the menu and in the log.
+//  * the 2nd generated-frame buffer: on the CUSA18723 family it exists only when the game started in a mode that shows
+//    2 generated frames per pair, Fast or below30 = 1 (main.c s14_decide: shave14 gives it). So a start with neither
+//    limits Fast chosen later to 1 generated frame per pair and leaves below30 turned on later inert, both until the
+//    next start; and below30 turned off and saved outside Fast drops the buffer at the next start. Each of these is
+//    said in the menu and in the log.
 // The status never feeds back into a decision: main.c only copies the values its decisions already computed.
 #pragma once
 #include <stdint.h>
@@ -48,8 +49,8 @@ static inline int opt_menu_index_of(const int *ids, int n, int row)
 enum { OPT_OFF, OPT_ACTIVE, OPT_READY, OPT_INERT, OPT_LIMITED };
 // buf2_boot: how the 2nd generated-frame buffer was decided at game start
 enum { OPT_BUF2_NA,            // not tied to below30 for this title (mode-8 allocation)
-       OPT_BUF2_ON,            // shave14 gave it (the game started with below30 = 1)
-       OPT_BUF2_OFF_B30,       // none: the game started with below30 = 0 (restart with below30 = 1 to get it)
+       OPT_BUF2_ON,            // shave14 gave it (the game started in Fast or with below30 = 1)
+       OPT_BUF2_OFF_B30,       // none: the game started with neither (restart in Fast or with below30 = 1 to get it)
        OPT_BUF2_OFF_OTHER };   // none: shave14 refused for another reason
 typedef struct { int st; const char *why; } OptStat;   // why: short lowercase reason, "" when none
 
@@ -97,13 +98,15 @@ static inline OptStat opt_mode(const OptState *s)
 {
     if (s->preset != 1 || !opt_fg_running(s)) return opt_stat(OPT_OFF, "");
     if (s->nmid >= 2) return opt_stat(OPT_ACTIVE, "up to 2 generated");
-    return opt_stat(OPT_LIMITED, s->buf2_boot == OPT_BUF2_OFF_B30 ? "1 gen/pair: below30 off at boot" : "1 gen/pair: no 2nd buffer");
+    // A start in Fast gets the buffer (shave14): limited by the start only when it was in neither Fast nor below30.
+    return opt_stat(OPT_LIMITED, s->buf2_boot == OPT_BUF2_OFF_B30 ? "1 gen/pair: save, restart" : "1 gen/pair: no 2nd buffer");
 }
 
 // Below 30 FPS: the regime of 3-slot pairs. Ready/active exactly where b30_available() lets it run.
 static inline OptStat opt_b30(const OptState *s)
 {
-    if (!s->below30) return opt_stat(OPT_OFF, s->buf2_boot == OPT_BUF2_ON ? "save drops 2nd buffer" : "");
+    // Saving below30 = 0 drops the buffer at the next start only outside Fast (Fast asks for it by itself).
+    if (!s->below30) return opt_stat(OPT_OFF, s->buf2_boot == OPT_BUF2_ON && s->preset != 1 ? "save drops 2nd buffer" : "");
     if (!s->framegen) return opt_stat(OPT_INERT, "fg off");
     if (s->preset == 1) return opt_stat(OPT_INERT, "fast mode");
     if (s->fps_lock == 20) return opt_stat(OPT_INERT, "fps lock 20");
@@ -262,8 +265,8 @@ static inline size_t opt_format(char *out, size_t cap, const OptState *s)
     OPT_TOK(out, cap, &pos, "sharpness", v, opt_sharp(s), 1);
     OPT_TOK(out, cap, &pos, "enhance", opt_aa_name(s->upscale), opt_aa(s), 1);
     snprintf(v, sizeof(v), "%d", s->nmid);
-    OPT_TOK(out, cap, &pos, "gen_buffers", v, opt_stat(OPT_OFF, s->buf2_boot == OPT_BUF2_ON ? "below30 at boot"
-                                                     : s->buf2_boot == OPT_BUF2_OFF_B30 ? "below30=0 at boot"
+    OPT_TOK(out, cap, &pos, "gen_buffers", v, opt_stat(OPT_OFF, s->buf2_boot == OPT_BUF2_ON ? "fast or below30 at boot"
+                                                     : s->buf2_boot == OPT_BUF2_OFF_B30 ? "no fast, below30=0 at boot"
                                                      : s->buf2_boot == OPT_BUF2_OFF_OTHER ? "shave14 off" : ""), 0);
     OPT_TOK(out, cap, &pos, "game_vectors", s->game_vectors ? "on" : "off", opt_gv(s), 0);
     snprintf(v, sizeof(v), "%d", s->hud_protect);
