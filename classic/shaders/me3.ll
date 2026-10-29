@@ -15,6 +15,8 @@
 ; table: +0x70 consts {parity, ...}, +0xC0 V#L3cur, +0xD0 V#L3prev, +0xE0 V#V3 out (30x17 packed), +0x110 V#Fprev,
 ;        +0x120 V#misc
 target triple = "amdgcn--"
+declare i32 @llvm.amdgcn.readlane.i32(i32, i32)
+declare i32 @llvm.amdgcn.ds.swizzle(i32, i32 immarg)
 declare <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32>, i32, i32, i32 immarg)
 declare i32 @llvm.amdgcn.raw.buffer.load.i32(<4 x i32>, i32, i32, i32 immarg)
 declare i8 @llvm.amdgcn.raw.buffer.load.i8(<4 x i32>, i32, i32, i32 immarg)
@@ -297,17 +299,21 @@ entry:
   fence syncscope("workgroup") release
   call void @llvm.amdgcn.s.barrier()
   fence syncscope("workgroup") acquire
-  br label %loop
-loop:
-  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]
-  %m = phi i32 [ -1, %entry ], [ %m1, %loop ]
-  %ix = add i32 %base, %i
-  %q = getelementptr [64 x i32], ptr addrspace(3) @keys, i32 0, i32 %ix
-  %k = load i32, ptr addrspace(3) %q, align 4
-  %m1 = call i32 @llvm.umin.i32(i32 %m, i32 %k)
-  %i1 = add i32 %i, 1
-  %more = icmp ult i32 %i1, %n
-  br i1 %more, label %loop, label %done
+  ; butterfly over the lane's aligned group of 16 (ds_swizzle bit mode: and 0x1f, xor 1 / 2 / 4 / 8, 16, then the two wave halves)
+  %s1 = call i32 @llvm.amdgcn.ds.swizzle(i32 %key, i32 1055)
+  %r1 = call i32 @llvm.umin.i32(i32 %key, i32 %s1)
+  %s2 = call i32 @llvm.amdgcn.ds.swizzle(i32 %r1, i32 2079)
+  %r2 = call i32 @llvm.umin.i32(i32 %r1, i32 %s2)
+  %s4 = call i32 @llvm.amdgcn.ds.swizzle(i32 %r2, i32 4127)
+  %r4 = call i32 @llvm.umin.i32(i32 %r2, i32 %s4)
+  %s8 = call i32 @llvm.amdgcn.ds.swizzle(i32 %r4, i32 8223)
+  %r8 = call i32 @llvm.umin.i32(i32 %r4, i32 %s8)
+  %s16 = call i32 @llvm.amdgcn.ds.swizzle(i32 %r8, i32 16415)
+  %r16 = call i32 @llvm.umin.i32(i32 %r8, i32 %s16)
+  %h0 = call i32 @llvm.amdgcn.readlane.i32(i32 %r16, i32 0)
+  %h1 = call i32 @llvm.amdgcn.readlane.i32(i32 %r16, i32 32)
+  %m1 = call i32 @llvm.umin.i32(i32 %h0, i32 %h1)
+  br label %done
 done:
   fence syncscope("workgroup") release
   call void @llvm.amdgcn.s.barrier()
@@ -422,17 +428,23 @@ gdone:
   fence syncscope("workgroup") release
   call void @llvm.amdgcn.s.barrier()
   fence syncscope("workgroup") acquire
+  ; sum of the 64 lanes' %sv: ds_swizzle butterfly (xor 1 / 2 / 4 / 8 / 16) and the two wave halves; integer adds
+  ; in any order give the bits of lane 0's former serial loop over @vecs
+  %ss1 = call i32 @llvm.amdgcn.ds.swizzle(i32 %sv, i32 1055)
+  %sa1 = add i32 %sv, %ss1
+  %ss2 = call i32 @llvm.amdgcn.ds.swizzle(i32 %sa1, i32 2079)
+  %sa2 = add i32 %sa1, %ss2
+  %ss4 = call i32 @llvm.amdgcn.ds.swizzle(i32 %sa2, i32 4127)
+  %sa4 = add i32 %sa2, %ss4
+  %ss8 = call i32 @llvm.amdgcn.ds.swizzle(i32 %sa4, i32 8223)
+  %sa8 = add i32 %sa4, %ss8
+  %ss16 = call i32 @llvm.amdgcn.ds.swizzle(i32 %sa8, i32 16415)
+  %sa16 = add i32 %sa8, %ss16
+  %sh0 = call i32 @llvm.amdgcn.readlane.i32(i32 %sa16, i32 0)
+  %sh1 = call i32 @llvm.amdgcn.readlane.i32(i32 %sa16, i32 32)
+  %sacc1 = add i32 %sh0, %sh1
   %is0 = icmp eq i32 %tid, 0
-  br i1 %is0, label %sum, label %exit
-sum:
-  %si = phi i32 [ 0, %gdone ], [ %si1, %sum ]
-  %sacc = phi i32 [ 0, %gdone ], [ %sacc1, %sum ]
-  %pq = getelementptr [64 x i32], ptr addrspace(3) @vecs, i32 0, i32 %si
-  %q = load i32, ptr addrspace(3) %pq, align 4
-  %sacc1 = add i32 %sacc, %q
-  %si1 = add i32 %si, 1
-  %smore = icmp ult i32 %si1, 64
-  br i1 %smore, label %sum, label %st
+  br i1 %is0, label %st, label %exit
 st:
   %moff0 = shl i32 %par, 2
   %moff = add i32 %moff0, 8
