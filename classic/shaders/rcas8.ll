@@ -6,11 +6,17 @@
 ; packed RGBA8 + float luma = 1152 B of LDS) and barrier-synchronising the wave before any computation or store.
 ; Supports dynamic screen resolutions (reads width-1 and height-1 directly from T# dword 2).
 ; table: +0x20 T#cur (real frame), +0x40 T#out (generated mid frame),
-;        +0x220 {rcas_con (float bits), rcas_flags (bit 0 = mid, bit 1 = cur, bits 2..3 = enhance mode 0/1/2)}.
+;        +0x220 {rcas_con (float bits), rcas_flags (bit 0 = mid, bit 1 = cur, bits 2..3 = enhance mode 0/1/2,
+;        bit 4 = the mid's alpha carries warp8's static-pixel flag, honoured on the mid pass: those lanes stay raw (no AA,
+;        no sharpening, no store) and a wave whose 64 lanes are all static skips the pass after the tile load,
+;        bit 5 = with bits 0, 1 and 4: the real frame (processed in place, the next pair's P) skips the AA where the
+;        mid pass of the same lane found the static flag, and is written back raw where its AA result equals the
+;        texel of T#prev (+0x00): static, but P holds last frame's AA of it)}.
 target triple = "amdgcn--"
 declare <4 x float> @llvm.amdgcn.image.load.2d.v4f32.i32(i32 immarg, i32, i32, <8 x i32>, i32 immarg, i32 immarg)
 declare void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float>, i32 immarg, i32, i32, <8 x i32>, i32 immarg, i32 immarg)
 declare void @llvm.amdgcn.s.barrier()
+declare i64 @llvm.amdgcn.ballot.i64(i1)
 declare i32 @llvm.smax.i32(i32, i32)
 declare i32 @llvm.smin.i32(i32, i32)
 declare float @llvm.fabs.f32(float)
@@ -55,11 +61,11 @@ define internal <4 x float> @scale4(<4 x float> %a, float %s) alwaysinline {
 }
 
 define internal i32 @q8(float %v) alwaysinline {
+  ; r >= 0.5 after sat, so fptoui (truncation) already equals floor: no v_floor
   %c = call float @sat(float %v)
   %s = fmul float %c, 255.0
   %r = fadd float %s, 0.5
-  %f = call float @llvm.floor.f32(float %r)
-  %i = fptoui float %f to i32
+  %i = fptoui float %r to i32
   ret i32 %i
 }
 
@@ -101,8 +107,12 @@ define internal <4 x float> @unpack_rgb(i32 %pk) alwaysinline {
 }
 
 define internal void @lds_put(<8 x i32> %t, i32 %bx0, i32 %by0, i32 %wm1, i32 %hm1, i32 %idx) alwaysinline {
-  %ty = udiv i32 %idx, 12
-  %tx = urem i32 %idx, 12
+  ; idx < 144: idx / 12 == (idx * 171) >> 11 exactly (idx < 192), on full-rate 24-bit multiplies instead of the
+  ; quarter-rate v_mul_hi_u32 / v_mul_lo_u32 of udiv / urem
+  %ty171 = mul nuw nsw i32 %idx, 171
+  %ty = lshr i32 %ty171, 11
+  %ty12 = mul nuw nsw i32 %ty, 12
+  %tx = sub nuw nsw i32 %idx, %ty12
   %x0 = add i32 %bx0, %tx
   %x1 = sub i32 %x0, 2
   %xc0 = call i32 @llvm.smax.i32(i32 %x1, i32 0)
@@ -134,7 +144,7 @@ define internal <4 x float> @rd_c(i32 %idx) alwaysinline {
   ret <4 x float> %c
 }
 
-define internal <4 x float> @eval_tile(<8 x i32> %t, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode) alwaysinline {
+define internal { <4 x float>, i1, i1 } @eval_tile(<8 x i32> %t, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st, i1 %st_ext) alwaysinline {
 entry:
   %t2 = extractelement <8 x i32> %t, i32 2
   %wm1 = and i32 %t2, 16383
@@ -144,12 +154,12 @@ entry:
   %id1 = add i32 %tid, 64
   call void @lds_put(<8 x i32> %t, i32 %bxp, i32 %byp, i32 %wm1, i32 %hm1, i32 %id1)
   %lt16 = icmp ult i32 %tid, 16
-  br i1 %lt16, label %ld_tail, label %ld_sync
+  br i1 %lt16, label %ld_tail, label %ld_bar
 ld_tail:
   %id2 = add i32 %tid, 128
   call void @lds_put(<8 x i32> %t, i32 %bxp, i32 %byp, i32 %wm1, i32 %hm1, i32 %id2)
-  br label %ld_sync
-ld_sync:
+  br label %ld_bar
+ld_bar:
   call void @bar()
   ; center index in 12x12 LDS tile: (ly + 2) * 12 + (lx + 2)
   %ly2 = add i32 %ly, 2
@@ -166,7 +176,25 @@ ld_sync:
   %iSE = add i32 %ci, 13
 
   %M  = call <4 x float> @rd_c(i32 %ci)
-  %N  = call <4 x float> @rd_c(i32 %iN)
+  %N  = call <4 x float> @rd_c(i32 %iN)   ; read with M (one ds_read2), before the early-out
+  ; static pixel (warp8 alpha flag 1.0 = P == C here): the real frames show it raw, so any post-process only in the mid
+  ; alternates at 30 Hz; the lane stays raw (no AA, no sharpening: rcas_only with w_eff = 0 returns M bit for bit) and
+  ; skips its store. st_ext: the cur pass (bit 5) takes the static flag the mid pass read for this lane (con 0 there).
+  %aM = extractelement <4 x float> %M, i32 3
+  %st_c = fcmp ogt float %aM, 0x3FEFF7CEE0000000 ; 0.999
+  %st_skip0 = and i1 %use_st, %st_c
+  %st_skip = or i1 %st_skip0, %st_ext
+  %nst = xor i1 %st_skip, true
+  ; a wave (= workgroup) with every lane static returns M without any further work or store (uniform branch)
+  %nst_bal = call i64 @llvm.amdgcn.ballot.i64(i1 %nst)
+  %any_nst = icmp ne i64 %nst_bal, 0
+  br i1 %any_nst, label %ld_sync, label %all_still
+all_still:
+  %as0 = insertvalue { <4 x float>, i1, i1 } undef, <4 x float> %M, 0
+  %as1 = insertvalue { <4 x float>, i1, i1 } %as0, i1 false, 1
+  %as2 = insertvalue { <4 x float>, i1, i1 } %as1, i1 true, 2
+  ret { <4 x float>, i1, i1 } %as2
+ld_sync:
   %S  = call <4 x float> @rd_c(i32 %iS)
   %W  = call <4 x float> @rd_c(i32 %iW)
   %E  = call <4 x float> @rd_c(i32 %iE)
@@ -219,7 +247,12 @@ ld_sync:
   %tg0 = fdiv arcp afn float %gDir, %rng9e
   %tg1 = fmul float %tg0, 1.5
   %tex_gate = call float @sat(float %tg1)
+  %s_nw = fadd float %lN, %lW
+  %s_es = fadd float %lE, %lS
+  %s4l = fadd float %s_nw, %s_es
+  br i1 %sharp, label %rcas_w, label %rcas_w_done
 
+rcas_w:
   ; RCAS adaptive lobe weight (5-tap extrema + Karis highlight compression)
   %mx5e = fadd float %mx5, 0x3F10000000000000 ; 2^-14
   %den0 = fmul float %mx5e, 4.0
@@ -238,9 +271,6 @@ ld_sync:
   %w_karis = fdiv arcp afn float 1.0, %k_den
   %w0 = fmul float %w0_raw, %w_karis
 
-  %s_nw = fadd float %lN, %lW
-  %s_es = fadd float %lE, %lS
-  %s4l = fadd float %s_nw, %s_es
   %avg4 = fmul float %s4l, 0.25
   %nz0 = fsub float %avg4, %lM
   %anz = call float @llvm.fabs.f32(float %nz0)
@@ -262,17 +292,12 @@ ld_sync:
   %w_sh1 = fmul float %w_sh0, 0x3FB99999A0000000 ; 0.10
   %w_sh2 = fmul float %w_sh1, %w_karis
   %w_shim = fmul float %w_sh2, %con_g
-  %w_rcas = fadd float %w_sharp, %w_shim
+  %w_rcas0 = fadd float %w_sharp, %w_shim
+  br label %rcas_w_done
 
+rcas_w_done:
+  %w_rcas = phi float [ %w_rcas0, %rcas_w ], [ 0.0, %ld_sync ]
   %has_enh = icmp ugt i32 %emode, 0
-  br i1 %has_enh, label %do_aa, label %rcas_only
-
-do_aa:
-  %NW = call <4 x float> @rd_c(i32 %iNW)
-  %NE = call <4 x float> @rd_c(i32 %iNE)
-  %SW = call <4 x float> @rd_c(i32 %iSW)
-  %SE = call <4 x float> @rd_c(i32 %iSE)
-
   %is_str = icmp uge i32 %emode, 2
   %thr_abs = select i1 %is_str, float 0.015625, float 0.0234375 ; 4/256 vs 6/256
   %thr_rel = select i1 %is_str, float 0.0625, float 0.09375     ; 4/64 vs 6/64
@@ -281,6 +306,19 @@ do_aa:
   %er0 = fsub float %rng9, %ethr
   %er1 = fmul float %er0, 32.0
   %edge_ramp = call float @sat(float %er1)
+  ; edge_ramp == 0 makes wAA == 0 and w_eff == w_rcas: the AA block returns M bit for bit, so those lanes take the
+  ; rcas_only path too (waves with no edge lane skip the AA block)
+  %has_edge = fcmp ogt float %edge_ramp, 0.0
+  %doaa0 = and i1 %has_enh, %nst
+  %doaa = and i1 %doaa0, %has_edge
+  br i1 %doaa, label %do_aa, label %rcas_only
+
+do_aa:
+  %NW = call <4 x float> @rd_c(i32 %iNW)
+  %NE = call <4 x float> @rd_c(i32 %iNE)
+  %SW = call <4 x float> @rd_c(i32 %iSW)
+  %SE = call <4 x float> @rd_c(i32 %iSE)
+
 
   ; directional AA Sobel orientation: horizontal vs vertical
   %lW2 = fmul float %lW, 2.0
@@ -461,11 +499,25 @@ do_aa:
   br label %rcas_apply
 
 rcas_only:
+  %w_ro = select i1 %st_skip, float 0.0, float %w_rcas
   br label %rcas_apply
 
 rcas_apply:
   %base_c = phi <4 x float> [ %aa_rgb, %do_aa ], [ %M, %rcas_only ]
-  %w_eff  = phi float [ %w_eff_aa, %do_aa ], [ %w_rcas, %rcas_only ]
+  %w_eff  = phi float [ %w_eff_aa, %do_aa ], [ %w_ro, %rcas_only ]
+  ; changed: the lane took the AA block. Otherwise (con == 0) out is M as read through the 8-bit LDS copy, which on
+  ; an 8_8_8_8 surface is the stored texel bit for bit, so main may skip its store
+  %chg = phi i1 [ true, %do_aa ], [ false, %rcas_only ]
+  br i1 %sharp, label %rcas_full, label %aa_out
+
+aa_out:
+  %out_aa = insertelement <4 x float> %base_c, float %aM, i32 3
+  %ra0 = insertvalue { <4 x float>, i1, i1 } undef, <4 x float> %out_aa, 0
+  %ra1 = insertvalue { <4 x float>, i1, i1 } %ra0, i1 %chg, 1
+  %ra2 = insertvalue { <4 x float>, i1, i1 } %ra1, i1 %st_skip, 2
+  ret { <4 x float>, i1, i1 } %ra2
+
+rcas_full:
 
   %dSum_c0 = fadd float %dNS, %dWE
   %dSum_c = fadd float %dSum_c0, 0x3F10000000000000 ; 2^-14
@@ -497,9 +549,11 @@ rcas_apply:
   %c_mx5 = call <4 x float> @llvm.maxnum.v4f32(<4 x float> %c_mx4, <4 x float> %base_c)
   %cl0 = call <4 x float> @llvm.maxnum.v4f32(<4 x float> %res0, <4 x float> %c_mn5)
   %cl1 = call <4 x float> @llvm.minnum.v4f32(<4 x float> %cl0, <4 x float> %c_mx5)
-  %alpha = extractelement <4 x float> %M, i32 3
-  %out = insertelement <4 x float> %cl1, float %alpha, i32 3
-  ret <4 x float> %out
+  %out = insertelement <4 x float> %cl1, float %aM, i32 3
+  %rf0 = insertvalue { <4 x float>, i1, i1 } undef, <4 x float> %out, 0
+  %rf1 = insertvalue { <4 x float>, i1, i1 } %rf0, i1 %nst, 1   ; a static lane is M bit for bit (w_eff 0): no store
+  %rf2 = insertvalue { <4 x float>, i1, i1 } %rf1, i1 %st_skip, 2
+  ret { <4 x float>, i1, i1 } %rf2
 }
 
 define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 inreg %gy, i32 %tid) #0 {
@@ -519,27 +573,75 @@ entry:
   %do_mid = icmp ne i32 %do_mid0, 0
   %em0 = lshr i32 %rfl, 2
   %emode = and i32 %em0, 3
+  ; bit 4: the mid's alpha carries warp8's static-pixel flag (set by main.c only when warp8 wrote the mid)
+  %stb = and i32 %rfl, 16
+  %use_st = icmp ne i32 %stb, 0
+  %rsb = and i32 %rfl, 32
+  %real_s1 = icmp ne i32 %rsb, 0
+  ; con == 0 (Sharpness 0): the RCAS weight is +-0 everywhere, so rcas_apply returns base_c bit for bit; skip it
+  %conabs = and i32 %conb, 2147483647
+  %sharp = icmp ne i32 %conabs, 0
+  ; unchanged lanes (no AA, no sharpening) skip their store only on an 8_8_8_8 surface (data format 10 in T# dword 1
+  ; bits 20..25, the same for T#cur and T#out): there the 8-bit LDS round trip returns the texel bit for bit, so the
+  ; store would rewrite the same value (and neighbour tiles read the same value either way). Other formats keep
+  ; storing every lane, as before.
+  %pdf = getelementptr i8, ptr addrspace(4) %tbl, i64 32
+  %tcd = load <4 x i32>, ptr addrspace(4) %pdf, align 16, !invariant.load !0
+  %t1w = extractelement <4 x i32> %tcd, i32 1
+  %dfs = lshr i32 %t1w, 20
+  %dfmt = and i32 %dfs, 63
+  %is8888 = icmp eq i32 %dfmt, 10
+  %keep_all = xor i1 %is8888, true
   br i1 %do_mid, label %pass_mid, label %check_cur
 pass_mid:
   %pto = getelementptr i8, ptr addrspace(4) %tbl, i64 64
   %to = load <8 x i32>, ptr addrspace(4) %pto, align 32, !invariant.load !0
-  %om = call <4 x float> @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode)
+  %omr = call { <4 x float>, i1, i1 } @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st, i1 false)
+  %om = extractvalue { <4 x float>, i1, i1 } %omr, 0
+  %omc = extractvalue { <4 x float>, i1, i1 } %omr, 1
+  %oms = extractvalue { <4 x float>, i1, i1 } %omr, 2
+  %om_st = or i1 %omc, %keep_all
+  br i1 %om_st, label %st_mid, label %mid_join
+st_mid:
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %om, i32 15, i32 %x, i32 %y, <8 x i32> %to, i32 0, i32 0)
+  br label %mid_join
+mid_join:
   call void @bar()
   br label %check_cur
 check_cur:
+  %mid_st = phi i1 [ %oms, %mid_join ], [ false, %entry ]
+  %cur_st = and i1 %mid_st, %real_s1
   %do_cur0 = and i32 %rfl, 2
   %do_cur = icmp ne i32 %do_cur0, 0
   br i1 %do_cur, label %pass_cur, label %done
 pass_cur:
   %ptc = getelementptr i8, ptr addrspace(4) %tbl, i64 32
   %tc = load <8 x i32>, ptr addrspace(4) %ptc, align 32, !invariant.load !0
-  %oc = call <4 x float> @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode)
+  %ocr = call { <4 x float>, i1, i1 } @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 false, i1 %cur_st)
+  %oc = extractvalue { <4 x float>, i1, i1 } %ocr, 0
+  %occ = extractvalue { <4 x float>, i1, i1 } %ocr, 1
+  %oc_st = or i1 %occ, %keep_all
+  br i1 %oc_st, label %wb_sel, label %done
+wb_sel:
+  %wb_try = and i1 %real_s1, %occ
+  br i1 %wb_try, label %wb_chk, label %st_cur
+wb_chk:
+  ; bit 5 write-back: the AA result equals P's stored code here, so P is last frame's AA of a static pixel; skip the
+  ; store (the real frame keeps its raw texel) so that the pixel compares static again from the next pair on
+  %tp = load <8 x i32>, ptr addrspace(4) %tbl, align 32, !invariant.load !0   ; T#prev (+0x00)
+  %pv = call <4 x float> @llvm.amdgcn.image.load.2d.v4f32.i32(i32 15, i32 %x, i32 %y, <8 x i32> %tp, i32 0, i32 0)
+  %pk_p = call i32 @pack_rgba(<4 x float> %pv)
+  %pk_o = call i32 @pack_rgba(<4 x float> %oc)
+  %pk_x = xor i32 %pk_p, %pk_o
+  %pk_rgb = and i32 %pk_x, 16777215
+  %wb_same = icmp eq i32 %pk_rgb, 0
+  br i1 %wb_same, label %done, label %st_cur
+st_cur:
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %oc, i32 15, i32 %x, i32 %y, <8 x i32> %tc, i32 0, i32 0)
   br label %done
 done:
   ret void
 }
 
-attributes #0 = { "amdgpu-flat-work-group-size"="64,64" }
+attributes #0 = { "amdgpu-flat-work-group-size"="64,64" "denormal-fp-math-f32"="preserve-sign,preserve-sign" }
 !0 = !{}
