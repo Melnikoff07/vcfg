@@ -247,6 +247,7 @@ static void log_open(void)
 
 // q-cpucost cuts (cpu_cost.h), one opt-in file each, read once by cc_read_cuts when the io thread starts.
 static int g_cc_monev = 0, g_cc_iolazy = 0, g_cc_nospin = 0, g_cc_quiet = 0;
+static int g_fast_pace = 0;   // FG Fast pacing (pace_policy.h fast_slots): opt-in file LOG_DIR/fastpace_<TITLE>
 static volatile uint32_t g_cc_lines = 0, g_cc_klog_bytes = 0;   // lines through klog and their bytes (CPU plugin line)
 
 static volatile uint32_t g_lgw_lock;   // lg_write may run on the game's thread (sync window) and the io thread at once
@@ -2578,6 +2579,9 @@ static void cc_read_cuts(void)
     g_cc_quiet = cc_file("quietlog");
     lg("cpu cuts: monev=%d iolazy=%d nospin=%d tracelite=%d quietlog=%d (files " LOG_DIR "/<cut>_%s)\n",
        g_cc_monev, g_cc_iolazy, g_cc_nospin, g_tr_lite, g_cc_quiet, g_title_id);
+    g_fast_pace = cc_file("fastpace");
+    lg("fast pace: %d (FG Fast: queue cut %.2f refreshes, phases 1/3 2/3 1/2; file " LOG_DIR "/fastpace_%s)\n",
+       g_fast_pace, FAST_QCUT_Q8 / 256.0, g_title_id);
 }
 
 // Timer pacers: wait until the process-time counter reaches target. Today: sleep until 1 ms before it (nothing below
@@ -4002,8 +4006,9 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     // below30 and FG Fast (the two that emit 3-slot pairs): the 1st generated frame goes into the buffer
                     // flipped longest ago, the 2nd into the next one (pace_policy.h mid_lru); with 2-slot pairs only this is
                     // the round robin above. Fast with the round robin waited ~5-11 ms per 3-slot pair in WaitFlipDone with
-                    // our DCB on the game's ring ("fence wait" 0.5-1.7 ms per pair, CUSA18723 29/10). Quality / Sharp
-                    // without below30: as v2.35.
+                    // our DCB on the game's ring ("fence wait" 0.5-1.7 ms per pair, CUSA18723 29/10). Fast takes this order
+                    // with or without fastpace_<TITLE>, which only changes the 3rd-slot cut and the phases (fast_slots).
+                    // Quality / Sharp without below30: as v2.35.
                     int mid_lru_on = (g_cfg.below30 || g_cfg.preset == 1) && !(pcopy && g_pcopy_k >= 2) && g_nmid >= 2 && (uint32_t)g_nmid <= MID_LRU_MAX;
                     if (mid_lru_on) {
                         if (g_mid_lru.n != (uint32_t)g_nmid) mid_lru_reset(&g_mid_lru, (uint32_t)g_nmid);
@@ -4027,29 +4032,21 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             g_fast_acc_q16 = 0;
                             t1_q16 = 0;
                         } else {
-                            uint32_t dt_clamped = g_ema_frame_us;
-                            if (dt_clamped < 25000u) dt_clamped = 25000u; // 40 fps
-                            if (dt_clamped > 50000u) dt_clamped = 50000u; // 20 fps
-                            int32_t r_q16 = (int32_t)(((uint64_t)dt_clamped << 16) / 16683ull);
-                            int32_t acc_prev = g_fast_acc_q16;
-                            int32_t acc_new = acc_prev + r_q16;
-                            int m_out = (int)((acc_new + 32768) >> 16);
-                            if (m_out < 2) m_out = 2;
-                            if (m_out > 3) m_out = 3;
-                            // Queue backpressure guard: drop to M=2 if flip queue has >=3 pending flips
-                            if (cc_pending_flips() >= 3u) m_out = 2;
-                            g_fast_acc_q16 = acc_new - (m_out << 16);
-                            if (g_fast_acc_q16 < -49152) g_fast_acc_q16 = -49152;
-                            if (g_fast_acc_q16 >  49152) g_fast_acc_q16 =  49152;
-
-                            int32_t phase_shift = (acc_prev * 3) >> 5; // smooth sub-vblank phase offset (~0.1 * acc_prev)
+                            // Slots and phases (pace_policy.h fast_slots / fast_phases_q16). fast_pace 0: the v2.35 rule,
+                            // queue guard on >= 3 pending flips. fast_pace 1: queue cut in refreshes of flips ahead.
+                            uint32_t f_pend = cc_pending_flips(), f_ahead = 0;
+                            if (g_fast_pace) {
+                                uint32_t vbu = 16683u;
+                                uint32_t to_vb = vblank_to_next_edge_us((int32_t)handle, sceKernelGetProcessTime(), &vbu);
+                                f_ahead = b30_queue_ahead_q8(f_pend, to_vb, refresh_period_q8());
+                            }
+                            int32_t acc_prev = 0;
+                            int m_out = (int)fast_slots(&g_fast_acc_q16, g_ema_frame_us, g_fast_pace, f_pend, f_ahead, &acc_prev);
+                            uint32_t f_t1 = t1_q16, f_t2 = t2_q16;
+                            fast_phases_q16((uint32_t)m_out, acc_prev, g_fast_pace, &f_t1, &f_t2);
                             if (m_out == 3) {
-                                int32_t p1 = 21845 + phase_shift; // ~1/3 (0.333)
-                                int32_t p2 = 43690 + phase_shift; // ~2/3 (0.667)
-                                if (p1 < 16384) p1 = 16384; if (p1 > 27525) p1 = 27525;
-                                if (p2 < 38010) p2 = 38010; if (p2 > 49152) p2 = 49152;
-                                t1_q16 = (uint32_t)p1;
-                                t2_q16 = (uint32_t)p2;
+                                t1_q16 = f_t1;
+                                t2_q16 = f_t2;
                                 if ((tb_fast ? g_pcopy_k : g_nmid) >= 2 && mi1 != mi2) {
                                     two_mids = 1;
                                     mid2_flip_idx = mi2;
@@ -4058,9 +4055,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                     t1_q16 = 32768u;
                                 }
                             } else {
-                                int32_t p1 = 32768 + phase_shift;
-                                if (p1 < 22937) p1 = 22937; if (p1 > 42598) p1 = 42598;
-                                t1_q16 = (uint32_t)p1;
+                                t1_q16 = f_t1;
                             }
                         }
                     } else if (!g_fg_off) {

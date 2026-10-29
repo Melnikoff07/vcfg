@@ -305,3 +305,64 @@ static inline uint32_t b30_feed_us(uint32_t own_us, uint32_t extra_us)
     return f < own_us / 2u ? own_us / 2u : f;
 }
 
+// ---- FG Fast (preset 1): slots per pair and display phases ----
+// fast_pace 0 keeps the slots and phases of FG Fast in v2.35: the accumulator reads g_ema_frame_us (hand-over
+// interval), a pair keeps 2 slots while >= 3 flips are pending, and the phases are 1/3, 2/3 (or 1/2) plus 3/32 of the
+// accumulator. The buffers are not part of the option: FG Fast writes its generated frames into the mid_lru buffers
+// (below-30 order, main.c mid_lru_on) with or without it. With g_flips % 2 the pair after a 3-slot pair wrote into the
+// buffer flipped last, and its WaitFlipDone held the graphics ring until the real after it latched (~10 ms in the
+// replay; console 29/10: fence 0.5-1.3 ms per real); the interval the accumulator reads included that wait, so more
+// 3-slot pairs made longer intervals and more 3-slot pairs. fast_pace 1 (opt-in file fastpace_<TITLE>) changes two
+// things, from the m-fast simulator (GPU-serialised replay of console FTRACE intervals, 20-30 fps):
+//  * the queue guard measures the flips ahead in refreshes (FAST_QCUT_Q8) instead of counting pending flips;
+//  * the phases are exactly 1/3, 2/3 and 1/2: the accumulator shift moved them off the display slots (judder rms
+//    -0.25 to -0.33 ms in the replay at 24-30 fps).
+#define FAST_QCUT_Q8 576u   // 2.25 refreshes of flips ahead at the decision (simulator sweep 1.5-2.5 at 24/26/28 fps)
+static inline uint32_t fast_slots(int32_t *acc_q16, uint32_t ema_frame_us, int fast_pace, uint32_t pending,
+                                  uint32_t queue_ahead_q8, int32_t *acc_prev)
+{
+    uint32_t dt = ema_frame_us;
+    if (dt < 25000u) dt = 25000u;   // 40 fps
+    if (dt > 50000u) dt = 50000u;   // 20 fps
+    int32_t r_q16 = (int32_t)(((uint64_t)dt << 16) / 16683ull);
+    int32_t prev = *acc_q16;
+    int32_t acc_new = prev + r_q16;
+    int m = (int)((acc_new + 32768) >> 16);
+    if (m < 2) m = 2;
+    if (m > 3) m = 3;
+    if (!fast_pace) {
+        if (pending >= 3u) m = 2;
+    } else if (m == 3 && queue_ahead_q8 > FAST_QCUT_Q8) {
+        m = 2;
+    }
+    int32_t a = acc_new - (m << 16);
+    if (a < -49152) a = -49152;
+    if (a > 49152) a = 49152;
+    *acc_q16 = a;
+    if (acc_prev) *acc_prev = prev;
+    return (uint32_t)m;
+}
+// Phases of the generated frames, Q16. A 2-slot pair writes only *t1 (t2 stays what the caller had).
+static inline void fast_phases_q16(uint32_t m, int32_t acc_prev, int fast_pace, uint32_t *t1, uint32_t *t2)
+{
+    if (fast_pace) {
+        if (m == 3u) { *t1 = 21845u; *t2 = 43691u; }
+        else *t1 = 32768u;
+        return;
+    }
+    int32_t sh = (acc_prev * 3) >> 5;   // ~0.094 * acc_prev
+    if (m == 3u) {
+        int32_t p1 = 21845 + sh, p2 = 43690 + sh;
+        if (p1 < 16384) p1 = 16384;
+        if (p1 > 27525) p1 = 27525;
+        if (p2 < 38010) p2 = 38010;
+        if (p2 > 49152) p2 = 49152;
+        *t1 = (uint32_t)p1;
+        *t2 = (uint32_t)p2;
+    } else {
+        int32_t p1 = 32768 + sh;
+        if (p1 < 22937) p1 = 22937;
+        if (p1 > 42598) p1 = 42598;
+        *t1 = (uint32_t)p1;
+    }
+}
