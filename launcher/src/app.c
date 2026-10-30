@@ -568,7 +568,8 @@ static void draw_dev_expanded(Canvas *c, App *a, int top, Game *g, DevCfg *d)
     Fonts *f = a->f;
     int y = top + 58, w = c->w - 2 * M, h = 756;
     uint32_t sub_box = a->dark_theme ? 0xFF11141Bu : 0xFFE4E2DAu;
-    int has_issue = !d->rec_applied && (d->diag_kind >= DIAG_OOM_BOOT || d->has_crash || d->safe_state > 0 || d->rec_mask != 0);
+    int has_issue = d->diag_kind == DIAG_GPU_HEADROOM ||
+                    (!d->rec_applied && (d->diag_kind >= DIAG_OOM_BOOT || d->has_crash || d->safe_state > 0 || d->rec_mask != 0));
     uint32_t adv_col = has_issue ? RED : ((d->rec_applied || d->diag_kind == DIAG_OK) ? BLUE : th.div);
 
     fill_round(c, M, y, w, h, 22, th.panel);
@@ -708,7 +709,8 @@ static void draw_dev(Canvas *c, App *a, int top)
 
     // ---- Block 2: Crash & Log Advisor Box (y+142 .. y+482, height 340) ----
     int ay = y + 142, ah = 340;
-    int has_issue = !d->rec_applied && (d->diag_kind >= DIAG_OOM_BOOT || d->has_crash || d->safe_state > 0 || d->rec_mask != 0);
+    int has_issue = d->diag_kind == DIAG_GPU_HEADROOM ||
+                    (!d->rec_applied && (d->diag_kind >= DIAG_OOM_BOOT || d->has_crash || d->safe_state > 0 || d->rec_mask != 0));
     uint32_t adv_border = has_issue ? RED : ((d->rec_applied || d->diag_kind == DIAG_OK) ? BLUE : th.div);
     fill_round(c, M, ay, lw, ah, 18, th.panel);
     stroke_rect(c, M, ay, lw, ah, 3, adv_border);

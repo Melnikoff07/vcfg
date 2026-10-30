@@ -379,6 +379,89 @@ static int kv_uint_after(const char *s, const char *key, unsigned def)
     if (!p) return (int)def;
     return atoi(p + strlen(key));
 }
+// Regime readings of the trace. The plugin writes one window line every 2-3 s; the first ones (7 s) are still the warm-up,
+// so the Advisor reads the last TR_WIN windows of each line, from the "last lines" part of the trace when there is one,
+// and takes their median. Values are fixed point x100 ("8.19" -> 819).
+#define TR_WIN 16
+static int x100_at(const char *p)
+{
+    while (*p == ' ') p++;
+    int v = 0, frac = 0, nf = 0;
+    while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; if (v > 1000000) break; }
+    if (*p == '.') { p++; while (*p >= '0' && *p <= '9' && nf < 2) { frac = frac * 10 + (*p - '0'); nf++; p++; } }
+    if (nf == 1) frac *= 10;
+    return v * 100 + frac;
+}
+// Value after key inside the line that starts at ln (up to its newline); -1 when the key is not on that line.
+static int line_x100(const char *ln, const char *key)
+{
+    const char *e = strchr(ln, '\n');
+    const char *p = strstr(ln, key);
+    if (!p || (e && p > e)) return -1;
+    return x100_at(p + strlen(key));
+}
+static int median_x100(const int *v, int n)
+{
+    if (n <= 0) return -1;
+    int s[TR_WIN];
+    for (int i = 0; i < n; i++) {
+        int x = v[i], j = i;
+        while (j > 0 && s[j - 1] > x) { s[j] = s[j - 1]; j--; }
+        s[j] = x;
+    }
+    return (n & 1) ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+}
+typedef struct {
+    int n_gpu, ours, fence;              // "GPU time of our passes: ... = X ms (+ fence wait F)"
+    int n_split, warp, rcas, pcopy;      // "PASSES split ms: warp8 W rcas8+osd R pcopy8 P"
+    int n_stat, fps, drops;              // "STAT gnm: F flips/s, max dt D ms": windows with a real frame held a refresh too long
+    int n_cad, pace_to, missed, hz;      // CADENCE: pace timeouts, missed (median), refresh
+} TraceRegime;
+static void trace_regime(const char *ts, TraceRegime *r)
+{
+    memset(r, 0, sizeof(*r));
+    r->ours = r->fence = r->warp = r->rcas = r->pcopy = r->fps = r->pace_to = r->missed = r->hz = -1;
+    if (!ts) return;
+    const char *base = strstr(ts, "---- last lines");
+    if (!base) base = ts;
+    int ours[TR_WIN], fence[TR_WIN], warp[TR_WIN], rcas[TR_WIN], pcopy[TR_WIN], fps[TR_WIN], dt[TR_WIN], pto[TR_WIN], mis[TR_WIN], hz[TR_WIN];
+    int ng = 0, ns = 0, nst = 0, nc = 0;
+    for (const char *p = base; (p = strstr(p, "GPU time of our passes:")) != NULL; p++) {
+        const char *eq = strstr(p, " = ");
+        const char *e = strchr(p, '\n');
+        int f = line_x100(p, "fence wait ");
+        if (!eq || (e && eq > e) || f < 0) continue;
+        ours[ng % TR_WIN] = x100_at(eq + 3); fence[ng % TR_WIN] = f; ng++;
+    }
+    for (const char *p = base; (p = strstr(p, "PASSES split ms:")) != NULL; p++) {
+        int w = line_x100(p, "warp8 "), rc = line_x100(p, "rcas8+osd "), pc = line_x100(p, "pcopy8 ");
+        if (w < 0 || rc < 0 || pc < 0) continue;
+        warp[ns % TR_WIN] = w; rcas[ns % TR_WIN] = rc; pcopy[ns % TR_WIN] = pc; ns++;
+    }
+    for (const char *p = base; (p = strstr(p, "STAT gnm:")) != NULL; p++) {
+        int f = line_x100(p, "STAT gnm:"), d = line_x100(p, "max dt ");
+        if (f < 0 || d < 0) continue;
+        fps[nst % TR_WIN] = f; dt[nst % TR_WIN] = d; nst++;
+    }
+    for (const char *p = base; (p = strstr(p, "CADENCE (")) != NULL; p++) {
+        int t = line_x100(p, "pace timeouts "), m = line_x100(p, "missed "), h = line_x100(p, "refresh ");
+        if (t < 0 || m < 0) continue;
+        pto[nc % TR_WIN] = t / 100; mis[nc % TR_WIN] = m / 100; hz[nc % TR_WIN] = h; nc++;
+    }
+    r->n_gpu = ng < TR_WIN ? ng : TR_WIN;
+    r->n_split = ns < TR_WIN ? ns : TR_WIN;
+    r->n_stat = nst < TR_WIN ? nst : TR_WIN;
+    r->n_cad = nc < TR_WIN ? nc : TR_WIN;
+    r->ours = median_x100(ours, r->n_gpu); r->fence = median_x100(fence, r->n_gpu);
+    r->warp = median_x100(warp, r->n_split); r->rcas = median_x100(rcas, r->n_split); r->pcopy = median_x100(pcopy, r->n_split);
+    r->fps = median_x100(fps, r->n_stat);
+    r->pace_to = median_x100(pto, r->n_cad); r->missed = median_x100(mis, r->n_cad); r->hz = median_x100(hz, r->n_cad);
+    if (r->hz < 2000) r->hz = 5994;
+    // A real frame held one refresh or more past its slot: 2 refreshes at 25+ fps, 3 below (x100 ms = 100000 * n / hz).
+    int nvb = r->fps >= 2500 ? 2 : 3;
+    int lim = (int)((100000LL * 100 * nvb + 50000LL * 100) / r->hz);   // n + 0.5 refreshes, x100 ms
+    for (int i = 0; i < r->n_stat; i++) if (dt[i] > lim) r->drops++;
+}
 static void add_tail_lines(DevCfg *d, const char *src)
 {
     if (!src || !*src) return;
@@ -604,8 +687,19 @@ static void refresh_dev_status(Game *g)
     int has_inert_log  = (has_safe_mem || has_hdr_inert || has_60fps_inert ||
                           strstr(bs, "INERT:") != NULL || strstr(ts, "INERT:") != NULL ||
                           strstr(bs, "refused (") != NULL || strstr(ts, "safe mode: refused") != NULL);
-    unsigned pace_to   = (unsigned)kv_uint_after(ts, "pace timeouts ", 0);
-    unsigned missed_vb = (unsigned)kv_uint_after(ts, "missed ", 0);
+    // Flip queue and GPU readings of the session's regime (median of the last windows, never the warm-up window).
+    // CADENCE "missed" counts flips the monitor thread did not see, not frames that missed the screen: on CUSA02299
+    // the unpinned monitor saw 3-14 of 60 generated frames while VideoOut showed all of them (M1R1 by FLIPLOG and the
+    // camera), so it is shown in the text but decides nothing.
+    TraceRegime tr;
+    trace_regime(tb ? ts : NULL, &tr);
+    unsigned pace_to   = tr.pace_to > 0 ? (unsigned)tr.pace_to : 0u;
+    unsigned missed_vb = tr.missed > 0 ? (unsigned)tr.missed : 0u;
+    int stalled        = strstr(ts, "STALL SNAPSHOT") != NULL || pace_to > 10;
+    // No GPU headroom: real frames held past their slot in a quarter or more of the windows while our passes take
+    // 6 ms or more of the GPU (the 30 fps budget is 33.4 ms and the game needs the rest). "game span" is not the game's
+    // GPU cost (it is the time between our passes, idle included: span + ours stays ~33.4 ms whatever we cost).
+    int gpu_tight      = tr.n_gpu >= 3 && tr.n_stat >= 4 && tr.ours >= 600 && tr.drops * 4 >= tr.n_stat;
     int fg_ran         = (strstr(ts, "mode4 #") != NULL || strstr(ts, "vout fg #") != NULL ||
                           strstr(bs, "gnm #100") != NULL || strstr(bs, "flip #100") != NULL);
 
@@ -787,7 +881,7 @@ static void refresh_dev_status(Game *g)
         snprintf(d->step2, sizeof(d->step2), "2. Sets VALVE ONLY + MID ONLY automatically.");
         snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch.");
     } else if (fg_ran) {
-        if (strstr(ts, "STALL SNAPSHOT") || pace_to > 10 || missed_vb > 40) {
+        if (stalled) {
             d->diag_kind      = DIAG_FLIP_STALL;
             d->rec_manual     = 1;
             d->rec_eng_sel    = SEL_AUTO;
@@ -808,6 +902,37 @@ static void refresh_dev_status(Game *g)
                      d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
             snprintf(d->step2, sizeof(d->step2), "2. Eliminates flip queue contention on loading/cutscenes.");
             snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch.");
+        } else if (gpu_tight) {
+            // The registration, pacing and memory recipe stay as they are (R2 changes nothing, do_apply_advice): the
+            // fix is a cheaper post-process. Name the most expensive pass of the split.
+            const char *pass = "WARP8";
+            int pms = tr.warp;
+            if (tr.rcas > pms) { pass = "RCAS8 (SHARPEN/AA)"; pms = tr.rcas; }
+            if (tr.pcopy > pms) { pass = "PCOPY8 (2-BUFFER COPY)"; pms = tr.pcopy; }
+            int rcas_top = tr.rcas >= 0 && tr.rcas >= tr.warp && tr.rcas >= tr.pcopy;
+            d->diag_kind      = DIAG_GPU_HEADROOM;
+            d->rec_manual     = d->manual_mode;
+            d->rec_eng_sel    = d->manual_mode ? g->eng_sel : SEL_AUTO;
+            d->rec_buf_sel    = d->manual_mode ? g->buf_sel : BUF_AUTO;
+            d->rec_shave_mode = d->manual_mode ? d->shave_mode : 0;
+            d->rec_reg_mode   = d->manual_mode ? d->reg_mode : 0;
+            d->rec_pace_order = d->manual_mode ? d->pace_order : 0;
+            d->rec_post_mid   = d->manual_mode ? d->post_mid : 0;
+            d->rec_fps_lock   = d->manual_mode ? d->fps_lock : 0;
+            d->rec_tile_mode  = d->manual_mode ? d->tile_mode : 0;
+            d->rec_row        = 0;
+            snprintf(d->diag_cause, sizeof(d->diag_cause), "NO GPU HEADROOM (OURS %d.%d MS, %d/%d DROPS)",
+                     tr.ours / 100, (tr.ours % 100) / 10, tr.drops, tr.n_stat);
+            snprintf(d->diag_stage, sizeof(d->diag_stage), "FG ACTIVE, GAME LOSES REAL FRAMES");
+            snprintf(d->diag_advice, sizeof(d->diag_advice), rcas_top ? "LOWER SHARPNESS / AA (NO R2 CHANGE)" :
+                     "LOWER POST-PROCESS COST (NO R2 CHANGE)");
+            snprintf(d->diag_detail, sizeof(d->diag_detail),
+                     "Our GPU passes take %d.%d ms per frame (largest: %s %d.%d ms) and the game held a frame too long in %d of %d windows. Flip queue OK (%u pace timeouts).",
+                     tr.ours / 100, (tr.ours % 100) / 10, pass, pms / 100, (pms % 100) / 10, tr.drops, tr.n_stat, pace_to);
+            snprintf(d->step1, sizeof(d->step1), rcas_top ? "1. VCFG game settings: Sharpness 0, Anti-aliasing OFF." :
+                     "1. VCFG game settings: lower Sharpness and Anti-aliasing.");
+            snprintf(d->step2, sizeof(d->step2), "2. Keep the current engine, buffers and pacing (R2: none).");
+            snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE, play the same scene and check again.");
         } else {
             d->diag_kind = DIAG_OK;
             if (g->experimental && is_2b_log) {
@@ -1142,6 +1267,11 @@ static void do_apply_advice(App *a)
     DevCfg *d = &g->dev;
     char path[96];
     refresh_dev_status(g);
+    if (d->diag_kind == DIAG_GPU_HEADROOM) {   // the fix is a game setting; engine, buffers, pacing and adapt-*.ini stay
+        snprintf(a->status, sizeof(a->status), "NO GPU HEADROOM ON %s: LOWER SHARPNESS / AA (NOTHING CHANGED)", g->id);
+        addlog(a, a->status);
+        return;
+    }
     if (d->rec_applied && g->s.fg && !d->has_adapt) {
         snprintf(a->status, sizeof(a->status), "ADVISOR PROFILE ALREADY ACTIVE FOR %s (NO CHANGES)", g->id);
         addlog(a, a->status);
