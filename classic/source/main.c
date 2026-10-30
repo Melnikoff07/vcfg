@@ -477,6 +477,7 @@ static long g_pre_gpu_phys = 0, g_pre_work_phys = 0, g_pre_mem_phys = 0, g_dump_
 #include "two_buffer_test.h"
 #include "pace_policy.h"
 #include "opt_status.h"
+#include "post_budget.h"
 _Static_assert(MENU_NROWS == OPT_ROW_N, "in-game menu rows and opt_status.h rows");
 
 // Option status (opt_status.h): copies of what the flip hooks already decided, read by the menu and the
@@ -487,6 +488,15 @@ static volatile int g_st_fg_on = 0;          // more than half of the last ~0.25
 static volatile int g_st_shq_on = 0, g_st_pace_timer = 0;
 static volatile uint32_t g_st_gv_frames = 0, g_st_gv_hits = 0;   // real frames / of them with warp8g (game vectors applied)
 static volatile int g_st_gv_active = 0;      // more than half of the last ~0.25 s window (io thread)
+// Post-process budget (post_budget.h): option post_budget (config-<TITLE>.ini, default 1), the level the flip hook
+// decides once per STAT window, and the rcas8 time of the last GPU timing line it reads.
+static volatile int g_post_budget = 1;
+static volatile int g_pb_level = 0;
+static volatile uint32_t g_last_rcas_ms_x100 = 0, g_last_warppost_ms_x100 = 0;
+// Monotonic counts the budget turns into per-window deltas: frames with GPU stats, of them with a scene cut or a fade,
+// their unmatched blocks and frames with foreground; real frames and of them through frame generation.
+static volatile uint32_t g_pb_st_n = 0, g_pb_st_dist = 0, g_pb_st_unm = 0, g_pb_st_fg = 0, g_pb_real = 0, g_pb_gen = 0;
+static PostBudget g_pb;
 static void opt_state_now(const fg_config_t *c, OptState *s);
 static void opt_log_effective(const char *why);
 
@@ -1343,6 +1353,7 @@ static void calc_rcas_params(uint32_t target_mask, uint32_t *con_bits_out, uint3
     int enh_mode = g_cfg.upscale;
     if (enh_mode < 0) enh_mode = 0;
     if (enh_mode > 2) enh_mode = 2;
+    pb_eff(__atomic_load_n(&g_pb_level, __ATOMIC_ACQUIRE), sharp_pct, enh_mode, &sharp_pct, &enh_mode);   // 0 = as set
     if ((sharp_pct > 0 || enh_mode > 0) && g_sh8_off[14]) {
         if (sharp_pct > 100) sharp_pct = 100;
         if (sharp_pct > 0) {
@@ -1792,6 +1803,7 @@ static void cfg_apply_title_defaults(fg_config_t *c)
 static void cfg_defaults(fg_config_t *c)
 {
     c->framegen       = (g_known_game && !g_detected_60fps) ? 1 : 0;
+    g_post_budget     = 1;   // option post_budget: every load starts from the default, a file without the key means on
     c->mode           = 8;
     c->preset         = 0;
     c->sharpness      = 40;
@@ -1867,6 +1879,7 @@ static int parse_ini_file_ex(const char *path, fg_config_t *c, uint32_t *hash_io
                 else if (strcmp(key, "game_vectors") == 0) c->game_vectors = (val != 0);
                 else if (strcmp(key, "tile_idx") == 0) g_tile_override = val < 0 ? -1 : (val > 31 ? 31 : val);
                 else if (strcmp(key, "tile_sweep") == 0) g_tile_sweep = val ? 1 : 0;
+                else if (strcmp(key, "post_budget") == 0) g_post_budget = (val != 0);
                 else if (strcmp(key, "t6_bit") == 0) g_t6_bit_override = val < 0 ? -1 : (val > 31 ? 31 : val);
                 else if (strcmp(key, "fps_lock") == 0) c->fps_lock = (val == 20 || val == 30 || val == 60) ? val : 0;
                 else if (strcmp(key, "below30") == 0) c->below30 = (val != 0);
@@ -3127,6 +3140,7 @@ static void cfg_save_game_ini(void)
     fprintf(f, "fps_lock = %d\n", c.fps_lock);
     fprintf(f, "below30 = %d\n", c.below30);
     fprintf(f, "shallow_queue = %d\n", c.shallow_queue);
+    fprintf(f, "post_budget = %d\n", g_post_budget ? 1 : 0);
     fprintf(f, "menu_hold_ms = %d\n", c.menu_hold_ms);
     fprintf(f, "menu_opacity = %d\n", c.menu_opacity);
     fprintf(f, "overlay = %d\n", c.overlay);
@@ -3721,6 +3735,64 @@ static uint32_t med3_u32(uint32_t a, uint32_t b, uint32_t c)
     return a > b ? a : b;
 }
 
+// Post-process budget, once per STAT window (post_budget.h). The detector runs while frames are generated (mode 8,
+// more than half of the last 0.25 s) with the menu closed; the level steps down only outside FG Fast and below 30.
+static void post_budget_window(double secs)
+{
+    static int s_init;
+    if (!s_init) { s_init = 1; pb_reset(&g_pb); lg("post budget: %s (option post_budget)\n", g_post_budget ? "on" : "off"); }
+    uint32_t q8 = __atomic_load_n(&g_vb_win_q8, __ATOMIC_RELAXED), hz10 = __atomic_load_n(&g_last_hz_x10, __ATOMIC_RELAXED);
+    PbIn in;
+    in.enabled = g_post_budget;
+    in.diag = g_inject_on == 8 && __atomic_load_n(&g_st_fg_on, __ATOMIC_RELAXED) && !g_menu_open && !g_detected_60fps;
+    in.active = in.diag && g_cfg.preset != 1 && !g_b30.on;
+    in.win_n = g_win_n;
+    in.win_us = (uint32_t)(secs * 1e6);
+    in.maxdt_us = g_win_max < 4000.0 ? (uint32_t)(g_win_max * 1000.0) : 4000000u;
+    in.vb_us = q8 ? (q8 + 128u) >> 8 : (hz10 ? 10000000u / hz10 : 16683u);
+    in.cost_x100 = __atomic_load_n(&g_last_rcas_ms_x100, __ATOMIC_ACQUIRE);
+    in.warp_x100 = __atomic_load_n(&g_last_warppost_ms_x100, __ATOMIC_ACQUIRE);
+    {   // this window's deltas of the frame counts
+        static uint32_t p_n, p_dist, p_unm, p_fg, p_real, p_gen;
+        uint32_t c_n = __atomic_load_n(&g_pb_st_n, __ATOMIC_RELAXED), c_dist = __atomic_load_n(&g_pb_st_dist, __ATOMIC_RELAXED);
+        uint32_t c_unm = __atomic_load_n(&g_pb_st_unm, __ATOMIC_RELAXED), c_fg = __atomic_load_n(&g_pb_st_fg, __ATOMIC_RELAXED);
+        uint32_t c_real = __atomic_load_n(&g_pb_real, __ATOMIC_RELAXED), c_gen = __atomic_load_n(&g_pb_gen, __ATOMIC_RELAXED);
+        uint32_t dn = c_n - p_n, dreal = c_real - p_real, dgen = c_gen - p_gen;
+        in.disturbed = (c_dist - p_dist) > 0u || (dreal >= 10u && (uint64_t)dgen * 10u < (uint64_t)dreal * 9u);
+        in.motion = dn > 0u && ((uint64_t)(c_unm - p_unm) >= 20ull * dn || (uint64_t)(c_fg - p_fg) * 10u >= (uint64_t)dn * 3u);
+        p_n = c_n; p_dist = c_dist; p_unm = c_unm; p_fg = c_fg; p_real = c_real; p_gen = c_gen;
+    }
+    in.sharp = g_cfg.sharpness < 0 ? 0 : (g_cfg.sharpness > 100 ? 100 : g_cfg.sharpness);
+    in.enh = g_cfg.upscale < 0 ? 0 : (g_cfg.upscale > 2 ? 2 : g_cfg.upscale);
+    PbEvt e;
+    if (!pb_window(&g_pb, &in, &e)) return;
+    __atomic_store_n(&g_pb_level, e.to, __ATOMIC_RELEASE);
+    static const char *const enh_name[3] = { "off", "light", "strong" };
+    if (e.why == PB_NOPOST) {   // the same lateness with no post-process to cede: the warp or the game, said once per episode
+        lg("post budget: real frame late in %u of the last 3 windows (max dt %.1f ms > %.1f), nothing to cede (%s: Sharpness %d, "
+           "Enhance AA %s, rcas8 %.2f ms), our warp/post %.2f ms: not the post-process\n", e.late3, e.maxdt_us / 1000.0,
+           e.thr_us / 1000.0, e.sub == PB_NOPOST_REGIME ? "FG Fast / below 30 never step" : "no post-process", in.sharp,
+           enh_name[in.enh], e.cost_x100 / 100.0, e.warp_x100 / 100.0);
+        return;
+    }
+    char lv[64];
+    if (e.to == 0) snprintf(lv, sizeof(lv), "Sharpness %d, Enhance AA %s as set", in.sharp, enh_name[in.enh]);
+    else if (e.to == 1) snprintf(lv, sizeof(lv), "Enhance AA off, Sharpness %d kept", in.sharp);
+    else snprintf(lv, sizeof(lv), "Sharpness and Enhance AA off");
+    if (e.why == PB_LATE)
+        lg("post budget: level %d -> %d (%s): real frame late in %u of the last 3 windows (max dt %.1f ms > %.1f), rcas8 %.2f ms\n",
+           e.from, e.to, lv, e.late3, e.maxdt_us / 1000.0, e.thr_us / 1000.0, e.cost_x100 / 100.0);
+    else if (e.why == PB_CLEAN)
+        lg("post budget: level %d -> %d (%s): %u windows in a row without a late real frame\n", e.from, e.to, lv, e.hold);
+    else if (e.why == PB_NOGAIN)
+        lg("post budget: level %d -> %d (%s): no gain, real frame still late in %u of %u windows, no step down for %u s\n",
+           e.from, e.to, lv, e.late_since, e.dwell, e.lock * 2u);
+    else
+        lg("post budget: level %d -> %d (%s): %s\n", e.from, e.to, lv,
+           e.why == PB_SETTINGS ? "Sharpness / Enhance AA changed" :
+           (!in.enabled ? "option post_budget = 0" : "frames not generated, menu, FG Fast or below 30"));
+}
+
 static void tick(uint32_t n, uint32_t handle, uint32_t index, uint32_t mode)
 {
     (void)handle;
@@ -3795,6 +3867,7 @@ static void tick(uint32_t n, uint32_t handle, uint32_t index, uint32_t mode)
     if (now - g_win_t >= g_freq * 2) {
         double secs = (now - g_win_t) / (double)g_freq;
         lgd("STAT gnm: %.1f flips/s, max dt %.1f ms (window %.1fs)\n", g_win_n / secs, g_win_max, secs);
+        post_budget_window(secs);
         if (!g_mon_on) cc_fgoff_log();
         g_win_t = now; g_win_n = 0; g_win_max = 0.0;
     }
@@ -4057,6 +4130,10 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                 if (cn > cb_thr) g_st_cuts++;
                                 if (fgn) g_st_fgf++;
                                 if (stv[4] == 1u) g_st_fades++;
+                                __atomic_fetch_add(&g_pb_st_n, 1u, __ATOMIC_RELAXED);
+                                __atomic_fetch_add(&g_pb_st_unm, cn, __ATOMIC_RELAXED);
+                                if (fgn) __atomic_fetch_add(&g_pb_st_fg, 1u, __ATOMIC_RELAXED);
+                                if (cn > cb_thr || stv[4] == 1u) __atomic_fetch_add(&g_pb_st_dist, 1u, __ATOMIC_RELAXED);
                                 g_st_gmx = (int32_t)stv[1]; g_st_gmy = (int32_t)stv[2];
                             }
                         }
@@ -4081,6 +4158,11 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             if (g_inject_on == 8) {
                                 double gpu_act = ms[0] + ms[1] + ms[3];
                                 g_last_gpu_ms_x100 = (uint32_t)(gpu_act * 100.0 + 0.5);
+                                {
+                                    double rc = g_pp_split_n ? (double)g_pp_split[3] / g_pp_split_n / unit * 1000.0 : 0.0;
+                                    __atomic_store_n(&g_last_rcas_ms_x100, (uint32_t)(rc * 100.0 + 0.5), __ATOMIC_RELEASE);
+                                    __atomic_store_n(&g_last_warppost_ms_x100, (uint32_t)(ms[3] * 100.0 + 0.5), __ATOMIC_RELEASE);
+                                }
                                 lgd("GPU time of our passes: pyramid %.2f + motion %.2f + warp/post %.2f = %.2f ms (+ fence wait %.2f) | "
                                    "game span avg %.1f max %.1f ms\n", ms[0], ms[1], ms[3], gpu_act, ms[2], span, spanmax);
                                 lgd("PASSES ms: pyr8 %.2f me3 %.2f me2 %.2f gm8+fgs8 %.2f me1 %.2f mf8 %.2f fence %.2f phase8 %.2f warp8+rcas+osd %.2f\n",
@@ -4132,6 +4214,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);
 
                 g_st_fg_frames++; if (can_fg8 && want_fg) { g_st_fg_hits++; __atomic_store_n(&g_st_fg_path, 1, __ATOMIC_RELAXED); }   // status copy
+                __atomic_fetch_add(&g_pb_real, 1u, __ATOMIC_RELAXED); if (can_fg8 && want_fg) __atomic_fetch_add(&g_pb_gen, 1u, __ATOMIC_RELAXED);
                 if (!(can_fg8 && want_fg)) {
                     pyr_cache_invalidate();
                 }
@@ -4789,6 +4872,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                            fg_res_supported(g_bw, g_bh) && g_prev_idx < game_idx_end() && mbufs_ready((uint32_t)handle));
             int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);
             g_st_fg_frames++; if (can_fg8 && want_fg) { g_st_fg_hits++; __atomic_store_n(&g_st_fg_path, 2, __ATOMIC_RELAXED); }   // status copy
+            __atomic_fetch_add(&g_pb_real, 1u, __ATOMIC_RELAXED); if (can_fg8 && want_fg) __atomic_fetch_add(&g_pb_gen, 1u, __ATOMIC_RELAXED);
 
             if (can_fg8 && want_fg) {
                 g_inert_reason[0] = 0;

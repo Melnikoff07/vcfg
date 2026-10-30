@@ -489,6 +489,8 @@ static void gv_fill_table(uint32_t *p, uint32_t s, uint32_t k) {{ (void)p; (void
 static int gv_pass_active(void) {{ return 0; }}
 static int gv_warp_active(void) {{ return 0; }}
 static int gv_viz_active(void) {{ return 0; }}
+static volatile int g_pb_level = 0;   /* post budget level (post_budget.h): 0 = the player's settings */
+#include "post_budget.h"
 
 #include "shaders.h"
 #include "fg_res.h"
