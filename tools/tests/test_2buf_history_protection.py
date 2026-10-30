@@ -112,6 +112,8 @@ DEFINES = "\n".join(
 
 FN_SAFE_STRIDE = extract_function(MAIN_C, "safe_surface_stride")
 FN_CALC_RCAS = extract_function(MAIN_C, "calc_rcas_params")
+FN_REAL_AA = extract_function(MAIN_C, "real_aa_on")   # called by rcas_static_flag (bit 5)
+FN_RCAS_STATIC = extract_function(MAIN_C, "rcas_static_flag")
 FN_BUILD_FLOW8 = extract_function(MAIN_C, "build_dcb_flow8")
 
 HARNESS_C = f"""
@@ -487,6 +489,8 @@ static void gv_fill_table(uint32_t *p, uint32_t s, uint32_t k) {{ (void)p; (void
 static int gv_pass_active(void) {{ return 0; }}
 static int gv_warp_active(void) {{ return 0; }}
 static int gv_viz_active(void) {{ return 0; }}
+static volatile int g_pb_level = 0;   /* post budget level (post_budget.h): 0 = the player's settings */
+#include "post_budget.h"
 
 #include "shaders.h"
 #include "fg_res.h"
@@ -503,6 +507,8 @@ static int vcfg_in_family(const char *t, const char *f) {{ return strcmp(t, f) =
 {FN_SAFE_STRIDE}
 {MAIN_2BUF_HELPERS}
 {FN_CALC_RCAS}
+{FN_REAL_AA}
+{FN_RCAS_STATIC}
 {FN_BUILD_FLOW8}
 
 // Simulate GPU pcopy8 execution on the descriptor table built at slotb + OSD_SLOT_OFF
