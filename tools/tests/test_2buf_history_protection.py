@@ -525,6 +525,7 @@ static int save_adapt_ini(void) {{ return 0; }}
 #include "shaders.h"
 #include "fg_res.h"
 #include "fg8_table.h"
+#include "late_tail.h"
 static int vcfg_in_family(const char *t, const char *f) {{ return strcmp(t, f) == 0; }}
 __attribute__((weak)) void vq_on_cadence_window(uint32_t m, uint32_t r, uint32_t ms) {{ (void)m; (void)r; (void)ms; }}
 #include "two_buffer_test.h"
