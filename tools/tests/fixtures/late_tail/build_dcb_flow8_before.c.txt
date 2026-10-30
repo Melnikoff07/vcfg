@@ -1,0 +1,247 @@
+// build_dcb_flow8 of classic/source/main.c before option late_tail (the TAIL row commit), extracted literally: the DCB the mode-8 gnm flip path
+// submitted before option late_tail existed. tools/tests/test_late_tail.py compiles it next to the current function and
+// compares their output word for word with late_tail off. Regenerate only together with a deliberate DCB change.
+static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M1, uint64_t M2,
+                                uint32_t pitch, uint32_t tidx, uint32_t nbytes, uint32_t slot, uint32_t seq,
+                                const uint32_t *nop64, int32_t vo_handle, uint32_t mid1_idx, uint32_t mid2_idx,
+                                uint32_t t1_q16, uint32_t t2_q16, int two_mids, int force_repeat,
+                                uint64_t copy_dst, uint32_t copy_idx)
+{
+    uint32_t *p = p0;
+    int pyr_warm = (P != 0 && P != C && P == g_pyr_last_cur_base && g_bw == g_pyr_last_w && g_bh == g_pyr_last_h);
+    uint32_t r = pyr_warm ? (g_pyr_parity ^ 1u) : 0u;
+    g_pyr_parity = r;
+    g_pyr_last_cur_base = C;
+    g_pyr_last_w = g_bw;
+    g_pyr_last_h = g_bh;
+    uint8_t *slotb = g_gpu + SLOT0 + slot * SLOT_SZ;
+    uint32_t *tb = (uint32_t *)(slotb + 0xB00);
+    uint64_t tbl = (uint64_t)(uintptr_t)tb;
+    uint64_t lbl = (uint64_t)(uintptr_t)(slotb + 0x900), lbl2 = lbl + 8;
+    uint64_t gb = (uint64_t)(uintptr_t)g_gpu;
+    volatile uint32_t *stats = (volatile uint32_t *)(slotb + STATS_OFF);
+    for (int i = 0; i < 8; i++) stats[i] = 0xFFFFFFFFu;
+
+    uint32_t base_flags = (g_opt_phase ? 1u : 0u) | (((g_fg_off && !g_bench_offscreen) || force_repeat) ? 2u : 0u) | (g_opt_marker ? 4u : 0u)
+                        | (g_opt_nocf ? 8u : 0u) | (g_opt_nofgk ? 16u : 0u) | (g_opt_noanc ? 32u : 0u)
+                        | (g_opt_notp ? 64u : 0u) | (g_opt_nomf ? 128u : 0u) | (g_opt_notex ? 256u : 0u)
+                        | (g_opt_notpg ? 512u : 0u) | (g_opt_sharp ? 1024u : 0u) | (g_opt_nostr ? 2048u : 0u)
+                        | (pyr_warm ? FG8_FLAG_PYR_WARM : 0u)
+                        | (cut_blocks8() << 16);
+    uint32_t mid1_packed = (mid1_idx & 0x7FFFu) | ((t1_q16 & 0xFFFFu) << 16);
+    // History copy on a 3-buffer ring (every title; proven on CUSA18723): a game that flips its buffers in turn leaves
+    // the previous real frame untouched in g_buf[g_prev_idx] until it renders into it again two flips later, which is
+    // submitted after this DCB on the same graphics ring. The full-frame pcopy8 into g_pbuf (8.3 MB written to
+    // FlexibleMemory plus two barriers per real frame) then copies exactly what P already holds: skip it and keep P in
+    // the game's buffer. Pacing is untouched (g_pcopy_on / g_pcopy_avail and the reserved g_pbuf stay as they are), and
+    // the copy comes back by itself when the ring turns 2-buffer at runtime or a real present copy runs (copy_dst != 0).
+    // A 3-buffer game that rewrote its previous buffer before the next flip would show the wrong P here.
+    if (!g_bench_offscreen) {
+        static int s_pbuf_skip_logged = 0;
+        int pbuf_skip = !copy_dst && g_ngame >= 3 && !g_runtime_2buf;
+        if (pbuf_skip != s_pbuf_skip_logged) {
+            s_pbuf_skip_logged = pbuf_skip;
+            lg("history copy: %s\n", pbuf_skip ? "skipped (3-buffer ring, P read from the game's buffer)" : "on");
+        }
+        if (pbuf_skip) { g_t_prev_half16 = 0; g_pcopy_dst_half16 = 0; g_pbuf_valid = 0; }
+        else fg8_resolve_2buf_history(&P, C, &copy_dst, &copy_idx, seq);
+    }
+
+    fill_table8_wh(tb, P, C, M1, g_bw, g_bh, pitch, tidx, r, mid1_packed, base_flags, g_work, g_mon, stats);
+
+    uint32_t rcas_con_bits = 0, rcas_flags1 = 0, osd_xy = 0, osd_wh1 = 0;
+    uint32_t mask1 = two_mids ? 1u /*mid1 only; mid2+cur done in pass 2*/ : 3u /*mid1 + cur*/;
+    if (g_bench_offscreen) mask1 = 1u;  // never post-process the game's B/scanout surface during capture
+    if (!g_mem_tight || g_cfg.upscale > 0)
+        calc_rcas_params((post_mid_only() || g_bench_offscreen) ? 1u /*mid1 only*/ : mask1, &rcas_con_bits, &rcas_flags1);
+    if (g_sh8_off[15] && !g_bench_offscreen) osd_build_slot(slotb + OSD_SLOT_OFF, &osd_xy, &osd_wh1, mask1);
+    rcas_flags1 = rcas_static_flag(rcas_flags1);
+    rcas_flags1 = rcas_precise_flag(rcas_flags1);
+    fill_table8_ext(tb, g_gpu, slotb, rcas_con_bits, rcas_flags1, osd_xy, osd_wh1);
+
+    *(volatile uint64_t *)(slotb + 0x900) = 0;
+    *(volatile uint64_t *)(slotb + 0x908) = 0;
+    for (int i = 0; i < 5; i++) *(volatile uint64_t *)(slotb + 0x910 + i * 8) = 0;
+    for (int i = 0; i < 11; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
+#define DISPATCH(x, y) do { *p++ = PKT3(0x15, 4, 1); *p++ = (x); *p++ = (y); *p++ = 1; *p++ = 1; } while (0)
+    const FgDim D = fg_dim(g_bw, g_bh);   // 1080p: the literals that stood here (30 x 68, 240 x 135, ...), see fg_res.h
+    *p++ = PKT3(0x46, 1, 0); *p++ = 0x0000002E;
+    *p++ = PKT3(0x46, 1, 0); *p++ = 0x00000407;
+    *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)lbl2; *p++ = 0x40000000u | ((uint32_t)(lbl2 >> 32) & 0xFFFFu); *p++ = seq; *p++ = 0;
+    *p++ = PKT3(0x3C, 6, 0); *p++ = 0x13; *p++ = (uint32_t)lbl2; *p++ = (uint32_t)(lbl2 >> 32); *p++ = seq; *p++ = 0xFFFFFFFFu; *p++ = 0x0A;
+    *p++ = PKT3(0x58, 6, 0); *p++ = 0x82003FC0; *p++ = (nbytes >> 8); *p++ = 0; *p++ = (uint32_t)(C >> 8); *p++ = (uint32_t)(C >> 40); *p++ = 0x0A;
+    *p++ = PKT3(0x58, 6, 0); *p++ = 0x80C40000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+    *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+    TS_EOP(0);
+    p = gv_emit_eof(p, seq, slot);
+    gv_fill_table(tb, seq, slot);
+    *p++ = PKT3(0x76, 4, 1); *p++ = 0x207; *p++ = 64; *p++ = 1; *p++ = 1;
+    *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl; *p++ = (uint32_t)(tbl >> 32);
+    SET_PASS(g_sh8_off[0], PYR8_RSRC1, PYR8_RSRC2);   DISPATCH(D.px, D.py);
+    PASS_BARRIER();
+    TS_EOP(1);
+    SET_PASS(g_sh8_off[1], ME3_RSRC1, ME3_RSRC2);     DISPATCH(D.m3x, D.m3y);
+    PASS_BARRIER(); TS2(0);
+    SET_PASS(g_sh8_off[2], ME2_RSRC1, ME2_RSRC2);     DISPATCH(D.m2x, D.m2y);
+    PASS_BARRIER(); TS2(1);
+    SET_PASS(g_sh8_off[7], GM8_RSRC1, GM8_RSRC2);     DISPATCH(1, 1);
+    PASS_BARRIER();
+    SET_PASS(g_sh8_off[8], FGS8_RSRC1, FGS8_RSRC2);   DISPATCH(32, 1);
+    PASS_BARRIER(); TS2(2);
+    SET_PASS(g_sh8_off[3], ME1_RSRC1, ME1_RSRC2);     DISPATCH(D.px, D.py);
+    PASS_BARRIER(); TS2(3);
+    SET_PASS(g_sh8_off[9], MF8_RSRC1, MF8_RSRC2);     DISPATCH(D.px, D.py);
+    PASS_BARRIER();
+    if (gv_pass_active()) {
+        p = gv_emit_ts(p, slot, 2);
+        SET_PASS(g_sh8_off[10], GV8_RSRC1, GV8_RSRC2);  DISPATCH(D.px, D.py);
+        PASS_BARRIER();
+        p = gv_emit_after_gv8(p, seq, slot);
+        p = gv_emit_ts(p, slot, 3);
+    }
+    TS_EOP(2);
+    if (!g_bench_offscreen) {
+        int32_t fr = insert_wait_flip_done(p, 7, vo_handle, mid1_idx);
+        if (fr != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
+        if (!g_fence_logged) { g_fence_logged = 1; lg("fence (mode 8): 0x%08x\n", (unsigned)fr); }
+        p += 7;
+    }
+    TS_EOP(3);
+    if (g_opt_phase || t1_q16) {
+        *p++ = PKT3(0x58, 6, 0); *p++ = 0x80C40000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+    }
+    SET_PASS(g_sh8_off[4], PHASE8_RSRC1, PHASE8_RSRC2); DISPATCH(1, 1);
+    PASS_BARRIER(); TS2(4);
+    if (gv_warp_active()) { SET_PASS(g_sh8_off[12], WARP8G_RSRC1, WARP8G_RSRC2); }
+    else { SET_PASS(g_sh8_off[5], WARP8_RSRC1, WARP8_RSRC2); }
+    DISPATCH(D.wx, D.wy);
+    PASS_BARRIER(); TS2(5);
+#define EMIT_PCOPY8() do { \
+        uint32_t *tb3 = (uint32_t *)(slotb + OSD_SLOT_OFF);   /* old text-grid OSD area, unused since the bitmap overlay */ \
+        uint64_t tbl3 = (uint64_t)(uintptr_t)tb3; \
+        fill_pcopy8_table(tb3, C, copy_dst, g_bw, g_bh, pitch, tidx, g_pcopy_dst_half16, g_pcopy_ycocg_mode); \
+        if (copy_idx != 0xFFFFu) { \
+            int32_t fr3 = insert_wait_flip_done(p, 7, vo_handle, copy_idx); \
+            if (fr3 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; } \
+            p += 7; \
+        } \
+        PASS_BARRIER(); \
+        *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; /* inv scalar cache */ \
+        *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl3; *p++ = (uint32_t)(tbl3 >> 32); \
+        SET_PASS(g_sh8_off[16], PCOPY8_RSRC1, PCOPY8_RSRC2); DISPATCH(D.wx, D.wy); \
+        PASS_BARRIER(); \
+    } while (0)
+    // History copy before the real frame is post-processed: when Sharpness / Enhance AA also run on the real frame
+    // (post_mid = 2), copying C after that pass made the next P an already filtered frame, and the generated frame,
+    // filtered again, came out filtered twice on its P side against once on the real frames around it. The history
+    // buffer (copy_idx 0xFFFF, read only by the next warp) now takes C right after this warp read P from it; a present
+    // copy that goes to the screen (copy_idx != 0xFFFF) and the 3-slot pair (its second warp still reads P) keep the
+    // copy at the end. CUSA02299 only for now (the title it was measured on).
+    const int pcopy_early = copy_dst && g_sh8_off[16] && copy_idx == 0xFFFFu && !two_mids && rcas_flags1 &&
+                            !g_bench_offscreen && !post_mid_only() && vcfg_in_family(g_title_id, "CUSA02299");
+    if (pcopy_early) {
+        EMIT_PCOPY8();
+        uint64_t tbl0 = (uint64_t)(uintptr_t)tb;   // back to this slot's table for the passes below
+        *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+        *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl0; *p++ = (uint32_t)(tbl0 >> 32);
+    }
+    if (rcas_flags1) {
+        SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy);
+        PASS_BARRIER();
+    }
+    TS2(8);   // t2[5]..t2[8] = rcas8 of the 1st mid alone (0 without post-process)
+    // post_mid_only: the real frame gets the profile's Enhance AA WITHOUT sharpening (Enhance off = real untouched), so
+    // the aliasing that crawls on edges is smoothed the same way in real and generated frames, and the sharpening only
+    // compensates the generated frame's softness. Separate table in the tb2 region (only FG Fast's mid2 uses it; in that
+    // mode this pass is skipped). Runs after the warp has read the raw C, before the overlay is drawn.
+    if (g_cfg.post_mid == 2 && post_mid_only() && !g_mem_tight && !two_mids && !g_bench_offscreen && g_sh8_off[14]) {
+        int enh = g_cfg.upscale < 0 ? 0 : (g_cfg.upscale > 2 ? 2 : g_cfg.upscale);
+        if (enh > 0) {
+            uint32_t *tbr = (uint32_t *)(slotb + SLOT_TB2_OFF);
+            uint64_t tblr = (uint64_t)(uintptr_t)tbr;
+            memcpy(tbr, tb, 140 * sizeof(uint32_t));
+            fill_table8_ext(tbr, g_gpu, slotb, 0u /*con 0 = no sharpening*/, 2u /*cur*/ | ((uint32_t)enh << 2), 0u, 0u);
+            *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; // inv scalar cache
+            *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tblr; *p++ = (uint32_t)(tblr >> 32);
+            SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy);
+            PASS_BARRIER();
+            *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+            *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl; *p++ = (uint32_t)(tbl >> 32);
+        }
+    }
+    if (gv_viz_active()) {
+        PASS_BARRIER();
+        SET_PASS(g_sh8_off[13], GVZ8_RSRC1, GVZ8_RSRC2); DISPATCH(D.zx, D.zy);
+    }
+    if (osd_wh1) {
+        PASS_BARRIER();
+        SET_PASS(g_sh8_off[15], OSD8_RSRC1, OSD8_RSRC2);
+        DISPATCH((osd_wh1 & 0xFFu) * 2u, ((osd_wh1 >> 8) & 0xFFu) * 2u);
+    }
+
+    // 1.1 FG Fast 3-step pulldown (two_mids == 1): generate mid2 at fractional phase t2 into M2 reusing F and GK!
+    if (two_mids) {
+        uint32_t *tb2 = (uint32_t *)(slotb + SLOT_TB2_OFF);
+        uint64_t tbl2 = (uint64_t)(uintptr_t)tb2;
+        memcpy(tb2, tb, 140 * sizeof(uint32_t));
+        make_t(tb2 + 16, M2, g_bw, g_bh, pitch, tidx); // T#out = M2
+        tb2[29] = (mid2_idx & 0x7FFFu) | 0x8000u /*skip_st*/ | ((t2_q16 & 0xFFFFu) << 16);
+        uint32_t rcas_con2 = 0, rcas_flags2 = 0, osd_wh2 = (osd_wh1 & 0x00FFFFFFu) | (3u << 24);
+        calc_rcas_params(post_mid_only() ? 1u /*mid2 only*/ : 3u /*mid2 + cur*/, &rcas_con2, &rcas_flags2);
+        rcas_flags2 = rcas_static_flag(rcas_flags2);
+        rcas_flags2 = rcas_precise_flag(rcas_flags2);
+        fill_table8_ext(tb2, g_gpu, slotb, rcas_con2, rcas_flags2, osd_xy, osd_wh1 ? osd_wh2 : 0u);
+
+        int32_t fr2 = insert_wait_flip_done(p, 7, vo_handle, mid2_idx);
+        if (fr2 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
+        p += 7;
+        TS2(9);   // t2[8]..t2[9] = osd8 of the 1st mid + the wait for the 2nd mid's buffer
+
+        *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; // inv scalar cache
+        *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl2; *p++ = (uint32_t)(tbl2 >> 32);
+        SET_PASS(g_sh8_off[4], PHASE8_RSRC1, PHASE8_RSRC2); DISPATCH(1, 1);
+        PASS_BARRIER();
+        if (gv_warp_active()) { SET_PASS(g_sh8_off[12], WARP8G_RSRC1, WARP8G_RSRC2); }
+        else { SET_PASS(g_sh8_off[5], WARP8_RSRC1, WARP8_RSRC2); }
+        DISPATCH(D.wx, D.wy);
+        PASS_BARRIER();
+        TS2(10);  // t2[9]..t2[10] = phase8 + warp8 of the 2nd mid, t2[10]..t2[7] = its rcas8 + osd8
+        if (rcas_flags2) {
+            SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy);
+            PASS_BARRIER();
+        }
+        if (osd_wh1) {
+            PASS_BARRIER();
+            SET_PASS(g_sh8_off[15], OSD8_RSRC1, OSD8_RSRC2);
+            DISPATCH((osd_wh2 & 0xFFu) * 2u, ((osd_wh2 >> 8) & 0xFFu) * 2u);
+        }
+    }
+
+    if (g_dump_req && g_dump_mem && !g_bench_offscreen) {
+        PASS_BARRIER();
+        make_v(tb + 88, (uint64_t)(uintptr_t)g_dump_mem, 3 * 960 * 1080 * 4 + 163200);
+        SET_PASS(g_sh8_off[6], DUMP8_RSRC1, DUMP8_RSRC2); DISPATCH(D.dx, D.dy);
+        {
+            uint64_t dl = (uint64_t)(uintptr_t)(g_gpu + DUMP_DONE_OFF);
+            *(volatile uint64_t *)(g_gpu + DUMP_DONE_OFF) = 0;
+            *p++ = PKT3(0x46, 1, 0); *p++ = 0x00000407;
+            *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)dl; *p++ = 0x40000000u | ((uint32_t)(dl >> 32) & 0xFFFFu); *p++ = seq; *p++ = 0;
+        }
+        g_dump_req = 0;
+        g_dump_frame = seq;
+    }
+    TS2(7);   // t2[5]..t2[7] = rcas8 (+ osd8 / FG Fast mid2), t2[7]..t2[6] = pcopy8 (0 when no copy runs; CUSA02299's early
+              // history copy runs before rcas8, inside t2[5]..t2[8])
+    if (copy_dst && g_sh8_off[16] && !pcopy_early) {   // present copy: finished real frame -> own display or history buffer (see g_pcopy_avail / g_pbuf)
+        EMIT_PCOPY8();
+    }
+    TS2(6);
+    TS_EOP(4);
+#undef EMIT_PCOPY8
+#undef DISPATCH
+    *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)lbl; *p++ = 0x40000000u | ((uint32_t)(lbl >> 32) & 0xFFFFu); *p++ = seq; *p++ = 0;
+    *p++ = PKT3(0x3C, 6, 0); *p++ = 0x13; *p++ = (uint32_t)lbl; *p++ = (uint32_t)(lbl >> 32); *p++ = seq; *p++ = 0xFFFFFFFFu; *p++ = 0x0A;
+    *p++ = PKT3(0x58, 6, 0); *p++ = 0x80C40000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+    for (int i = 0; i < 64; i++) *p++ = nop64[i];
+    return (uint32_t)(p - p0);
+}

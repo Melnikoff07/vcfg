@@ -378,6 +378,8 @@ static uint32_t g_ts_span_n = 0;
 static double g_tl_lag_min = 1e18, g_tl_lag_max = -1e18, g_tl_ours_max = 0.0, g_tl_end_max = -1e18;
 static double g_tl_lag[96], g_tl_ours[96];
 static uint32_t g_tl_n = 0;
+static double g_tl_rd_sum = 0.0, g_tl_rd_max = 0.0;   // late_tail.h: the real frame's DCB2 (start -> end), frames that had it
+static uint32_t g_tl_rd_n = 0;
 static uint32_t g_pend_seq = 0, g_pend_slot = 0;
 static int g_inject_on = 0;
 static int g_gpu_state = 0; // 0 untried, 1 ok, -1 failed
@@ -485,6 +487,7 @@ static long g_pre_gpu_phys = 0, g_pre_work_phys = 0, g_pre_mem_phys = 0, g_dump_
 #include "pace_policy.h"
 #include "opt_status.h"
 #include "post_budget.h"
+#include "late_tail.h"
 _Static_assert(MENU_NROWS == OPT_ROW_N, "in-game menu rows and opt_status.h rows");
 
 // Option status (opt_status.h): copies of what the flip hooks already decided, read by the menu and the
@@ -1539,6 +1542,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
                                 uint64_t copy_dst, uint32_t copy_idx)
 {
     uint32_t *p = p0;
+    g_lt_n[slot & 3u] = 0;   // late_tail.h: no DCB2 unless this call builds one
     int pyr_warm = (P != 0 && P != C && P == g_pyr_last_cur_base && g_bw == g_pyr_last_w && g_bh == g_pyr_last_h);
     uint32_t r = pyr_warm ? (g_pyr_parity ^ 1u) : 0u;
     g_pyr_parity = r;
@@ -1588,7 +1592,32 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     if (g_sh8_off[15] && !g_bench_offscreen) osd_build_slot(slotb + OSD_SLOT_OFF, &osd_xy, &osd_wh1, mask1);
     rcas_flags1 = rcas_static_flag(rcas_flags1);
     rcas_flags1 = rcas_precise_flag(rcas_flags1);
+    // late_tail.h: the real frame's work (history copy; with rcas8 on both frames, its half of rcas8 and of the overlay)
+    // moves to DCB2. Eligibility as listed there; the split keeps every flag bit but the target mask (bits 0..1).
+    const int lt_real_aa_pass = g_cfg.post_mid == 2 && post_mid_only() && !g_mem_tight && !two_mids && g_sh8_off[14] && g_cfg.upscale > 0;
+    const int lt = g_lt_req && !two_mids && !g_bench_offscreen && !g_dump_req && copy_dst && copy_idx == 0xFFFFu && g_sh8_off[16] &&
+                   !(rcas_flags1 & 32u) && !lt_real_aa_pass;
+    const int lt_rcas = lt && (rcas_flags1 & 3u) == 3u;
+    uint32_t lt_rcas_cur = 0, lt_osd_cur = 0;
+    if (lt_rcas) {
+        lt_rcas_cur = (rcas_flags1 & ~3u) | 2u;
+        rcas_flags1 = (rcas_flags1 & ~3u) | 1u;
+        if (osd_wh1 & (2u << 24)) {
+            lt_osd_cur = osd_wh1 & ~(1u << 24);
+            osd_wh1 &= ~(2u << 24);
+        }
+    }
     fill_table8_ext(tb, g_gpu, slotb, rcas_con_bits, rcas_flags1, osd_xy, osd_wh1);
+    uint32_t *lt_tbr = (uint32_t *)(slotb + SLOT_TB2_OFF);   // the real frame's table (DCB2), with lt_rcas only
+    uint64_t lt_tblr = (uint64_t)(uintptr_t)lt_tbr;
+    if (lt_rcas) {
+        memcpy(lt_tbr, tb, 140 * sizeof(uint32_t));
+        fill_table8_ext(lt_tbr, g_gpu, slotb, rcas_con_bits, lt_rcas_cur, osd_xy, lt_osd_cur);
+    }
+    if (lt) {
+        *(volatile uint64_t *)(slotb + LT_LBL_OFF) = 0;
+        for (int i = 0; i < 2; i++) *(volatile uint64_t *)(slotb + LT_TS_OFF + i * 8) = 0;
+    }
 
     *(volatile uint64_t *)(slotb + 0x900) = 0;
     *(volatile uint64_t *)(slotb + 0x908) = 0;
@@ -1668,8 +1697,9 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     // buffer (copy_idx 0xFFFF, read only by the next warp) now takes C right after this warp read P from it; a present
     // copy that goes to the screen (copy_idx != 0xFFFF) and the 3-slot pair (its second warp still reads P) keep the
     // copy at the end. CUSA02299 only for now (the title it was measured on).
-    const int pcopy_early = copy_dst && g_sh8_off[16] && copy_idx == 0xFFFFu && !two_mids && rcas_flags1 &&
-                            !g_bench_offscreen && !post_mid_only() && vcfg_in_family(g_title_id, "CUSA02299");
+    const int pcopy_early_c = copy_dst && g_sh8_off[16] && copy_idx == 0xFFFFu && !two_mids && rcas_flags1 &&
+                              !g_bench_offscreen && !post_mid_only() && vcfg_in_family(g_title_id, "CUSA02299");
+    const int pcopy_early = pcopy_early_c && !lt;   // late_tail: the copy goes to DCB2, still before the real's rcas8
     if (pcopy_early) {
         EMIT_PCOPY8();
         uint64_t tbl0 = (uint64_t)(uintptr_t)tb;   // back to this slot's table for the passes below
@@ -1763,9 +1793,53 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     }
     TS2(7);   // t2[5]..t2[7] = rcas8 (+ osd8 / FG Fast mid2), t2[7]..t2[6] = pcopy8 (0 when no copy runs; CUSA02299's early
               // history copy runs before rcas8, inside t2[5]..t2[8])
-    if (copy_dst && g_sh8_off[16] && !pcopy_early) {   // present copy: finished real frame -> own display or history buffer (see g_pcopy_avail / g_pbuf)
+    if (copy_dst && g_sh8_off[16] && !pcopy_early && !lt) {   // present copy: finished real frame -> own display or history buffer (see g_pcopy_avail / g_pbuf)
         EMIT_PCOPY8();
     }
+    // late_tail.h: the real frame's work, in the order the DCB had it (early history copy before the real's rcas8).
+#define EMIT_REAL_WORK() do { \
+        if (pcopy_early_c || !lt_rcas) EMIT_PCOPY8(); \
+        if (lt_rcas) { \
+            *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; /* inv scalar cache */ \
+            *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)lt_tblr; *p++ = (uint32_t)(lt_tblr >> 32); \
+            SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy); \
+            PASS_BARRIER(); \
+            if (lt_osd_cur) { \
+                PASS_BARRIER(); \
+                SET_PASS(g_sh8_off[15], OSD8_RSRC1, OSD8_RSRC2); \
+                DISPATCH((lt_osd_cur & 0xFFu) * 2u, ((lt_osd_cur >> 8) & 0xFFu) * 2u); \
+            } \
+            if (!pcopy_early_c) EMIT_PCOPY8(); \
+        } \
+    } while (0)
+#define LT_TS(off) do { uint64_t al_ = (uint64_t)(uintptr_t)(slotb + (off)); \
+        *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)al_; *p++ = 0x60000000u | ((uint32_t)(al_ >> 32) & 0xFFFFu); *p++ = 0; *p++ = 0; } while (0)
+    if (lt) {
+        // room: DCB1 still takes TS2(6), TS_EOP(4), the end-of-pipe label, its wait, a cache action and the flip packet
+        // (up to 128 dwords); DCB2 has DCB8_SZ / 4 - LT_DCB2_DW dwords (384) for ~150 + its own flip packet
+        if ((uint32_t)(p - p0) + 6u + 6u + 6u + 7u + 7u + 128u <= LT_DCB2_DW) {
+            uint32_t *p_d1 = p, *q0 = p0 + LT_DCB2_DW;
+            uint64_t lbl3 = (uint64_t)(uintptr_t)(slotb + LT_LBL_OFF);
+            p = q0;
+            LT_TS(LT_TS_OFF);
+            // a separate submission: set again what our passes rely on (thread count here, then per pass the user data,
+            // the shader address and resources), and make the writes of DCB1 visible
+            PASS_BARRIER();
+            *p++ = PKT3(0x76, 4, 1); *p++ = 0x207; *p++ = 64; *p++ = 1; *p++ = 1;
+            EMIT_REAL_WORK();
+            LT_TS(LT_TS_OFF + 8);
+            *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)lbl3; *p++ = 0x40000000u | ((uint32_t)(lbl3 >> 32) & 0xFFFFu); *p++ = seq; *p++ = 0;
+            *p++ = PKT3(0x3C, 6, 0); *p++ = 0x13; *p++ = (uint32_t)lbl3; *p++ = (uint32_t)(lbl3 >> 32); *p++ = seq; *p++ = 0xFFFFFFFFu; *p++ = 0x0A;
+            *p++ = PKT3(0x58, 6, 0); *p++ = 0x80C40000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+            g_lt_n[slot & 3u] = (uint32_t)(p - q0);
+            p = p_d1;
+        } else {
+            g_lt_fallbacks++;
+            EMIT_REAL_WORK();
+        }
+    }
+#undef LT_TS
+#undef EMIT_REAL_WORK
     TS2(6);
     TS_EOP(4);
 #undef EMIT_PCOPY8
@@ -1862,6 +1936,7 @@ static void cfg_defaults(fg_config_t *c)
 {
     c->framegen       = (g_known_game && !g_detected_60fps) ? 1 : 0;
     g_post_budget     = 1;   // option post_budget: every load starts from the default, a file without the key means on
+    g_late_tail       = 1;   // option late_tail (late_tail.h): the same, a file without the key means on
     c->mode           = 8;
     c->preset         = 0;
     c->sharpness      = 40;
@@ -1938,6 +2013,7 @@ static int parse_ini_file_ex(const char *path, fg_config_t *c, uint32_t *hash_io
                 else if (strcmp(key, "tile_idx") == 0) g_tile_override = val < 0 ? -1 : (val > 31 ? 31 : val);
                 else if (strcmp(key, "tile_sweep") == 0) g_tile_sweep = val ? 1 : 0;
                 else if (strcmp(key, "post_budget") == 0) g_post_budget = (val != 0);
+                else if (strcmp(key, "late_tail") == 0) g_late_tail = (val != 0);
                 else if (strcmp(key, "t6_bit") == 0) g_t6_bit_override = val < 0 ? -1 : (val > 31 ? 31 : val);
                 else if (strcmp(key, "fps_lock") == 0) c->fps_lock = (val == 20 || val == 30 || val == 60) ? val : 0;
                 else if (strcmp(key, "below30") == 0) c->below30 = (val != 0);
@@ -3446,6 +3522,7 @@ static void cfg_save_game_ini(void)
     fprintf(f, "below30 = %d\n", c.below30);
     fprintf(f, "shallow_queue = %d\n", c.shallow_queue);
     fprintf(f, "post_budget = %d\n", g_post_budget ? 1 : 0);
+    fprintf(f, "late_tail = %d\n", g_late_tail ? 1 : 0);
     fprintf(f, "menu_hold_ms = %d\n", c.menu_hold_ms);
     fprintf(f, "menu_opacity = %d\n", c.menu_opacity);
     fprintf(f, "overlay = %d\n", c.overlay);
@@ -4423,6 +4500,13 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             g_tl_ours[g_tl_n] = (double)(ts[4] - ts[0]) / (double)g_ts_ticks_per_ms;
                             g_tl_n++;
                             if (lag < g_tl_lag_min) g_tl_lag_min = lag;
+                            volatile uint64_t *lts = (volatile uint64_t *)(g_gpu + SLOT0 + ps * SLOT_SZ + LT_TS_OFF);
+                            if (lts[0] && lts[1] > lts[0]) {
+                                double rd = (double)(lts[1] - lts[0]) / (double)g_ts_ticks_per_ms;
+                                g_tl_rd_sum += rd; g_tl_rd_n++;
+                                if (rd > g_tl_rd_max) g_tl_rd_max = rd;
+                            }
+                            lts[0] = 0;   // the DCB2 sample is read once
                         }
                         {
                             volatile uint64_t *t2 = (volatile uint64_t *)(g_gpu + SLOT0 + ps * SLOT_SZ + 0x980);
@@ -4513,9 +4597,12 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                         if (e > g_tl_end_max) g_tl_end_max = e;
                                         l3 += l > 3.0; l6 += l > 6.0; e12 += e > 12.0; e14 += e > 14.0;
                                     }
-                                    lgd("TAIL ms after hand-over (%u fr): gpu start max %.1f >3:%u >6:%u | ours max %.1f | end max %.1f >12:%u >14:%u\n",
-                                       g_tl_n, g_tl_lag_max, l3, l6, g_tl_ours_max, g_tl_end_max, e12, e14);
+                                    lgd("TAIL ms after hand-over (%u fr): gpu start max %.1f >3:%u >6:%u | ours max %.1f | end max %.1f >12:%u >14:%u"
+                                       " | real dcb %u avg %.2f max %.2f fb %u\n",
+                                       g_tl_n, g_tl_lag_max, l3, l6, g_tl_ours_max, g_tl_end_max, e12, e14,
+                                       g_tl_rd_n, g_tl_rd_n ? g_tl_rd_sum / g_tl_rd_n : 0.0, g_tl_rd_max, g_lt_fallbacks);
                                 }
+                                g_tl_rd_sum = g_tl_rd_max = 0.0; g_tl_rd_n = 0;
                                 g_tl_n = 0; g_tl_lag_min = 1e18; g_tl_lag_max = -1e18; g_tl_ours_max = 0.0; g_tl_end_max = -1e18;
                                 lgd("PASSES ms: pyr8 %.2f me3 %.2f me2 %.2f gm8+fgs8 %.2f me1 %.2f mf8 %.2f fence %.2f phase8 %.2f warp8+rcas+osd %.2f\n",
                                    (double)g_pp[0] / g_ts_n / unit * 1000.0, (double)g_pp[1] / g_ts_n / unit * 1000.0, (double)g_pp[2] / g_ts_n / unit * 1000.0,
@@ -4561,6 +4648,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 int third_flip = 0;
                 uint32_t hold_mid_us = 0;
 
+                g_lt_n[slot & 3u] = 0;   // late_tail.h: a DCB2 exists only when build_dcb_flow8 makes one for this frame
                 int can_fg8 = (g_inject_on == 8 && g_work && g_sh8_ok && g_fmt_supported &&
                                fg_res_supported(g_bw, g_bh) && g_prev_idx < game_idx_end() && mbufs_ready(handle));
                 int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);
@@ -4704,9 +4792,19 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         mid_lru_flipped(&g_mid_lru, mi1 - (uint32_t)g_mbase, third_flip && mid2_flip_idx == mi2 && mi2 >= (uint32_t)g_mbase &&
                                         mi2 < (uint32_t)g_mbase + (uint32_t)g_nmid, mi2 - (uint32_t)g_mbase);
                     g_slot_three[slot] = (uint8_t)(third_flip ? 1 : 0);
+                    {   // late_tail.h: this path submits DCB2 as the real frame's flip (DCB8 region only, no 3-slot pair)
+                        static int s_lt_logged = -1;
+                        int lt_on = g_late_tail ? 1 : 0;
+                        if (lt_on != s_lt_logged) {
+                            s_lt_logged = lt_on;
+                            lg("late tail: %s (option late_tail)\n", lt_on ? "on, history copy and the real frame's post-process ride its own flip" : "off");
+                        }
+                        g_lt_req = lt_on && dcb8 && !third_flip;
+                    }
                     n = build_dcb_flow8(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi1], g_buf[mi2], g_pitch,
                                         tidx, px * 4, slot, g_flips, tail64, (int32_t)handle, mi1, mi2,
                                         t1_q16, t2_q16, two_mids, force_repeat, pcopy ? g_buf[ci] : 0ull, ci);
+                    g_lt_req = 0;
                     flip_idx = mi1;
                     second_flip = 1;
                 } else if (g_inject_on == 8 && g_sh8_ok && g_fmt_supported && g_bw >= 640 && g_bh >= 360 && g_bw <= 3840 && g_bh <= 2160) {
@@ -4904,6 +5002,13 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     t_hold = sceKernelGetProcessTime();
                     void *d3[1] = { fb };
                     uint32_t s3[1] = { tail_dw * 4u };
+                    uint32_t lt_n = dcb8 ? g_lt_n[slot & 3u] : 0u;
+                    if (lt_n && lt_n + tail_dw <= DCB8_SZ / 4u - LT_DCB2_DW) {   // late_tail.h: DCB2 + the game's flip packet
+                        uint32_t *q = mine + LT_DCB2_DW;
+                        for (uint32_t i = 0; i < tail_dw; i++) q[lt_n + i] = tail[i];
+                        d3[0] = q;
+                        s3[0] = (lt_n + tail_dw) * 4u;
+                    }
                     // Experiment 2: the first mid keeps the game's opaque argument;
                     // tag only the real copy. This does not virtualize status or labels.
                     int64_t real_arg = flipArg;

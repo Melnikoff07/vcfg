@@ -85,7 +85,7 @@ class TestPluginIni(unittest.TestCase):
 """ + combo + fam + r"""
 static char g_dir[512];
 #define LOG_DIR "%s"
-static int g_known_game, g_detected_60fps, g_tile_override = -1, g_tile_sweep, g_t6_bit_override = -1, g_adapt_early_crashes = 0, g_post_budget = 1;
+static int g_known_game, g_detected_60fps, g_tile_override = -1, g_tile_sweep, g_t6_bit_override = -1, g_adapt_early_crashes = 0, g_post_budget = 1, g_late_tail = 1;
 static char g_title_id[16] = "CUSA18723";
 static char g_family_id[16] = "CUSA18723";
 static char g_osd_toast[32]; static uint64_t g_osd_toast_until; static uint32_t g_last_disk_hash;

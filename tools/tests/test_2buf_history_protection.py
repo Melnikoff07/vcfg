@@ -497,6 +497,7 @@ static volatile int g_pb_level = 0;   /* post budget level (post_budget.h): 0 = 
 #include "shaders.h"
 #include "fg_res.h"
 #include "fg8_table.h"
+#include "late_tail.h"
 static int vcfg_in_family(const char *t, const char *f) {{ return strcmp(t, f) == 0; }}
 #include "two_buffer_test.h"
 

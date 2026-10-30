@@ -577,7 +577,7 @@ static int g_known_game = 1, g_detected_60fps, g_is_neo, g_fg_off, g_adapt_early
 static int g_bench_enabled, g_safe_never, g_s14_on, g_s14_opt;
 static const char *g_s14_why;
 /* parse_ini_file_ex also reads dev keys into these */
-static volatile int g_gv_cal_winner = -1, g_tile_override = -1, g_tile_sweep = -1, g_t6_bit_override = -1, g_post_budget = 1;
+static volatile int g_gv_cal_winner = -1, g_tile_override = -1, g_tile_sweep = -1, g_t6_bit_override = -1, g_post_budget = 1, g_late_tail = 1;
 __G_CFG__
 /* a tiny file system: the files plugin_load reads (config.ini, config-<TITLE>.ini, adapt-<TITLE>.ini, shave14_<TITLE>) */
 static const char *g_fs_path[4], *g_fs_text[4];
