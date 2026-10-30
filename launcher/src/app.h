@@ -10,7 +10,7 @@ enum { SEL_AUTO, SEL_CLASSIC, SEL_ALT, SEL_NEW, SEL_COUNT };
 // 2-BUFFER = force present copy + virtual flip queue (two_buffer=1, present_copy=1), STANDARD = force standard mid buffers (present_copy=2).
 enum { BUF_AUTO, BUF_2BUF, BUF_STD, BUF_COUNT };
 enum { TAB_GAMES, TAB_DEFAULTS, TAB_OVERLAY, TAB_INSTALL, TAB_DEV, TAB_COUNT };
-enum { DIAG_NONE, DIAG_OK, DIAG_OOM_BOOT, DIAG_REG_CONFLICT, DIAG_2BUF_NEEDED, DIAG_FLIP_STALL, DIAG_BOOT_EARLY, DIAG_INERT };
+enum { DIAG_NONE, DIAG_OK, DIAG_OOM_BOOT, DIAG_REG_CONFLICT, DIAG_2BUF_NEEDED, DIAG_FLIP_STALL, DIAG_BOOT_EARLY, DIAG_INERT, DIAG_GPU_HEADROOM };
 
 // preset 0 quality 1 fast; overlay 0..8; b30 / shq = classic engine below30 / shallow_queue (0 / 1)
 typedef struct { int fg, preset, sharp, enhance, overlay, b30, shq; } Settings;
