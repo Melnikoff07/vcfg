@@ -50,4 +50,5 @@ Write-Host "SHA256 $((Get-FileHash "$out/vcfg_classic.prx" -Algorithm SHA256).Ha
 if (-not $Bench -and $Test -eq 0) {
     Run $cfg.python @('-I', "$root/tools/tests/test_lowmem_valve.py")
     Run $cfg.python @('-I', "$root/tools/tests/test_real_traces.py")
+    Run $cfg.python @('-I', "$root/tools/tests/test_vout_gpu_flip.py")
 }
