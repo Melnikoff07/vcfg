@@ -371,6 +371,13 @@ static uint32_t g_pp_split_n = 0;
 static uint64_t g_pp_g2[3];      // 2nd generated frame (two_mids): osd + flip wait t2[8]..t2[9], phase8 + warp8 t2[9]..t2[10],
 static uint32_t g_pp_g2_n = 0;   // rcas8 + osd t2[10]..t2[7]; frames that had it
 static uint32_t g_ts_span_n = 0;
+// TAIL (mode 8, per GPU window): when our first pass starts after the game hands the frame over (lag = GPU start in
+// ms minus hand-over CPU time in ms, offset by the window's smallest lag, so a constant submit latency cancels), our
+// own time to the generated frame's flip packet, and their sum. A sum past ~13 ms misses the refresh after the
+// hand-over, which delays the generated frame and the real one behind it by one refresh.
+static double g_tl_lag_min = 1e18, g_tl_lag_max = -1e18, g_tl_ours_max = 0.0, g_tl_end_max = -1e18;
+static double g_tl_lag[96], g_tl_ours[96];
+static uint32_t g_tl_n = 0;
 static uint32_t g_pend_seq = 0, g_pend_slot = 0;
 static int g_inject_on = 0;
 static int g_gpu_state = 0; // 0 untried, 1 ok, -1 failed
@@ -3666,6 +3673,8 @@ static void *mon_thread(void *arg)
                hz, pend_max, gcq_max, g_mon_missed, g_mon_gaps, g_pace_timeouts, g_pace_resync, g_pace_fix,
                cn_ ? csum_ / 1000.0 / cn_ : 0.0, cmax_ / 1000.0);
             memset(g_hist, 0, sizeof(g_hist));
+            // The CADENCE row passes 198 characters, so the flight recorder cuts its CPU field: repeat it on a short row.
+            if (!tb_title() && cn_) lgd("CPU release->submit avg %.1f max %.1f ms\n", csum_ / 1000.0 / cn_, cmax_ / 1000.0);
             // Keep the CPU measurement visible in the 200-byte flight-recorder rows.
             if (tb_title()) {
                 lgd("CPU release->submit avg %.1f max %.1f ms | test=%d FG=%d pcopy=%d preset=%d\n",
@@ -4408,6 +4417,13 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         if (!g_ts_first) { g_ts_first = ts[0]; g_ts_cpu_first = g_slot_cpu[ps]; }
                         g_ts_last = ts[0]; g_ts_cpu_last = g_slot_cpu[ps];
                         for (int i = 0; i < 4; i++) g_ts_pass[i] += (ts[i + 1] > ts[i]) ? ts[i + 1] - ts[i] : 0;
+                        if (g_inject_on == 8 && g_ts_ticks_per_ms && g_freq && g_slot_cpu[ps] && g_tl_n < 96u) {   // TAIL
+                            double lag = (double)ts[0] / (double)g_ts_ticks_per_ms - (double)g_slot_cpu[ps] * 1000.0 / (double)g_freq;
+                            g_tl_lag[g_tl_n] = lag;
+                            g_tl_ours[g_tl_n] = (double)(ts[4] - ts[0]) / (double)g_ts_ticks_per_ms;
+                            g_tl_n++;
+                            if (lag < g_tl_lag_min) g_tl_lag_min = lag;
+                        }
                         {
                             volatile uint64_t *t2 = (volatile uint64_t *)(g_gpu + SLOT0 + ps * SLOT_SZ + 0x980);
                             for (int i = 0; i < 5; i++) g_praw[i] = ts[i];
@@ -4488,6 +4504,19 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                 }
                                 lgd("GPU time of our passes: pyramid %.2f + motion %.2f + warp/post %.2f = %.2f ms (+ fence wait %.2f) | "
                                    "game span avg %.1f max %.1f ms\n", ms[0], ms[1], ms[3], gpu_act, ms[2], span, spanmax);
+                                if (g_tl_n) {   // separate short line (200-byte trace rows): see g_tl_* above
+                                    uint32_t l3 = 0, l6 = 0, e12 = 0, e14 = 0;
+                                    for (uint32_t i = 0; i < g_tl_n; i++) {
+                                        double l = g_tl_lag[i] - g_tl_lag_min, e = l + g_tl_ours[i];
+                                        if (l > g_tl_lag_max) g_tl_lag_max = l;
+                                        if (g_tl_ours[i] > g_tl_ours_max) g_tl_ours_max = g_tl_ours[i];
+                                        if (e > g_tl_end_max) g_tl_end_max = e;
+                                        l3 += l > 3.0; l6 += l > 6.0; e12 += e > 12.0; e14 += e > 14.0;
+                                    }
+                                    lgd("TAIL ms after hand-over (%u fr): gpu start max %.1f >3:%u >6:%u | ours max %.1f | end max %.1f >12:%u >14:%u\n",
+                                       g_tl_n, g_tl_lag_max, l3, l6, g_tl_ours_max, g_tl_end_max, e12, e14);
+                                }
+                                g_tl_n = 0; g_tl_lag_min = 1e18; g_tl_lag_max = -1e18; g_tl_ours_max = 0.0; g_tl_end_max = -1e18;
                                 lgd("PASSES ms: pyr8 %.2f me3 %.2f me2 %.2f gm8+fgs8 %.2f me1 %.2f mf8 %.2f fence %.2f phase8 %.2f warp8+rcas+osd %.2f\n",
                                    (double)g_pp[0] / g_ts_n / unit * 1000.0, (double)g_pp[1] / g_ts_n / unit * 1000.0, (double)g_pp[2] / g_ts_n / unit * 1000.0,
                                    (double)g_pp[3] / g_ts_n / unit * 1000.0, (double)g_pp[4] / g_ts_n / unit * 1000.0, (double)g_pp[5] / g_ts_n / unit * 1000.0,
