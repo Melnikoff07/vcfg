@@ -3875,6 +3875,32 @@ static int32_t vout_submit_dcb(uint32_t *mine, uint32_t n_dwords)
     return rc;
 }
 
+// CUSA06381 (vout path, present copy): its frame keeps the GPU busy past our CPU flips, so the mid and the copy were
+// scanned out before the GPU had written them, and the copy's WaitFlipDone then waited for that copy to leave the
+// screen (game + GPU deadlock at frame 122). Flip both on the GPU timeline instead, like the gnm path does.
+static int vout_gpu_flip_title(void)
+{
+    return strcmp(g_title_id, "CUSA06381") == 0;
+}
+
+// 64-dword prepareFlip placeholder (the layout of the game tails matched in the gnm path); the driver writes the flip here.
+static void vout_prepare_flip_tail(uint32_t *t)
+{
+    t[0] = k_nop64_pkt[0];
+    t[1] = 0x68750777u;
+    for (int i = 2; i < 64; i++) t[i] = 0u;
+}
+
+static int32_t vout_submit_and_flip(uint32_t *dcb, uint32_t n_dwords, int32_t handle, uint32_t index, uint32_t mode, int64_t arg)
+{
+    void *d[1] = { dcb };
+    uint32_t s[1] = { n_dwords * 4u };
+    vcfg_in_submit_inc();
+    int32_t rc = gnm_submit_and_flip_raw(0, 0, 1u, d, s, NULL, NULL, (uint32_t)handle, index, mode, arg);
+    vcfg_in_submit_dec();
+    return rc;
+}
+
 // Full FrameGen + OSD/RCAS pipeline for games that separate sceGnmSubmitCommandBuffers and sceVideoOutSubmitFlip.
 int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode, int64_t arg)
 {
@@ -4068,23 +4094,47 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                 g_vo_last_submit_enter_t = vo_t_s1;
                 __atomic_store_n(&g_done, (volatile uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0x900), __ATOMIC_RELEASE);
                 __atomic_store_n(&g_last_seq, vf, __ATOMIC_RELEASE);
-                int32_t s_rc = vout_submit_dcb(mine, n);
+                int gpu_flip = vout_gpu_flip_title() && g_pcopy_on && second_flip && !third_flip && show_idx != u_idx &&
+                               n > 64u && mine[n - 64u] == k_nop64_pkt[0];
+                int32_t s_rc = 0, vr1 = 0;
+                if (gpu_flip) {
+                    vout_prepare_flip_tail(mine + n - 64u);
+                    vr1 = vout_submit_and_flip(mine, n, handle, flip_idx, mode, arg);
+                    if (vr1 != 0) {
+                        lg("vout gpu flip(mid %u) failed 0x%08x: CPU flips\n", flip_idx, (unsigned)vr1);
+                        mine[n - 63u] = 0u;
+                        gpu_flip = 0;
+                    }
+                }
+                if (!gpu_flip) s_rc = vout_submit_dcb(mine, n);
                 if (vf == INJECT_AFTER_FLIPS || (vf % 600u) == 0)
                     lg("vout inject #%u: dcb=%u dw submit=0x%08x flip_idx=%u show_idx=%u pcopy=%d pace_pre=%d\n",
                        vf, n, (unsigned)s_rc, flip_idx, show_idx, g_pcopy_on, pace_pre);
-                int32_t vr1 = HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t),
-                                            handle, (int32_t)flip_idx, mode, arg);
+                if (!gpu_flip)
+                    vr1 = HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t),
+                                        handle, (int32_t)flip_idx, mode, arg);
                 if (third_flip) {
                     HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t),
                                   handle, (int32_t)mid2_flip_idx, mode, arg);
                 }
                 if (second_flip) {
                     if (hold_mid_us > 0) sceKernelUsleep(hold_mid_us);
-                    int32_t vr2 = HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t),
-                                                handle, (int32_t)show_idx, mode, arg);
+                    int32_t vr2 = -1;
+                    if (gpu_flip) {   // queued behind our DCB: the copy is on screen only once the GPU has written it
+                        uint32_t *tail = (uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0xE00);
+                        vout_prepare_flip_tail(tail);
+                        vr2 = vout_submit_and_flip(tail, 64u, handle, show_idx, mode, arg);
+                        if (vr2 != 0) {
+                            lg("vout gpu flip(real %u) failed 0x%08x: showing game buffer %u\n", show_idx, (unsigned)vr2, u_idx);
+                            show_idx = u_idx;
+                        }
+                    }
+                    if (vr2 != 0)
+                        vr2 = HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t),
+                                            handle, (int32_t)show_idx, mode, arg);
                     if (vf < INJECT_AFTER_FLIPS + 12)
-                        lg("vout fg #%u: flip(mid %u)=0x%08x flip(real %u)=0x%08x\n",
-                           vf, flip_idx, (unsigned)vr1, show_idx, (unsigned)vr2);
+                        lg("vout fg #%u: flip(mid %u)=0x%08x flip(real %u)=0x%08x%s\n",
+                           vf, flip_idx, (unsigned)vr1, show_idx, (unsigned)vr2, gpu_flip ? " (gpu)" : "");
                 }
                 if (!pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
