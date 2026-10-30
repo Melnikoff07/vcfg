@@ -3229,10 +3229,23 @@ static void *mon_thread(void *arg)
     uint64_t last_count = 0, last_t = 0, win_t = 0, win_vb = 0, osd_t = 0, osd_fcnt = 0;
     int last_buf = -1, pend_max = 0, gcq_max = 0;
     uint32_t ft_mid_nv = 0, ft_real_rec = 0;   // FTRACE: hold of the last generated frame, record of the real on screen
+    int aff_done = 0;
     for (;;) {
         int woke_vb = cc_mon_wait();   // 500 us sleep as before, or with monev the next vblank / flip event
         g_cc_mon_wakes++;
         if (g_handle < 0) continue;
+        // CUSA02299: on its default core (mask 0x2) the monitor saw 3-14 of the 60 generated frames per 2 s and logged
+        // the rest as "missed", while VideoOut showed every one (FLIPLOG M1R1, camera). On core 6 alone it saw 120 of
+        // 120 refreshes from the first window. No other thread of ours sets an affinity. Once, when the handle is known.
+        if (!aff_done) {
+            aff_done = 1;
+            if (vcfg_in_family(g_title_id, "CUSA02299")) {
+                uint64_t old_mask = 0;
+                scePthreadGetaffinity(scePthreadSelf(), &old_mask);
+                int32_t arc = ((int32_t (*)(OrbisPthread, uint64_t))(void *)scePthreadSetaffinity)(scePthreadSelf(), 0x40ull);
+                lg("cadence monitor: affinity core 6 (mask 0x40) = 0x%08x (was 0x%llx)\n", (unsigned)arc, (unsigned long long)old_mask);
+            }
+        }
         memset(&fs, 0, sizeof(fs));
         memset(&vs, 0, sizeof(vs));
         if (read_flip_status(g_handle, &fs) != 0) continue;
