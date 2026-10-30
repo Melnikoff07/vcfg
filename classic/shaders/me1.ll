@@ -9,6 +9,7 @@
 ; table: +0x80 V#L1cur, +0x90 V#L1prev, +0xF0 V#V2 (60x34 packed), +0x100 V#Fcur, +0x110 V#Fprev, +0x120 V#misc,
 ;        +0x150 V#GK (120x68 splat keys from fgs8: prio | closeness | L2 block, 0 = none), +0x180 V#FT (raw)
 target triple = "amdgcn--"
+declare i32 @llvm.amdgcn.ds.swizzle(i32, i32 immarg)
 declare <3 x i32> @llvm.amdgcn.raw.buffer.load.v3i32(<4 x i32>, i32, i32, i32 immarg)
 declare i32 @llvm.amdgcn.raw.buffer.load.i32(<4 x i32>, i32, i32, i32 immarg)
 declare <2 x float> @llvm.amdgcn.raw.buffer.load.v2f32(<4 x i32>, i32, i32, i32 immarg)
@@ -320,22 +321,21 @@ entry:
   fence syncscope("workgroup") release
   call void @llvm.amdgcn.s.barrier()
   fence syncscope("workgroup") acquire
-  br label %loop
-loop:
-  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]
-  %m = phi i32 [ -1, %entry ], [ %m1, %loop ]
-  %ix = add i32 %base, %i
-  %q = getelementptr [64 x i32], ptr addrspace(3) @keys, i32 0, i32 %ix
-  %k = load i32, ptr addrspace(3) %q, align 4
-  %m1 = call i32 @llvm.umin.i32(i32 %m, i32 %k)
-  %i1 = add i32 %i, 1
-  %more = icmp ult i32 %i1, %n
-  br i1 %more, label %loop, label %done
+  ; butterfly over the lane's aligned group of 16 (ds_swizzle bit mode: and 0x1f, xor 1 / 2 / 4 / 8)
+  %s1 = call i32 @llvm.amdgcn.ds.swizzle(i32 %key, i32 1055)
+  %r1 = call i32 @llvm.umin.i32(i32 %key, i32 %s1)
+  %s2 = call i32 @llvm.amdgcn.ds.swizzle(i32 %r1, i32 2079)
+  %r2 = call i32 @llvm.umin.i32(i32 %r1, i32 %s2)
+  %s4 = call i32 @llvm.amdgcn.ds.swizzle(i32 %r2, i32 4127)
+  %r4 = call i32 @llvm.umin.i32(i32 %r2, i32 %s4)
+  %s8 = call i32 @llvm.amdgcn.ds.swizzle(i32 %r4, i32 8223)
+  %r8 = call i32 @llvm.umin.i32(i32 %r4, i32 %s8)
+  br label %done
 done:
   fence syncscope("workgroup") release
   call void @llvm.amdgcn.s.barrier()
   fence syncscope("workgroup") acquire
-  ret i32 %m1
+  ret i32 %r8
 }
 
 ; 8.6: manhattan distance (L1 px) of (cx, cy) to the L2 vector of block (ix, iy) x 2
@@ -790,22 +790,34 @@ fin:
   %fsp = uitofp i32 %sump to float
   %fdif = fsub float %fsc, %fsp
   %fad = call float @llvm.fabs.f32(float %fdif)
-  %flim = fmul float %fsp, 0x3F947AE140000000 ; 0.02
-  %fade0 = fcmp ogt float %fad, %flim
-  ; 8.3: only while the camera (gm8) moves at most 1 L2 px (4 full-res px) per frame and fg_blocks <= 32.
+  ; 8.3: at 2 % only while the camera (gm8) moves at most 1 L2 px (4 full-res px) per frame and fg_blocks <= 32.
+  ; fade_hi (consts.flags bit 13): a change above 8 % is a fade whatever gm8 and the foreground count say (a dark
+  ; fade whose camera vector is noise). One threshold per frame: 2 % when slow (8 % implies 2 %), else 8 % with
+  ; bit 13, else no fade; with bit 13 clear this is the 8.3 rule exactly.
   %gax = call i32 @llvm.abs.i32(i32 %gmx, i1 false)
   %gay = call i32 @llvm.abs.i32(i32 %gmy, i1 false)
   %gaxy = call i32 @llvm.smax.i32(i32 %gax, i32 %gay)
   %slow1a = icmp sle i32 %gaxy, 1
   %slow1 = and i1 %slow1a, %fg_still
-  %fade = and i1 %fade0, %slow1
+  %fhflags = extractelement <4 x i32> %cn, i32 2
+  %fhbit = and i32 %fhflags, 8192
+  %fhon = icmp ne i32 %fhbit, 0
+  %fdok = or i1 %slow1, %fhon
+  %fki = select i1 %slow1, i32 1017370378, i32 1034147594 ; bits of 0.02f / 0.08f
+  %fk = bitcast i32 %fki to float
+  %flim = fmul float %fsp, %fk
+  %fade0 = fcmp ogt float %fad, %flim
+  %fade = and i1 %fade0, %fdok
   %zero = or i1 %zero0, %fade
-  ; block (0, 0) reports the fade decision in misc dword 7 (frame statistics for the log)
+  ; block (0, 0) reports the fade decision in misc dword 7 (frame statistics for the log): 1 = 2 % fade with a
+  ; still camera, 2 = fade_hi only (mf8 reads any non-zero value as a fade)
   %b00a = or i32 %bx, %gy
   %b00 = icmp eq i32 %b00a, 0
   br i1 %b00, label %rfade, label %fin2
 rfade:
-  %fadei = zext i1 %fade to i32
+  %fcl = and i1 %fade, %slow1
+  %fh2 = select i1 %fade, i32 2, i32 0
+  %fadei = select i1 %fcl, i32 1, i32 %fh2
   call void @llvm.amdgcn.raw.buffer.store.i32(i32 %fadei, <4 x i32> %vm, i32 28, i32 0, i32 0)
   br label %fin2
 fin2:
@@ -855,5 +867,6 @@ define internal float @equi(float %m, float %c, float %p) alwaysinline {
   ret float %o2
 }
 
-attributes #0 = { "amdgpu-flat-work-group-size"="64,64" }
+; 5 waves per SIMD (<= 48 VGPRs) instead of 4: register allocation and scheduling only, same machine IR before scheduling (tools/tests/test_motion_wave_reduce.py)
+attributes #0 = { "amdgpu-flat-work-group-size"="64,64" "amdgpu-waves-per-eu"="5,10" }
 !0 = !{}

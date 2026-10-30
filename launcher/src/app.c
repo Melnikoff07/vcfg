@@ -42,7 +42,7 @@ static Theme theme_of(const App *a)
 static void itoa_(int v, char *o) { char t[12]; int n = 0, neg = v < 0; if (neg) v = -v; do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v); int k = 0; if (neg) o[k++] = '-'; while (n) o[k++] = t[--n]; o[k] = 0; }
 static void cat(char *d, const char *s) { while (*d) d++; while (*s) *d++ = *s++; *d = 0; }
 
-static const char *mode_name(int p) { return p ? "FAST" : "QUALITY"; }
+static const char *mode_name(int p) { return p == 1 ? "FAST" : p == 2 ? "SHARP" : "QUALITY"; }   // preset 0 / 1 / 2, as the plugin
 static const char *aa_name(int e) { return e == 2 ? "STRONG" : e == 1 ? "LIGHT" : "OFF"; }
 static const char *engine_name(int e) { return e == ENGINE_NEW ? "NEW" : e == ENGINE_CLASSIC_ALT ? "ALT" : "CLASSIC"; }
 static const char *buf_name(int b) { return b == BUF_2BUF ? "2-BUFFER" : "STANDARD"; }
@@ -82,8 +82,8 @@ static const char *pace_name(int v)
 }
 static const char *post_name(int v)
 {
-    static const char *n[3] = { "AUTO", "MID ONLY", "MID + REAL" };
-    return (v >= 0 && v <= 2) ? n[v] : n[0];
+    static const char *n[4] = { "AUTO", "MID ONLY", "MID + REAL", "MID + REAL AA" };
+    return (v >= 0 && v <= 3) ? n[v] : n[0];
 }
 static const char *fps_lock_name(int v)
 {
@@ -322,17 +322,17 @@ static void draw_games(Canvas *c, App *a, int top)
 // ---- settings panel (game detail, defaults) ----
 typedef struct { const char *name; char value[36]; int kind; int level; } Row;   // kind 0 text, 1 pill on/off, 2 blocks, 3 recommended fix, 4 auto-dimmed
 static void draw_rows(Canvas *c, App *a, int x, int y, int w, const char *head, const char *bignum, const char *bigsub,
-                      Row *r, int n)
+                      Row *r, int n, int sel_i)
 {
     Theme th = theme_of(a);
     Fonts *f = a->f;
     int hh = n > 7 ? 214 : (n > 6 ? 236 : 250);
-    int rh = n > 7 ? 64  : (n > 6 ? 70  : (n > 5 ? 80 : 92));
-    int ty_off = rh <= 64 ? 45 : (rh <= 72 ? 50 : 60);
-    int pill_y = rh <= 64 ? 11 : (rh <= 72 ? 15 : 26);
+    int rh = n > 8 ? 56  : (n > 7 ? 64  : (n > 6 ? 70  : (n > 5 ? 80 : 92)));
+    int ty_off = rh <= 56 ? 41 : (rh <= 64 ? 45 : (rh <= 72 ? 50 : 60));
+    int pill_y = rh <= 56 ? 7 : (rh <= 64 ? 11 : (rh <= 72 ? 15 : 26));
     int pill_h = rh <= 64 ? 42 : 48;
     int pill_ty = rh <= 64 ? 30 : 34;
-    int blk_y  = rh <= 64 ? 21 : (rh <= 72 ? 26 : 36);
+    int blk_y  = rh <= 56 ? 17 : (rh <= 64 ? 21 : (rh <= 72 ? 26 : 36));
     fill_round(c, x, y, w, hh + rh * n + 30, 22, th.panel);
     fill_round(c, x, y, w, hh + 22, 22, th.head_bg);
     fill_rect(c, x, y + hh, w, 22, th.panel);
@@ -344,7 +344,7 @@ static void draw_rows(Canvas *c, App *a, int x, int y, int w, const char *head, 
     for (int i = 0; i < n; i++) {
         int yy = ry + i * rh;
         if (i) fill_rect(c, x + 34, yy, w - 68, 4, th.div);
-        int sel = i == a->row;
+        int sel = i == sel_i;
         if (sel) fill_rect(c, x, yy + 4, 12, rh - 4, a->dark_theme ? YEL : INK);
         uint32_t ncol = r[i].kind == 3 ? (a->dark_theme ? YEL : RED) : (r[i].kind == 4 ? th.dim : th.ink);
         draw_text(c, &f->title, x + 34, yy + ty_off, r[i].name, ncol, 0);
@@ -365,14 +365,58 @@ static void draw_rows(Canvas *c, App *a, int x, int y, int w, const char *head, 
         }
     }
 }
-static int settings_rows(Settings *s, Row *r)
+// Rows 0..6 of the settings panel that apply to the settings, with the in-game menu's rule (classic/source/opt_status.h
+// opt_row_visible): Mode and Low latency need frame generation on, Below 30 FPS needs it on and a mode other than FAST;
+// with a CUSTOM 20 FPS lock (lock20) Below 30 FPS and Low latency do nothing either. Row 7 (Pipeline control / Theme)
+// is always shown. The app does not know the running game, so only the dependency between settings is shown.
+static int settings_row_visible(const Settings *s, int lock20, int row)
 {
-    r[0] = (Row){ "Frame generation", "", 1, s->fg }; cat(r[0].value, s->fg ? "ON" : "OFF");
-    r[1] = (Row){ "Mode", "", 0, 0 }; cat(r[1].value, mode_name(s->preset));
-    r[2] = (Row){ "Sharpness", "", 2, s->sharp / 10 };
-    r[3] = (Row){ "Anti-aliasing", "", 0, 0 }; cat(r[3].value, aa_name(s->enhance));
-    r[4] = (Row){ "Performance overlay", "", 0, 0 }; cat(r[4].value, corner_name(s->overlay));
-    return 5;
+    if (row == 1) return s->fg != 0;
+    if (row == 5) return s->fg != 0 && s->preset != 1 && !lock20;
+    if (row == 6) return s->fg != 0 && !lock20;
+    return row >= 0 && row <= 7;
+}
+static int settings_lock20(const App *a, const Game *g)
+{
+    return a->tab == TAB_GAMES && g && g->dev.manual_mode && g->dev.fps_lock == 1;   // DEV fps_lock 1 = 20 FPS
+}
+// Next visible row from row in direction dir (wraps over rows 0..7).
+static int settings_row_step(const Settings *s, int lock20, int row, int dir)
+{
+    for (int k = 0; k < 8; k++) {
+        row = (row + dir + 8) % 8;
+        if (settings_row_visible(s, lock20, row)) return row;
+    }
+    return 0;
+}
+// Visible rows into r; ids[i] = the row number (0..6) of r[i].
+static int settings_rows(Settings *s, int lock20, Row *r, int *ids)
+{
+    Row all[7];
+    all[0] = (Row){ "Frame generation", "", 1, s->fg }; cat(all[0].value, s->fg ? "ON" : "OFF");
+    all[1] = (Row){ "Mode", "", 0, 0 }; cat(all[1].value, mode_name(s->preset));
+    all[2] = (Row){ "Sharpness", "", 2, s->sharp / 10 };
+    all[3] = (Row){ "Anti-aliasing", "", 0, 0 }; cat(all[3].value, aa_name(s->enhance));
+    all[4] = (Row){ "Performance overlay", "", 0, 0 }; cat(all[4].value, corner_name(s->overlay));
+    all[5] = (Row){ "Below 30 FPS", "", 1, s->b30 }; cat(all[5].value, s->b30 ? "ON" : "OFF");
+    all[6] = (Row){ "Low latency", "", 1, s->shq }; cat(all[6].value, s->shq ? "ON" : "OFF");
+    int n = 0;
+    for (int i = 0; i < 7; i++) if (settings_row_visible(s, lock20, i)) { r[n] = all[i]; ids[n++] = i; }
+    return n;
+}
+// one-line help for the selected row of the settings panel (game detail and defaults)
+static const char *settings_row_guide(int row, int game)
+{
+    switch (row) {
+    case 0: return "FRAME GENERATION: a generated frame between game frames, 30 FPS shown at 60 Hz.";
+    case 1: return "MODE: QUALITY best image, SHARP crisper, FAST 60 Hz pulldown. FAST's 2nd frame may need BELOW 30 FPS on.";
+    case 2: return "SHARPNESS: sharpens the generated frame. 0 = off.";
+    case 3: return "ANTI-ALIASING: smooths jagged edges. OFF, LIGHT or STRONG.";
+    case 4: return "PERFORMANCE OVERLAY: FPS counter and its corner.";
+    case 5: return "BELOW 30 FPS: two generated frames when the game drops under 30 FPS (QUALITY or SHARP, needs spare memory).";
+    case 6: return "LOW LATENCY: a shorter frame queue while the game has spare time.";
+    default: return game ? "PIPELINE CONTROL: AUTO, or your CUSTOM 05 DEV profile (Triangle opens it)." : "THEME: dark or light app theme.";
+    }
 }
 static void draw_detail(Canvas *c, App *a, int top, Game *g, Settings *s, const char *head)
 {
@@ -398,7 +442,7 @@ static void draw_detail(Canvas *c, App *a, int top, Game *g, Settings *s, const 
             if (g->dev.diag_advice[0]) draw_text_clip(c, &f->mono, M, ty + 72, left - 60, g->dev.diag_advice, a->dark_theme ? YEL : RED, 0);
         }
     }
-    Row r[7]; int n = settings_rows(s, r);
+    Row r[10]; int ids[10]; int lock20 = settings_lock20(a, g), n = settings_rows(s, lock20, r, ids);
     if (g) {   // clear separation: 01 GAMES has visual settings + master Pipeline Control indicator (TRIANGLE opens 05 DEV)
         r[n] = (Row){ "Pipeline control", "", 1, g->dev.manual_mode };
         cat(r[n].value, g->dev.manual_mode ? "CUSTOM (05 DEV)" : "AUTO (ALGORITHM)");
@@ -408,7 +452,12 @@ static void draw_detail(Canvas *c, App *a, int top, Game *g, Settings *s, const 
         cat(r[n].value, a->dark_theme ? "DARK" : "LIGHT");
         n++;
     }
-    draw_rows(c, a, M + left, y, c->w - 2 * M - left, head, s->fg ? "60" : "30", s->fg ? "FROM 30" : "NATIVE", r, n);
+    ids[n - 1] = 7;
+    int sel_i = n - 1;   // a->row is a row number (0..7): highlight where it is drawn
+    for (int i = 0; i < n; i++) if (ids[i] == a->row) sel_i = i;
+    draw_rows(c, a, M + left, y, c->w - 2 * M - left, head, s->fg ? "60" : "30", s->fg ? "FROM 30" : "NATIVE", r, n, sel_i);
+    int crash = g && (g->dev.has_crash || g->dev.safe_state > 0 || g->dev.diag_kind >= DIAG_OOM_BOOT);   // its lines use that space
+    if (!crash) draw_wrapped(c, &f->mono, M, c->h - FOOT - 156, 34, left - 60, 4, settings_row_guide(a->row, g != 0), th.dim, 0);
 }
 
 // ---- install tab ----
@@ -519,7 +568,8 @@ static void draw_dev_expanded(Canvas *c, App *a, int top, Game *g, DevCfg *d)
     Fonts *f = a->f;
     int y = top + 58, w = c->w - 2 * M, h = 756;
     uint32_t sub_box = a->dark_theme ? 0xFF11141Bu : 0xFFE4E2DAu;
-    int has_issue = !d->rec_applied && (d->diag_kind >= DIAG_OOM_BOOT || d->has_crash || d->safe_state > 0 || d->rec_mask != 0);
+    int has_issue = d->diag_kind == DIAG_GPU_HEADROOM ||
+                    (!d->rec_applied && (d->diag_kind >= DIAG_OOM_BOOT || d->has_crash || d->safe_state > 0 || d->rec_mask != 0));
     uint32_t adv_col = has_issue ? RED : ((d->rec_applied || d->diag_kind == DIAG_OK) ? BLUE : th.div);
 
     fill_round(c, M, y, w, h, 22, th.panel);
@@ -659,7 +709,8 @@ static void draw_dev(Canvas *c, App *a, int top)
 
     // ---- Block 2: Crash & Log Advisor Box (y+142 .. y+482, height 340) ----
     int ay = y + 142, ah = 340;
-    int has_issue = !d->rec_applied && (d->diag_kind >= DIAG_OOM_BOOT || d->has_crash || d->safe_state > 0 || d->rec_mask != 0);
+    int has_issue = d->diag_kind == DIAG_GPU_HEADROOM ||
+                    (!d->rec_applied && (d->diag_kind >= DIAG_OOM_BOOT || d->has_crash || d->safe_state > 0 || d->rec_mask != 0));
     uint32_t adv_border = has_issue ? RED : ((d->rec_applied || d->diag_kind == DIAG_OK) ? BLUE : th.div);
     fill_round(c, M, ay, lw, ah, 18, th.panel);
     stroke_rect(c, M, ay, lw, ah, 3, adv_border);
@@ -741,7 +792,7 @@ static void draw_dev(Canvas *c, App *a, int top)
     char head[64] = "TECHNICAL PIPELINE / "; cat(head, g->id);
     const char *bnum = d->manual_mode ? "CUSTOM" : "AUTO";
     const char *sub  = d->manual_mode ? "MANUAL DEV OVERRIDE ACTIVE" : "ALGORITHM IN CONTROL (CHANGE ANY ROW FOR CUSTOM)";
-    draw_rows(c, a, M + left, y, c->w - 2 * M - left, head, bnum, sub, r, 8);
+    draw_rows(c, a, M + left, y, c->w - 2 * M - left, head, bnum, sub, r, 8, a->row);
 }
 
 void app_draw(Canvas *c, App *a)
@@ -776,7 +827,7 @@ void app_draw(Canvas *c, App *a)
         }
         else menu_combo_name(a->menu_combo, r[3].value, (int)sizeof(r[3].value));
         (void)s;
-        draw_rows(c, a, M + 520, top + 58, c->w - 2 * M - 520, "PERFORMANCE OVERLAY", "60", "GAME 30 / GPU 1.7 MS", r, 4);
+        draw_rows(c, a, M + 520, top + 58, c->w - 2 * M - 520, "PERFORMANCE OVERLAY", "60", "GAME 30 / GPU 1.7 MS", r, 4, a->row);
         draw_text(c, a->f->mono.ttf ? &a->f->mono : &a->f->mono, M, top + 120, "SHOWS GAME FPS,", th.ink, 1);
         draw_text(c, &a->f->mono, M, top + 162, "FRAMES ON SCREEN", th.ink, 1);
         draw_text(c, &a->f->mono, M, top + 204, "AND GPU TIME", th.ink, 1);
@@ -808,10 +859,12 @@ static void change(Settings *s, int row, int dir)
 {
     switch (row) {
     case 0: s->fg = !s->fg; break;
-    case 1: s->preset = !s->preset; break;
+    case 1: s->preset = (s->preset + (dir > 0 ? 1 : 2)) % 3; break;   // QUALITY -> FAST -> SHARP, as the in-game menu
     case 2: step(&s->sharp, dir * 10, 0, 100, 0); break;
     case 3: step(&s->enhance, dir, 0, 2, 1); break;
     case 4: step(&s->overlay, dir, 0, 8, 1); break;
+    case 5: s->b30 = !s->b30; break;
+    case 6: s->shq = !s->shq; break;
     }
 }
 static void set_msg(App *a, const char *s) { a->rec_msg[0] = 0; cat(a->rec_msg, s); }
@@ -854,7 +907,7 @@ int app_input(App *a, uint32_t b)
         return ACT_NONE;
     }
     Settings *s = a->tab == TAB_GAMES ? &a->games[a->sel].s : &a->defaults;
-    int rows = a->tab == TAB_OVERLAY ? 4 : (a->tab == TAB_DEV ? 8 : 6);
+    int rows = a->tab == TAB_OVERLAY ? 4 : 8;
     if (a->tab == TAB_INSTALL) {
         if (b & PAD_R2) {
             if (armed) { a->status[0] = 0; return ACT_CLEAN; }
@@ -868,8 +921,11 @@ int app_input(App *a, uint32_t b)
         return ACT_NONE;
     }
     int r_lo = (a->tab == TAB_DEV && a->dev_expand) ? 1 : 0;
-    if (b & PAD_UP) step(&a->row, -1, r_lo, rows - 1, 1);
-    if (b & PAD_DOWN) step(&a->row, 1, r_lo, rows - 1, 1);
+    int settings_tab = a->tab == TAB_GAMES || a->tab == TAB_DEFAULTS;   // rows that do not apply are hidden and skipped
+    int lock20 = settings_lock20(a, a->tab == TAB_GAMES ? &a->games[a->sel] : 0);
+    if (settings_tab && !settings_row_visible(s, lock20, a->row)) a->row = settings_row_step(s, lock20, a->row, -1);
+    if (b & PAD_UP) { if (settings_tab) a->row = settings_row_step(s, lock20, a->row, -1); else step(&a->row, -1, r_lo, rows - 1, 1); }
+    if (b & PAD_DOWN) { if (settings_tab) a->row = settings_row_step(s, lock20, a->row, 1); else step(&a->row, 1, r_lo, rows - 1, 1); }
     int dir = (b & PAD_RIGHT) ? 1 : (b & PAD_LEFT) ? -1 : 0;
     if (a->tab == TAB_DEV) {
         if (!a->ngames) return ACT_NONE;
@@ -903,7 +959,7 @@ int app_input(App *a, uint32_t b)
             else if (a->row == 2) step(&d->shave_mode, dir, 0, 2, 1);
             else if (a->row == 3) step(&d->reg_mode, dir, 0, 2, 1);
             else if (a->row == 4) step(&d->pace_order, dir, 0, 3, 1);
-            else if (a->row == 5) step(&d->post_mid, dir, 0, 2, 1);
+            else if (a->row == 5) step(&d->post_mid, dir, 0, 3, 1);
             else if (a->row == 6) step(&d->fps_lock, dir, 0, 3, 1);
             else if (a->row == 7) step(&d->tile_mode, dir, 0, 6, 1);
             a->dirty = 1; a->status[0] = 0; cat(a->status, "CUSTOM OVERRIDE (PRESS CROSS TO SAVE)");
@@ -926,12 +982,12 @@ int app_input(App *a, uint32_t b)
                 int i = menu_combo_index(a->menu_combo); if (i < 0) i = dir > 0 ? -1 : MENU_COMBO_COUNT;
                 step(&i, dir, 0, MENU_COMBO_COUNT - 1, 1); a->menu_combo = menu_combo_from_index(i); set_msg(a, "");
             }
-        } else if (a->tab == TAB_GAMES && a->row == 5) {
+        } else if (a->tab == TAB_GAMES && a->row == 7) {
             Game *g = &a->games[a->sel];
             g->dev.manual_mode = !g->dev.manual_mode;
             if (!g->dev.manual_mode) return ACT_RESET_DEV;
         }
-        else if (a->tab == TAB_DEFAULTS && a->row == 5) a->dark_theme = !a->dark_theme;
+        else if (a->tab == TAB_DEFAULTS && a->row == 7) a->dark_theme = !a->dark_theme;
         else change(s, a->row, dir);
         a->dirty = 1;
     }

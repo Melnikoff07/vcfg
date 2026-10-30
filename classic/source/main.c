@@ -42,7 +42,7 @@ static volatile int g_opt_nocf = 0;  // inject letter k: confidence fallback off
 #define INJECT 1
 #define FG8_PAD 0   /* inline hooks on libScePad stay OFF (crash at ~frame 27-30); GOT patch + poll thread used */
 #define INJECT_AFTER_FLIPS 120
-#define MENU_NROWS 9
+#define MENU_NROWS 11
 
 typedef struct {
     int framegen;        // 0 = off, 1 = on
@@ -63,18 +63,22 @@ typedef struct {
     int pace_order;      // 0 = auto (!pcopy -> pre-submit), 1 = force pre-submit, 2 = force post-submit, 3 = timer pacing
     int shave_mode;      // 0 = auto (Valve+Shave), 1 = Valve only (no Shave), 2 = Late alloc (no early alloc at boot)
     int reg_mode;        // 0 = auto (inline extend + auto-reloc), 1 = separate group at top (16-N), 2 = deferred (frame 120)
-    int post_mid;        // 0 = auto, 1 = generated mid frames only, 2 = generated + real frames
+    int post_mid;        // 0 = auto, 1 = generated mid frames only, 2 = generated + real frames,
+                         //     3 = AA Light on the real frame too, with the static handling (Sharpness 0 only)
     int manual_mode;     // 0 = auto (algorithm), 1 = manual dev overrides active in config-<TITLE>.ini
     int vout_path;       // 0 = auto, 1 = decoupled sceVideoOutSubmitFlip path learned at runtime
     int gv_conv;         // -1 = auto/uncalibrated, 0..15 = learned motion-vector convention
     int audio_fix;       // CUSA10249 audio DirectMemory variant: 0 = c87af66, 1 = Variant C (default for CUSA10249), 2 = Variant D
+    int below30;         // 0 = off (default), 1 = on: below 30 fps a pair predicted to take 3 refreshes shows 2 generated
+                         //     frames; it only runs where the 2nd generated-frame buffer already exists (off otherwise)
+    int shallow_queue;   // 0 = off (the game is handed back with 3-4 flips pending, as before), 1 = on (default)
 } fg_config_t;
 
 static char g_title_id[16] = "UNKNOWN";
 static int g_known_game = 0;
 static int g_is_game_proc = 1;
-static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0 };
-static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0 };
+static volatile fg_config_t g_cfg = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 1 };
+static fg_config_t g_menu_edit    = { 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 1 };
 static volatile uint32_t g_mem_hibernate_count = 0;
 static volatile uint32_t g_vout_fg_inited = 0;
 static volatile uint32_t g_injects = 0;
@@ -89,6 +93,7 @@ static char g_inert_reason[32] = "";
 static volatile int g_detected_60fps = 0;
 static volatile int g_fmt_supported = 1;
 static volatile uint32_t g_last_gpu_ms_x100 = 0, g_last_hz_x10 = 600;
+static volatile uint32_t g_vb_win_q8 = 0;   // refresh period measured over the last ~2 s of vblanks, Q24.8 us (0 = none yet)
 static volatile uint32_t g_osd_real_fps_x10 = 300, g_osd_out_fps_x10 = 600, g_osd_frame_ms_x10 = 333;
 static volatile uint32_t g_cur_pending_flips = 0, g_cur_gcq = 0;
 // Latency of real frames: time the game handed frame <buffer> to the flip hook -> time it was on screen.
@@ -238,13 +243,25 @@ static void log_open(void)
 
 #define VCFG_ENGINE "classic"
 #include "vcfg_trace.h"
+#include "cpu_cost.h"
+
+// q-cpucost cuts (cpu_cost.h), one opt-in file each, read once by cc_read_cuts when the io thread starts.
+static int g_cc_monev = 0, g_cc_iolazy = 0, g_cc_nospin = 0, g_cc_quiet = 0;
+static int g_fast_pace = 0;   // FG Fast pacing (pace_policy.h fast_slots): opt-in file LOG_DIR/fastpace_<TITLE>
+static volatile uint32_t g_cc_lines = 0, g_cc_klog_bytes = 0;   // lines through klog and their bytes (CPU plugin line)
 
 static volatile uint32_t g_lgw_lock;   // lg_write may run on the game's thread (sync window) and the io thread at once
 static void lg_write(const char *buf)
 {
     while (__atomic_exchange_n(&g_lgw_lock, 1u, __ATOMIC_ACQUIRE)) sceKernelUsleep(50);
-    klog("[bb_probe] %s", buf);
-    vcfg_trace(buf);
+    if (buf[0] == CC_QUIET_MARK) {   // quietlog: a periodic diagnostic line, probe.log only
+        buf++;
+    } else {
+        klog("[bb_probe] %s", buf);
+        g_cc_lines++;
+        g_cc_klog_bytes += (uint32_t)strlen(buf) + 11u;
+        vcfg_trace(buf);
+    }
     log_open();
     if (g_log) { fputs(buf, g_log); fflush(g_log); }
     __atomic_store_n(&g_lgw_lock, 0u, __ATOMIC_RELEASE);
@@ -267,6 +284,18 @@ static int lgq_trylock(void)
 }
 static void lgq_unlock(void) { __atomic_store_n(&g_lgq_lock, 0u, __ATOMIC_RELEASE); }
 
+// buf is a 384-byte line buffer (the size of a queue slot), so the whole slot is copied.
+static void lg_put(char *buf)
+{
+    if (g_lg_async && !lg_sync_window()) {
+        if (lgq_trylock()) {
+            if (g_lgq_w - g_lgq_r < LGQ_N) { memcpy(g_lgq[g_lgq_w % LGQ_N], buf, sizeof(g_lgq[0])); g_lgq_w++; } else g_lgq_drop++;
+            lgq_unlock();
+        } else g_lgq_drop++;
+        return;
+    }
+    lg_write(buf);
+}
 void lg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void lg(const char *fmt, ...)
 {
@@ -275,14 +304,30 @@ void lg(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (g_lg_async && !lg_sync_window()) {
-        if (lgq_trylock()) {
-            if (g_lgq_w - g_lgq_r < LGQ_N) { memcpy(g_lgq[g_lgq_w % LGQ_N], buf, sizeof(buf)); g_lgq_w++; } else g_lgq_drop++;
-            lgq_unlock();
-        } else g_lgq_drop++;
-        return;
-    }
-    lg_write(buf);
+    lg_put(buf);
+}
+// Periodic diagnostic line (LATENCY, CADENCE, PASSES, FRAMES, ...): the same as lg() unless quietlog is on; then it
+// goes to probe.log only, and without the debug log it is not even formatted.
+static void lgd(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void lgd(const char *fmt, ...)
+{
+    if (g_cc_quiet && !g_log) return;
+    char buf[384];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf + (g_cc_quiet ? 1 : 0), sizeof(buf) - 1u, fmt, ap);
+    va_end(ap);
+    buf[sizeof(buf) - 1u] = 0;
+    if (g_cc_quiet) buf[0] = CC_QUIET_MARK;
+    lg_put(buf);
+}
+
+// File only (no klog, no trace copy): bulk debug lines such as FTRACE.
+static void lg_file_only(const char *buf)
+{
+    while (__atomic_exchange_n(&g_lgw_lock, 1u, __ATOMIC_ACQUIRE)) sceKernelUsleep(50);
+    if (g_log) { fputs(buf, g_log); fflush(g_log); }
+    __atomic_store_n(&g_lgw_lock, 0u, __ATOMIC_RELEASE);
 }
 
 static void lg_drain(void)
@@ -320,7 +365,21 @@ static uint64_t g_slot_cpu[4], g_ts_slot_seen = 0, g_ts_first = 0, g_ts_cpu_firs
 static uint32_t g_ts_n = 0;
 static uint64_t g_praw[12];
 static uint64_t g_ts_pass[4], g_pp[10], g_ts_span = 0, g_ts_span_max = 0;
+static uint64_t g_pp_split[5];   // mode 8, per window: warp8 t2[4]..t2[5], rcas8+osd t2[5]..t2[7], pcopy8 t2[7]..t2[6],
+                                 // rcas8 of the 1st mid t2[5]..t2[8], the rest (osd, 2nd mid) t2[8]..t2[7]
+static uint32_t g_pp_split_n = 0;
+static uint64_t g_pp_g2[3];      // 2nd generated frame (two_mids): osd + flip wait t2[8]..t2[9], phase8 + warp8 t2[9]..t2[10],
+static uint32_t g_pp_g2_n = 0;   // rcas8 + osd t2[10]..t2[7]; frames that had it
 static uint32_t g_ts_span_n = 0;
+// TAIL (mode 8, per GPU window): when our first pass starts after the game hands the frame over (lag = GPU start in
+// ms minus hand-over CPU time in ms, offset by the window's smallest lag, so a constant submit latency cancels), our
+// own time to the generated frame's flip packet, and their sum. A sum past ~13 ms misses the refresh after the
+// hand-over, which delays the generated frame and the real one behind it by one refresh.
+static double g_tl_lag_min = 1e18, g_tl_lag_max = -1e18, g_tl_ours_max = 0.0, g_tl_end_max = -1e18;
+static double g_tl_lag[96], g_tl_ours[96];
+static uint32_t g_tl_n = 0;
+static double g_tl_rd_sum = 0.0, g_tl_rd_max = 0.0;   // late_tail.h: the real frame's DCB2 (start -> end), frames that had it
+static uint32_t g_tl_rd_n = 0;
 static uint32_t g_pend_seq = 0, g_pend_slot = 0;
 static int g_inject_on = 0;
 static int g_gpu_state = 0; // 0 untried, 1 ok, -1 failed
@@ -337,7 +396,7 @@ static volatile uint32_t *g_mon = NULL;
 static uint32_t g_sh8_off[17];         // code offsets in g_gpu: 0..9 pyr8..mf8, 10..13 gv8..gvz8, 14 rcas8, 15 osd8, 16 pcopy8
 #define STATS_OFF 0x960u
 #define CUT_BLOCKS 5600u
-static uint32_t g_st_n = 0, g_st_cut_max = 0, g_st_cuts = 0, g_st_fgf = 0, g_st_fades = 0;
+static uint32_t g_st_n = 0, g_st_cut_max = 0, g_st_cuts = 0, g_st_fgf = 0, g_st_fades = 0, g_st_fades_hi = 0;
 static uint64_t g_st_cut_sum = 0, g_st_fg_sum = 0;
 static int32_t g_st_gmx = 0, g_st_gmy = 0;
 static uint64_t g_pyr_last_cur_base = 0;
@@ -425,6 +484,41 @@ static size_t g_pre_size = 0, g_pre_work_sz = 0;
 static long g_pre_gpu_phys = 0, g_pre_work_phys = 0, g_pre_mem_phys = 0, g_dump_phys = 0;
 
 #include "two_buffer_test.h"
+#include "pace_policy.h"
+#include "opt_status.h"
+#include "post_budget.h"
+#include "late_tail.h"
+_Static_assert(MENU_NROWS == OPT_ROW_N, "in-game menu rows and opt_status.h rows");
+
+// Option status (opt_status.h): copies of what the flip hooks already decided, read by the menu and the
+// "options effective:" log line. Written once per real frame, never read back by a decision.
+static volatile int g_st_fg_path = 0;        // path of the last generated frame: 1 SubmitAndFlip, 2 VideoOutSubmitFlip
+static volatile uint32_t g_st_fg_frames = 0, g_st_fg_hits = 0;   // real frames / of them through frame generation
+static volatile int g_st_fg_on = 0;          // more than half of the last ~0.25 s window (io thread): no flapping state
+static volatile int g_st_shq_on = 0, g_st_pace_timer = 0;
+static volatile uint32_t g_st_gv_frames = 0, g_st_gv_hits = 0;   // real frames / of them with warp8g (game vectors applied)
+static volatile int g_st_gv_active = 0;      // more than half of the last ~0.25 s window (io thread)
+// Post-process budget (post_budget.h): option post_budget (config-<TITLE>.ini, default 1), the level the flip hook
+// decides once per STAT window, and the rcas8 time of the last GPU timing line it reads.
+static volatile int g_post_budget = 1;
+// Option fade_hi (config-<TITLE>.ini, default 1): me1 also takes a frame luma-sum change above 8 % as a fade while the
+// camera vector moves (consts.flags bit 13, FG8_FLAG_FADE_HI); the FRAMES line counts those frames as fade_hi frames.
+static volatile int g_fade_hi = 1;
+static volatile int g_pb_level = 0;
+static volatile uint32_t g_last_rcas_ms_x100 = 0, g_last_warppost_ms_x100 = 0;
+// Monotonic counts the budget turns into per-window deltas: frames with GPU stats, of them with a scene cut or a fade,
+// their unmatched blocks and frames with foreground; real frames and of them through frame generation.
+static volatile uint32_t g_pb_st_n = 0, g_pb_st_dist = 0, g_pb_st_unm = 0, g_pb_st_fg = 0, g_pb_real = 0, g_pb_gen = 0;
+static PostBudget g_pb;
+static void opt_state_now(const fg_config_t *c, OptState *s);
+static void opt_log_effective(const char *why);
+
+// FTRACE (pace_policy.h): one 3 x 32-bit record per real frame, only while the debug log is on. The hook writes the
+// hand-over / submit / own time, the monitor adds the time on screen and the vblanks held, the io thread prints them.
+static uint32_t g_ft[FT_N][3];
+static volatile uint32_t g_ft_w;          // records started by the hook
+static volatile uint32_t g_ft_slot[16];   // per display buffer: record index + 1 of the real frame flipped to it
+static uint32_t g_ft_r, g_ft_prev_h;      // io thread: next record to print, hand-over time of the last one printed
 #include "bench_state.h"
 #include "boot_stage.h"
 
@@ -458,6 +552,29 @@ static uint64_t g_pbuf_prev_va = 0;
 static uint32_t g_flip_ring_hist[8] __attribute__((unused));
 static uint32_t g_flip_ring_cnt __attribute__((unused)) = 0;
 #endif
+// shave14, on for the CUSA18723 family when the game starts in a mode that shows two generated frames per pair (Fast
+// or below30), opt-in by file for any other title (LOG_DIR/shave14_<TITLE>), decided once in plugin_load by s14_decide. A 3-buffer game whose
+// boot valve shrinks the display reserve to 8 MiB (one generated-frame buffer) keeps S14_KEEP instead: two buffers, both
+// DirectMemory, which VideoOut requires (it refuses FlexibleMemory, 0x80290013). The game allocation that is then short
+// takes those 8 MiB as a longer FlexibleMemory tail (Arena Shaving, the mechanism that already backs 6 MiB today), and the
+// history buffer g_pbuf (8 MiB of FlexibleMemory, idle in a 3-buffer ring) is not allocated, so the game ends its boot
+// with the FlexibleMemory it has today. g_s14_state: 0 unused, 1 reserve kept at S14_KEEP, 2 two buffers registered,
+// -1 back to today's single buffer (logged). g_s14_tail_extra > 0: the arena tail took that much more FlexibleMemory than
+// it would with an 8 MiB reserve, so g_pbuf stays unallocated for the whole boot (alloc_pbuf_history).
+#define S14_KEEP       0x1000000u   // 2 x (1920 x 1088 x 4 = 0x7F8000 rounded to 64 KiB) = 2 x 0x800000, on the valve's 2 MiB grid
+#define S14_EXTRA      (S14_KEEP - 0x800000u)
+#define S14_FLEX_FLOOR 0x1000000u   // shave_game_alloc: FlexibleMemory left after the tail, see the budget there
+static int g_s14_on __attribute__((unused)) = 0;
+static int g_s14_pbuf_logged __attribute__((unused)) = 0;
+static volatile int g_s14_state __attribute__((unused)) = 0;
+static size_t g_s14_tail_extra __attribute__((unused)) = 0, g_s14_flex_before __attribute__((unused)) = 0;
+// Every path that shrinks or drops the display reserve reports here: below S14_KEEP shave14 is back to one buffer.
+static void s14_reserve_now(size_t sz, const char *why)
+{
+    if (g_s14_state != 1 || sz >= S14_KEEP) return;
+    g_s14_state = -1;
+    STAGE("shave14: display reserve now 0x%zx (%s) -> one generated-frame buffer, as without shave14", sz, why);
+}
 
 static void free_dm_block(void **va, long *phys, size_t *sz, const char *tag)
 {
@@ -520,6 +637,7 @@ static void release_early_dump(void)
 static void release_early_mem(void)
 {
     free_dm_block(&g_pre_mem, &g_pre_mem_phys, &g_pre_size, "display");
+    s14_reserve_now(0, "released");
     if (g_mbuf_state == 1) g_mbuf_state = -1;
     pyr_cache_invalidate();
 }
@@ -672,6 +790,16 @@ static void *alloc_pbuf_history(size_t surf_sz)
     if (g_pbuf && g_pbuf_sz > 0) return g_pbuf;
     if (!surf_sz) surf_sz = 0x800000u;
     size_t full_sz = (surf_sz + 0xFFFFu) & ~(size_t)0xFFFFu;
+    if (g_s14_tail_extra) {   // shave14: its FlexibleMemory backs the longer arena tail (see S14_KEEP)
+        if (!g_s14_pbuf_logged) {
+            size_t fa = 0;
+            ((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&fa);
+            g_s14_pbuf_logged = 1;
+            STAGE("shave14: history buffer not allocated (0x%zx of FlexibleMemory stays with the game; the arena tail took "
+                  "0x%zx more), flex_av=0x%zx", full_sz, g_s14_tail_extra, fa);
+        }
+        return NULL;
+    }
     size_t half_sz = ((surf_sz >> 1) + 0x3FFFFu) & ~(size_t)0xFFFFu;
     if (half_sz < 0x440000u && full_sz >= 0x7E9000u) half_sz = 0x440000u;
     size_t flex_av = 0;
@@ -687,6 +815,14 @@ static void *alloc_pbuf_history(size_t surf_sz)
     }
     g_pbuf_skip_logged = 0;
     int prefer_half = (fq == 0 && flex_av > 0 && (flex_av < 0x1800000u || flex_av < full_sz + 0x1000000u));
+    // CUSA02299 (2_10_10_10 display, 18 MB of FlexibleMemory at frame 120): the 16-bit history costs the generated
+    // frame precision against the real frames around it, so keep the full 8-bit history whenever 8 MB of FlexibleMemory
+    // still stays with the game after it. Below that it takes the 16-bit history (or none) like every other title.
+    if (prefer_half && fq == 0 && vcfg_in_family(g_title_id, "CUSA02299") && flex_av >= full_sz + 0x800000u) {
+        prefer_half = 0;
+        STAGE("alloc_pbuf_history: CUSA02299 keeps the 8-bit history (full_sz=0x%zx, flex_av=0x%zx, 0x%zx stays with the game)",
+              full_sz, flex_av, flex_av - full_sz);
+    }
     if (!prefer_half) {
         void *fl = alloc_flex_gpu(full_sz, 0x10000u);
         if (fl) {
@@ -1056,7 +1192,7 @@ static uint32_t build_dcb_flow(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M,
     *(volatile uint64_t *)(slotb + 0x900) = 0;
     *(volatile uint64_t *)(slotb + 0x908) = 0;
     for (int i = 0; i < 5; i++) *(volatile uint64_t *)(slotb + 0x910 + i * 8) = 0;
-    for (int i = 0; i < 8; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
+    for (int i = 0; i < 11; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
 #define TS_EOP(i) do { uint64_t a_ = (uint64_t)(uintptr_t)(slotb + 0x910 + (i) * 8); \
         *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)a_; *p++ = 0x60000000u | ((uint32_t)(a_ >> 32) & 0xFFFFu); *p++ = 0; *p++ = 0; } while (0)
 #define TS2(j) do { uint64_t a2_ = (uint64_t)(uintptr_t)(slotb + 0x980 + (j) * 8); \
@@ -1125,7 +1261,7 @@ static char g_vov_title[48];
 static int vov_ready(void)
 {
     if (g_vov_state) return g_vov_state > 0;
-    const size_t min_full_vsz = (VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu; // 0x60000 (384 KB): full 720 px height (fits all 9 rows)
+    const size_t min_full_vsz = (VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu; // 0x60000 (384 KB): full 720 px height (fits all 11 rows)
     const size_t dbl_full_vsz = (2u * VOV_BUF_SZ + 0xFFFFu) & ~(size_t)0xFFFFu;
     size_t vsz = ((g_mem_tight ? dbl_full_vsz : VOV_MEM_SZ) + 0xFFFFu) & ~(size_t)0xFFFFu;
     void *mem = alloc_flex_gpu(vsz, 0x10000);
@@ -1197,18 +1333,33 @@ static void osd_build_slot(uint8_t *osd_mem, uint32_t *xy_out, uint32_t *wh_out,
     if (toast) {
         vov_cpy(m.status, g_osd_toast, sizeof(m.status));
     } else {
-        m.sel = g_menu_sel;
+        m.sel = g_menu_sel;   // index among the visible rows (opt_menu_rows)
         if (g_inert_reason[0]) vov_cpy(m.status, g_inert_reason, sizeof(m.status));
+        // A row whose setting cannot act under the other settings is hidden (opt_row_visible); a shown row that can be
+        // inert gets its live state (ACTIVE / READY / INERT / LIMITED) and, when selected, its reason in the header line.
+        OptState os; opt_state_now(&c, &os);
+        int vis[OPT_ROW_N], nvis = opt_menu_rows(c.framegen, c.preset, c.fps_lock, vis);
+        if (m.sel >= nvis) m.sel = nvis ? nvis - 1 : 0;
+#define VIS(r) (opt_menu_index_of(vis, nvis, (r)) >= 0)
         vov_row(&m, "Frame generation", VOV_TOGGLE, c.framegen, 0, "");
-        vov_row(&m, "Mode", VOV_TEXT, 0, 0, c.preset == 1 ? "Fast" : (c.preset == 2 ? "Sharp" : "Quality"));
+        if (VIS(OPT_ROW_MODE)) vov_row(&m, "Mode", VOV_TEXT, 0, 0, c.preset == 1 ? "Fast" : (c.preset == 2 ? "Sharp" : "Quality"));
         vov_row(&m, "Sharpness", VOV_SEGMENTS, 0, c.sharpness, "");
         vov_row(&m, "Anti-aliasing", VOV_TEXT, 0, 0, c.upscale <= 0 ? "Off" : (c.upscale == 1 ? "Light" : "Strong"));
         vov_row(&m, "FPS counter", VOV_TEXT, 0, 0, overlay_label(c.overlay));
-        vov_row(&m, "Game vectors", VOV_TOGGLE, c.game_vectors, 0, "");
-        vov_row(&m, "HUD protection", VOV_TEXT, 0, 0, c.hud_protect <= 0 ? "Off" : (c.hud_protect == 1 ? "Conservative" : "Aggressive"));
+        if (VIS(OPT_ROW_GV)) vov_row(&m, "Game vectors", VOV_TOGGLE, c.game_vectors, 0, "");
+        if (VIS(OPT_ROW_HUD)) vov_row(&m, "HUD protection", VOV_TEXT, 0, 0, c.hud_protect <= 0 ? "Off" : (c.hud_protect == 1 ? "Conservative" : "Aggressive"));
         char lock[16]; if (c.fps_lock <= 0) vov_cpy(lock, "Auto", sizeof(lock)); else snprintf(lock, sizeof(lock), "%d", c.fps_lock);
         vov_row(&m, "FPS lock", VOV_TEXT, 0, 0, lock);
+        if (VIS(OPT_ROW_B30)) vov_row(&m, "Below 30 FPS", VOV_TOGGLE, c.below30, 0, "");
+        if (VIS(OPT_ROW_SHQ)) vov_row(&m, "Low latency", VOV_TOGGLE, c.shallow_queue, 0, "");
         vov_row(&m, "Opacity", VOV_SEGMENTS, 0, c.menu_opacity, "");
+#undef VIS
+        for (int i = 0; i < m.nrows && i < nvis; i++) {
+            OptStat t = opt_row_stat(&os, vis[i]);
+            m.rows[i].tag = t.st;   // OPT_ACTIVE / READY / INERT / LIMITED == VOV_TAG_ACTIVE / READY / INERT / LIMITED
+            char d[48];
+            if (i == m.sel && opt_row_detail(d, sizeof(d), vis[i], t)) vov_cpy(m.status, d, sizeof(m.status));
+        }
         vov_cpy(m.hints, "\xe2\x86\x95 \xe2\x86\x90 \xe2\x86\x92  \xc3\x97 APPLY  \xe2\x96\xa1 RESET  \xe2\x96\xb3 SAVE  \xe2\x97\x8b", sizeof(m.hints));
     }
     if (!vov_menu(&m, &g_vov_pal, &g_vov_pix, &w, &h)) return;
@@ -1223,6 +1374,7 @@ static void calc_rcas_params(uint32_t target_mask, uint32_t *con_bits_out, uint3
     int enh_mode = g_cfg.upscale;
     if (enh_mode < 0) enh_mode = 0;
     if (enh_mode > 2) enh_mode = 2;
+    pb_eff(__atomic_load_n(&g_pb_level, __ATOMIC_ACQUIRE), sharp_pct, enh_mode, &sharp_pct, &enh_mode);   // 0 = as set
     if ((sharp_pct > 0 || enh_mode > 0) && g_sh8_off[14]) {
         if (sharp_pct > 100) sharp_pct = 100;
         if (sharp_pct > 0) {
@@ -1235,6 +1387,50 @@ static void calc_rcas_params(uint32_t target_mask, uint32_t *con_bits_out, uint3
     }
     *con_bits_out = rcas_con_bits;
     *flags_out = rcas_flags;
+}
+
+// Option post_mid = 3 (first measured on CUSA18723): with Enhance AA on and Sharpness 0, the real frame gets the same
+// AA as the generated one (rcas8 flags 3 in one dispatch, plus the static handling of bit 5 below), so edges are
+// smoothed the same way in both frames. Not the default: the real frame is the next pair's P, so a moving edge is
+// smoothed in P and again in the generated frame (corpus, Sharpness 0: moving-edge PSNR -0.32 dB training, -0.74 dB
+// validation against v2.35). Sharpness > 0 keeps the generated-frame-only post-process (sharpening the real frame in
+// place was measured worse, see post_mid_only). P must be the game's own 8-bit buffer (the 3-buffer ring without the
+// history copy, or a full-size copy): with the 16-bpp history copy the write-back test of bit 5 cannot match, so it
+// stays mid-only. Game vectors (warp8g) keep the game's alpha, so the static bits 4 and 5 below are never set and the
+// real frame would get the AA on its static pixels too (offline: HUD -1.9 dB, still areas -3.2 dB): mid-only there.
+static int real_aa_on(void)
+{
+    return g_cfg.post_mid == 3 && g_cfg.upscale > 0 && g_cfg.sharpness == 0 && !g_t_prev_half16 && !gv_warp_active();
+}
+
+// rcas8 flag bit 4: warp8 writes the mid's alpha as a static-pixel flag (1.0 where P == C in RGB, 254/255 elsewhere)
+// and rcas8 leaves those pixels raw on the mid pass (no AA and, with Sharpness > 0, no sharpening either; no store,
+// and a wave whose 64 pixels are all static skips the pass after its tile load): the real frames show those pixels
+// raw, so a post-process only in the generated frame alternates at 30 Hz (HUD, still scenery). warp8g keeps the game's alpha, so the bit is set only for warp8, and
+// only when the real frame is not post-processed in the same dispatch (bit 1, post_mid = 2): then both frames get the
+// AA and a static pixel must get it in the mid too.
+//
+// Bit 5 (with bits 0, 1 and 4, real_aa_on() only): the real frame gets the AA too, in place, and it is the next
+// pair's P. AA on the static pixels of P made warp8 stop seeing them as static (offline: HUD -1.9 dB, still areas
+// -3.2 dB, HUD flicker +18 % against the mid-only AA), so the cur pass skips the AA where the mid pass found the static
+// flag, and writes the pixel back raw where its AA result equals P's stored code (static, but P holds last frame's AA
+// of it; without that, every edge that once moved stays AA'd in P and never compares static again).
+static uint32_t rcas_static_flag(uint32_t rcas_flags)
+{
+    if (gv_warp_active()) return rcas_flags;
+    if ((rcas_flags & 3u) == 1u) return rcas_flags | 16u;
+    if ((rcas_flags & 3u) == 3u && real_aa_on()) return rcas_flags | 48u;
+    return rcas_flags;
+}
+
+// bit 6: rcas8 adds back the part of the centre texel its 8-bit LDS tile drops (texel - unpack(pack(texel))), so a
+// 2_10_10_10 surface keeps all 10 bits where the pass leaves the pixel unchanged. Without it every lane of a non
+// 8_8_8_8 surface is stored as the 8-bit LDS value: the 2 low bits of the mid and of the real frame are lost, and a
+// 1-code mid/real difference becomes a 4-code step. On 8_8_8_8 the residual is 0 (the round trip is exact).
+static uint32_t rcas_precise_flag(uint32_t rcas_flags)
+{
+    if (rcas_flags && g_t_dfmt != 10u && vcfg_in_family(g_title_id, "CUSA02299")) return rcas_flags | 64u;
+    return rcas_flags;
 }
 
 // 1.4: Native post-processing pass on T#cur only (when FrameGen is OFF or inert due to resolution / 60fps / no mbuf).
@@ -1258,6 +1454,12 @@ static uint32_t build_dcb_post8(uint32_t *p0, uint64_t C, uint32_t w, uint32_t h
     fill_table8_ext(tb, g_gpu, slotb, rcas_con_bits, rcas_flags, osd_xy, osd_wh);
     *(volatile uint64_t *)(slotb + 0x900) = 0;
     *(volatile uint64_t *)(slotb + 0x908) = 0;
+    // GPU time with FG off: this slot's timestamps are written here too (the reader took stale FG-on values of all four
+    // slots and divided them by the CPU time: "GPU time ... 400 ms"); pyramid / motion / fence are 0, warp/post = the
+    // post pass. No frame statistics (no motion search): marked absent for the FRAMES line.
+    for (int i = 0; i < 5; i++) *(volatile uint64_t *)(slotb + 0x910 + i * 8) = 0;
+    for (int i = 0; i < 11; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
+    for (int i = 0; i < 8; i++) ((volatile uint32_t *)(slotb + STATS_OFF))[i] = 0xFFFFFFFFu;
 
     uint32_t *p = p0;
     *p++ = PKT3(0x46, 1, 0); *p++ = 0x0000002E;
@@ -1268,6 +1470,7 @@ static uint32_t build_dcb_post8(uint32_t *p0, uint64_t C, uint32_t w, uint32_t h
     *p++ = PKT3(0x58, 6, 0); *p++ = 0x80C40000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
     *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
 
+    TS_EOP(0); TS_EOP(1); TS_EOP(2); TS_EOP(3);
     *p++ = PKT3(0x76, 4, 1); *p++ = 0x207; *p++ = 64; *p++ = 1; *p++ = 1;
     *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl; *p++ = (uint32_t)(tbl >> 32);
 
@@ -1281,6 +1484,7 @@ static uint32_t build_dcb_post8(uint32_t *p0, uint64_t C, uint32_t w, uint32_t h
         *p++ = PKT3(0x15, 4, 1); *p++ = (osd_wh & 0xFFu) * 2u; *p++ = ((osd_wh >> 8) & 0xFFu) * 2u; *p++ = 1; *p++ = 1;
         PASS_BARRIER();
     }
+    TS_EOP(4);
 
     *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)lbl; *p++ = 0x40000000u | ((uint32_t)(lbl >> 32) & 0xFFFFu); *p++ = seq; *p++ = 0;
     *p++ = PKT3(0x3C, 6, 0); *p++ = 0x13; *p++ = (uint32_t)lbl; *p++ = (uint32_t)(lbl >> 32); *p++ = seq; *p++ = 0xFFFFFFFFu; *p++ = 0x0A;
@@ -1326,6 +1530,7 @@ static int post_mid_only(void)
 {
     if (g_cfg.post_mid == 1) return 1;
     if (g_cfg.post_mid == 2) return 0;
+    if (real_aa_on()) return 0;
     if (g_mid_only < 0) {
         g_mid_only = 1;
         lg("post-process target: generated frames only (default, keeps real C/P unmodified)\n");
@@ -1340,6 +1545,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
                                 uint64_t copy_dst, uint32_t copy_idx)
 {
     uint32_t *p = p0;
+    g_lt_n[slot & 3u] = 0;   // late_tail.h: no DCB2 unless this call builds one
     int pyr_warm = (P != 0 && P != C && P == g_pyr_last_cur_base && g_bw == g_pyr_last_w && g_bh == g_pyr_last_h);
     uint32_t r = pyr_warm ? (g_pyr_parity ^ 1u) : 0u;
     g_pyr_parity = r;
@@ -1358,10 +1564,26 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
                         | (g_opt_nocf ? 8u : 0u) | (g_opt_nofgk ? 16u : 0u) | (g_opt_noanc ? 32u : 0u)
                         | (g_opt_notp ? 64u : 0u) | (g_opt_nomf ? 128u : 0u) | (g_opt_notex ? 256u : 0u)
                         | (g_opt_notpg ? 512u : 0u) | (g_opt_sharp ? 1024u : 0u) | (g_opt_nostr ? 2048u : 0u)
-                        | (pyr_warm ? FG8_FLAG_PYR_WARM : 0u)
+                        | (pyr_warm ? FG8_FLAG_PYR_WARM : 0u) | (g_fade_hi ? FG8_FLAG_FADE_HI : 0u)
                         | (cut_blocks8() << 16);
     uint32_t mid1_packed = (mid1_idx & 0x7FFFu) | ((t1_q16 & 0xFFFFu) << 16);
-    if (!g_bench_offscreen) fg8_resolve_2buf_history(&P, C, &copy_dst, &copy_idx, seq);
+    // History copy on a 3-buffer ring (every title; proven on CUSA18723): a game that flips its buffers in turn leaves
+    // the previous real frame untouched in g_buf[g_prev_idx] until it renders into it again two flips later, which is
+    // submitted after this DCB on the same graphics ring. The full-frame pcopy8 into g_pbuf (8.3 MB written to
+    // FlexibleMemory plus two barriers per real frame) then copies exactly what P already holds: skip it and keep P in
+    // the game's buffer. Pacing is untouched (g_pcopy_on / g_pcopy_avail and the reserved g_pbuf stay as they are), and
+    // the copy comes back by itself when the ring turns 2-buffer at runtime or a real present copy runs (copy_dst != 0).
+    // A 3-buffer game that rewrote its previous buffer before the next flip would show the wrong P here.
+    if (!g_bench_offscreen) {
+        static int s_pbuf_skip_logged = 0;
+        int pbuf_skip = !copy_dst && g_ngame >= 3 && !g_runtime_2buf;
+        if (pbuf_skip != s_pbuf_skip_logged) {
+            s_pbuf_skip_logged = pbuf_skip;
+            lg("history copy: %s\n", pbuf_skip ? "skipped (3-buffer ring, P read from the game's buffer)" : "on");
+        }
+        if (pbuf_skip) { g_t_prev_half16 = 0; g_pcopy_dst_half16 = 0; g_pbuf_valid = 0; }
+        else fg8_resolve_2buf_history(&P, C, &copy_dst, &copy_idx, seq);
+    }
 
     fill_table8_wh(tb, P, C, M1, g_bw, g_bh, pitch, tidx, r, mid1_packed, base_flags, g_work, g_mon, stats);
 
@@ -1371,12 +1593,39 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     if (!g_mem_tight || g_cfg.upscale > 0)
         calc_rcas_params((post_mid_only() || g_bench_offscreen) ? 1u /*mid1 only*/ : mask1, &rcas_con_bits, &rcas_flags1);
     if (g_sh8_off[15] && !g_bench_offscreen) osd_build_slot(slotb + OSD_SLOT_OFF, &osd_xy, &osd_wh1, mask1);
+    rcas_flags1 = rcas_static_flag(rcas_flags1);
+    rcas_flags1 = rcas_precise_flag(rcas_flags1);
+    // late_tail.h: the real frame's work (history copy; with rcas8 on both frames, its half of rcas8 and of the overlay)
+    // moves to DCB2. Eligibility as listed there; the split keeps every flag bit but the target mask (bits 0..1).
+    const int lt_real_aa_pass = g_cfg.post_mid == 2 && post_mid_only() && !g_mem_tight && !two_mids && g_sh8_off[14] && g_cfg.upscale > 0;
+    const int lt = g_lt_req && !two_mids && !g_bench_offscreen && !g_dump_req && copy_dst && copy_idx == 0xFFFFu && g_sh8_off[16] &&
+                   !(rcas_flags1 & 32u) && !lt_real_aa_pass;
+    const int lt_rcas = lt && (rcas_flags1 & 3u) == 3u;
+    uint32_t lt_rcas_cur = 0, lt_osd_cur = 0;
+    if (lt_rcas) {
+        lt_rcas_cur = (rcas_flags1 & ~3u) | 2u;
+        rcas_flags1 = (rcas_flags1 & ~3u) | 1u;
+        if (osd_wh1 & (2u << 24)) {
+            lt_osd_cur = osd_wh1 & ~(1u << 24);
+            osd_wh1 &= ~(2u << 24);
+        }
+    }
     fill_table8_ext(tb, g_gpu, slotb, rcas_con_bits, rcas_flags1, osd_xy, osd_wh1);
+    uint32_t *lt_tbr = (uint32_t *)(slotb + SLOT_TB2_OFF);   // the real frame's table (DCB2), with lt_rcas only
+    uint64_t lt_tblr = (uint64_t)(uintptr_t)lt_tbr;
+    if (lt_rcas) {
+        memcpy(lt_tbr, tb, 140 * sizeof(uint32_t));
+        fill_table8_ext(lt_tbr, g_gpu, slotb, rcas_con_bits, lt_rcas_cur, osd_xy, lt_osd_cur);
+    }
+    if (lt) {
+        *(volatile uint64_t *)(slotb + LT_LBL_OFF) = 0;
+        for (int i = 0; i < 2; i++) *(volatile uint64_t *)(slotb + LT_TS_OFF + i * 8) = 0;
+    }
 
     *(volatile uint64_t *)(slotb + 0x900) = 0;
     *(volatile uint64_t *)(slotb + 0x908) = 0;
     for (int i = 0; i < 5; i++) *(volatile uint64_t *)(slotb + 0x910 + i * 8) = 0;
-    for (int i = 0; i < 7; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
+    for (int i = 0; i < 11; i++) *(volatile uint64_t *)(slotb + 0x980 + i * 8) = 0;
 #define DISPATCH(x, y) do { *p++ = PKT3(0x15, 4, 1); *p++ = (x); *p++ = (y); *p++ = 1; *p++ = 1; } while (0)
     const FgDim D = fg_dim(g_bw, g_bh);   // 1080p: the literals that stood here (30 x 68, 240 x 135, ...), see fg_res.h
     *p++ = PKT3(0x46, 1, 0); *p++ = 0x0000002E;
@@ -1430,10 +1679,41 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
     else { SET_PASS(g_sh8_off[5], WARP8_RSRC1, WARP8_RSRC2); }
     DISPATCH(D.wx, D.wy);
     PASS_BARRIER(); TS2(5);
+#define EMIT_PCOPY8() do { \
+        uint32_t *tb3 = (uint32_t *)(slotb + OSD_SLOT_OFF);   /* old text-grid OSD area, unused since the bitmap overlay */ \
+        uint64_t tbl3 = (uint64_t)(uintptr_t)tb3; \
+        fill_pcopy8_table(tb3, C, copy_dst, g_bw, g_bh, pitch, tidx, g_pcopy_dst_half16, g_pcopy_ycocg_mode); \
+        if (copy_idx != 0xFFFFu) { \
+            int32_t fr3 = insert_wait_flip_done(p, 7, vo_handle, copy_idx); \
+            if (fr3 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; } \
+            p += 7; \
+        } \
+        PASS_BARRIER(); \
+        *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; /* inv scalar cache */ \
+        *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl3; *p++ = (uint32_t)(tbl3 >> 32); \
+        SET_PASS(g_sh8_off[16], PCOPY8_RSRC1, PCOPY8_RSRC2); DISPATCH(D.wx, D.wy); \
+        PASS_BARRIER(); \
+    } while (0)
+    // History copy before the real frame is post-processed: when Sharpness / Enhance AA also run on the real frame
+    // (post_mid = 2), copying C after that pass made the next P an already filtered frame, and the generated frame,
+    // filtered again, came out filtered twice on its P side against once on the real frames around it. The history
+    // buffer (copy_idx 0xFFFF, read only by the next warp) now takes C right after this warp read P from it; a present
+    // copy that goes to the screen (copy_idx != 0xFFFF) and the 3-slot pair (its second warp still reads P) keep the
+    // copy at the end. CUSA02299 only for now (the title it was measured on).
+    const int pcopy_early_c = copy_dst && g_sh8_off[16] && copy_idx == 0xFFFFu && !two_mids && rcas_flags1 &&
+                              !g_bench_offscreen && !post_mid_only() && vcfg_in_family(g_title_id, "CUSA02299");
+    const int pcopy_early = pcopy_early_c && !lt;   // late_tail: the copy goes to DCB2, still before the real's rcas8
+    if (pcopy_early) {
+        EMIT_PCOPY8();
+        uint64_t tbl0 = (uint64_t)(uintptr_t)tb;   // back to this slot's table for the passes below
+        *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+        *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl0; *p++ = (uint32_t)(tbl0 >> 32);
+    }
     if (rcas_flags1) {
         SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy);
         PASS_BARRIER();
     }
+    TS2(8);   // t2[5]..t2[8] = rcas8 of the 1st mid alone (0 without post-process)
     // post_mid_only: the real frame gets the profile's Enhance AA WITHOUT sharpening (Enhance off = real untouched), so
     // the aliasing that crawls on edges is smoothed the same way in real and generated frames, and the sharpening only
     // compensates the generated frame's softness. Separate table in the tb2 region (only FG Fast's mid2 uses it; in that
@@ -1472,11 +1752,14 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         tb2[29] = (mid2_idx & 0x7FFFu) | 0x8000u /*skip_st*/ | ((t2_q16 & 0xFFFFu) << 16);
         uint32_t rcas_con2 = 0, rcas_flags2 = 0, osd_wh2 = (osd_wh1 & 0x00FFFFFFu) | (3u << 24);
         calc_rcas_params(post_mid_only() ? 1u /*mid2 only*/ : 3u /*mid2 + cur*/, &rcas_con2, &rcas_flags2);
+        rcas_flags2 = rcas_static_flag(rcas_flags2);
+        rcas_flags2 = rcas_precise_flag(rcas_flags2);
         fill_table8_ext(tb2, g_gpu, slotb, rcas_con2, rcas_flags2, osd_xy, osd_wh1 ? osd_wh2 : 0u);
 
         int32_t fr2 = insert_wait_flip_done(p, 7, vo_handle, mid2_idx);
         if (fr2 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
         p += 7;
+        TS2(9);   // t2[8]..t2[9] = osd8 of the 1st mid + the wait for the 2nd mid's buffer
 
         *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; // inv scalar cache
         *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl2; *p++ = (uint32_t)(tbl2 >> 32);
@@ -1486,6 +1769,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         else { SET_PASS(g_sh8_off[5], WARP8_RSRC1, WARP8_RSRC2); }
         DISPATCH(D.wx, D.wy);
         PASS_BARRIER();
+        TS2(10);  // t2[9]..t2[10] = phase8 + warp8 of the 2nd mid, t2[10]..t2[7] = its rcas8 + osd8
         if (rcas_flags2) {
             SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy);
             PASS_BARRIER();
@@ -1510,23 +1794,58 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
         g_dump_req = 0;
         g_dump_frame = seq;
     }
-    if (copy_dst && g_sh8_off[16]) {   // present copy: finished real frame -> own display or history buffer (see g_pcopy_avail / g_pbuf)
-        uint32_t *tb3 = (uint32_t *)(slotb + OSD_SLOT_OFF);   // old text-grid OSD area, unused since the bitmap overlay
-        uint64_t tbl3 = (uint64_t)(uintptr_t)tb3;
-        fill_pcopy8_table(tb3, C, copy_dst, g_bw, g_bh, pitch, tidx, g_pcopy_dst_half16, g_pcopy_ycocg_mode);
-        if (copy_idx != 0xFFFFu) {
-            int32_t fr3 = insert_wait_flip_done(p, 7, vo_handle, copy_idx);
-            if (fr3 != 0) { p[0] = PKT3(0x10, 6, 0); for (int i = 1; i < 7; i++) p[i] = 0; }
-            p += 7;
-        }
-        PASS_BARRIER();
-        *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; // inv scalar cache
-        *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)tbl3; *p++ = (uint32_t)(tbl3 >> 32);
-        SET_PASS(g_sh8_off[16], PCOPY8_RSRC1, PCOPY8_RSRC2); DISPATCH(D.wx, D.wy);
-        PASS_BARRIER();
+    TS2(7);   // t2[5]..t2[7] = rcas8 (+ osd8 / FG Fast mid2), t2[7]..t2[6] = pcopy8 (0 when no copy runs; CUSA02299's early
+              // history copy runs before rcas8, inside t2[5]..t2[8])
+    if (copy_dst && g_sh8_off[16] && !pcopy_early && !lt) {   // present copy: finished real frame -> own display or history buffer (see g_pcopy_avail / g_pbuf)
+        EMIT_PCOPY8();
     }
+    // late_tail.h: the real frame's work, in the order the DCB had it (early history copy before the real's rcas8).
+#define EMIT_REAL_WORK() do { \
+        if (pcopy_early_c || !lt_rcas) EMIT_PCOPY8(); \
+        if (lt_rcas) { \
+            *p++ = PKT3(0x58, 6, 0); *p++ = 0x88400000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A; /* inv scalar cache */ \
+            *p++ = PKT3(0x76, 3, 1); *p++ = 0x240; *p++ = (uint32_t)lt_tblr; *p++ = (uint32_t)(lt_tblr >> 32); \
+            SET_PASS(g_sh8_off[14], RCAS8_RSRC1, RCAS8_RSRC2); DISPATCH(D.wx, D.wy); \
+            PASS_BARRIER(); \
+            if (lt_osd_cur) { \
+                PASS_BARRIER(); \
+                SET_PASS(g_sh8_off[15], OSD8_RSRC1, OSD8_RSRC2); \
+                DISPATCH((lt_osd_cur & 0xFFu) * 2u, ((lt_osd_cur >> 8) & 0xFFu) * 2u); \
+            } \
+            if (!pcopy_early_c) EMIT_PCOPY8(); \
+        } \
+    } while (0)
+#define LT_TS(off) do { uint64_t al_ = (uint64_t)(uintptr_t)(slotb + (off)); \
+        *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)al_; *p++ = 0x60000000u | ((uint32_t)(al_ >> 32) & 0xFFFFu); *p++ = 0; *p++ = 0; } while (0)
+    if (lt) {
+        // room: DCB1 still takes TS2(6), TS_EOP(4), the end-of-pipe label, its wait, a cache action and the flip packet
+        // (up to 128 dwords); DCB2 has DCB8_SZ / 4 - LT_DCB2_DW dwords (384) for ~150 + its own flip packet
+        if ((uint32_t)(p - p0) + 6u + 6u + 6u + 7u + 7u + 128u <= LT_DCB2_DW) {
+            uint32_t *p_d1 = p, *q0 = p0 + LT_DCB2_DW;
+            uint64_t lbl3 = (uint64_t)(uintptr_t)(slotb + LT_LBL_OFF);
+            p = q0;
+            LT_TS(LT_TS_OFF);
+            // a separate submission: set again what our passes rely on (thread count here, then per pass the user data,
+            // the shader address and resources), and make the writes of DCB1 visible
+            PASS_BARRIER();
+            *p++ = PKT3(0x76, 4, 1); *p++ = 0x207; *p++ = 64; *p++ = 1; *p++ = 1;
+            EMIT_REAL_WORK();
+            LT_TS(LT_TS_OFF + 8);
+            *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)lbl3; *p++ = 0x40000000u | ((uint32_t)(lbl3 >> 32) & 0xFFFFu); *p++ = seq; *p++ = 0;
+            *p++ = PKT3(0x3C, 6, 0); *p++ = 0x13; *p++ = (uint32_t)lbl3; *p++ = (uint32_t)(lbl3 >> 32); *p++ = seq; *p++ = 0xFFFFFFFFu; *p++ = 0x0A;
+            *p++ = PKT3(0x58, 6, 0); *p++ = 0x80C40000; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0x0A;
+            g_lt_n[slot & 3u] = (uint32_t)(p - q0);
+            p = p_d1;
+        } else {
+            g_lt_fallbacks++;
+            EMIT_REAL_WORK();
+        }
+    }
+#undef LT_TS
+#undef EMIT_REAL_WORK
     TS2(6);
     TS_EOP(4);
+#undef EMIT_PCOPY8
 #undef DISPATCH
     *p++ = PKT3(0x47, 5, 0); *p++ = 0x00000528; *p++ = (uint32_t)lbl; *p++ = 0x40000000u | ((uint32_t)(lbl >> 32) & 0xFFFFu); *p++ = seq; *p++ = 0;
     *p++ = PKT3(0x3C, 6, 0); *p++ = 0x13; *p++ = (uint32_t)lbl; *p++ = (uint32_t)(lbl >> 32); *p++ = seq; *p++ = 0xFFFFFFFFu; *p++ = 0x0A;
@@ -1583,7 +1902,19 @@ static void cfg_apply_title_defaults(fg_config_t *c)
         c->reg_mode = 1;
         c->pace_order = 2;
     } else if (vcfg_in_family(g_title_id, "CUSA02299")) {
-        c->reg_mode = 1;
+        // CUSA02299 (base PS4 boots, dm=0x13b400000, 2.34 and 2.35): after RegisterBuffers the game asks for a 0x10000000
+        // type 0 pool (BatchMap at 1900000000) when only 0xe600000 is free next to our 32 MB display reserve. With the
+        // early group registered (g_mbuf_state == 1) the valve may not shrink that reserve, the arena shave needs a
+        // 0x1a00000 FlexibleMemory tail, the request fails and the game never leaves the loading screen. Late activation
+        // (reg_mode=2) keeps g_mbuf_state=0 during boot: nothing of ours is registered with VideoOut or submitted to the
+        // GPU before frame 120, so the valve shrinks the reserve to 8 MB and shaves an 8 MB tail, or gives the reserve
+        // back when FlexibleMemory is short (FG then stays off at frame 120: NO DISPLAY MEM). When the pool does not
+        // need it, frame 120 registers the same 4 buffers at the top as reg_mode=1.
+        c->reg_mode = 2;
+        // Its display buffers are 2_10_10_10 and the generated frame alternates with the real one every refresh: with
+        // Sharpness / Enhance AA on the generated frame only, the two differ and smooth areas (sky) flicker. Post-process
+        // both frames (post_mid = 2).
+        c->post_mid = 2;
     } else if (vcfg_in_family(g_title_id, "CUSA09311") ||
                vcfg_in_family(g_title_id, "CUSA18534") ||
                vcfg_in_family(g_title_id, "CUSA10123")) {
@@ -1607,6 +1938,9 @@ static void cfg_apply_title_defaults(fg_config_t *c)
 static void cfg_defaults(fg_config_t *c)
 {
     c->framegen       = (g_known_game && !g_detected_60fps) ? 1 : 0;
+    g_post_budget     = 1;   // option post_budget: every load starts from the default, a file without the key means on
+    g_late_tail       = 1;   // option late_tail (late_tail.h): the same, a file without the key means on
+    g_fade_hi         = 1;   // option fade_hi: the same, a file without the key means on
     c->mode           = 8;
     c->preset         = 0;
     c->sharpness      = 40;
@@ -1629,6 +1963,8 @@ static void cfg_defaults(fg_config_t *c)
     c->vout_path      = 0;
     c->gv_conv        = -1;
     c->audio_fix      = 0;
+    c->below30        = 0;
+    c->shallow_queue  = 1;
     cfg_apply_title_defaults(c);
 }
 
@@ -1669,7 +2005,7 @@ static int parse_ini_file_ex(const char *path, fg_config_t *c, uint32_t *hash_io
                 else if (strcmp(key, "pace_order") == 0) raw_pace = val < 0 ? 0 : (val > 3 ? 3 : val);
                 else if (strcmp(key, "shave_mode") == 0) raw_shave = val < 0 ? 0 : (val > 2 ? 2 : val);
                 else if (strcmp(key, "reg_mode") == 0) raw_reg = val < 0 ? 0 : (val > 2 ? 2 : val);
-                else if (strcmp(key, "post_mid") == 0) raw_post = val < 0 ? 0 : (val > 2 ? 2 : val);
+                else if (strcmp(key, "post_mid") == 0) raw_post = val < 0 ? 0 : (val > 3 ? 3 : val);
                 else if (strcmp(key, "adapt_ver") == 0) raw_adapt_ver = val;
                 else if (strcmp(key, "shave2_failed") == 0) raw_shave2_failed = (val != 0);
                 else if (strcmp(key, "early_crashes") == 0) raw_early_crashes = val < 0 ? 0 : (val > 99 ? 99 : val);
@@ -1680,8 +2016,13 @@ static int parse_ini_file_ex(const char *path, fg_config_t *c, uint32_t *hash_io
                 else if (strcmp(key, "game_vectors") == 0) c->game_vectors = (val != 0);
                 else if (strcmp(key, "tile_idx") == 0) g_tile_override = val < 0 ? -1 : (val > 31 ? 31 : val);
                 else if (strcmp(key, "tile_sweep") == 0) g_tile_sweep = val ? 1 : 0;
+                else if (strcmp(key, "post_budget") == 0) g_post_budget = (val != 0);
+                else if (strcmp(key, "late_tail") == 0) g_late_tail = (val != 0);
+                else if (strcmp(key, "fade_hi") == 0) g_fade_hi = (val != 0);
                 else if (strcmp(key, "t6_bit") == 0) g_t6_bit_override = val < 0 ? -1 : (val > 31 ? 31 : val);
                 else if (strcmp(key, "fps_lock") == 0) c->fps_lock = (val == 20 || val == 30 || val == 60) ? val : 0;
+                else if (strcmp(key, "below30") == 0) c->below30 = (val != 0);
+                else if (strcmp(key, "shallow_queue") == 0) c->shallow_queue = (val != 0);
                 else if (strcmp(key, "menu_hold_ms") == 0) c->menu_hold_ms = val < 500 ? 500 : (val > 10000 ? 10000 : val);
                 else if (strcmp(key, "menu_opacity") == 0) c->menu_opacity = val < 20 ? 20 : (val > 100 ? 100 : val);
                 else if (strcmp(key, "overlay") == 0) c->overlay = val < 0 ? 0 : (val > 8 ? 8 : val);
@@ -1853,9 +2194,11 @@ static void cfg_apply_live(const fg_config_t *c, const char *reason)
     else if (!(g_gv_letters_base & GVL_ON)) gl &= ~GVL_ON;
     gv_set_letters(gl);
     if (reason) {
-        lg("config (%s): framegen=%d mode=%d preset=%d sharpness=%d enhance=%d hud_protect=%d game_vectors=%d fps_lock=%d overlay=%d opacity=%d%%\n",
+        lg("config (%s): framegen=%d mode=%d preset=%d sharpness=%d enhance=%d hud_protect=%d game_vectors=%d fps_lock=%d overlay=%d opacity=%d%% below30=%d shallow_queue=%d\n",
            reason, c->framegen, c->mode, c->preset, c->sharpness, c->upscale,
-           c->hud_protect, c->game_vectors, c->fps_lock, c->overlay, c->menu_opacity);
+           c->hud_protect, c->game_vectors, c->fps_lock, c->overlay, c->menu_opacity, c->below30, c->shallow_queue);
+        lg("fade_hi: %s (option fade_hi; FRAMES lines count its fades as fade_hi frames)\n", g_fade_hi ? "on" : "off");
+        opt_log_effective(reason);
     }
 }
 
@@ -1986,6 +2329,10 @@ static void check_title_version_upgrade(void)
     }
 }
 
+// The preset the game starts with (config.ini / config-<TITLE>.ini / adapt), for s14_decide only. g_cfg.preset itself
+// stays at its static value until the first cfg_apply_live ("init"), as in v2.35: every other reader of it before then
+// (flip hooks, boot STAGE lines) keeps today's behaviour.
+static int g_boot_preset = 0;
 static void load_early_adapt_cfg(void)
 {
     fg_config_t c;
@@ -2010,6 +2357,9 @@ static void load_early_adapt_cfg(void)
     g_cfg.vout_path    = c.vout_path;
     g_cfg.gv_conv      = c.gv_conv;
     g_cfg.audio_fix    = c.audio_fix;
+    g_cfg.below30      = c.below30;
+    g_cfg.shallow_queue = c.shallow_queue;
+    g_boot_preset      = c.preset;
     g_fg_off           = !c.framegen;
 }
 
@@ -2232,6 +2582,244 @@ static int g_ext_nm = 0;
 static int g_ext_attr_slot = -1;
 static VoAttr g_ext_attr;
 
+// One display group (CUSA02299). With reg_mode = 2 the late activation at frame 120 registered our buffer as a group of
+// its own at the top index; the game's group carries the output format the game set on it (HDR10 PQ, 0x88740000, set
+// at gameplay entry), ours did not, and the TV alternated a PQ and a non-PQ frame every refresh. Here our buffer joins
+// the game's group, the layout the early start uses. VideoOut refuses to drop a group whose buffer is on screen
+// (0x80290009), so the game's buffer goes off the screen first, with our buffer already allocated:
+//   1. our buffer gets a copy of the game's buffer on screen and is registered alone at the top index (temporary group);
+//   2. a CPU flip shows it, and the wait ends once VideoOut reports it on screen with no flip pending;
+//   3. the game's group is dropped; 4. the game's buffers, at the same indices 0..ngame-1, and ours are registered as
+//   one group; 5. a flip brings the game's buffer back from the one group; 6. the temporary group is dropped (retried
+//   on the next flips while it is still on screen).
+// When the copy cannot be made, steps 1-2 show the blank screen (index -1) instead. When the one group is refused (the
+// temporary group holds our buffer at another index), the blank screen replaces the temporary group and the one group
+// is tried once more. Any other failure ends in the separate group: the game's group back alone, ours alone at the top.
+// VideoOut must give the one group the slot the game already knows (it keeps using that slot for its own attribute
+// changes and unregister); any other slot undoes the one group the same way. Putting the game's group back is retried
+// once. Every step's return code goes to the boot log. Other titles keep the separate group.
+// Later, when the game registers its buffers at index 0 again (it dropped its slot, ours went with it), ours is
+// registered again as a separate group at the top index (og2_game_reregistered).
+static int g_og2 = -1;                   // -1 until the activation decides: 1 on CUSA02299, 0 elsewhere
+static int g_og2_active = 0;             // 1 while our buffers live in the game's group
+static int32_t g_game_attr_slot = 0;     // attribute slot VideoOut returned for the game's buffers at index 0
+static int32_t g_og2_pend_slot = -1;     // temporary group still to drop
+static int og2_copy(void *dst, const void *src, size_t n);   // CPU copy when both are mapped for the CPU; 1 = copied
+
+static int32_t og2_flip(int32_t handle, int idx, int64_t arg)
+{
+    return HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t), handle, idx, 1u /*VSYNC*/, arg);
+}
+
+// Waits up to max_ms for a flip past count0 with nothing pending and idx on screen (any buffer for the blank, -1).
+static int og2_wait(int32_t handle, int idx, uint64_t count0, int max_ms, VoFlipStatus *fs, int *waited)
+{
+    for (*waited = 0;; (*waited)++) {
+        memset(fs, 0, sizeof(*fs));
+        if (read_flip_status(handle, fs) != 0) return 0;
+        if (fs->flipPendingNum <= 0 && fs->count > count0 && (idx < 0 || fs->currentBuffer == idx)) return 1;
+        if (*waited >= max_ms) return 0;
+        sceKernelUsleep(1000);
+    }
+}
+
+// Puts the game's buffers back as their own group at 0..ngame-1 after its group was dropped, one retry; logs both tries.
+static int32_t og2_game_back(int32_t h, void *const *all, int32_t game_slot)
+{
+    int32_t rr = -1;
+    for (int k = 0; k < 2 && rr < 0; k++) {
+        rr = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                           h, 0, all, g_ngame, &g_attr);
+        STAGE("onegroup: the game's group back alone (try %d) = 0x%08x (the game knows slot %d)", k + 1, (unsigned)rr, (int)game_slot);
+    }
+    if (rr >= 0) g_game_attr_slot = rr;
+    else lg("onegroup: the game's group could not be registered again (0x%08x): its flips will fail\n", (unsigned)rr);
+    return rr;
+}
+
+// Returns 1: one group at 0..ngame+nm-1 (*slot); 2: ours alone at base, registered here (*slot); 0: nothing of ours
+// registered here (other title, or stopped before any change, or the game's group put back), the caller goes on as before.
+static int safe_one_group(uint32_t handle, void *const *ext, int nm, int base, int32_t *slot)
+{
+    if (g_og2 < 0) g_og2 = vcfg_in_family(g_title_id, "CUSA02299") ? 1 : 0;
+    if (!g_og2) return 0;
+    int32_t h = (int32_t)handle;
+    int n = g_ngame + nm;
+    const char *why = NULL;
+    STAGE("onegroup: try at frame %u: handle=%u ngame=%d nm=%d base=%d game slot=%d", g_flips, handle, g_ngame, nm, base,
+          (int)g_game_attr_slot);
+    if (g_ngame < 1 || nm < 1 || n > 8) why = "buffer count";
+    for (int i = 0; !why && i < g_ngame; i++) if (!g_buf[i]) why = "a game buffer address is unknown";
+    for (int i = g_ngame; !why && i < n; i++) if (g_buf[i]) why = "index in use";
+    if (!why && g_game_idx_hi > g_ngame) why = "the game uses indices above its group";
+    if (!why && (base < n || base + nm > 16)) why = "temporary indices overlap the one group";
+    VoFlipStatus fs;
+    int waited = 0, pend = -1, gcq = -1;
+    while (!why) {
+        memset(&fs, 0, sizeof(fs));
+        if (read_flip_status(h, &fs) != 0) { why = "GetFlipStatus failed"; break; }
+        pend = fs.flipPendingNum; gcq = fs.gcQueueNum;
+        if (pend <= 0 && gcq <= 0) break;
+        if (waited >= 100) { why = "flips still pending after 100 ms"; break; }
+        sceKernelUsleep(1000);
+        waited++;
+    }
+    if (why) {
+        STAGE("onegroup: not tried (%s; pending=%d gcQueue=%d after %d ms)", why, pend, gcq, waited);
+        lg("onegroup: not tried (%s)\n", why);
+        return 0;
+    }
+    int cur = fs.currentBuffer;
+    int64_t arg = fs.flipArg;
+    uint64_t c0 = fs.count;
+    // the surface as allocated: a tiled surface spans align64(height) rows (safe_surface_stride), never past one buffer
+    size_t bytes = (size_t)g_pitch * (size_t)((g_bh + 63u) & ~63u) * 4u;
+    size_t one = safe_surface_stride();
+    if (one && bytes > one) bytes = one;
+    int copied = 0;
+    if (cur >= 0 && cur < g_ngame) {
+        copied = 1;
+        for (int i = 0; i < nm; i++) copied &= og2_copy(ext[i], (const void *)(uintptr_t)g_buf[cur], bytes);
+    }
+    STAGE("onegroup: on screen buf %d (flip count %llu, arg %lld), copy into ours (%zu bytes) = %d -> %s", cur,
+          (unsigned long long)c0, (long long)arg, bytes, copied, copied ? "temporary group" : "blank screen");
+    int32_t t = -1, fr, ur, r, ut;
+    int ok;
+    if (copied) {
+        t = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                          h, base, ext, nm, &g_attr);
+        STAGE("onegroup: step 1 register(temporary group, ours at %d) = 0x%08x", base, (unsigned)t);
+        if (t < 0) return 0;
+        fr = og2_flip(h, base, arg);
+        ok = fr == 0 && og2_wait(h, base, c0, 100, &fs, &waited);
+        STAGE("onegroup: step 2 flip(ours %d) = 0x%08x, on screen=%d after %d ms (current %d, pending %d)", base, (unsigned)fr, ok,
+              waited, (int)fs.currentBuffer, (int)fs.flipPendingNum);
+        if (!ok) {
+            *slot = t;
+            STAGE("onegroup: kept the separate group (slot %d, ours at %d)", (int)t, base);
+            return 2;
+        }
+    } else {
+        fr = og2_flip(h, -1, arg);
+        ok = fr == 0 && og2_wait(h, -1, c0, 100, &fs, &waited);
+        STAGE("onegroup: step 2 flip(blank) = 0x%08x, done=%d after %d ms (current %d, pending %d)", (unsigned)fr, ok, waited,
+              (int)fs.currentBuffer, (int)fs.flipPendingNum);
+        if (!ok) {
+            STAGE("onegroup: kept the separate group (the blank flip did not complete)");
+            return 0;
+        }
+    }
+    c0 = fs.count;
+    const int32_t game_slot = g_game_attr_slot;   // the slot the game keeps using after this
+    ur = sceVideoOutUnregisterBuffers(h, game_slot);
+    STAGE("onegroup: step 3 unregister(game slot %d) = 0x%08x", (int)g_game_attr_slot, (unsigned)ur);
+    if (ur != 0) {
+        if (t >= 0) { *slot = t; return 2; }
+        return 0;
+    }
+    void *all[8];
+    for (int i = 0; i < g_ngame; i++) all[i] = (void *)(uintptr_t)g_buf[i];
+    for (int i = 0; i < nm; i++) all[g_ngame + i] = ext[i];
+    r = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                      h, 0, all, n, &g_attr);
+    STAGE("onegroup: step 4 register(0..%d, %d game + %d ours) = 0x%08x", n - 1, g_ngame, nm, (unsigned)r);
+    if (r < 0 && t >= 0) {
+        fr = og2_flip(h, -1, arg);
+        ok = fr == 0 && og2_wait(h, -1, c0, 100, &fs, &waited);
+        ut = ok ? sceVideoOutUnregisterBuffers(h, t) : -1;
+        STAGE("onegroup: step 4b flip(blank) = 0x%08x done=%d, unregister(temporary slot %d) = 0x%08x", (unsigned)fr, ok, (int)t,
+              (unsigned)ut);
+        if (ut == 0) {
+            t = -1;
+            c0 = fs.count;
+            r = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                              h, 0, all, n, &g_attr);
+            STAGE("onegroup: step 4c register(0..%d) again = 0x%08x", n - 1, (unsigned)r);
+        }
+    }
+    if (r >= 0 && r != game_slot) {
+        // the game would keep addressing its old slot: undo the one group
+        int32_t ur2 = sceVideoOutUnregisterBuffers(h, r);
+        STAGE("onegroup: one group got slot %d, the game knows slot %d: unregister(%d) = 0x%08x", (int)r, (int)game_slot, (int)r,
+              (unsigned)ur2);
+        lg("onegroup: one group got slot %d, the game knows slot %d: unregister(%d) = 0x%08x\n", (int)r, (int)game_slot, (int)r,
+           (unsigned)ur2);
+        if (ur2 == 0) r = -1;
+    }
+    if (r < 0) {
+        int32_t rr = og2_game_back(h, all, game_slot);
+        lg("onegroup: one group not kept, the game's group back alone = 0x%08x\n", (unsigned)rr);
+        if (t >= 0) { *slot = t; return 2; }
+        return 0;
+    }
+    g_game_attr_slot = r;
+    g_og2_active = 1;
+    *slot = r;
+    int show = (cur >= 0 && cur < g_ngame) ? cur : -1;
+    if (show >= 0) {
+        fr = og2_flip(h, show, arg);
+        ok = fr == 0 && og2_wait(h, show, c0, 100, &fs, &waited);
+        STAGE("onegroup: step 5 flip(game buf %d in the one group) = 0x%08x, on screen=%d after %d ms", show, (unsigned)fr, ok,
+              waited);
+    }
+    if (t >= 0) {
+        ut = sceVideoOutUnregisterBuffers(h, t);
+        STAGE("onegroup: step 6 unregister(temporary slot %d) = 0x%08x%s", (int)t, (unsigned)ut,
+              ut ? " (retried on the next flips)" : "");
+        if (ut != 0) g_og2_pend_slot = t;
+    }
+    STAGE("onegroup: one group, slot %d, indices 0..%d (ours from %d)", (int)r, n - 1, g_ngame);
+    lg("onegroup: one group, slot %d, indices 0..%d (ours from %d)\n", (int)r, n - 1, g_ngame);
+    return 1;
+}
+
+// On the game's flips after the activation: drops the temporary group once it is off the screen (up to 600 tries).
+static void og2_tick(int32_t handle)
+{
+    if (g_og2_pend_slot < 0) return;
+    static int tries = 0;
+    int32_t ut = sceVideoOutUnregisterBuffers(handle, g_og2_pend_slot);
+    tries++;
+    if (ut == 0 || tries >= 600) {
+        STAGE("onegroup: unregister(temporary slot %d) = 0x%08x after %d more tries", (int)g_og2_pend_slot, (unsigned)ut, tries);
+        g_og2_pend_slot = -1;
+    }
+}
+
+// The game registered its buffers at index 0 again while ours were in its group: VideoOut dropped ours with the group it
+// unregistered, so they are registered again alone at the top index, as the separate group of the late activation.
+// attr: the game's new attributes (NULL keeps ours). Returns 1 when ours are registered again, 0 when frame generation
+// stops (g_mbuf_state = -1, frames stay native). game_hi: the game's highest index + 1.
+static int og2_game_reregistered(int32_t handle, const VoAttr *attr, int game_hi)
+{
+    if (!g_og2_active) return 0;
+    g_og2_active = 0;
+    int old = g_mbase, base = 16 - g_ext_nm;
+    for (int i = 0; i < g_ext_nm && old + i < 16; i++)
+        if (old + i >= game_hi && g_buf[old + i] == (uint64_t)(uintptr_t)g_ext_va[i]) g_buf[old + i] = 0;
+    int32_t r1 = -1;
+    if (g_ext_nm >= 1 && base >= game_hi) {
+        if (attr) g_ext_attr = *attr;
+        r1 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                           handle, base, g_ext_va, g_ext_nm, &g_ext_attr);
+    }
+    STAGE("onegroup: the game registered 0..%d again, ours (were at %d) registered alone at %d = 0x%08x", game_hi - 1, old, base,
+          (unsigned)r1);
+    lg("onegroup: the game registered 0..%d again, ours (were at %d) registered alone at %d = 0x%08x\n", game_hi - 1, old, base,
+       (unsigned)r1);
+    if (r1 < 0) {
+        g_mbuf_state = -1;
+        g_ext_attr_slot = -1;
+        if (g_nbuf > game_hi) g_nbuf = game_hi;
+        return 0;
+    }
+    g_ext_attr_slot = r1;
+    g_mbase = base;
+    for (int i = 0; i < g_ext_nm; i++) g_buf[base + i] = (uint64_t)(uintptr_t)g_ext_va[i];
+    g_nbuf = base + g_ext_nm;
+    return 1;
+}
+
 // Called once on the game's flip thread at frame INJECT_AFTER_FLIPS, after the config was read.
 static void safe_try_activate(uint32_t handle)
 {
@@ -2331,16 +2919,25 @@ static void safe_try_activate(uint32_t handle)
     if (base < free_base) { safe_refuse("NO INDICES"); return; }
     void *ext[8];
     for (int i = 0; i < nm; i++) ext[i] = m + (size_t)i * one;
-    int32_t r1 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
-                               (int32_t)handle, base, ext, nm, &g_attr);
-    if (r1 == (int32_t)0x80290010) {
-        for (int sl = 1; sl < 4; sl++) sceVideoOutUnregisterBuffers((int32_t)handle, sl);
+    int32_t r1 = -1;
+    int og = safe_one_group(handle, ext, nm, base, &r1);   // 0: separate group below, 1: one group, 2: ours at base already
+    int one_grp = (og == 1);
+    if (one_grp) {
+        base = g_ngame;
+    } else if (og == 2) {
+        STAGE("safe mode RegisterBuffers (late group at %d, %d x 0x%zx, by onegroup) = 0x%08x", base, nm, one, (unsigned)r1);
+    } else {
         r1 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
                            (int32_t)handle, base, ext, nm, &g_attr);
+        if (r1 == (int32_t)0x80290010) {
+            for (int sl = 1; sl < 4; sl++) sceVideoOutUnregisterBuffers((int32_t)handle, sl);
+            r1 = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
+                               (int32_t)handle, base, ext, nm, &g_attr);
+        }
+        STAGE("safe mode RegisterBuffers (late group at %d, %d x 0x%zx) = 0x%08x", base, nm, one, (unsigned)r1);
     }
-    STAGE("safe mode RegisterBuffers (late group at %d, %d x 0x%zx) = 0x%08x", base, nm, one, (unsigned)r1);
     if (r1 < 0) { safe_refuse("REGISTER FAILED"); return; }
-    g_ext_attr_slot = r1;
+    g_ext_attr_slot = one_grp ? -1 : r1;   // -1: ours share the game's group (never unregistered on their own)
     g_ext_nm = nm <= 8 ? nm : 8;
     for (int i = 0; i < g_ext_nm; i++) g_ext_va[i] = ext[i];
     g_ext_attr = g_attr;
@@ -2361,19 +2958,305 @@ static void safe_try_activate(uint32_t handle)
 }
 
 static uint64_t g_pace_next = 0;
+// Refresh period for the pacers: the measured one (exact), or the rounded rate until the first window is measured.
+static uint32_t refresh_period_q8(void)
+{
+    uint32_t q = __atomic_load_n(&g_vb_win_q8, __ATOMIC_ACQUIRE);
+    return q ? q : vb_period_q8_from_hz10(g_last_hz_x10);
+}
+
+// ---- q-cpucost (cpu_cost.h): opt-in cuts of the plugin's own CPU work and the CPU plugin line ----
+static uint32_t g_cpu_ema_us;   // defined with the pacers' state below
+int32_t sceVideoOutAddVblankEvent(OrbisKernelEqueue eq, int32_t handle, void *udata);
+int32_t sceVideoOutAddFlipEvent(OrbisKernelEqueue eq, int32_t handle, void *udata);
+static volatile uint32_t g_cc_mon_wakes, g_cc_mon_vb, g_cc_mon_flip, g_cc_mon_to, g_cc_mon_lat_n, g_cc_mon_lat_max;
+static volatile uint64_t g_cc_mon_lat_sum;
+static volatile uint32_t g_cc_io_wakes, g_cc_pad_wakes, g_cc_shq_polls, g_cc_pace_n, g_cc_pace_err_max;
+static volatile uint64_t g_cc_spin_us, g_cc_pace_err_sum;
+static volatile uint64_t g_cc_io_cpu_us, g_cc_pad_cpu_us;   // cumulative thread CPU of the io and pad threads (us)
+static uint64_t g_cc_off_rel = 0;                           // framegen=0: when the game's SubmitAndFlip returned (us)
+static uint32_t g_cc_off_n = 0, g_cc_off_sum_us = 0, g_cc_off_max_us = 0;   // hook thread only
+static uint32_t g_cc_late_ema = 0;                          // pacer sleep lateness (hook thread only)
+static int32_t g_cc_clk_rc = 0;                             // last refusal of a CPU clock (0: none)
+#define CC_CLK_THREAD  14   // FreeBSD CLOCK_THREAD_CPUTIME_ID (the toolchain's time.h has the Linux numbers)
+#define CC_CLK_PROCESS 15   // FreeBSD CLOCK_PROCESS_CPUTIME_ID (Sony's header names 15 PROCTIME: checked against CLOCK_PROF)
+#define CC_CLK_PROF    2    // FreeBSD CLOCK_PROF: user + system time of the process
+
+// CPU time of the calling thread or of the whole game process (us), through sceKernelClockGettime (declared without a
+// prototype in the toolchain header). 0, with the error code kept in g_cc_clk_rc, when the clock is refused.
+static uint64_t cc_cpu_us(int32_t clk)
+{
+    struct timespec ts;
+    memset(&ts, 0, sizeof(ts));
+    int32_t rc = ((int32_t (*)(int32_t, struct timespec *))sceKernelClockGettime)(clk, &ts);
+    if (rc) { g_cc_clk_rc = rc; return 0u; }
+    return cc_ts_us((int64_t)ts.tv_sec, (int64_t)ts.tv_nsec);
+}
+static int cc_file(const char *name)
+{
+    char p[64];
+    snprintf(p, sizeof(p), LOG_DIR "/%s_%s", name, g_title_id);
+    int fd = sceKernelOpen(p, 0, 0666);
+    if (fd < 0) return 0;
+    sceKernelClose(fd);
+    return 1;
+}
+// Once, when the io thread starts (title known, outside plugin_load).
+static void cc_read_cuts(void)
+{
+    g_cc_monev = cc_file("monev");
+    g_cc_iolazy = cc_file("iolazy");
+    g_cc_nospin = cc_file("nospin");
+    g_tr_lite = cc_file("tracelite");
+    g_cc_quiet = cc_file("quietlog");
+    lg("cpu cuts: monev=%d iolazy=%d nospin=%d tracelite=%d quietlog=%d (files " LOG_DIR "/<cut>_%s)\n",
+       g_cc_monev, g_cc_iolazy, g_cc_nospin, g_tr_lite, g_cc_quiet, g_title_id);
+    g_fast_pace = cc_file("fastpace");
+    lg("fast pace: %d (FG Fast: queue cut %.2f refreshes, phases 1/3 2/3 1/2; file " LOG_DIR "/fastpace_%s)\n",
+       g_fast_pace, FAST_QCUT_Q8 / 256.0, g_title_id);
+}
+
+// Timer pacers: wait until the process-time counter reaches target. Today: sleep until 1 ms before it (nothing below
+// 1.5 ms) and spin the rest. nospin: sleep the remaining time minus the measured lateness and return, never spin.
+// Both measure the spin and how far from the target the game is released.
+static void cc_wait_until(uint64_t target)
+{
+    uint64_t now = sceKernelGetProcessTimeCounter();
+    if (now >= target || !g_freq) return;
+    uint64_t rem_us = (target - now) * 1000000ull / g_freq;
+    uint32_t s = g_cc_nospin ? cc_nospin_sleep_us(rem_us, g_cc_late_ema) : cc_spin_sleep_us(rem_us);
+    if (s) {
+        uint64_t a = sceKernelGetProcessTime();
+        sceKernelUsleep(s);
+        g_cc_late_ema = cc_late_ema(g_cc_late_ema, s, sceKernelGetProcessTime() - a);
+    }
+    if (!g_cc_nospin) {
+        uint64_t s0 = sceKernelGetProcessTimeCounter();
+        while (sceKernelGetProcessTimeCounter() < target) { }
+        uint64_t s1 = sceKernelGetProcessTimeCounter();
+        if (s1 > s0) g_cc_spin_us += (s1 - s0) * 1000000ull / g_freq;
+    }
+    uint64_t end = sceKernelGetProcessTimeCounter();
+    uint64_t err = (end > target ? end - target : target - end) * 1000000ull / g_freq;
+    g_cc_pace_n++;
+    g_cc_pace_err_sum += err;
+    if (err > g_cc_pace_err_max) g_cc_pace_err_max = err > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)err;
+}
+
+// Pending flips for a decision in the hook. With monev the monitor sleeps between vblanks, so its sample misses the
+// flips the hook submitted since: read the raw status instead (one VideoOut call per decision, a few per frame).
+static uint32_t cc_pending_flips(void)
+{
+    if (g_cc_monev && g_handle >= 0) {
+        VoFlipStatus fs;
+        memset(&fs, 0, sizeof(fs));
+        if (read_flip_status(g_handle, &fs) == 0) return (uint32_t)(fs.flipPendingNum > 0 ? fs.flipPendingNum : 0);
+    }
+    return __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE);
+}
+
+// monev: our own event queue on the game's handle, vblank + flip events (udata tells them apart). Returns 1 while
+// vblank events are on; on any refusal the monitor polls as before.
+static OrbisKernelEqueue g_cc_eq;
+static int g_cc_eq_made = 0, g_cc_eq_vb = 0;
+static int32_t g_cc_eq_h = -1;
+static int cc_mon_attach(int32_t h)
+{
+    if (g_cc_eq_h == h) return g_cc_eq_vb;
+    if (!g_cc_eq_made) {
+        int32_t r = sceKernelCreateEqueue(&g_cc_eq, "bb_mon");
+        if (r) { lg("monitor events: equeue 0x%08x -> polling as before\n", (unsigned)r); g_cc_monev = 0; return 0; }
+        g_cc_eq_made = 1;
+    }
+    int32_t rv = sceVideoOutAddVblankEvent(g_cc_eq, h, CC_EV_VBLANK);
+#if VCFG_2BUF_TEST
+    int32_t rf = -1;   // test builds hook sceVideoOutAddFlipEvent to find the game's own waits: vblank events only
+#else
+    int32_t rf = sceVideoOutAddFlipEvent(g_cc_eq, h, CC_EV_FLIP);
+#endif
+    g_cc_eq_h = h;
+    g_cc_eq_vb = rv == 0;
+    lg("monitor events on handle %d: vblank 0x%08x flip 0x%08x -> %s\n", (int)h, (unsigned)rv, (unsigned)rf,
+       g_cc_eq_vb ? "event wait" : "polling as before");
+    if (!g_cc_eq_vb) g_cc_monev = 0;
+    return g_cc_eq_vb;
+}
+// Monitor wait: 1 when a vblank event woke it (the vblank status then belongs to the vblank that just happened).
+static int cc_mon_wait(void)
+{
+    if (g_cc_monev && g_handle >= 0 && cc_mon_attach(g_handle)) {
+        OrbisKernelEvent ev[4];
+        int32_t n = 0, vb = 0;
+        OrbisKernelUseconds to = CC_MON_EV_TIMEOUT_US;
+        int32_t rc = sceKernelWaitEqueue(g_cc_eq, ev, 4, &n, &to);
+        if (rc == 0 && n > 0) {
+            for (int32_t i = 0; i < n && i < 4; i++) {
+                if (ev[i].udata == CC_EV_VBLANK) { vb = 1; g_cc_mon_vb++; }
+                else if (ev[i].udata == CC_EV_FLIP) g_cc_mon_flip++;
+            }
+        } else if (rc == 0 || (uint32_t)rc == 0x8002003cu || (uint32_t)rc == 0x80020004u) {
+            g_cc_mon_to++;   // timeout or interrupted: sample anyway
+        } else {
+            lg("monitor events: wait 0x%08x -> polling as before\n", (unsigned)rc);
+            g_cc_monev = 0;
+        }
+        return vb;
+    }
+    sceKernelUsleep(CC_MON_POLL_US);
+    return 0;
+}
+static void cc_mon_vblank_latency(uint64_t vb_t)
+{
+    uint64_t now = sceKernelGetProcessTime();
+    uint64_t l = now > vb_t ? now - vb_t : 0u;
+    if (l > 0xFFFFFFFFull) l = 0xFFFFFFFFull;
+    g_cc_mon_lat_n++;
+    g_cc_mon_lat_sum += l;
+    if ((uint32_t)l > g_cc_mon_lat_max) g_cc_mon_lat_max = (uint32_t)l;
+}
+// Monitor window (2 s), debug log on: wake-ups per second of each plugin thread, their CPU and the game process's CPU,
+// the pacer's spin and release error, the shallow queue's polls, the flight recorder's and klog's writes, the cuts on
+// and the game's own time per frame. The same line with and without a cut file compares it in the same scene.
+static void cc_window_log(uint64_t dt_us)
+{
+    static uint64_t last_mon, last_io, last_pad, last_proc, last_prof, last_tr_bytes;
+    static uint32_t last_tr_flushes;
+    static int primed = 0;
+    uint64_t mon = cc_cpu_us(CC_CLK_THREAD), proc = cc_cpu_us(CC_CLK_PROCESS), prof = cc_cpu_us(CC_CLK_PROF);
+    uint64_t io = __atomic_load_n(&g_cc_io_cpu_us, __ATOMIC_ACQUIRE), pad = __atomic_load_n(&g_cc_pad_cpu_us, __ATOMIC_ACQUIRE);
+    uint32_t wk = __atomic_exchange_n(&g_cc_mon_wakes, 0u, __ATOMIC_ACQ_REL), vb = __atomic_exchange_n(&g_cc_mon_vb, 0u, __ATOMIC_ACQ_REL);
+    uint32_t fl = __atomic_exchange_n(&g_cc_mon_flip, 0u, __ATOMIC_ACQ_REL), to = __atomic_exchange_n(&g_cc_mon_to, 0u, __ATOMIC_ACQ_REL);
+    uint32_t ln = __atomic_exchange_n(&g_cc_mon_lat_n, 0u, __ATOMIC_ACQ_REL), lmax = __atomic_exchange_n(&g_cc_mon_lat_max, 0u, __ATOMIC_ACQ_REL);
+    uint64_t lsum = __atomic_exchange_n(&g_cc_mon_lat_sum, 0ull, __ATOMIC_ACQ_REL);
+    uint32_t iow = __atomic_exchange_n(&g_cc_io_wakes, 0u, __ATOMIC_ACQ_REL), pw = __atomic_exchange_n(&g_cc_pad_wakes, 0u, __ATOMIC_ACQ_REL);
+    uint32_t shq = __atomic_exchange_n(&g_cc_shq_polls, 0u, __ATOMIC_ACQ_REL), pn = __atomic_exchange_n(&g_cc_pace_n, 0u, __ATOMIC_ACQ_REL);
+    uint32_t pmax = __atomic_exchange_n(&g_cc_pace_err_max, 0u, __ATOMIC_ACQ_REL);
+    uint64_t psum = __atomic_exchange_n(&g_cc_pace_err_sum, 0ull, __ATOMIC_ACQ_REL), spin = __atomic_exchange_n(&g_cc_spin_us, 0ull, __ATOMIC_ACQ_REL);
+    uint32_t lines = __atomic_exchange_n(&g_cc_lines, 0u, __ATOMIC_ACQ_REL), kb = __atomic_exchange_n(&g_cc_klog_bytes, 0u, __ATOMIC_ACQ_REL);
+    uint32_t trf = g_tr_flushes;
+    uint64_t trb = g_tr_bytes;
+    if (primed && g_log && dt_us) {
+        double k = 1000.0 / (double)dt_us;   // us of CPU over the window -> ms per second
+        lgd("CPU plugin: wake/s mon %.0f (vb %u flip %u to %u, vb lat avg %.0f max %u us) io %.0f pad %.0f | cpu ms/s mon %.2f "
+            "io %.2f pad %.2f game process %.0f (prof %.0f) | pacer spin ms/s %.2f err avg %.0f max %u us (%u) | shq polls/s %.0f | "
+            "trace %u flushes %.0f B/s | klog %.1f lines/s %.0f B/s | cuts %d%d%d%d%d clk 0x%x | own %.1f ms\n",
+            cc_per_s(wk, dt_us), vb, fl, to, ln ? (double)lsum / ln : 0.0, lmax, cc_per_s(iow, dt_us), cc_per_s(pw, dt_us),
+            (double)(mon - last_mon) * k, (double)(io - last_io) * k,
+            (double)(pad - last_pad) * k, (double)(proc - last_proc) * k, (double)(prof - last_prof) * k,
+            (double)spin * k, pn ? (double)psum / pn : 0.0, pmax, pn, cc_per_s(shq, dt_us),
+            trf - last_tr_flushes, cc_per_s(trb - last_tr_bytes, dt_us), cc_per_s(lines, dt_us), cc_per_s(kb, dt_us),
+            g_cc_monev, g_cc_iolazy, g_cc_nospin, g_tr_lite, g_cc_quiet, (unsigned)g_cc_clk_rc, g_cpu_ema_us / 1000.0);
+    }
+    primed = 1;
+    last_mon = mon; last_io = io; last_pad = pad; last_proc = proc; last_prof = prof; last_tr_flushes = trf; last_tr_bytes = trb;
+}
+// framegen=0 (no monitor thread): the game's own time per frame (its SubmitAndFlip returning -> the next one entering)
+// and the process CPU, from the STAT gnm window, debug log on. The same scene with framegen=1 separates the CPU.
+static void cc_fgoff_log(void)
+{
+    static uint64_t last_proc, last_prof, last_t;
+    uint64_t proc = cc_cpu_us(CC_CLK_PROCESS), prof = cc_cpu_us(CC_CLK_PROF), t = sceKernelGetProcessTime();
+    uint32_t n = g_cc_off_n, sum = g_cc_off_sum_us, mx = g_cc_off_max_us;
+    g_cc_off_n = g_cc_off_sum_us = g_cc_off_max_us = 0;
+    if (last_t && t > last_t && g_log)
+        lgd("OWN fg-off: game release->submit avg %.1f max %.1f ms (%u frames) | game process cpu ms/s %.0f (prof %.0f) | klog %u lines clk 0x%x\n",
+            n ? sum / 1000.0 / n : 0.0, mx / 1000.0, n, (double)(proc - last_proc) / (double)(t - last_t) * 1000.0,
+            (double)(prof - last_prof) / (double)(t - last_t) * 1000.0,
+            __atomic_exchange_n(&g_cc_lines, 0u, __ATOMIC_ACQ_REL), (unsigned)g_cc_clk_rc);
+    last_proc = proc; last_prof = prof; last_t = t;
+}
+
 static void pace_hz(uint32_t hz)
 {
     if (!hz || !g_freq) return;
-    uint64_t period = g_freq / hz;
+    uint32_t vb_q8 = refresh_period_q8();
+    uint64_t period = vb_ticks(g_freq, vb_q8, vb_per_frame(hz, vb_q8));   // whole refreshes: 60 -> 1, 30 -> 2, 20 -> 3
     uint64_t now = sceKernelGetProcessTimeCounter();
     if (g_pace_next == 0 || now > g_pace_next + period * 4) { g_pace_next = now + period; return; }
-    if (now < g_pace_next) {
-        uint64_t us = (g_pace_next - now) * 1000000ull / g_freq;
-        if (us > 1500) sceKernelUsleep((uint32_t)(us - 1000));
-        while (sceKernelGetProcessTimeCounter() < g_pace_next) { }
-    }
+    if (now < g_pace_next) cc_wait_until(g_pace_next);
     g_pace_next += period;
 }
+// ---- shave14: 2nd generated-frame buffer from a 16 MiB display reserve (S14_KEEP) ----
+// Decided once in plugin_load, before the game's first allocation. Candidates: the CUSA18723 family (where it was
+// validated on the console) when the game starts in a mode that shows two generated frames per pair (s14_two_gen:
+// preset 1 = Fast, or below30 on), and any title with LOG_DIR/shave14_<TITLE>. It needs the configuration where today
+// the plugin takes the 8 MiB history buffer that shave14 gives back to the game (two_buffer or present_copy forced),
+// FG mode 8 with Fast or below30, and arena shaving available; otherwise the boot is exactly as without shave14.
+// Quality / Sharp without below30 at start keep today's boot (one generated frame per pair needs one buffer). Any
+// other title keeps today's boot: Fast and the below-30 regime then get 2 generated frames per pair only where the
+// mode-8 allocation already has a 2nd generated-frame buffer.
+// Runs inside plugin_load: STAGE (raw kernel I/O) only. lg() opens probe.log with stdio, and stdio inside plugin_load
+// faults in libSceLibcInternal (boot_stage.h); the probe.log line is written later, at RegisterBuffers (s14_log_decision).
+static int g_s14_opt = 0;   // 0 not a candidate (no line), 1 LOG_DIR/shave14_<TITLE>, 2 CUSA18723 family default
+static const char *g_s14_why = NULL;
+static const char *g_s14_boot = "";   // the boot's mode that asks for 2 generated frames per pair ("fast", "below30", ...)
+static const char k_s14_why_one_gen[] = "neither Fast nor below30 at start";   // opt_state reads it (buf2_boot)
+// The start asks for a mode that shows two generated frames per pair: FG Fast (3-slot pairs at 20-30 fps) or below30.
+// s14_decide runs in plugin_load before the first cfg_apply_live: the preset comes from load_early_adapt_cfg
+// (g_boot_preset); g_cfg.preset is still the static default there.
+static int s14_two_gen(void) { return g_cfg.below30 || g_boot_preset == 1; }
+static void s14_decide(int mode)
+{
+    char p[64];
+    snprintf(p, sizeof(p), LOG_DIR "/shave14_%s", g_title_id);
+    int fd = sceKernelOpen(p, 0, 0666);
+    int opt = fd >= 0 ? 1 : (vcfg_in_family(g_title_id, "CUSA18723") && s14_two_gen()) ? 2 : 0;
+    g_s14_boot = g_boot_preset == 1 ? (g_cfg.below30 ? "fast, below30" : "fast") : g_cfg.below30 ? "below30" : "";
+    if (fd >= 0) sceKernelClose(fd);
+    const char *why = !opt ? "no file"
+        : g_bench_enabled ? "bench"
+        : mode != 8 ? "FG mode is not 8"
+        : g_safe_never ? "safe mode only observes this title"
+        : g_cfg.shave_mode != 0 ? "shave_mode is not 0 (no boot valve or no arena shaving)"
+        : !s14_two_gen() ? k_s14_why_one_gen
+        : (g_cfg.present_copy == 2 || (g_cfg.present_copy != 1 && g_cfg.two_buffer != 1))
+          ? "no history buffer to give back (two_buffer=0), the game would lose 8 MiB of FlexibleMemory"
+        : cusa10249_audio_fix() ? "audio_fix"
+        : NULL;
+    g_s14_on = why == NULL;
+    g_s14_opt = opt;
+    g_s14_why = why;
+    if (!opt) return;   // not a candidate: no line, the boot log stays as it is
+    STAGE("shave14: %s (%s%s%s)%s%s", g_s14_on ? "on" : "off", opt == 1 ? p : "CUSA18723 family default",
+          g_s14_boot[0] ? ", start in " : "", g_s14_boot, why ? ": " : "", why ? why : "");
+}
+// The decision in probe.log, once, from the game's RegisterBuffers (stdio is safe there; plugin_load is not).
+static void s14_log_decision(void)
+{
+    static int done;
+    if (done || !g_s14_opt) return;
+    done = 1;
+    if (g_s14_opt == 1)
+        lg("shave14: %s (" LOG_DIR "/shave14_%s%s%s)%s%s\n", g_s14_on ? "on" : "off", g_title_id,
+           g_s14_boot[0] ? ", start in " : "", g_s14_boot, g_s14_why ? ": " : "", g_s14_why ? g_s14_why : "");
+    else
+        lg("shave14: %s (CUSA18723 family default, start in %s)%s%s\n", g_s14_on ? "on" : "off", g_s14_boot,
+           g_s14_why ? ": " : "", g_s14_why ? g_s14_why : "");
+}
+// RegisterBuffers (reg_mode 0 and 1) after our nm display buffers of `one` bytes at m are registered: with the reserve
+// kept at S14_KEEP (trimmed to what nm buffers need below 1080p) the 2nd one is the 2nd generated-frame buffer (g_nmid = 2,
+// b30_available), otherwise back to one.
+static void s14_after_register(int nm, size_t one, const uint8_t *m, int idx2)
+{
+    s14_log_decision();
+    if (g_s14_state != 1) return;
+    size_t fa = 0;
+    ((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&fa);
+    if (nm >= 2 && m && g_pre_mem == (const void *)m) {
+        g_s14_state = 2;
+        STAGE("shave14: 2nd generated-frame buffer at %p (phys=0x%lx, DirectMemory, display index %d), reserve 0x%zx, "
+              "flex_av=0x%zx (before the arena tail 0x%zx)", (const void *)(m + one), g_pre_mem_phys + (long)one, idx2,
+              g_pre_size, fa, g_s14_flex_before);
+        lg("shave14: 2 generated-frame buffers of 0x%zx in DirectMemory (2nd at %p, index %d), arena tail +0x%zx, "
+           "flex_av 0x%zx -> 0x%zx\n", one, (const void *)(m + one), idx2, g_s14_tail_extra, g_s14_flex_before, fa);
+    } else {
+        g_s14_state = -1;
+        STAGE("shave14: %d display buffer(s) of 0x%zx from reserve 0x%zx -> one generated-frame buffer, as without shave14",
+              nm, one, g_pre_size);
+        lg("shave14: back to one generated-frame buffer (%d of 0x%zx from 0x%zx)\n", nm, one, g_pre_size);
+    }
+}
+
 static void pace_30(void) { pace_hz(30); }
 
 // ---- flip cadence monitor ----
@@ -2391,6 +3274,17 @@ static volatile uint64_t g_pll_vb_cnt = 0;
 static volatile uint32_t g_pll_period_q8 = (16683u << 8) | 85u; // 16683.33 us (59.94 Hz) in Q24.8
 static volatile uint64_t g_pll_last_real_vb_us = 0;
 static volatile uint32_t g_pll_t_interp_q16 = 32768u;
+static volatile uint32_t g_pll_t2_q16 = 43690u;   // phase of the 2nd generated frame of a 3-slot pair (below-30 regime)
+static volatile uint32_t g_pair_slots = 2u;       // refreshes of the pair being submitted: 2, or 3 in the below-30 regime
+static uint32_t b30_win_frames, b30_win_on, b30_win_on_vb, b30_win_three, b30_win_cut;   // BELOW30 log line, per HOOK window
+static Below30 g_b30;                             // below-30 regime state (pace_policy.h), game thread only
+// Below-30 regime cost (pace_policy.h mid_lru / b30x), with below30 on: the 1st generated frame goes into the buffer
+// flipped longest ago, and the regime is fed own - our extra GPU time.
+static MidLru g_mid_lru;
+static B30Extra g_b30x;
+static uint32_t g_ts_ticks_per_ms = 0;            // GPU timestamp clock, from the PASSES window (0 = not measured yet)
+static uint8_t g_slot_three[4];                   // the pair of each DCB slot had 3 slots (read back 3 frames later)
+static uint32_t b30c_win_f1_after3_us, b30c_win_n_after3, b30c_win_f1_us, b30c_win_n;   // B30COST line, per HOOK window
 static volatile uint32_t g_pll_t_permille = 500u;
 static volatile uint32_t g_pll_lock = 0;
 static uint64_t g_last_submit_enter_t = 0;
@@ -2471,6 +3365,92 @@ static int file_flags_ex(uint32_t *hash_io)
 }
 static int file_flags(void) { return file_flags_ex(NULL); }
 
+// Option status (opt_status.h) from the settings c and the state the flip hooks copied (g_st_*) or keep anyway.
+static void opt_state_now(const fg_config_t *c, OptState *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->framegen = c->framegen; s->preset = c->preset; s->sharpness = c->sharpness; s->upscale = c->upscale;
+    s->hud_protect = c->hud_protect; s->game_vectors = c->game_vectors; s->fps_lock = c->fps_lock; s->below30 = c->below30;
+    s->shallow_queue = c->shallow_queue; s->post_mid = g_cfg.post_mid; s->present_copy = g_cfg.present_copy;
+    s->started = g_flips >= INJECT_AFTER_FLIPS || g_vo_submit_flips >= INJECT_AFTER_FLIPS;
+    s->fg_path = __atomic_load_n(&g_st_fg_on, __ATOMIC_RELAXED) ? __atomic_load_n(&g_st_fg_path, __ATOMIC_RELAXED) : 0;
+    char why[sizeof(g_inert_reason)];
+    memcpy(why, g_inert_reason, sizeof(why)); why[sizeof(why) - 1] = 0;
+    opt_norm_reason(s->fg_why, sizeof(s->fg_why), why);
+    s->detected_60fps = g_detected_60fps;
+    s->mode8 = g_inject_on == 8;
+    s->nmid = g_nmid;
+    s->mem_tight_b30 = g_mem_tight && g_s14_state != 2;   // as the b30_available call in the flip hook
+    s->mem_tight = g_mem_tight;                           // as the rcas gate of build_dcb_flow8
+    s->pace_timer = __atomic_load_n(&g_st_pace_timer, __ATOMIC_RELAXED);
+    s->b30_on = (int)g_b30.on;
+    s->shq_on = __atomic_load_n(&g_st_shq_on, __ATOMIC_RELAXED);
+    s->rcas_shader = g_sh8_off[14] != 0;
+    s->real_aa = real_aa_on();
+    s->mid_only = g_cfg.post_mid == 1 || (g_cfg.post_mid != 2 && !s->real_aa);   // post_mid_only() without its log line
+    s->gv_active = __atomic_load_n(&g_st_gv_active, __ATOMIC_RELAXED);
+    s->hud_rect = g_hud_file_packed != 0;
+    s->pcopy_on = g_pcopy_on;
+    s->mid_lru = (c->below30 || c->preset == 1) && !(g_pcopy_on && g_pcopy_k >= 2) && g_nmid >= 2 && (uint32_t)g_nmid <= MID_LRU_MAX;
+    s->fast_pace = g_fast_pace;
+    // The 2nd generated-frame buffer of the CUSA18723 family comes from shave14, decided at start from the preset and
+    // below30 then in effect (s14_decide: no LOG_DIR/shave14_<TITLE> file, not Fast and below30 = 0 -> not even a
+    // candidate).
+    int fam = vcfg_in_family(g_title_id, "CUSA18723");
+    s->buf2_boot = (!g_s14_opt && !fam) ? OPT_BUF2_NA
+                 : g_s14_state == 2 ? OPT_BUF2_ON
+                 : ((!g_s14_opt && fam) || g_s14_why == k_s14_why_one_gen) ? OPT_BUF2_OFF_B30
+                 : OPT_BUF2_OFF_OTHER;
+}
+// One "options effective:" line: the effective state of every option, not only the value asked for. why: what caused it
+// (init, hot-reload, menu-apply, ..., or the runtime states that changed).
+static OptState g_opt_last;
+static volatile uint32_t g_opt_last_sig = 0;
+static volatile uint64_t g_opt_last_t = 0;
+static void opt_log_line(const OptState *s, const char *why)
+{
+    char tail[112], b[384];   // one log slot is 384 bytes: the tokens get what the prefix and the cause leave
+    int tl = snprintf(tail, sizeof(tail), " | %s", why ? why : "");
+    if (tl < 0) tl = 0;
+    if (tl >= (int)sizeof(tail)) tl = (int)sizeof(tail) - 1;
+    opt_format(b, sizeof(b) - (sizeof("options effective: ") - 1u) - (size_t)tl - 2u, s);
+    lg("options effective: %s%s\n", b, tail);
+    g_opt_last = *s;
+    __atomic_store_n(&g_opt_last_sig, opt_signature(s), __ATOMIC_RELEASE);
+    __atomic_store_n(&g_opt_last_t, sceKernelGetProcessTime(), __ATOMIC_RELEASE);
+}
+static void opt_log_effective(const char *why)
+{
+    OptState s;
+    fg_config_t c = g_cfg;
+    opt_state_now(&c, &s);
+    opt_log_line(&s, why);
+}
+// io thread, every ~250 ms: a new line when a state or a setting changed, at most one per 2 s (a state that flips back
+// within that time writes nothing). Also closes the windows of frame generation and game vectors (on when more than
+// half the real frames of the window had it), so a state that changes frame by frame does not make lines.
+#define OPT_TICK_US     250000ull
+#define OPT_MIN_GAP_US 2000000ull
+static void opt_status_tick(uint64_t now)
+{
+    static uint64_t last_tick;
+    if (now - last_tick < OPT_TICK_US) return;
+    last_tick = now;
+    uint32_t fr = __atomic_exchange_n(&g_st_gv_frames, 0u, __ATOMIC_RELAXED), hit = __atomic_exchange_n(&g_st_gv_hits, 0u, __ATOMIC_RELAXED);
+    if (fr) __atomic_store_n(&g_st_gv_active, hit * 2u > fr, __ATOMIC_RELAXED);
+    uint32_t ff = __atomic_exchange_n(&g_st_fg_frames, 0u, __ATOMIC_RELAXED), fh = __atomic_exchange_n(&g_st_fg_hits, 0u, __ATOMIC_RELAXED);
+    if (ff) __atomic_store_n(&g_st_fg_on, fh * 2u > ff, __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&g_opt_last_t, __ATOMIC_ACQUIRE)) return;   // nothing logged yet: the init line comes first
+    if (now - __atomic_load_n(&g_opt_last_t, __ATOMIC_ACQUIRE) < OPT_MIN_GAP_US) return;
+    OptState s;
+    fg_config_t c = g_cfg;
+    opt_state_now(&c, &s);
+    if (opt_signature(&s) == __atomic_load_n(&g_opt_last_sig, __ATOMIC_ACQUIRE)) return;
+    char ch[80] = "runtime: ";
+    if (!opt_changes(ch + 9, sizeof(ch) - 9u, &g_opt_last, &s)) snprintf(ch, sizeof(ch), "change");
+    opt_log_line(&s, ch);
+}
+
 static uint32_t g_last_disk_hash = 0;
 static void cfg_reload_from_disk(int force)
 {
@@ -2545,6 +3525,11 @@ static void cfg_save_game_ini(void)
     fprintf(f, "hud_protect = %d\n", c.hud_protect);
     fprintf(f, "game_vectors = %d\n", c.game_vectors);
     fprintf(f, "fps_lock = %d\n", c.fps_lock);
+    fprintf(f, "below30 = %d\n", c.below30);
+    fprintf(f, "shallow_queue = %d\n", c.shallow_queue);
+    fprintf(f, "post_budget = %d\n", g_post_budget ? 1 : 0);
+    fprintf(f, "late_tail = %d\n", g_late_tail ? 1 : 0);
+    fprintf(f, "fade_hi = %d\n", g_fade_hi ? 1 : 0);
     fprintf(f, "menu_hold_ms = %d\n", c.menu_hold_ms);
     fprintf(f, "menu_opacity = %d\n", c.menu_opacity);
     fprintf(f, "overlay = %d\n", c.overlay);
@@ -2563,15 +3548,39 @@ static void *io_thread(void *arg)
 {
     (void)arg;
     unsigned poll_n = 0;
-    int no_flip_logged = 0;
+    int no_flip_logged = 0, inert_checked = 0, busy = 1;
+    uint64_t io_t0 = sceKernelGetProcessTime(), cfg_t = io_t0, cpu_t = io_t0;
     for (;;) {
-        sceKernelUsleep(2000);
-        if (g_lgq_r != g_lgq_w) lg_drain();
+        sceKernelUsleep(cc_io_sleep_us(g_cc_iolazy, busy || g_cfg.game_vectors));   // 2 ms; iolazy 10 ms while idle
+        g_cc_io_wakes++;
+        busy = 0;
+        if (g_lgq_r != g_lgq_w) { lg_drain(); busy = 1; }
+        if (g_log) {   // FTRACE: 15 records per line, each at least 6 real frames old (the monitor has completed it)
+            uint32_t w = __atomic_load_n(&g_ft_w, __ATOMIC_ACQUIRE);
+            if (w - g_ft_r > FT_N - 8u) { g_ft_r = w - (FT_N - 8u); g_ft_prev_h = 0; }   // fell behind: skip, restart dh
+            if (w - g_ft_r >= 6u + 15u) {
+                uint32_t rec[15][3];
+                for (uint32_t i = 0; i < 15u; i++)
+                    for (int j = 0; j < 3; j++) rec[i][j] = __atomic_load_n(&g_ft[(g_ft_r + i) % FT_N][j], __ATOMIC_RELAXED);
+                char fb[512];
+                uint32_t nd = ft_format(fb, sizeof(fb), (const uint32_t (*)[3])rec, 15u, g_ft_prev_h);
+                if (nd) { g_ft_prev_h = rec[nd - 1][0]; g_ft_r += nd; lg_file_only(fb); busy = 1; }
+                else g_ft_r += 15u;
+            }
+        }
         bench_io_tick();
         if (__atomic_exchange_n(&g_cfg_save_req, 0, __ATOMIC_ACQ_REL)) cfg_save_game_ini();
+        opt_status_tick(sceKernelGetProcessTime());
         if (g_inject_on == 8) gv_io_tick();
         poll_n++;
-        if (!no_flip_logged && poll_n == 5000 && g_flips == 0 && g_vo_submit_flips == 0) {
+        uint64_t io_now = sceKernelGetProcessTime();
+        // Periodic jobs: by wake-up count as before (5000 x 2 ms, 250 x 2 ms), by elapsed time with iolazy.
+        int inert_due = g_cc_iolazy ? (!inert_checked && io_now - io_t0 >= CC_IO_INERT_US) : (poll_n == 5000);
+        int cfg_due = g_cc_iolazy ? (io_now - cfg_t >= CC_IO_CFG_US) : ((poll_n % 250) == 0);
+        if (inert_due) inert_checked = 1;
+        if (cfg_due) cfg_t = io_now;
+        if (io_now - cpu_t >= 1000000ull) { cpu_t = io_now; __atomic_store_n(&g_cc_io_cpu_us, cc_cpu_us(CC_CLK_THREAD), __ATOMIC_RELEASE); }
+        if (!no_flip_logged && inert_due && g_flips == 0 && g_vo_submit_flips == 0) {
             no_flip_logged = 1;
             snprintf(g_inert_reason, sizeof(g_inert_reason), "INERT: NO GNM FLIP");
             size_t dm2m = dm_avail(0x200000), dm4k = dm_avail(0x4000);
@@ -2586,7 +3595,7 @@ static void *io_thread(void *arg)
                   g_dbg_allocs, g_dbg_alloc_fail, g_dbg_maps, g_dbg_releases, g_dbg_batch_maps,
                   rw ? g_api_ring[(rw - 1u) % API_RING_N] : "none");
         }
-        if ((poll_n % 250) == 0 && g_inject_on == 8 && !g_bench_enabled) {
+        if (cfg_due && g_inject_on == 8 && !g_bench_enabled) {
             save_adapt_ini();
             cfg_reload_from_disk(0);
         }
@@ -2622,9 +3631,24 @@ static void *mon_thread(void *arg)
     VoVblankStatus vs;
     uint64_t last_count = 0, last_t = 0, win_t = 0, win_vb = 0, osd_t = 0, osd_fcnt = 0;
     int last_buf = -1, pend_max = 0, gcq_max = 0;
+    uint32_t ft_mid_nv = 0, ft_real_rec = 0;   // FTRACE: hold of the last generated frame, record of the real on screen
+    int aff_done = 0;
     for (;;) {
-        sceKernelUsleep(500);
+        int woke_vb = cc_mon_wait();   // 500 us sleep as before, or with monev the next vblank / flip event
+        g_cc_mon_wakes++;
         if (g_handle < 0) continue;
+        // CUSA02299: on its default core (mask 0x2) the monitor saw 3-14 of the 60 generated frames per 2 s and logged
+        // the rest as "missed", while VideoOut showed every one (FLIPLOG M1R1, camera). On core 6 alone it saw 120 of
+        // 120 refreshes from the first window. No other thread of ours sets an affinity. Once, when the handle is known.
+        if (!aff_done) {
+            aff_done = 1;
+            if (vcfg_in_family(g_title_id, "CUSA02299")) {
+                uint64_t old_mask = 0;
+                scePthreadGetaffinity(scePthreadSelf(), &old_mask);
+                int32_t arc = ((int32_t (*)(OrbisPthread, uint64_t))(void *)scePthreadSetaffinity)(scePthreadSelf(), 0x40ull);
+                lg("cadence monitor: affinity core 6 (mask 0x40) = 0x%08x (was 0x%llx)\n", (unsigned)arc, (unsigned long long)old_mask);
+            }
+        }
         memset(&fs, 0, sizeof(fs));
         memset(&vs, 0, sizeof(vs));
         if (read_flip_status(g_handle, &fs) != 0) continue;
@@ -2632,6 +3656,7 @@ static void *mon_thread(void *arg)
             __atomic_store_n(&g_vblank_t_us, vs.processTime, __ATOMIC_RELEASE);
             __atomic_store_n(&g_vblank_cnt, vs.count, __ATOMIC_RELEASE);
             vblank_pll_update(vs.count, vs.processTime);
+            if (woke_vb) cc_mon_vblank_latency(vs.processTime);
         }
         __atomic_store_n(&g_cur_pending_flips, (uint32_t)(fs.flipPendingNum > 0 ? fs.flipPendingNum : 0), __ATOMIC_RELEASE);
         __atomic_store_n(&g_cur_gcq, (uint32_t)(fs.gcQueueNum > 0 ? fs.gcQueueNum : 0), __ATOMIC_RELEASE);
@@ -2647,6 +3672,12 @@ static void *mon_thread(void *arg)
                     if (nv < 1) nv = 1;
                     if (nv > 4) nv = 4;
                     g_hist[IS_MID(last_buf) ? 0 : 1][nv - 1]++;
+                    if (IS_MID(last_buf)) ft_mid_nv += nv;   // both generated frames of a 3-slot pair
+                    else if (ft_real_rec && g_log && __atomic_load_n(&g_ft_w, __ATOMIC_ACQUIRE) - (ft_real_rec - 1u) < FT_N) {
+                        uint32_t *fr = &g_ft[(ft_real_rec - 1u) % FT_N][2];
+                        __atomic_store_n(fr, ft_with_real_vb(__atomic_load_n(fr, __ATOMIC_RELAXED), nv), __ATOMIC_RELAXED);
+                        ft_real_rec = 0;
+                    }
                     if (!IS_MID(last_buf) && g_mon) {
                         static uint32_t ema_dt = 16683u;
                         uint32_t dtu = dt > 66732u ? 66732u : (uint32_t)dt;
@@ -2667,7 +3698,7 @@ static void *mon_thread(void *arg)
                     g_mon_gaps++;
                 } else {
                     if (fs.currentBuffer >= 0 && !IS_MID(fs.currentBuffer) && last_buf >= 0 && IS_MID(last_buf)) g_reals_shown++;
-                    if (IS_MID(fs.currentBuffer) && last_buf >= 0 && !IS_MID(last_buf)) g_mids_shown++;
+                    if (IS_MID(fs.currentBuffer) && last_buf >= 0 && (!IS_MID(last_buf) || fs.currentBuffer != last_buf)) g_mids_shown++;
                 }
             }
             if (fs.currentBuffer >= 0 && !IS_MID(fs.currentBuffer) && fs.currentBuffer < 16 && fs.currentBuffer != last_buf) {
@@ -2675,6 +3706,18 @@ static void *mon_thread(void *arg)
                 if (t0 && fs.processTime > t0 && fs.processTime - t0 < 500000ull) {
                     uint64_t l = fs.processTime - t0; g_lat_sum += l; g_lat_n++; if (l > g_lat_max) g_lat_max = l;
                 }
+                uint32_t fs_slot = __atomic_exchange_n(&g_ft_slot[fs.currentBuffer], 0u, __ATOMIC_ACQ_REL);
+                ft_real_rec = 0;
+                if (fs_slot && g_log && __atomic_load_n(&g_ft_w, __ATOMIC_ACQUIRE) - (fs_slot - 1u) < FT_N) {
+                    uint32_t *fr = &g_ft[(fs_slot - 1u) % FT_N][2];
+                    uint32_t fv = __atomic_load_n(fr, __ATOMIC_RELAXED);
+                    uint64_t h0 = __atomic_load_n(&g_ft[(fs_slot - 1u) % FT_N][0], __ATOMIC_RELAXED);
+                    uint64_t dscr = (uint32_t)fs.processTime - (uint32_t)h0;   // both are process time in us (low 32 bits)
+                    fv = ft_with_mid_vb(ft_with_screen(fv, dscr), ft_mid_nv);
+                    __atomic_store_n(fr, fv, __ATOMIC_RELAXED);
+                    ft_real_rec = fs_slot;
+                }
+                ft_mid_nv = 0;
             }
             if (fs.currentBuffer >= 0 && !IS_MID(fs.currentBuffer)) g_last_real_buf = fs.currentBuffer;
             last_count = fs.count;
@@ -2697,27 +3740,34 @@ static void *mon_thread(void *arg)
         if (vs.processTime > win_t + 2000000) {
             double hz = (double)(vs.count - win_vb) * 1e6 / (double)(vs.processTime - win_t);
             g_last_hz_x10 = (uint32_t)(hz * 10.0 + 0.5);
+            {
+                uint32_t wq8 = vb_period_q8_from_window(vs.count - win_vb, vs.processTime - win_t);
+                if (wq8) __atomic_store_n(&g_vb_win_q8, wq8, __ATOMIC_RELEASE);
+            }
             uint32_t cn_ = __atomic_exchange_n(&g_cpu_n, 0u, __ATOMIC_ACQ_REL);
             uint32_t csum_ = __atomic_exchange_n(&g_cpu_sum_us, 0u, __ATOMIC_ACQ_REL);
             uint32_t cmax_ = __atomic_exchange_n(&g_cpu_max_us, 0u, __ATOMIC_ACQ_REL);
-            lg("LATENCY real frame hand-over -> on screen: avg %.1f max %.1f ms (%llu frames) | FG %s preset %d | pending max %d\n",
+            lgd("LATENCY real frame hand-over -> on screen: avg %.1f max %.1f ms (%llu frames) | FG %s preset %d | pending max %d\n",
                g_lat_n ? (double)g_lat_sum / 1000.0 / (double)g_lat_n : 0.0, (double)g_lat_max / 1000.0,
                (unsigned long long)g_lat_n, (g_cfg.framegen && !g_fg_off && g_fmt_supported && g_mbuf_state == 1 && !g_inert_reason[0]) ? "on" : "off", g_cfg.preset, pend_max);
             g_lat_sum = g_lat_n = g_lat_max = 0;
-            lg("CADENCE (vblanks on screen) mid 1:%u 2:%u 3:%u 4+:%u | real 1:%u 2:%u 3:%u 4+:%u | refresh %.3f Hz | "
+            lgd("CADENCE (vblanks on screen) mid 1:%u 2:%u 3:%u 4+:%u | real 1:%u 2:%u 3:%u 4+:%u | refresh %.3f Hz | "
                "pending max %d gcq max %d | missed %u (gaps %u) | pace timeouts %u resync %u fix %u | game cpu release->submit avg %.1f max %.1f ms\n",
                g_hist[0][0], g_hist[0][1], g_hist[0][2], g_hist[0][3], g_hist[1][0], g_hist[1][1], g_hist[1][2], g_hist[1][3],
                hz, pend_max, gcq_max, g_mon_missed, g_mon_gaps, g_pace_timeouts, g_pace_resync, g_pace_fix,
                cn_ ? csum_ / 1000.0 / cn_ : 0.0, cmax_ / 1000.0);
             memset(g_hist, 0, sizeof(g_hist));
+            // The CADENCE row passes 198 characters, so the flight recorder cuts its CPU field: repeat it on a short row.
+            if (!tb_title() && cn_) lgd("CPU release->submit avg %.1f max %.1f ms\n", csum_ / 1000.0 / cn_, cmax_ / 1000.0);
             // Keep the CPU measurement visible in the 200-byte flight-recorder rows.
             if (tb_title()) {
-                lg("CPU release->submit avg %.1f max %.1f ms | test=%d FG=%d pcopy=%d preset=%d\n",
+                lgd("CPU release->submit avg %.1f max %.1f ms | test=%d FG=%d pcopy=%d preset=%d\n",
                    cn_ ? csum_ / 1000.0 / cn_ : 0.0, cmax_ / 1000.0,
                    VCFG_2BUF_TEST, !g_fg_off, g_pcopy_on, g_cfg.preset);
                 tb_report();
             }
             vq_report();
+            cc_window_log(vs.processTime - win_t);
             {
                 static uint32_t stall_last_flips = 0, stall_win_cnt = 0;
                 uint32_t cur_flips = g_flips + g_vo_submit_flips;
@@ -2758,6 +3808,7 @@ static void io_start(void)
     static int io_started = 0;
     if (io_started) return;
     io_started = 1;
+    cc_read_cuts();
     OrbisPthread th2;
     int r2 = scePthreadCreate(&th2, NULL, io_thread, NULL, "bb_io");
     g_lg_async = (r2 == 0);
@@ -2787,8 +3838,7 @@ static uint32_t vblank_period_us(void)
     if (p_q8 >= (10000u << 8) && p_q8 <= (25000u << 8)) {
         return (p_q8 + 128u) >> 8;
     }
-    uint32_t hz10 = (g_last_hz_x10 > 400u && g_last_hz_x10 < 800u) ? g_last_hz_x10 : 599u;
-    uint32_t vb_us = (10000000u + (hz10 >> 1)) / hz10;
+    uint32_t vb_us = (refresh_period_q8() + 128u) >> 8;
     return (vb_us >= 10000u && vb_us <= 25000u) ? vb_us : 16683u;
 }
 
@@ -2843,7 +3893,7 @@ static uint32_t pll_predict_t_interp_q16(int32_t handle, uint64_t now_us, uint64
     }
 
     uint32_t extra_mid_vb = (hold_mid_us > (vb_us >> 1)) ? ((hold_mid_us + (vb_us >> 1)) / vb_us) : 0u;
-    uint32_t vb_m_to_c = 1u + extra_mid_vb;
+    uint32_t vb_m_to_c = (__atomic_load_n(&g_pair_slots, __ATOMIC_ACQUIRE) == 3u ? 2u : 1u) + extra_mid_vb;
 
     uint32_t vb_p_to_m = 1u;
     if (v_p_us > 0 && v_m_us > v_p_us && (v_m_us - v_p_us) <= (uint64_t)vb_us * 6ull) {
@@ -2860,9 +3910,9 @@ static uint32_t pll_predict_t_interp_q16(int32_t handle, uint64_t now_us, uint64
     }
 
     uint32_t vb_p_to_c = vb_p_to_m + vb_m_to_c;
-    uint32_t t_q16 = ((vb_p_to_m << 16) + (vb_p_to_c >> 1)) / vb_p_to_c;
-    if (t_q16 < 21845u) t_q16 = 21845u;
-    if (t_q16 > 43691u) t_q16 = 43691u;
+    uint32_t t_q16 = 32768u, t2_q16 = 43690u;
+    pll_slot_phases_q16(vb_p_to_m, vb_m_to_c, &t_q16, &t2_q16);
+    __atomic_store_n(&g_pll_t2_q16, t2_q16, __ATOMIC_RELEASE);
 
     uint32_t t_permille = (vb_p_to_m * 1000u + (vb_p_to_c >> 1)) / vb_p_to_c;
     if (t_permille < 333u) t_permille = 333u;
@@ -2884,7 +3934,8 @@ static void pll_commit_frame_vblank(int32_t handle, uint64_t submit_us, uint32_t
         v_m_us = prev_vp + (uint64_t)vb_us;
     }
     uint32_t extra_mid_vb = (hold_mid_us > (vb_us >> 1)) ? ((hold_mid_us + (vb_us >> 1)) / vb_us) : 0u;
-    uint64_t v_c_us = v_m_us + (uint64_t)(1u + extra_mid_vb) * (uint64_t)vb_us;
+    uint32_t vb_m_to_c = (__atomic_load_n(&g_pair_slots, __ATOMIC_ACQUIRE) == 3u ? 2u : 1u) + extra_mid_vb;
+    uint64_t v_c_us = v_m_us + (uint64_t)vb_m_to_c * (uint64_t)vb_us;
     __atomic_store_n(&g_pll_last_real_vb_us, v_c_us, __ATOMIC_RELEASE);
 }
 
@@ -2925,6 +3976,15 @@ static uint32_t pll_adaptive_hold_us(int32_t handle, uint64_t now_us, uint64_t d
 
 static uint64_t g_dbl_frames = 0;
 static int64_t g_pace_off = 0;
+// Present-copy state as the pacers see it. With two_buffer or present_copy forced, the history buffer makes
+// g_pcopy_avail 1 (on_register_buffers_2buf), so g_pcopy_on = g_pcopy_avail && present_copy != 2 picks timer pacing,
+// post-submit release and the deeper drain threshold for that title. shave14 withholds that history buffer
+// (g_s14_tail_extra, alloc_pbuf_history) and takes g_pcopy_on to 0 with it; the pacers keep the decision the title has
+// without shave14. Rendering still follows g_pcopy_on (no history buffer to copy into).
+static int pace_pcopy(void)
+{
+    return g_pcopy_on || (g_s14_tail_extra && g_cfg.present_copy != 2);
+}
 static void pace_vblank_ex(int prev2_real, int prev_real, int cur_real, int32_t handle, uint64_t dt_enter_us, int pace_pre)
 {
     if (!g_mon_on) { pace_30(); return; }
@@ -2932,7 +3992,7 @@ static void pace_vblank_ex(int prev2_real, int prev_real, int cur_real, int32_t 
     volatile uint64_t *cnt = g_opt_early ? &g_mids_shown : &g_reals_shown;
     // Present copy (2-buffer games): release the game when the frame before the previous one is on screen, so its CPU
     // work overlaps the GPU of the previous frame (waiting for the previous one serialised them: 26 + 26 ms, 24 fps).
-    int64_t step = g_pcopy_on ? 2 : 1;
+    int64_t step = pace_pcopy() ? 2 : 1;
     int64_t target = (int64_t)g_dbl_frames - step + g_pace_off;
     int64_t have = (int64_t)*cnt;
     if (have > target) {
@@ -2943,12 +4003,12 @@ static void pace_vblank_ex(int prev2_real, int prev_real, int cur_real, int32_t 
     }
     uint64_t t0 = sceKernelGetProcessTime();
     uint64_t max_wait_us = 60000ull;
-    if (pace_pre && dt_enter_us > 0 && __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) <= 1u) {
+    if (pace_pre && dt_enter_us > 0 && cc_pending_flips() <= 1u) {
         max_wait_us = pll_adaptive_hold_us(handle, t0, dt_enter_us, 60000u);
     }
     while ((int64_t)*cnt < target) {
         uint64_t el = sceKernelGetProcessTime() - t0;
-        if (el >= max_wait_us && __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) <= 1u) {
+        if (el >= max_wait_us && cc_pending_flips() <= 1u) {
             g_pace_off = (int64_t)*cnt - ((int64_t)g_dbl_frames - step);
             break;
         }
@@ -2961,7 +4021,7 @@ static void pace_vblank_ex(int prev2_real, int prev_real, int cur_real, int32_t 
     }
     int distinct_ok = (g_ngame == 2) ? (prev_real >= 0 && prev_real != cur_real)
                                      : (prev2_real != cur_real && prev_real != cur_real && prev2_real != prev_real);
-    if (distinct_ok && g_pcopy_on) {
+    if (distinct_ok && pace_pcopy()) {
         VoFlipStatus fs;
         memset(&fs, 0, sizeof(fs));
         if (read_flip_status(g_handle, &fs) == 0) {
@@ -2978,16 +4038,17 @@ static void pace_vblank(int prev2_real, int prev_real, int cur_real)
 }
 
 // VCFG timer pacing for FG pairs, per title (LOG_DIR/pace_timer_<TITLE> exists): releases the game once per pair
-// period (2 refreshes at the measured rate) from the previous release, instead of waiting until its previous real
+// period (2 refreshes at the measured period, exact to ~0.01 us: the rounded 59.9 Hz drifted 22 us per pair and made
+// the latency a 1.3 ms / 2 s sawtooth) from the previous release, instead of waiting until its previous real
 // frame is on screen (pace_vblank). CUSA05571 needs 25 ms per frame but waited ~13 ms more in pace_vblank behind a
 // 4-deep flip queue and ran at 24-25 fps. +2 ms on the next release while 3+ flips are pending (drift).
 static int g_pace_timer = -1;
 static uint64_t g_pair_next;
-static void pace_pair_ex(int32_t handle, uint64_t dt_enter_us, int pace_pre)
+static void pace_pair_ex(int32_t handle, uint64_t dt_enter_us, int pace_pre, uint32_t nvb)
 {
     if (!g_freq) return;
-    uint32_t hz10 = g_last_hz_x10 > 400u && g_last_hz_x10 < 800u ? g_last_hz_x10 : 599u;
-    uint64_t period = g_freq * 20ull / hz10;                  // 2 refreshes
+    if (nvb < 2u || nvb > 3u) nvb = 2u;
+    uint64_t period = vb_ticks(g_freq, refresh_period_q8(), nvb);   // nvb refreshes (2, or 3 for a 3-slot pair) at the measured period
     uint64_t now = sceKernelGetProcessTimeCounter();
     if (!g_pair_next || now > g_pair_next + period * 3) { g_pair_next = now + period; g_rel_t = sceKernelGetProcessTime(); return; }
     if (now < g_pair_next) {
@@ -2999,8 +4060,7 @@ static void pace_pair_ex(int32_t handle, uint64_t dt_enter_us, int pace_pre)
                 g_pair_next = now + (uint64_t)us * g_freq / 1000000ull;
             }
         }
-        if (us > 1500) sceKernelUsleep((uint32_t)(us - 1000));
-        while (sceKernelGetProcessTimeCounter() < g_pair_next) { }
+        cc_wait_until(g_pair_next);
         now = sceKernelGetProcessTimeCounter();
     }
     g_pair_next += period;
@@ -3014,23 +4074,24 @@ static void pace_pair_ex(int32_t handle, uint64_t dt_enter_us, int pace_pre)
             g_pair_next = now + period;
         }
     }
-    uint32_t drain_thr = g_pcopy_on ? 5u : (pace_pre ? 3u : 4u);
-    if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= drain_thr) g_pair_next += g_freq / 500u;   // drain: +2 ms
+    uint32_t drain_thr = pace_pcopy() ? 5u : (pace_pre ? 3u : 4u);
+    if (cc_pending_flips() >= drain_thr) g_pair_next += g_freq / 500u;   // drain: +2 ms
     g_rel_t = sceKernelGetProcessTime();
 }
-static void pace_pair(void) { pace_pair_ex(g_handle, 0ull, 0); }
+static void pace_pair(void) { pace_pair_ex(g_handle, 0ull, 0, 2u); }
 static int pace_timer_on(void)
 {
     if (g_cfg.pace_order == 3) return 1;
     if (g_cfg.pace_order == 0 &&
-        (g_pcopy_on ||
+        (pace_pcopy() ||
          vcfg_in_family(g_title_id, "CUSA05571") ||
          vcfg_in_family(g_title_id, "CUSA09311") ||
          vcfg_in_family(g_title_id, "CUSA18534") ||
          vcfg_in_family(g_title_id, "CUSA10123"))) {
         if (g_pace_timer < 0) {
             g_pace_timer = 1;
-            lg("pacing: timer (auto for pcopy/%s)\n", g_title_id);
+            lg("pacing: timer (auto for pcopy/%s)%s\n", g_title_id,
+               (!g_pcopy_on && g_s14_tail_extra) ? " (shave14: history buffer withheld, present-copy pacing kept)" : "");
         }
         return 1;
     }
@@ -3042,11 +4103,85 @@ static int pace_timer_on(void)
     return g_pace_timer;
 }
 
+// The below-30 regime's buffer order and feed state, set up once on the game thread (never in plugin_load).
+static void b30cost_init(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    mid_lru_reset(&g_mid_lru, (uint32_t)g_nmid);
+    b30x_reset(&g_b30x);
+}
+// Own time the below-30 regime and its accumulator read: without the GPU time the regime itself adds.
+static uint32_t b30_feed(uint64_t own_us)
+{
+    uint32_t o = own_us < 1000000ull ? (uint32_t)own_us : 0u;
+    return b30_feed_us(o, g_b30x.ema_us);
+}
+
 static uint32_t med3_u32(uint32_t a, uint32_t b, uint32_t c)
 {
     if (a > b) { uint32_t t = a; a = b; b = t; }
     if (b > c) { b = c; }
     return a > b ? a : b;
+}
+
+// Post-process budget, once per STAT window (post_budget.h). The detector runs while frames are generated (mode 8,
+// more than half of the last 0.25 s) with the menu closed; the level steps down only outside FG Fast and below 30.
+static void post_budget_window(double secs)
+{
+    static int s_init;
+    if (!s_init) { s_init = 1; pb_reset(&g_pb); lg("post budget: %s (option post_budget)\n", g_post_budget ? "on" : "off"); }
+    uint32_t q8 = __atomic_load_n(&g_vb_win_q8, __ATOMIC_RELAXED), hz10 = __atomic_load_n(&g_last_hz_x10, __ATOMIC_RELAXED);
+    PbIn in;
+    in.enabled = g_post_budget;
+    in.diag = g_inject_on == 8 && __atomic_load_n(&g_st_fg_on, __ATOMIC_RELAXED) && !g_menu_open && !g_detected_60fps;
+    in.active = in.diag && g_cfg.preset != 1 && !g_b30.on;
+    in.win_n = g_win_n;
+    in.win_us = (uint32_t)(secs * 1e6);
+    in.maxdt_us = g_win_max < 4000.0 ? (uint32_t)(g_win_max * 1000.0) : 4000000u;
+    in.vb_us = q8 ? (q8 + 128u) >> 8 : (hz10 ? 10000000u / hz10 : 16683u);
+    in.cost_x100 = __atomic_load_n(&g_last_rcas_ms_x100, __ATOMIC_ACQUIRE);
+    in.warp_x100 = __atomic_load_n(&g_last_warppost_ms_x100, __ATOMIC_ACQUIRE);
+    {   // this window's deltas of the frame counts
+        static uint32_t p_n, p_dist, p_unm, p_fg, p_real, p_gen;
+        uint32_t c_n = __atomic_load_n(&g_pb_st_n, __ATOMIC_RELAXED), c_dist = __atomic_load_n(&g_pb_st_dist, __ATOMIC_RELAXED);
+        uint32_t c_unm = __atomic_load_n(&g_pb_st_unm, __ATOMIC_RELAXED), c_fg = __atomic_load_n(&g_pb_st_fg, __ATOMIC_RELAXED);
+        uint32_t c_real = __atomic_load_n(&g_pb_real, __ATOMIC_RELAXED), c_gen = __atomic_load_n(&g_pb_gen, __ATOMIC_RELAXED);
+        uint32_t dn = c_n - p_n, dreal = c_real - p_real, dgen = c_gen - p_gen;
+        in.disturbed = (c_dist - p_dist) > 0u || (dreal >= 10u && (uint64_t)dgen * 10u < (uint64_t)dreal * 9u);
+        in.motion = dn > 0u && ((uint64_t)(c_unm - p_unm) >= 20ull * dn || (uint64_t)(c_fg - p_fg) * 10u >= (uint64_t)dn * 3u);
+        p_n = c_n; p_dist = c_dist; p_unm = c_unm; p_fg = c_fg; p_real = c_real; p_gen = c_gen;
+    }
+    in.sharp = g_cfg.sharpness < 0 ? 0 : (g_cfg.sharpness > 100 ? 100 : g_cfg.sharpness);
+    in.enh = g_cfg.upscale < 0 ? 0 : (g_cfg.upscale > 2 ? 2 : g_cfg.upscale);
+    PbEvt e;
+    if (!pb_window(&g_pb, &in, &e)) return;
+    __atomic_store_n(&g_pb_level, e.to, __ATOMIC_RELEASE);
+    static const char *const enh_name[3] = { "off", "light", "strong" };
+    if (e.why == PB_NOPOST) {   // the same lateness with no post-process to cede: the warp or the game, said once per episode
+        lg("post budget: real frame late in %u of the last 3 windows (max dt %.1f ms > %.1f), nothing to cede (%s: Sharpness %d, "
+           "Enhance AA %s, rcas8 %.2f ms), our warp/post %.2f ms: not the post-process\n", e.late3, e.maxdt_us / 1000.0,
+           e.thr_us / 1000.0, e.sub == PB_NOPOST_REGIME ? "FG Fast / below 30 never step" : "no post-process", in.sharp,
+           enh_name[in.enh], e.cost_x100 / 100.0, e.warp_x100 / 100.0);
+        return;
+    }
+    char lv[64];
+    if (e.to == 0) snprintf(lv, sizeof(lv), "Sharpness %d, Enhance AA %s as set", in.sharp, enh_name[in.enh]);
+    else if (e.to == 1) snprintf(lv, sizeof(lv), "Enhance AA off, Sharpness %d kept", in.sharp);
+    else snprintf(lv, sizeof(lv), "Sharpness and Enhance AA off");
+    if (e.why == PB_LATE)
+        lg("post budget: level %d -> %d (%s): real frame late in %u of the last 3 windows (max dt %.1f ms > %.1f), rcas8 %.2f ms\n",
+           e.from, e.to, lv, e.late3, e.maxdt_us / 1000.0, e.thr_us / 1000.0, e.cost_x100 / 100.0);
+    else if (e.why == PB_CLEAN)
+        lg("post budget: level %d -> %d (%s): %u windows in a row without a late real frame\n", e.from, e.to, lv, e.hold);
+    else if (e.why == PB_NOGAIN)
+        lg("post budget: level %d -> %d (%s): no gain, real frame still late in %u of %u windows, no step down for %u s\n",
+           e.from, e.to, lv, e.late_since, e.dwell, e.lock * 2u);
+    else
+        lg("post budget: level %d -> %d (%s): %s\n", e.from, e.to, lv,
+           e.why == PB_SETTINGS ? "Sharpness / Enhance AA changed" :
+           (!in.enabled ? "option post_budget = 0" : "frames not generated, menu, FG Fast or below 30"));
 }
 
 static void tick(uint32_t n, uint32_t handle, uint32_t index, uint32_t mode)
@@ -3099,13 +4234,19 @@ static void tick(uint32_t n, uint32_t handle, uint32_t index, uint32_t mode)
                 if (rate_class) lg("rate change: %d -> %d fps class at flip %u (%.1f fps, detected_60=%d)\n", rate_class, cls, n, rfps, g_detected_60fps);
                 rate_class = cls;
             }
+            static int lock60_logged;
             if (g_detected_60fps && n > INJECT_AFTER_FLIPS && low_fps_wins >= 2) {
-                g_detected_60fps = 0;
-                g_inert_reason[0] = 0;
-                if (g_known_game && !g_menu_open) { g_cfg.framegen = 1; g_fg_off = 0; }
-                g_last_disk_hash = 0;
-                gv_start(g_inject_on == 8 && fg_res_supported(g_bw, g_bh));
-                lg("auto-detect: game dropped to %.1f fps (30 fps class) -> FrameGen auto-enabled\n", rfps);
+                if (fg_auto_reenable_allowed(g_cfg.fps_lock)) {
+                    g_detected_60fps = 0;
+                    g_inert_reason[0] = 0;
+                    if (g_known_game && !g_menu_open) { g_cfg.framegen = 1; g_fg_off = 0; }
+                    g_last_disk_hash = 0;
+                    gv_start(g_inject_on == 8 && fg_res_supported(g_bw, g_bh));
+                    lg("auto-detect: game dropped to %.1f fps (30 fps class) -> FrameGen auto-enabled\n", rfps);
+                } else if (!lock60_logged) {   // fps_lock = 60: the player wants the game free, without frame generation
+                    lock60_logged = 1;
+                    lg("auto-detect: game dropped to %.1f fps (30 fps class), fps_lock=60 -> FrameGen stays off, game free up to 60 fps\n", rfps);
+                }
             }
         }
         g_fps_win_t = now;
@@ -3116,7 +4257,9 @@ static void tick(uint32_t n, uint32_t handle, uint32_t index, uint32_t mode)
         lg("gnm #%u t=%.3fs dt=%.2fms idx=%u mode=%u\n", n, (now - g_t0) / (double)g_freq, dt, index, mode);
     if (now - g_win_t >= g_freq * 2) {
         double secs = (now - g_win_t) / (double)g_freq;
-        lg("STAT gnm: %.1f flips/s, max dt %.1f ms (window %.1fs)\n", g_win_n / secs, g_win_max, secs);
+        lgd("STAT gnm: %.1f flips/s, max dt %.1f ms (window %.1fs)\n", g_win_n / secs, g_win_max, secs);
+        post_budget_window(secs);
+        if (!g_mon_on) cc_fgoff_log();
         g_win_t = now; g_win_n = 0; g_win_max = 0.0;
     }
 }
@@ -3142,6 +4285,30 @@ static int dcb_mem_ok(uintptr_t a, size_t n)
         if ((prot & 0x01 /*PROT_CPU_READ*/) == 0) return 0;
         cur = (uintptr_t)en;
     }
+    return 1;
+}
+
+static int og2_cpu_writable(uintptr_t a, size_t n)
+{
+    uintptr_t end = a + n, cur = a;
+    if (!a || !n || end < a) return 0;
+    while (cur < end) {
+        void *s = NULL, *en = NULL;
+        int32_t prot = 0;
+        if (sceKernelQueryMemoryProtection((void *)cur, &s, &en, &prot) != 0) return 0;
+        if ((uintptr_t)s > cur || (uintptr_t)en <= cur || (prot & 0x02 /*PROT_CPU_WRITE*/) == 0) return 0;
+        cur = (uintptr_t)en;
+    }
+    return 1;
+}
+
+// One display group: the game's buffer on screen into ours. Our buffer is write-combined: the copy is drained with
+// sfence before VideoOut is asked to show it.
+static int og2_copy(void *dst, const void *src, size_t n)
+{
+    if (!dcb_mem_ok((uintptr_t)src, n) || !og2_cpu_writable((uintptr_t)dst, n)) return 0;
+    memcpy(dst, src, n);
+    __asm__ volatile("sfence" ::: "memory");
     return 1;
 }
 
@@ -3235,13 +4402,21 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
         lg("CLASSIC_BUILD version=%s test=%d target=%d two_buffer=%d status_hook=%d\n", VCFG_TRACE_VERSION, VCFG_2BUF_TEST, tb_title(),
            g_vq_on, g_status_hooked);
     }
+    uint64_t ft_own_us = 0;
+    if (g_cc_off_rel) {   // framegen=0, debug log: kept apart from g_cpu_* (the pacers' own-time average)
+        uint64_t us = sceKernelGetProcessTime() - g_cc_off_rel;
+        g_cc_off_rel = 0;
+        if (us < 1000000) { g_cc_off_n++; g_cc_off_sum_us += (uint32_t)us; if (us > g_cc_off_max_us) g_cc_off_max_us = (uint32_t)us; }
+    }
     if (g_rel_t) {
         uint64_t us = sceKernelGetProcessTime() - g_rel_t;
+        ft_own_us = us;
         g_rel_t = 0;
         if (us < 1000000) { g_cpu_n++; g_cpu_sum_us += (uint32_t)us; if (us > g_cpu_max_us) g_cpu_max_us = (uint32_t)us;
                             g_cpu_ema_us = g_cpu_ema_us ? (g_cpu_ema_us * 7u + (uint32_t)us) / 8u : (uint32_t)us; }
     }
     tick(g_flips, handle, index, flipMode);
+    if (g_flips > INJECT_AFTER_FLIPS) og2_tick((int32_t)handle);   // one display group: a temporary group still to drop
     uint64_t raw_dt_us = (prev_flip_t && g_freq) ? ((g_last - prev_flip_t) * 1000000ull / g_freq) : 33366ull;
 #if VCFG_BENCH
     if (g_bench_enabled) return bench_flip(count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg, t_hook_in);
@@ -3326,6 +4501,20 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         if (!g_ts_first) { g_ts_first = ts[0]; g_ts_cpu_first = g_slot_cpu[ps]; }
                         g_ts_last = ts[0]; g_ts_cpu_last = g_slot_cpu[ps];
                         for (int i = 0; i < 4; i++) g_ts_pass[i] += (ts[i + 1] > ts[i]) ? ts[i + 1] - ts[i] : 0;
+                        if (g_inject_on == 8 && g_ts_ticks_per_ms && g_freq && g_slot_cpu[ps] && g_tl_n < 96u) {   // TAIL
+                            double lag = (double)ts[0] / (double)g_ts_ticks_per_ms - (double)g_slot_cpu[ps] * 1000.0 / (double)g_freq;
+                            g_tl_lag[g_tl_n] = lag;
+                            g_tl_ours[g_tl_n] = (double)(ts[4] - ts[0]) / (double)g_ts_ticks_per_ms;
+                            g_tl_n++;
+                            if (lag < g_tl_lag_min) g_tl_lag_min = lag;
+                            volatile uint64_t *lts = (volatile uint64_t *)(g_gpu + SLOT0 + ps * SLOT_SZ + LT_TS_OFF);
+                            if (lts[0] && lts[1] > lts[0]) {
+                                double rd = (double)(lts[1] - lts[0]) / (double)g_ts_ticks_per_ms;
+                                g_tl_rd_sum += rd; g_tl_rd_n++;
+                                if (rd > g_tl_rd_max) g_tl_rd_max = rd;
+                            }
+                            lts[0] = 0;   // the DCB2 sample is read once
+                        }
                         {
                             volatile uint64_t *t2 = (volatile uint64_t *)(g_gpu + SLOT0 + ps * SLOT_SZ + 0x980);
                             for (int i = 0; i < 5; i++) g_praw[i] = ts[i];
@@ -3334,6 +4523,30 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                 uint64_t mk[9] = { ts[0], ts[1], t2[0], t2[1], t2[2], t2[3], ts[2], ts[3], t2[4] };
                                 for (int i = 0; i < 8; i++) g_pp[i] += (mk[i + 1] > mk[i]) ? mk[i + 1] - mk[i] : 0;
                                 g_pp[8] += (ts[4] > t2[4]) ? ts[4] - t2[4] : 0;
+                                if (t2[7] && t2[5] >= t2[4] && t2[7] >= t2[5] && t2[6] >= t2[7]) {
+                                    g_pp_split[0] += t2[5] - t2[4];
+                                    g_pp_split[1] += t2[7] - t2[5];
+                                    g_pp_split[2] += t2[6] - t2[7];
+                                    g_pp_split_n++;
+                                    if (g_cfg.below30 && g_ts_ticks_per_ms)
+                                        b30x_add(&g_b30x, b30x_ticks_us(ts[3] > ts[2] ? ts[3] - ts[2] : 0u, g_ts_ticks_per_ms),
+                                                 b30x_ticks_us(t2[7] - t2[5], g_ts_ticks_per_ms), g_slot_three[ps]);
+                                    if (g_cfg.below30) {   // B30COST: fence before the 1st generated frame, by the pair before
+                                        uint32_t f1 = b30x_ticks_us(ts[3] > ts[2] ? ts[3] - ts[2] : 0u, g_ts_ticks_per_ms);
+                                        b30c_win_f1_us += f1; b30c_win_n++;
+                                        if (g_slot_three[(ps + 3u) & 3u]) { b30c_win_f1_after3_us += f1; b30c_win_n_after3++; }
+                                    }
+                                    if (t2[8] >= t2[5] && t2[7] >= t2[8]) {
+                                        g_pp_split[3] += t2[8] - t2[5];
+                                        g_pp_split[4] += t2[7] - t2[8];
+                                        if (t2[9] >= t2[8] && t2[10] >= t2[9] && t2[7] >= t2[10]) {
+                                            g_pp_g2[0] += t2[9] - t2[8];
+                                            g_pp_g2[1] += t2[10] - t2[9];
+                                            g_pp_g2[2] += t2[7] - t2[10];
+                                            g_pp_g2_n++;
+                                        }
+                                    }
+                                }
                             }
                         }
                         g_ts_n++;
@@ -3346,7 +4559,13 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                 uint32_t cb_thr = cut_blocks8() ? cut_blocks8() * 8u : CUT_BLOCKS;
                                 if (cn > cb_thr) g_st_cuts++;
                                 if (fgn) g_st_fgf++;
-                                if (stv[4] == 1u) g_st_fades++;
+                                // me1 fade flag: 1 = 2 % fade with a still camera, 2 = fade_hi only (option fade_hi)
+                                if (stv[4] == 1u || stv[4] == 2u) g_st_fades++;
+                                if (stv[4] == 2u) g_st_fades_hi++;
+                                __atomic_fetch_add(&g_pb_st_n, 1u, __ATOMIC_RELAXED);
+                                __atomic_fetch_add(&g_pb_st_unm, cn, __ATOMIC_RELAXED);
+                                if (fgn) __atomic_fetch_add(&g_pb_st_fg, 1u, __ATOMIC_RELAXED);
+                                if (cn > cb_thr || stv[4] == 1u || stv[4] == 2u) __atomic_fetch_add(&g_pb_st_dist, 1u, __ATOMIC_RELAXED);
                                 g_st_gmx = (int32_t)stv[1]; g_st_gmy = (int32_t)stv[2];
                             }
                         }
@@ -3362,6 +4581,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             double secs = (double)(g_ts_cpu_last - g_ts_cpu_first) / (double)g_freq;
                             double unit = (double)(g_ts_last - g_ts_first) / secs;
                             gv_set_gpu_rate(unit);
+                            if (unit > 1e6 && unit < 1e10) g_ts_ticks_per_ms = (uint32_t)(unit / 1000.0 + 0.5);
                             double ms[4], tot = 0;
                             for (int i = 0; i < 4; i++) { ms[i] = (double)g_ts_pass[i] / (double)g_ts_n / unit * 1000.0; tot += ms[i]; }
                             double span = g_ts_span_n ? (double)g_ts_span / g_ts_span_n / unit * 1000.0 : 0.0;
@@ -3370,25 +4590,62 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             if (g_inject_on == 8) {
                                 double gpu_act = ms[0] + ms[1] + ms[3];
                                 g_last_gpu_ms_x100 = (uint32_t)(gpu_act * 100.0 + 0.5);
-                                lg("GPU time of our passes: pyramid %.2f + motion %.2f + warp/post %.2f = %.2f ms (+ fence wait %.2f) | "
+                                {
+                                    double rc = g_pp_split_n ? (double)g_pp_split[3] / g_pp_split_n / unit * 1000.0 : 0.0;
+                                    __atomic_store_n(&g_last_rcas_ms_x100, (uint32_t)(rc * 100.0 + 0.5), __ATOMIC_RELEASE);
+                                    __atomic_store_n(&g_last_warppost_ms_x100, (uint32_t)(ms[3] * 100.0 + 0.5), __ATOMIC_RELEASE);
+                                }
+                                lgd("GPU time of our passes: pyramid %.2f + motion %.2f + warp/post %.2f = %.2f ms (+ fence wait %.2f) | "
                                    "game span avg %.1f max %.1f ms\n", ms[0], ms[1], ms[3], gpu_act, ms[2], span, spanmax);
-                                lg("PASSES ms: pyr8 %.2f me3 %.2f me2 %.2f gm8+fgs8 %.2f me1 %.2f mf8 %.2f fence %.2f phase8 %.2f warp8+rcas+osd %.2f\n",
+                                if (g_tl_n) {   // separate short line (200-byte trace rows): see g_tl_* above
+                                    uint32_t l3 = 0, l6 = 0, e12 = 0, e14 = 0;
+                                    for (uint32_t i = 0; i < g_tl_n; i++) {
+                                        double l = g_tl_lag[i] - g_tl_lag_min, e = l + g_tl_ours[i];
+                                        if (l > g_tl_lag_max) g_tl_lag_max = l;
+                                        if (g_tl_ours[i] > g_tl_ours_max) g_tl_ours_max = g_tl_ours[i];
+                                        if (e > g_tl_end_max) g_tl_end_max = e;
+                                        l3 += l > 3.0; l6 += l > 6.0; e12 += e > 12.0; e14 += e > 14.0;
+                                    }
+                                    lgd("TAIL ms after hand-over (%u fr): gpu start max %.1f >3:%u >6:%u | ours max %.1f | end max %.1f >12:%u >14:%u"
+                                       " | real dcb %u avg %.2f max %.2f fb %u\n",
+                                       g_tl_n, g_tl_lag_max, l3, l6, g_tl_ours_max, g_tl_end_max, e12, e14,
+                                       g_tl_rd_n, g_tl_rd_n ? g_tl_rd_sum / g_tl_rd_n : 0.0, g_tl_rd_max, g_lt_fallbacks);
+                                }
+                                g_tl_rd_sum = g_tl_rd_max = 0.0; g_tl_rd_n = 0;
+                                g_tl_n = 0; g_tl_lag_min = 1e18; g_tl_lag_max = -1e18; g_tl_ours_max = 0.0; g_tl_end_max = -1e18;
+                                lgd("PASSES ms: pyr8 %.2f me3 %.2f me2 %.2f gm8+fgs8 %.2f me1 %.2f mf8 %.2f fence %.2f phase8 %.2f warp8+rcas+osd %.2f\n",
                                    (double)g_pp[0] / g_ts_n / unit * 1000.0, (double)g_pp[1] / g_ts_n / unit * 1000.0, (double)g_pp[2] / g_ts_n / unit * 1000.0,
                                    (double)g_pp[3] / g_ts_n / unit * 1000.0, (double)g_pp[4] / g_ts_n / unit * 1000.0, (double)g_pp[5] / g_ts_n / unit * 1000.0,
                                    (double)g_pp[6] / g_ts_n / unit * 1000.0, (double)g_pp[7] / g_ts_n / unit * 1000.0, (double)g_pp[8] / g_ts_n / unit * 1000.0);
-                                lg("PASS RAW last frame: ts %llu %llu %llu %llu %llu | t2 %llu %llu %llu %llu %llu %llu %llu\n", (unsigned long long)g_praw[0], (unsigned long long)g_praw[1], (unsigned long long)g_praw[2], (unsigned long long)g_praw[3], (unsigned long long)g_praw[4], (unsigned long long)g_praw[5], (unsigned long long)g_praw[6], (unsigned long long)g_praw[7], (unsigned long long)g_praw[8], (unsigned long long)g_praw[9], (unsigned long long)g_praw[10], (unsigned long long)g_praw[11]);
+                                lgd("PASS RAW last frame: ts %llu %llu %llu %llu %llu | t2 %llu %llu %llu %llu %llu %llu %llu\n", (unsigned long long)g_praw[0], (unsigned long long)g_praw[1], (unsigned long long)g_praw[2], (unsigned long long)g_praw[3], (unsigned long long)g_praw[4], (unsigned long long)g_praw[5], (unsigned long long)g_praw[6], (unsigned long long)g_praw[7], (unsigned long long)g_praw[8], (unsigned long long)g_praw[9], (unsigned long long)g_praw[10], (unsigned long long)g_praw[11]);
+                                if (g_pp_split_n) {   // separate line: parsers of "PASSES ms:" / "PASS RAW" stay valid
+                                    // the fields after "(frames N)" split rcas8+osd: rcas8 of the 1st mid alone, then the rest; with two
+                                    // generated frames per pair (below30, FG Fast) the rest holds the 2nd mid, split again per G2 frame
+                                    double g2n = g_pp_g2_n ? (double)g_pp_g2_n : 1.0;
+                                    lgd("PASSES split ms: warp8 %.2f rcas8+osd %.2f pcopy8 %.2f (frames %u) | rcas8 %.2f rest %.2f | "
+                                       "G2 frames %u: osd+wait %.2f phase8+warp8 %.2f rcas8+osd %.2f\n",
+                                       (double)g_pp_split[0] / g_pp_split_n / unit * 1000.0, (double)g_pp_split[1] / g_pp_split_n / unit * 1000.0,
+                                       (double)g_pp_split[2] / g_pp_split_n / unit * 1000.0, g_pp_split_n,
+                                       (double)g_pp_split[3] / g_pp_split_n / unit * 1000.0, (double)g_pp_split[4] / g_pp_split_n / unit * 1000.0,
+                                       g_pp_g2_n, (double)g_pp_g2[0] / g2n / unit * 1000.0, (double)g_pp_g2[1] / g2n / unit * 1000.0,
+                                       (double)g_pp_g2[2] / g2n / unit * 1000.0);
+                                }
                                 for (int i = 0; i < 10; i++) g_pp[i] = 0;
+                                for (int i = 0; i < 5; i++) g_pp_split[i] = 0;
+                                for (int i = 0; i < 3; i++) g_pp_g2[i] = 0;
+                                g_pp_split_n = 0; g_pp_g2_n = 0;
                                 if (g_st_n)
-                                    lg("FRAMES %u: unmatched blocks avg %.0f max %u, scene-cut frames %u, fade frames %u | foreground: "
-                                       "in %u frames, avg %.1f L2 blocks | camera %d,%d L2 px | log lines dropped %u\n", g_st_n,
+                                    lgd("FRAMES %u: unmatched blocks avg %.0f max %u, scene-cut frames %u, fade frames %u | foreground: "
+                                       "in %u frames, avg %.1f L2 blocks | camera %d,%d L2 px | log lines dropped %u | fade_hi frames %u\n", g_st_n,
                                        (double)g_st_cut_sum / g_st_n, g_st_cut_max, g_st_cuts, g_st_fades, g_st_fgf,
-                                       (double)g_st_fg_sum / g_st_n, g_st_gmx, g_st_gmy, g_lgq_drop);
-                                g_st_n = g_st_cut_max = g_st_cuts = g_st_fgf = g_st_fades = 0; g_st_cut_sum = g_st_fg_sum = 0;
+                                       (double)g_st_fg_sum / g_st_n, g_st_gmx, g_st_gmy, g_lgq_drop, g_st_fades_hi);
+                                g_st_n = g_st_cut_max = g_st_cuts = g_st_fgf = g_st_fades = g_st_fades_hi = 0; g_st_cut_sum = g_st_fg_sum = 0;
                             }
                             else
-                                lg("GPU time of our passes: total %.2f ms = luma %.2f + search %.2f + refine %.2f + warp %.2f\n", tot, ms[0], ms[1], ms[2], ms[3]);
+                                lgd("GPU time of our passes: total %.2f ms = luma %.2f + search %.2f + refine %.2f + warp %.2f\n", tot, ms[0], ms[1], ms[2], ms[3]);
                             g_ts_n = 0; g_ts_first = 0; for (int i = 0; i < 4; i++) g_ts_pass[i] = 0;
                         }
+                        ts[0] = 0;   // consumed: a slot no DCB rewrites (nothing injected) is not read again as new
                     }
                     g_slot_cpu[slot] = cpu;
                 }
@@ -3400,10 +4657,13 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 int third_flip = 0;
                 uint32_t hold_mid_us = 0;
 
+                g_lt_n[slot & 3u] = 0;   // late_tail.h: a DCB2 exists only when build_dcb_flow8 makes one for this frame
                 int can_fg8 = (g_inject_on == 8 && g_work && g_sh8_ok && g_fmt_supported &&
                                fg_res_supported(g_bw, g_bh) && g_prev_idx < game_idx_end() && mbufs_ready(handle));
                 int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);
 
+                g_st_fg_frames++; if (can_fg8 && want_fg) { g_st_fg_hits++; __atomic_store_n(&g_st_fg_path, 1, __ATOMIC_RELAXED); }   // status copy
+                __atomic_fetch_add(&g_pb_real, 1u, __ATOMIC_RELAXED); if (can_fg8 && want_fg) __atomic_fetch_add(&g_pb_gen, 1u, __ATOMIC_RELAXED);
                 if (!(can_fg8 && want_fg)) {
                     pyr_cache_invalidate();
                 }
@@ -3416,6 +4676,19 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     g_pcopy_on = pcopy;
                     uint32_t mi1 = (pcopy && g_pcopy_k >= 2) ? (uint32_t)g_mbase + (g_flips % (uint32_t)g_pcopy_k) : (uint32_t)g_mbase + (g_flips % (uint32_t)g_nmid);
                     uint32_t mi2 = (uint32_t)g_mbase + ((g_flips + 1u) % (uint32_t)g_nmid);
+                    b30cost_init();
+                    // below30 and FG Fast (the two that emit 3-slot pairs): the 1st generated frame goes into the buffer
+                    // flipped longest ago, the 2nd into the next one (pace_policy.h mid_lru); with 2-slot pairs only this is
+                    // the round robin above. Fast with the round robin waited ~5-11 ms per 3-slot pair in WaitFlipDone with
+                    // our DCB on the game's ring ("fence wait" 0.5-1.7 ms per pair, CUSA18723 29/10). Fast takes this order
+                    // with or without fastpace_<TITLE>, which only changes the 3rd-slot cut and the phases (fast_slots).
+                    // Quality / Sharp without below30: as v2.35.
+                    int mid_lru_on = (g_cfg.below30 || g_cfg.preset == 1) && !(pcopy && g_pcopy_k >= 2) && g_nmid >= 2 && (uint32_t)g_nmid <= MID_LRU_MAX;
+                    if (mid_lru_on) {
+                        if (g_mid_lru.n != (uint32_t)g_nmid) mid_lru_reset(&g_mid_lru, (uint32_t)g_nmid);
+                        mi1 = (uint32_t)g_mbase + mid_lru_pick(&g_mid_lru, 0u);
+                        mi2 = (uint32_t)g_mbase + mid_lru_pick(&g_mid_lru, 1u);
+                    }
                     int tb_fast = VCFG_2BUF_TEST == 3 && tb_title() && pcopy && !g_fg_off;
                     static uint32_t tb_mid_cursor;
                     if (tb_fast) {
@@ -3425,6 +4698,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     uint32_t t1_q16 = 32768u, t2_q16 = 43690u;
                     int two_mids = 0;
                     int force_repeat = (raw_dt_us > 66667ull) ? 1 : 0; // >66.7 ms (<15 fps hitch) -> repeat frame
+                    __atomic_store_n(&g_pair_slots, 2u, __ATOMIC_RELEASE);
 
                     if ((g_cfg.preset == 1 || tb_fast) && !g_fg_off) {
                         // 1.1 FG Fast (aggressive 60 Hz output target for 20..40 fps):
@@ -3432,29 +4706,21 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             g_fast_acc_q16 = 0;
                             t1_q16 = 0;
                         } else {
-                            uint32_t dt_clamped = g_ema_frame_us;
-                            if (dt_clamped < 25000u) dt_clamped = 25000u; // 40 fps
-                            if (dt_clamped > 50000u) dt_clamped = 50000u; // 20 fps
-                            int32_t r_q16 = (int32_t)(((uint64_t)dt_clamped << 16) / 16683ull);
-                            int32_t acc_prev = g_fast_acc_q16;
-                            int32_t acc_new = acc_prev + r_q16;
-                            int m_out = (int)((acc_new + 32768) >> 16);
-                            if (m_out < 2) m_out = 2;
-                            if (m_out > 3) m_out = 3;
-                            // Queue backpressure guard: drop to M=2 if flip queue has >=3 pending flips
-                            if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= 3u) m_out = 2;
-                            g_fast_acc_q16 = acc_new - (m_out << 16);
-                            if (g_fast_acc_q16 < -49152) g_fast_acc_q16 = -49152;
-                            if (g_fast_acc_q16 >  49152) g_fast_acc_q16 =  49152;
-
-                            int32_t phase_shift = (acc_prev * 3) >> 5; // smooth sub-vblank phase offset (~0.1 * acc_prev)
+                            // Slots and phases (pace_policy.h fast_slots / fast_phases_q16). fast_pace 0: the v2.35 rule,
+                            // queue guard on >= 3 pending flips. fast_pace 1: queue cut in refreshes of flips ahead.
+                            uint32_t f_pend = cc_pending_flips(), f_ahead = 0;
+                            if (g_fast_pace) {
+                                uint32_t vbu = 16683u;
+                                uint32_t to_vb = vblank_to_next_edge_us((int32_t)handle, sceKernelGetProcessTime(), &vbu);
+                                f_ahead = b30_queue_ahead_q8(f_pend, to_vb, refresh_period_q8());
+                            }
+                            int32_t acc_prev = 0;
+                            int m_out = (int)fast_slots(&g_fast_acc_q16, g_ema_frame_us, g_fast_pace, f_pend, f_ahead, &acc_prev);
+                            uint32_t f_t1 = t1_q16, f_t2 = t2_q16;
+                            fast_phases_q16((uint32_t)m_out, acc_prev, g_fast_pace, &f_t1, &f_t2);
                             if (m_out == 3) {
-                                int32_t p1 = 21845 + phase_shift; // ~1/3 (0.333)
-                                int32_t p2 = 43690 + phase_shift; // ~2/3 (0.667)
-                                if (p1 < 16384) p1 = 16384; if (p1 > 27525) p1 = 27525;
-                                if (p2 < 38010) p2 = 38010; if (p2 > 49152) p2 = 49152;
-                                t1_q16 = (uint32_t)p1;
-                                t2_q16 = (uint32_t)p2;
+                                t1_q16 = f_t1;
+                                t2_q16 = f_t2;
                                 if ((tb_fast ? g_pcopy_k : g_nmid) >= 2 && mi1 != mi2) {
                                     two_mids = 1;
                                     mid2_flip_idx = mi2;
@@ -3463,21 +4729,47 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                     t1_q16 = 32768u;
                                 }
                             } else {
-                                int32_t p1 = 32768 + phase_shift;
-                                if (p1 < 22937) p1 = 22937; if (p1 > 42598) p1 = 42598;
-                                t1_q16 = (uint32_t)p1;
+                                t1_q16 = f_t1;
                             }
                         }
                     } else if (!g_fg_off) {
-                        // 1.1 FG Quality (strict 2x): 1 mid frame per real frame, VBlank-PLL display-slot phase
+                        // 1.1 FG Quality (strict 2x): 1 mid frame per real frame, VBlank-PLL display-slot phase.
+                        // Below-30 regime (pace_policy.h b30_*): a pair predicted to take 3 refreshes shows 2 generated
+                        // frames (t ~ 1/3, 2/3) in the 2nd buffer the mode-8 allocation already gave, then the real.
                         g_q2x_hold_acc = 0;
+                        uint32_t pq8 = refresh_period_q8();
+                        int b30_ok = b30_available(g_cfg.below30, g_nmid, g_mem_tight && g_s14_state != 2, g_cfg.preset, g_fg_off, pace_timer_on(), g_cfg.fps_lock);
+                        int b30_on = b30_regime_step(&g_b30, (b30_ok && !force_repeat) ? b30_feed(ft_own_us) : 0u, pq8);
+                        b30_win_frames++;
+                        if (b30_on) b30_win_on++;
                         if (force_repeat) {
                             t1_q16 = 0u;
                         } else {
+                            if (b30_on) {
+                                uint32_t vbu = 16683u;
+                                uint32_t to_vb = vblank_to_next_edge_us((int32_t)handle, sceKernelGetProcessTime(), &vbu);
+                                int cut = 0;
+                                uint32_t m_out = b30_slots(&g_b30, b30_feed(g_cpu_ema_us), pq8,
+                                                           b30_queue_ahead_q8(cc_pending_flips(), to_vb, pq8), &cut);
+                                if (cut) b30_win_cut++;
+                                if (m_out == 3u && g_nmid >= 2 && mi1 != mi2) {
+                                    two_mids = 1;
+                                    mid2_flip_idx = mi2;
+                                    third_flip = 1;
+                                    __atomic_store_n(&g_pair_slots, 3u, __ATOMIC_RELEASE);
+                                }
+                                b30_win_on_vb += third_flip ? 3u : 2u;
+                            }
                             t1_q16 = pll_predict_t_interp_q16((int32_t)handle, sceKernelGetProcessTime(), dt_enter_us, hold_mid_us);
+                            t2_q16 = __atomic_load_n(&g_pll_t2_q16, __ATOMIC_ACQUIRE);
                         }
                     }
 
+                    // 3-slot pair of the below-30 regime (FG Quality): the present-copy block below drops the 2nd generated
+                    // frame whenever a copy is possible; it comes back when the copy did not run (pcopy cleared: one copy
+                    // buffer or none, e.g. a 3-buffer game with g_pcopy_k = 1), because then no buffer takes the real's place.
+                    int b30_two = two_mids && g_cfg.preset != 1 && !tb_fast;
+                    uint32_t b30_mid2 = mid2_flip_idx;
                     on_flip_2buf_track(index);
                     int two_buf_now = (g_cfg.two_buffer || g_runtime_2buf || g_ngame == 2 || g_cfg.present_copy == 1);
                     if (!pcopy && two_buf_now && g_pbuf && g_cfg.present_copy != 2) pcopy = 1;
@@ -3500,9 +4792,28 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                             lg("PULLDOWN dt_us=%u mids=%d mi1=%u mi2=%u copy=%u pending=%u\n", g_ema_frame_us,
                                two_mids ? 2 : 1, mi1, mi2, ci, __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE));
                     }
+                    if (b30_two && !two_mids) {
+                        if (!pcopy) { two_mids = 1; third_flip = 1; mid2_flip_idx = b30_mid2; }
+                        else { t2_q16 = 43690u; __atomic_store_n(&g_pair_slots, 2u, __ATOMIC_RELEASE); }   // the copy runs
+                    }
+                    if (third_flip && g_cfg.preset != 1 && !tb_fast) b30_win_three++;
+                    if (mid_lru_on)   // a 2nd generated frame outside the ring (late DirectMemory buffer) leaves the order alone
+                        mid_lru_flipped(&g_mid_lru, mi1 - (uint32_t)g_mbase, third_flip && mid2_flip_idx == mi2 && mi2 >= (uint32_t)g_mbase &&
+                                        mi2 < (uint32_t)g_mbase + (uint32_t)g_nmid, mi2 - (uint32_t)g_mbase);
+                    g_slot_three[slot] = (uint8_t)(third_flip ? 1 : 0);
+                    {   // late_tail.h: this path submits DCB2 as the real frame's flip (DCB8 region only, no 3-slot pair)
+                        static int s_lt_logged = -1;
+                        int lt_on = g_late_tail ? 1 : 0;
+                        if (lt_on != s_lt_logged) {
+                            s_lt_logged = lt_on;
+                            lg("late tail: %s (option late_tail)\n", lt_on ? "on, history copy and the real frame's post-process ride its own flip" : "off");
+                        }
+                        g_lt_req = lt_on && dcb8 && !third_flip;
+                    }
                     n = build_dcb_flow8(mine, g_buf[g_prev_idx], g_buf[index], g_buf[mi1], g_buf[mi2], g_pitch,
                                         tidx, px * 4, slot, g_flips, tail64, (int32_t)handle, mi1, mi2,
                                         t1_q16, t2_q16, two_mids, force_repeat, pcopy ? g_buf[ci] : 0ull, ci);
+                    g_lt_req = 0;
                     flip_idx = mi1;
                     second_flip = 1;
                 } else if (g_inject_on == 8 && g_sh8_ok && g_fmt_supported && g_bw >= 640 && g_bh >= 360 && g_bw <= 3840 && g_bh <= 2160) {
@@ -3555,6 +4866,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     int32_t rc0 = gnm_submit_and_flip_raw(has_wl, workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 30 && !g_detected_60fps && want_fg) pace_hz(30);
+                    g_rel_t = sceKernelGetProcessTime();
                     return rc0;
                 }
 
@@ -3601,7 +4913,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 if (third_flip)  { for (uint32_t i = 0; i < tail_dw; i++) fb2[i] = tail[i]; }
                 if (second_flip) { for (uint32_t i = 0; i < tail_dw; i++) fb[i]  = tail[i]; }
                 static int last_show = -1;                  // with present copy the shown real buffers are the copies
-                int pace_pre = (g_cfg.pace_order == 1) ? 1 : (g_cfg.pace_order == 2) ? 0 : (!g_pcopy_on);
+                int pace_pre = (g_cfg.pace_order == 1) ? 1 : (g_cfg.pace_order == 2) ? 0 : (!pace_pcopy());
                 g_last_pace_pre = pace_pre;
                 if (hold_mid_us > 0) {
                     if (pace_pre) {
@@ -3613,11 +4925,40 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         if (to_vb + 1500u < hold_mid_us) { hold_mid_us = to_vb + 1500u; g_pll_shortened++; }
                     }
                 }
+                if (third_flip) hold_mid_us = 0;   // 3-slot pair: mid1, mid2, real flipped back to back; a late real repeats the real
+                // Shallow flip queue (pace_policy.h): FG pairs on the timer pacer, the game's own time well below 2 refreshes
+                // for ~4 s -> the frame enters the queue only when at most one flip is still pending (raw status, not the
+                // virtual one the game sees). Before the pre-submit pacer, or before the submit with post-submit pacing.
+                static ShallowQueue s_shq;
+                static uint32_t s_shq_frames, s_shq_on_frames, s_shq_timeouts;
+                static uint64_t s_shq_wait_sum, s_shq_wait_max;
+                int shq_ok = g_inject_on == 8 && second_flip && !third_flip && g_cfg.fps_lock != 20 && pace_timer_on();
+                if (!g_cfg.shallow_queue || g_b30.on) shq_ok = 0;   // player setting; never in the below-30 regime (resets the dwell)
+                int shq_on = shq_step(&s_shq, shq_ok ? g_cpu_ema_us : 0u);
+                __atomic_store_n(&g_st_shq_on, shq_on, __ATOMIC_RELAXED);              // status copies (opt_status.h)
+                __atomic_store_n(&g_st_pace_timer, pace_timer_on(), __ATOMIC_RELAXED);
+                if (can_fg8 && want_fg) { g_st_gv_frames++; if (gv_warp_active()) g_st_gv_hits++; }
+                uint64_t t_shq0 = sceKernelGetProcessTime();
+                if (shq_on) {
+                    for (;;) {
+                        VoFlipStatus qs;
+                        memset(&qs, 0, sizeof(qs));
+                        if (read_flip_status((int32_t)handle, &qs) != 0 || qs.flipPendingNum <= SHQ_MAX_PENDING) break;
+                        if (sceKernelGetProcessTime() - t_shq0 > 40000ull) { s_shq_timeouts++; break; }
+                        g_cc_shq_polls++;
+                        sceKernelUsleep(200);
+                    }
+                }
+                uint64_t shq_wait = sceKernelGetProcessTime() - t_shq0;
+                if (shq_ok) {
+                    s_shq_frames++;
+                    if (shq_on) { s_shq_on_frames++; s_shq_wait_sum += shq_wait; if (shq_wait > s_shq_wait_max) s_shq_wait_max = shq_wait; }
+                }
                 uint64_t t_p0 = sceKernelGetProcessTime(), t_p1 = t_p0;
                 if (pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
-                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex((int32_t)handle, dt_enter_us, 1);
+                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex((int32_t)handle, dt_enter_us, 1, b30_pace_nvb(g_pair_slots));
                     else if (g_inject_on >= 7 && second_flip) {
                         int shown = (int)show_idx, pp1 = show_idx != index ? last_show : pace_p1;
                         pace_vblank_ex(show_idx != index ? -1 : pace_p2, pp1, shown, (int32_t)handle, dt_enter_us, 1);
@@ -3637,11 +4978,24 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                         uint32_t t_pll_q16 = pll_predict_t_interp_q16((int32_t)handle, t_s1, dt_enter_us, hold_mid_us);
                         uint32_t *tb_slot = (uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0xB00);
                         tb_slot[29] = (tb_slot[29] & 0xFFFFu) | ((t_pll_q16 & 0xFFFFu) << 16);
+                        if (third_flip) {   // 2nd generated frame of a 3-slot pair (its table in the tb2 region of the slot)
+                            uint32_t *tb2_slot = (uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + SLOT_TB2_OFF);
+                            uint32_t t2n = __atomic_load_n(&g_pll_t2_q16, __ATOMIC_ACQUIRE);
+                            tb2_slot[29] = (tb2_slot[29] & 0xFFFFu) | ((t2n & 0xFFFFu) << 16);
+                        }
                         if (g_mon) g_mon[3] = t_pll_q16;
                     }
                     pll_commit_frame_vblank((int32_t)handle, t_s1, hold_mid_us);
                 }
                 g_last_submit_enter_t = t_s1;
+                if (g_log && show_idx < 16u) {   // FTRACE record of this real frame (debug log only)
+                    uint32_t fw = __atomic_load_n(&g_ft_w, __ATOMIC_RELAXED), fi = fw % FT_N;
+                    __atomic_store_n(&g_ft[fi][0], (uint32_t)t_hook_in, __ATOMIC_RELAXED);
+                    __atomic_store_n(&g_ft[fi][1], ft_pack_sub(t_s1 - t_hook_in, ft_own_us), __ATOMIC_RELAXED);
+                    __atomic_store_n(&g_ft[fi][2], ft_with_ngen(0u, (second_flip && can_fg8 && want_fg && !g_fg_off && raw_dt_us <= 66667ull) ? (third_flip ? 2u : 1u) : 0u), __ATOMIC_RELAXED);
+                    __atomic_store_n(&g_ft_slot[show_idx], fw + 1u, __ATOMIC_RELEASE);
+                    __atomic_store_n(&g_ft_w, fw + 1u, __ATOMIC_RELEASE);
+                }
                 __atomic_store_n(&g_done, (volatile uint32_t *)(g_gpu + SLOT0 + slot * SLOT_SZ + 0x900), __ATOMIC_RELEASE);
                 __atomic_store_n(&g_last_seq, g_flips, __ATOMIC_RELEASE);
                 g_injects++;
@@ -3657,6 +5011,13 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     t_hold = sceKernelGetProcessTime();
                     void *d3[1] = { fb };
                     uint32_t s3[1] = { tail_dw * 4u };
+                    uint32_t lt_n = dcb8 ? g_lt_n[slot & 3u] : 0u;
+                    if (lt_n && lt_n + tail_dw <= DCB8_SZ / 4u - LT_DCB2_DW) {   // late_tail.h: DCB2 + the game's flip packet
+                        uint32_t *q = mine + LT_DCB2_DW;
+                        for (uint32_t i = 0; i < tail_dw; i++) q[lt_n + i] = tail[i];
+                        d3[0] = q;
+                        s3[0] = (lt_n + tail_dw) * 4u;
+                    }
                     // Experiment 2: the first mid keeps the game's opaque argument;
                     // tag only the real copy. This does not virtualize status or labels.
                     int64_t real_arg = flipArg;
@@ -3673,7 +5034,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 if (!pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
-                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex((int32_t)handle, dt_enter_us, 0);
+                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex((int32_t)handle, dt_enter_us, 0, b30_pace_nvb(g_pair_slots));
                     else if (g_inject_on >= 7 && second_flip) {
                         int shown = (int)show_idx, pp1 = show_idx != index ? last_show : pace_p1;
                         pace_vblank_ex(show_idx != index ? -1 : pace_p2, pp1, shown, (int32_t)handle, dt_enter_us, 0);
@@ -3683,17 +5044,45 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                 } else if (second_flip) {
                     g_rel_t = t_s2e;
                 }
+                if (!second_flip) g_rel_t = sceKernelGetProcessTime();   // FG off: release -> submit is measured too
                 if (second_flip) {   // where the game's thread spends its time inside this hook (FG frames)
                     static uint64_t a_build, a_sub, a_hold, a_flip2, a_pace, a_n;
                     uint64_t t_end = sceKernelGetProcessTime();
-                    a_build += t_p0 - t_hook_in; a_sub += t_s1e - t_s1; a_hold += t_hold - t_s1e; a_flip2 += t_s2e - t_hold;
+                    a_build += t_p0 - t_hook_in - shq_wait; a_sub += t_s1e - t_s1; a_hold += t_hold - t_s1e; a_flip2 += t_s2e - t_hold;
                     a_pace += pace_pre ? (t_p1 - t_p0) : (t_end - t_s2e); a_n++;
                     if (a_n >= 60) {
                         double k = 1.0 / 1000.0 / (double)a_n;
-                        lg("HOOK ms per FG frame: build %.1f submit %.1f hold %.1f flip2 %.1f pace %.1f total %.1f | game own %.1f | pending %u pll %u\n",
+                        lgd("HOOK ms per FG frame: build %.1f submit %.1f hold %.1f flip2 %.1f pace %.1f total %.1f | game own %.1f | pending %u pll %u\n",
                            a_build * k, a_sub * k, a_hold * k, a_flip2 * k, a_pace * k, (a_build + a_sub + a_hold + a_flip2 + a_pace) * k,
                            g_cpu_ema_us / 1000.0, __atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE), g_pll_shortened);
                         a_build = a_sub = a_hold = a_flip2 = a_pace = a_n = 0;
+                        if (s_shq_frames)   // separate line: parsers of "HOOK ms per FG frame" stay valid
+                            lgd("QUEUE shallow %s: on in %u of %u frames, wait avg %.2f max %.2f ms, timeouts %u (on below %.1f ms own for %u frames, off above %.1f)\n",
+                               shq_on ? "on" : "off", s_shq_on_frames, s_shq_frames,
+                               s_shq_on_frames ? (double)s_shq_wait_sum / 1000.0 / s_shq_on_frames : 0.0, (double)s_shq_wait_max / 1000.0,
+                               s_shq_timeouts, SHQ_ENTER_US / 1000.0, SHQ_DWELL, SHQ_EXIT_US / 1000.0);
+                        s_shq_frames = s_shq_on_frames = s_shq_timeouts = 0; s_shq_wait_sum = s_shq_wait_max = 0;
+                        if (g_cfg.below30 && b30_win_frames) {   // separate line, as QUEUE
+                            uint32_t pq = refresh_period_q8();
+                            lgd("BELOW30 %s: regime %u of %u frames (%.1f s), 3-slot pairs %u, 2nd generated dropped by the queue %u, "
+                               "median own %.2f refreshes (on above %.2f, off below %.2f)%s\n",
+                               g_b30.on ? "on" : "off", b30_win_on, b30_win_frames, (double)b30_win_on_vb * pq / 256.0 / 1e6,
+                               b30_win_three, b30_win_cut, b30_median_q8(&g_b30) / 256.0, B30_ENTER_Q8 / 256.0, B30_EXIT_Q8 / 256.0,
+                               g_s14_state == 2 ? " | 2nd buffer: shave14 DirectMemory reserve"
+                               : (g_nmid < 2 || g_mem_tight) ? " | unavailable: one generated-frame buffer (memory tight)" : "");
+                        }
+                        if (g_cfg.below30 && b30_win_frames) {   // separate line, as BELOW30
+                            lg("B30COST: fence before the 1st generated frame avg %.2f ms (%u), after a 3-slot pair %.2f ms (%u) | "
+                               "extra GPU fed back avg %.2f ms (fence %.2f + 2nd generated %.2f over %u frames, %u 3-slot) | own %.1f fed %.1f ms\n",
+                               b30c_win_n ? b30c_win_f1_us / 1000.0 / b30c_win_n : 0.0, b30c_win_n,
+                               b30c_win_n_after3 ? b30c_win_f1_after3_us / 1000.0 / b30c_win_n_after3 : 0.0, b30c_win_n_after3,
+                               g_b30x.ema_us / 1000.0, g_b30x.nw ? g_b30x.fence_sum_us / 1000.0 / g_b30x.nw : 0.0,
+                               g_b30x.nw ? g_b30x.g2_sum_us / 1000.0 / g_b30x.nw : 0.0, g_b30x.nw, g_b30x.n3,
+                               g_cpu_ema_us / 1000.0, b30_feed(g_cpu_ema_us) / 1000.0);
+                            b30c_win_f1_us = b30c_win_n = b30c_win_f1_after3_us = b30c_win_n_after3 = 0;
+                            g_b30x.fence_sum_us = g_b30x.g2_sum_us = g_b30x.nw = g_b30x.n3 = 0;
+                        }
+                        b30_win_frames = b30_win_on = b30_win_on_vb = b30_win_three = b30_win_cut = 0;
                     }
                 }
                 return rc;
@@ -3720,7 +5109,9 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
     }
 #endif
     g_last_submit_enter_t = sceKernelGetProcessTime();
-    return gnm_submit_and_flip_raw(has_wl, workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+    int32_t prc = gnm_submit_and_flip_raw(has_wl, workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+    if (!g_mon_on && g_log) g_cc_off_rel = sceKernelGetProcessTime();   // framegen=0: own time per frame (cc_fgoff_log)
+    return prc;
 }
 
 #include "vout_trace.h"
@@ -3898,6 +5289,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
     uint64_t prev_flip_t = g_last;
     uint32_t vf = ++g_vo_submit_flips;
     tb_on_game_submit();
+    og2_tick(handle);   // one display group: a temporary group still to drop (returns at once otherwise)
 
     if (vf == 1) {
         uint32_t sw = __atomic_load_n(&g_vo_sub_w, __ATOMIC_ACQUIRE);
@@ -3946,11 +5338,14 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
             int can_fg8 = (g_inject_on == 8 && g_work && g_sh8_ok && g_fmt_supported &&
                            fg_res_supported(g_bw, g_bh) && g_prev_idx < game_idx_end() && mbufs_ready((uint32_t)handle));
             int want_fg = (!g_fg_off || g_ab_x_flag) && (!g_detected_60fps || g_cfg.fps_lock == 30);
+            g_st_fg_frames++; if (can_fg8 && want_fg) { g_st_fg_hits++; __atomic_store_n(&g_st_fg_path, 2, __ATOMIC_RELAXED); }   // status copy
+            __atomic_fetch_add(&g_pb_real, 1u, __ATOMIC_RELAXED); if (can_fg8 && want_fg) __atomic_fetch_add(&g_pb_gen, 1u, __ATOMIC_RELAXED);
 
             if (can_fg8 && want_fg) {
                 g_inert_reason[0] = 0;
                 uint32_t px = g_pitch * ((g_bh + 15u) & ~15u);
                 uint32_t tidx = tile_idx_now();
+                __atomic_store_n(&g_pair_slots, 2u, __ATOMIC_RELEASE);   // the below-30 regime runs on the gnm path only
                 int pcopy = g_pcopy_avail && g_cfg.present_copy != 2;
                 g_pcopy_on = pcopy;
                 uint32_t mi1 = (pcopy && g_pcopy_k >= 2) ? (uint32_t)g_mbase + (vf % (uint32_t)g_pcopy_k)
@@ -3968,7 +5363,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                     int m_out = (int)((acc_new + 32768) >> 16);
                     if (m_out < 2) m_out = 2;
                     if (m_out > 3) m_out = 3;
-                    if (__atomic_load_n(&g_cur_pending_flips, __ATOMIC_ACQUIRE) >= 3u) m_out = 2;
+                    if (cc_pending_flips() >= 3u) m_out = 2;
                     g_fast_acc_q16 = acc_new - (m_out << 16);
                     if (g_fast_acc_q16 < -49152) g_fast_acc_q16 = -49152;
                     if (g_fast_acc_q16 >  49152) g_fast_acc_q16 =  49152;
@@ -4027,7 +5422,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
 
             if (n > 0) {
                 static int vo_last_show = -1;
-                int pace_pre = (g_cfg.pace_order == 1) ? 1 : (g_cfg.pace_order == 2) ? 0 : (!g_pcopy_on);
+                int pace_pre = (g_cfg.pace_order == 1) ? 1 : (g_cfg.pace_order == 2) ? 0 : (!pace_pcopy());
                 g_last_pace_pre = pace_pre;
                 if (hold_mid_us > 0) {
                     if (pace_pre) {
@@ -4041,7 +5436,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                 if (pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
-                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex(handle, dt_enter_us, 1);
+                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex(handle, dt_enter_us, 1, 2u);
                     else if (g_inject_on >= 7 && second_flip) {
                         int shown = (int)show_idx, pp1 = show_idx != u_idx ? vo_last_show : pace_p1;
                         pace_vblank_ex(show_idx != u_idx ? -1 : pace_p2, pp1, shown, handle, dt_enter_us, 1);
@@ -4089,7 +5484,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                 if (!pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
-                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex(handle, dt_enter_us, 0);
+                    else if (g_inject_on == 8 && second_flip && pace_timer_on()) pace_pair_ex(handle, dt_enter_us, 0, 2u);
                     else if (g_inject_on >= 7 && second_flip) {
                         int shown = (int)show_idx, pp1 = show_idx != u_idx ? vo_last_show : pace_p1;
                         pace_vblank_ex(show_idx != u_idx ? -1 : pace_p2, pp1, shown, handle, dt_enter_us, 0);
@@ -4408,6 +5803,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                         for (int i = 0; i < nm; i++) g_buf[base + i] = (uint64_t)(uintptr_t)ext[g_ngame + i];
                         g_nbuf = base + nm;
                         g_mbuf_state = 1;
+                        s14_after_register(nm, one, m, base + 1);
                         if (g_flips >= INJECT_AFTER_FLIPS) {
                             gv_set_display(g_buf, g_nbuf, g_bw, g_bh);
                             if (g_fmt_supported && fg_res_supported(g_bw, g_bh) &&
@@ -4434,6 +5830,7 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
                     for (int i = 0; i < nm; i++) g_buf[g_ngame + i] = (uint64_t)(uintptr_t)ext[g_ngame + i];
                     g_nbuf = g_ngame + nm;
                     g_mbuf_state = 1;
+                    s14_after_register(nm, one, m, g_ngame + 1);
                     if (g_flips >= INJECT_AFTER_FLIPS) {
                         gv_set_display(g_buf, g_nbuf, g_bw, g_bh);
                         if (g_fmt_supported && fg_res_supported(g_bw, g_bh) &&
@@ -4455,6 +5852,10 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
     }
     int32_t rn = HOOK_CONTINUE(sceVideoOutRegisterBuffers, int32_t (*)(int32_t, int32_t, void *const *, int32_t, const VoAttr *),
                                handle, startIndex, addresses, bufferNum, attr);
+    if (rn >= 0 && startIndex == 0) g_game_attr_slot = rn;
+    if (rn >= 0 && startIndex == 0 && g_og2_active &&
+        og2_game_reregistered(handle, attr, g_game_idx_hi > bufferNum ? g_game_idx_hi : bufferNum))
+        need_rereg_ext_fmt = 0;   // ours were just registered again with the new attributes
     if (rn >= 0 && need_rereg_ext_fmt && attr && g_mbuf_state == 1 && g_ext_nm >= 1) {
         if (g_ext_attr_slot > 0) {
             sceVideoOutUnregisterBuffers(handle, g_ext_attr_slot);
@@ -4538,7 +5939,9 @@ static void menu_adjust_row(fg_config_t *c, int row, int dir)
         c->fps_lock = locks[idx];
         break;
     }
-    case 8: c->menu_opacity += dir * 5; if (c->menu_opacity < 20) c->menu_opacity = 20; if (c->menu_opacity > 100) c->menu_opacity = 100; break;
+    case 8: c->below30 = !c->below30; break;
+    case 9: c->shallow_queue = !c->shallow_queue; break;
+    case 10: c->menu_opacity += dir * 5; if (c->menu_opacity < 20) c->menu_opacity = 20; if (c->menu_opacity > 100) c->menu_opacity = 100; break;
     default: break;
     }
 }
@@ -4613,16 +6016,24 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
         g_combo_t = now;
         g_pad_swallow_until = now + 300000ull;
         snprintf(g_osd_toast, sizeof(g_osd_toast), "FG:%s AA:%d RCAS:%d%%",
-                 g_cfg.framegen ? (g_cfg.preset == 1 ? "F60" : "2X") : "OFF", g_cfg.upscale, g_cfg.sharpness);
+                 g_cfg.framegen ? (g_cfg.preset == 1 ? "F60" : g_cfg.preset == 2 ? "SHARP" : "2X") : "OFF", g_cfg.upscale, g_cfg.sharpness);
         g_osd_toast_until = now + 1500000ull;
         lg("menu closed (pad wrapper calls: state %u read %u stateExt %u readExt %u)\n", g_pad_calls[0], g_pad_calls[1], g_pad_calls[2], g_pad_calls[3]);
         return;
     }
-    if (edge & PAD_UP)   g_menu_sel = (g_menu_sel + MENU_NROWS - 1) % MENU_NROWS;
-    if (edge & PAD_DOWN) g_menu_sel = (g_menu_sel + 1) % MENU_NROWS;
+    // g_menu_sel walks the visible rows only (opt_menu_rows: of the MENU_NROWS rows, those that apply to the current
+    // settings); Left/Right change the row it points at, and the selection stays on that row when others appear or hide.
+    int vis[OPT_ROW_N], nvis = opt_menu_rows(g_menu_edit.framegen, g_menu_edit.preset, g_menu_edit.fps_lock, vis);
+    if (g_menu_sel >= nvis) g_menu_sel = nvis ? nvis - 1 : 0;
+    if (edge & PAD_UP)   g_menu_sel = (g_menu_sel + nvis - 1) % nvis;
+    if (edge & PAD_DOWN) g_menu_sel = (g_menu_sel + 1) % nvis;
     if (edge & (PAD_LEFT | PAD_RIGHT)) {
         int dir = (edge & PAD_RIGHT) ? 1 : -1;
-        menu_adjust_row(&g_menu_edit, g_menu_sel, dir);
+        int row = vis[g_menu_sel];
+        menu_adjust_row(&g_menu_edit, row, dir);
+        nvis = opt_menu_rows(g_menu_edit.framegen, g_menu_edit.preset, g_menu_edit.fps_lock, vis);
+        int at = opt_menu_index_of(vis, nvis, row);
+        if (at >= 0) g_menu_sel = at; else if (g_menu_sel >= nvis) g_menu_sel = nvis - 1;
         cfg_apply_live(&g_menu_edit, NULL);
         snprintf(g_osd_toast, sizeof(g_osd_toast), "LIVE ([/\\] SAVE)");
     }
@@ -4636,6 +6047,8 @@ static void pad_menu_step(PadDataRaw *pkts, int count)
         g_menu_edit.menu_combo = g_cfg.menu_combo;   // the hotkey is not a visible setting: defaults must not change it
         g_menu_edit.present_copy = present_copy;  // profile-only option is not reset by the overlay
         cfg_apply_live(&g_menu_edit, "menu-defaults");
+        nvis = opt_menu_rows(g_menu_edit.framegen, g_menu_edit.preset, g_menu_edit.fps_lock, vis);
+        if (g_menu_sel >= nvis) g_menu_sel = nvis - 1;
         snprintf(g_osd_toast, sizeof(g_osd_toast), "DEFAULTS LOADED");
     }
     if (edge & PAD_TRIANGLE) {
@@ -4748,8 +6161,11 @@ static void *pad_poll_thread(void *arg)
     (void)arg;
     int32_t uid = -1, handle = -1, errs = 0, got_tries = 0;
     uint64_t next_got_try = 0;
+    uint32_t cpu_n = 0;
     for (;;) {
         sceKernelUsleep(16000);
+        g_cc_pad_wakes++;
+        if ((++cpu_n & 63u) == 0) __atomic_store_n(&g_cc_pad_cpu_us, cc_cpu_us(CC_CLK_THREAD), __ATOMIC_RELEASE);
         if (g_flips < INJECT_AFTER_FLIPS + 60 && g_vo_submit_flips < INJECT_AFTER_FLIPS + 60) continue;
         uint64_t now = sceKernelGetProcessTime();
         // 1.4: Retry GOT patching up to 12 times (every 5 s) in case the game resolves lazy PLT slots after splash screens
@@ -4883,6 +6299,7 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
         }
         int late_alloc = (!g_bench_enabled &&
                           (g_cfg.shave_mode == 2 || (g_cfg.shave_mode == 1 && g_cfg.reg_mode == 2)));
+        s14_decide(m);
         if (late_alloc) {
             STAGE("dev override: late_alloc active (shave_mode=%d reg_mode=%d) -> skipping all early DirectMemory allocations in plugin_load",
                   g_cfg.shave_mode, g_cfg.reg_mode);

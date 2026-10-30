@@ -3,6 +3,8 @@
 Float32 throughout. The texture sampler is an exact bilinear filter with clamp-to-edge (the GPU quantises the
 fractional part to 1/256 texel: not modelled).
 """
+import struct
+
 import numpy as np
 
 F32 = np.float32
@@ -51,14 +53,17 @@ def sat(x):
 
 
 def crw(f, c):
-    f2 = f * f
-    f3 = f2 * f
-    w0 = (f2 * F32(2.0) - f - f3) * F32(c)
-    w1 = f2 * (F32(c) - F32(3.0)) + f3 * (F32(2.0) - F32(c)) + F32(1.0)
-    w2 = f * F32(c) + f2 * (F32(3.0) - F32(2.0) * F32(c)) + f3 * (F32(c) - F32(2.0))
-    w3 = (f3 - f2) * F32(c)
-    w12 = w1 + w2
-    return w0, w12, w3, w2 / w12
+    """weights of the B = 0 cubic (C = c) for the 5-tap resample, factored as warp8.ll @crw evaluates them: with
+    g = 1 - f and cfg = c f g, w0 = -cfg g, w3 = -cfg f, w1 + w2 = 1 + cfg, w2 = f^2 (3 - 2 f) + cfg g.
+    Returns (w0, w1 + w2, w3, w2 / (w1 + w2))."""
+    c = F32(c) if np.ndim(c) == 0 else np.asarray(c, F32)
+    g = F32(1.0) - f
+    cfg = c * (f * g)
+    w0n = cfg * g
+    w3n = cfg * f
+    w12 = cfg + F32(1.0)
+    w2 = (f * f) * (f * F32(-2.0) + F32(3.0)) + w0n
+    return -w0n, w12, -w3n, w2 / w12
 
 
 def cr(img, u, v, csh, return_hl=False):
@@ -107,7 +112,7 @@ def sum3(a):
     return a[..., 0] + a[..., 1] + a[..., 2]
 
 
-def side_lerp(a2, b2, sp, sc, e0, eac, ebp, t, v_ex=0.0, w_occ=0.0, div_b=0.0):
+def side_lerp(a2, b2, sp, sc, e0, eac, ebp, t, v_ex=0.0, w_occ=0.0, div_b=0.0, gem0=0.02, mob=None):
     ga = np.maximum(diff3(a2, sp), F32(0.0))
     gb = np.maximum(diff3(b2, sc), F32(0.0))
     da = np.minimum(eac, ga)
@@ -119,7 +124,7 @@ def side_lerp(a2, b2, sp, sc, e0, eac, ebp, t, v_ex=0.0, w_occ=0.0, div_b=0.0):
     wsf = np.maximum(sat(F32(v_ex) * F32(0.125)), F32(1.0) - F32(w_occ))
     d_sf = d_sf0 * wsf
     adadb = np.maximum(np.abs(d_min), np.abs(F32(div_b)) * F32(3.0) * F32(w_occ))
-    g_em = sat((e0 - F32(0.08)) * F32(6.0))
+    g_em = sat((e0 - F32(gem0)) * F32(6.0))
     s01 = d_min * F32(0.33) + d_cr * F32(0.07)
     s23 = d_sf * F32(0.14) + d_lu * F32(0.04)
     raw0 = s01 + s23
@@ -128,24 +133,47 @@ def side_lerp(a2, b2, sp, sc, e0, eac, ebp, t, v_ex=0.0, w_occ=0.0, div_b=0.0):
     b_hi = F32(0.07) + F32(0.43) * F32(w_occ)
     dlt = np.clip(g_em * raw, -b_hi, b_hi)
     tab = sat(F32(t) + dlt)
+    if mob is not None:   # experiment (Mob-FGSR blend rule): one side where the two warps agree, ramped
+        agree = sat((F32(mob[0]) - e0) * F32(mob[1]))
+        side = np.where(dlt >= 0, F32(1.0), F32(0.0))
+        tab = tab + (side - tab) * agree
     return a2 + (b2 - a2) * tab[..., None], adadb
 
 
+def _irf(bits):
+    """float constant written in warp8.ll as the bit pattern of the equivalent double (LLVM IR hex float)"""
+    return F32(struct.unpack('>d', bytes.fromhex(bits))[0])
+
+
+# @mlp_cw of warp8.ll: per hidden unit (bias, weights x0..x6, output weight), in the IR's evaluation order
+MLP_OUT_BIAS = _irf('3FA0F414A0000000')
+MLP_UNITS = [
+    ('3FAA7194A0000000', ('3FC3F44680000000', 'BFB065BB20000000', '3FCC696560000000', 'BFCD760280000000',
+                          '3FCA876A80000000', '3F91AA4D20000000', '3F9C0450A0000000'), '3FC5607260000000'),
+    ('3FB502A940000000', ('3FB7DEC400000000', 'BFCE7815E0000000', '3FB3174D20000000', '3FE3445960000000',
+                          '3F8D88B180000000', 'BFA1481FA0000000', '3F9858A580000000'), 'BFBEEB9EA0000000'),
+    ('3FB1FFCAE0000000', ('3FA57A3F20000000', 'BFBD902FC0000000', '3FBC89F040000000', '3FE3C65A20000000',
+                          'BFB5D25000000000', 'BF8994F1E0000000', 'BF949280A0000000'), 'BFC311BD60000000'),
+    ('3FB5F7C1A0000000', ('BFB118CFE0000000', 'BFC6C64040000000', 'BF75439B40000000', '3FE5C938E0000000',
+                          'BFBD267DC0000000', 'BF8AD32C60000000', 'BF957503E0000000'), 'BFC9E87220000000'),
+    ('3FA75E5680000000', ('3FB8A754A0000000', 'BFD45CA740000000', 'BFC288DB80000000', '3FE207A9E0000000',
+                          '3FBB9C1E00000000', 'BF973F9A40000000', '3F725395C0000000'), 'BFB4C43480000000'),
+    ('3FB94845C0000000', ('3FC2543F20000000', 'BFC28ECE00000000', '3FC7A203E0000000', '3F9AF58FC0000000',
+                          '3FB81CA580000000', '3F88B067A0000000', '3F8FB664A0000000'), '3FC2CAC0E0000000'),
+]
+MLP_UNITS = [(_irf(b), tuple(_irf(w) for w in ws), _irf(o)) for b, ws, o in MLP_UNITS]
+CW_ACT_THR = _irf('3F999999A0000000')   # 0.025: the residual is active above this motion error
+
+
 def mlp_cw(x0, x1, x2, x3, x4, x5, x6):
-    h0 = sat(F32(0.08378879) + x0 * F32(0.3122884) + x1 * F32(-0.06405229) + x2 * F32(0.39919406) +
-             x3 * F32(-0.40893617) + x4 * F32(0.39562488) + x5 * F32(0.03776005) + x6 * F32(0.05472043))
-    h1 = sat(F32(0.10258989) + x0 * F32(0.09324288) + x1 * F32(-0.45190883) + x2 * F32(0.07457424) +
-             x3 * F32(1.2041868) + x4 * F32(0.01678786) + x5 * F32(-0.06750677) + x6 * F32(0.04755138))
-    h2 = sat(F32(0.08788525) + x0 * F32(0.04194829) + x1 * F32(-0.23096271) + x2 * F32(0.11147978) +
-             x3 * F32(1.2359258) + x4 * F32(-0.08524036) + x5 * F32(-0.01249109) + x6 * F32(-0.02008916))
-    h3 = sat(F32(0.10726561) + x0 * F32(-0.06678485) + x1 * F32(-0.35585028) + x2 * F32(-0.00519136) +
-             x3 * F32(1.3616265) + x4 * F32(-0.22773714) + x5 * F32(-0.01309819) + x6 * F32(-0.02095419))
-    h4 = sat(F32(0.05736038) + x0 * F32(0.09630327) + x1 * F32(-0.6363102) + x2 * F32(-0.14480157) +
-             x3 * F32(1.126871) + x4 * F32(0.10785085) + x5 * F32(-0.01815644) + x6 * F32(0.00447425))
-    h5 = sat(F32(0.12341757) + x0 * F32(0.2863919) + x1 * F32(-0.28996587) + x2 * F32(0.3041999) +
-             x3 * F32(0.05265474) + x4 * F32(0.09418704) + x5 * F32(0.01205526) + x6 * F32(0.01750351))
-    return (F32(0.04139773) + h0 * F32(0.3545042) + h1 * F32(-0.24156542) + h2 * F32(-0.29795778) +
-            h3 * F32(-0.40481237) + h4 * F32(-0.08111887) + h5 * F32(0.29362506))
+    xs = (x0, x1, x2, x3, x4, x5, x6)
+    acc = F32(0.0) + MLP_OUT_BIAS
+    for b, ws, o in MLP_UNITS:
+        s_ = (xs[0] * ws[0]).astype(F32) + b
+        for xi, wi in zip(xs[1:], ws[1:]):
+            s_ = s_ + xi * wi
+        acc = acc + sat(s_) * o
+    return acc
 
 
 def _taps(tp, tc, u, v, vx, vy, t, sp, sc, es, str_en, quad, csh=0.5, use_cr=False, return_hl=False, return_spen=False):
@@ -282,6 +310,8 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         flx, fly = np.floor(fbx), np.floor(fby)
         wx, wy = fbx - flx, fby - fly
         ixr, iyr = flx.astype(np.int64), fly.astype(np.int64)
+        # nearest 16-px block (GK and fill lookups): warp8.ll takes it from the block weights before the 8x8 unpack
+        xh_r, yh_b0 = wx < F32(0.5), wy < F32(0.5)
         ix0, ix1 = np.clip(ixr, 0, nbx - 1), np.clip(ixr + 1, 0, nbx - 1)
         iy0, iy1 = np.clip(iyr, 0, nby - 1), np.clip(iyr + 1, 0, nby - 1)
         raw00, raw10, raw01, raw11 = F[iy0, ix0], F[iy0, ix1], F[iy1, ix0], F[iy1, ix1]
@@ -318,8 +348,6 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         coh_thr = ( np.maximum(vm4 * F32(0.125), F32(2.0))
                     if "coh_thr" not in wp else F32(wp["coh_thr"]) )
         coh = spr <= coh_thr
-        xh_r = wx < F32(0.5)
-        yh_b0 = wy < F32(0.5)
         gbx = np.where(xh_r, ix0, ix1)
         gby = np.where(yh_b0, iy0, iy1)
         vmn = np.minimum(np.minimum(lsum[0], lsum[1]), np.minimum(lsum[2], lsum[3]))
@@ -344,7 +372,7 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
             fe = np.where(usebil[..., 0], feb, fe)
             hl_tag = np.where(usebil[..., 0], F32(0.0), hl_tag)
         eac_f, ebp_f = diff3_k(a2, sc), diff3_k(b2, sp)
-        fm, fad = side_lerp(a2, b2, sp, sc, fe, eac_f, ebp_f, t, vmb, F32(0.0), F32(0.0))
+        fm, fad = side_lerp(a2, b2, sp, sc, fe, eac_f, ebp_f, t, vmb, F32(0.0), F32(0.0), gem0=wp.get('gem0', 0.02), mob=wp.get('mob'))
         frel = np.minimum(fad * F32(0.10), fe * F32(0.60))
         fe_rel = np.maximum(fe - frel, F32(0.0))
         fast_mov = np.where(zv[..., None], zm, fm)
@@ -378,7 +406,7 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
                 g_occ = w_occ_s * dv_g * sat((eb - F32(0.55)) * F32(4.0))
                 div_eff = div_b_s * dv_g
                 eac_s, ebp_s = diff3(a2, sc), diff3(b2, sp)
-                m_s, adadb = side_lerp(a2, b2, sp, sc, eb, eac_s, ebp_s, t, v_ex, g_occ, div_eff)
+                m_s, adadb = side_lerp(a2, b2, sp, sc, eb, eac_s, ebp_s, t, v_ex, g_occ, div_eff, gem0=wp.get('gem0', 0.02), mob=wp.get('mob'))
                 rk = F32(0.10) + F32(0.75) * g_occ
                 rel = np.minimum(adadb * rk, eb * F32(0.82))
                 e = np.maximum(eb + spen - rel, F32(0.0))
@@ -388,17 +416,33 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
                     a2, b2, e = np.where(sharp[..., None], a2, ab), np.where(sharp[..., None], b2, bb), np.where(sharp, e, eb_b)
                 if win > 1:
                     e = boxf(e, win)
-                is_fg_sub = any_split & u2 & (e < F32(0.18))
-                w_eff = np.where(is_fg_sub, w * F32(4.0) + F32(0.16), w)
-                e_eff = np.where(is_fg_sub, np.maximum(e - F32(0.08), F32(0.0)), e)
+                # warp8.ll @accum: weight (w_eff + 0.08) * exp2(8 * (emin - e)); a clean foreground sub-block (e < 0.18)
+                # gets w * 4 + 0.16. Its error was also lowered by 0.08 before round 2, which pulled the mix and emov
+                # towards the foreground at motion boundaries (wp={"fg_boost": True}; False = no boost at all).
+                w_eff, e_eff = w, e
+                fgb = wp.get("fg_boost", "w")
+                if fgb:
+                    is_fg_sub = any_split & u2 & (e < F32(0.18))
+                    if fgb in (True, "w"):
+                        w_eff = np.where(is_fg_sub, w * F32(4.0) + F32(0.16), w)
+                    if fgb in (True, "e"):
+                        e_eff = np.where(is_fg_sub, np.maximum(e - F32(0.08), F32(0.0)), e)
+                if wp.get("acc") == "err":   # experiment: error-only weight, no distance weight
+                    w_eff = None
+                if dbg is not None and wp.get("dump4"):   # analysis only: per-corner colour, error, weight
+                    dbg.setdefault("_c4", []).append((core0, slow, m_s, e_eff, w_eff, eb, w, e))
                 if wp.get("slow_select"):
                     ranked.append((e_eff, m_s, w_eff))
                 if em is None:
                     em = e_eff.copy()
                 em1 = np.minimum(em, e_eff)
-                scl = np.exp2((em1 - em) * F32(wp.get("k", 8.0)))
-                x1 = np.exp2((em1 - e_eff) * F32(wp.get("k", 8.0)))
-                om = (w_eff + F32(wp.get("w_eps", 0.08))) * x1
+                # one exp2 per candidate (warp8.ll @accum): one of the two factors is exp2(0) = 1, and the other is
+                # exp2(-k * |em - e|) bit for bit, since fl(a - b) == -fl(b - a) and k is a power of two
+                z = np.exp2(np.abs(em - e_eff) * F32(-wp.get("k", 8.0)))
+                lo = e_eff < em
+                scl = np.where(lo, z, F32(1.0)).astype(F32)
+                x1 = np.where(lo, F32(1.0), z).astype(F32)
+                om = x1 if w_eff is None else (w_eff + F32(wp.get("w_eps", 0.08))) * x1
                 acc = acc * scl[..., None] + m_s * om[..., None]
                 sw = sw * scl + om
                 em = em1
@@ -460,8 +504,8 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         dmc = diff3_k(mov, sc)
         dmv = diff3_k(mov, stat)
         ddm = dmp - dmc
-        k_ddm = F32(0.45) + F32(0.45) * w_occ_m
-        lim_hi = F32(0.30) + F32(0.20) * w_occ_m
+        k_ddm = F32(wp.get("k_ddm0", 0.45)) + F32(wp.get("k_ddm1", 0.45)) * w_occ_m
+        lim_hi = F32(wp.get("lim0", 0.30)) + F32(wp.get("lim1", 0.20)) * w_occ_m
         dtsc = np.clip(ddm * k_ddm, -lim_hi, lim_hi)
         tsc = sat(F32(t) + dtsc)
         fillc = sp + (sc - sp) * tsc[..., None]
@@ -472,24 +516,33 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         dsw = sat((dl_s - F32(0.18)) * F32(2.5)) * sat((emov - F32(0.22)) * F32(5.0)) * sat((F32(0.30) - es) * F32(4.0))
         cw_base = np.maximum(np.maximum(cw2, bgw), dsw)
         res_cw = mlp_cw(ddm, emov, es, dmv, dl_s, spr, vmg)
-        dcw = sat((emov - F32(0.15)) * F32(10.0)) * res_cw
+        dcw = sat((emov - CW_ACT_THR) * F32(10.0)) * res_cw
         cw3_0 = sat(cw_base + dcw)
         gcw = sat((emov - es) * F32(4.0))
         cw3_1 = cw3_0 * gcw
-        if prevF is not None:
-            gbx_m = np.where(wx < F32(0.5), ix0, ix1)
-            gby_m = np.where(wy < F32(0.5), iy0, iy1)
+        # NOTE: warp8.ll computes this temporal damping (%tc_dmp) but does not apply it; wp={"tc_dmp": False} gives
+        # the shader behaviour (round 2: |dPSNR| <= 0.00004 dB per frame on the corpus either way)
+        if prevF is not None and wp.get("tc_dmp", True):
+            gbx_m, gby_m = gbx, gby
             fg_cx, fg_cy = F[gby_m, gbx_m, 0], F[gby_m, gbx_m, 1]
             fg_bx = np.clip(gbx_m + (fg_cx * F32(1.0 / block)).astype(np.int64), 0, nbx - 1)
             fg_by = np.clip(gby_m + (fg_cy * F32(1.0 / block)).astype(np.int64), 0, nby - 1)
             fg_px, fg_py = prevF[fg_by, fg_bx, 0], prevF[fg_by, fg_bx, 1]
             tc_err = np.abs(fg_cx - fg_px) + np.abs(fg_cy - fg_py)
             tc_pm = np.abs(fg_px) + np.abs(fg_py)
+            if wp.get("tc_src") == "q":   # experiment: reuse the trajectory sample of the quadratic offset
+                tc_err, tc_pm = am_q, vm_p
             tc_w = sat(tc_pm - F32(2.0)) * sat((F32(2.0) - tc_err) * F32(0.5)) * sat((F32(0.35) - emov) * F32(4.0))
-            cw3_1 = cw3_1 * (F32(1.0) - F32(0.30) * tc_w)
+            cw3_1 = cw3_1 * (F32(1.0) - F32(wp.get("tc_k", 0.30)) * tc_w)
         cw3_s = cw3_1 * ws_keep
         cw3 = np.where(hl_act, F32(0.0), cw3_s)
         cw = np.where(np.bool_((flags & 8) != 0), F32(0.0), cw3)
+        # warp8.ll runs the fill block only for waves with a lane where cw can be nonzero: cw is exactly 0 when
+        # emov <= 0.025 (residual and base terms off), emov <= es (gcw = 0), on hl_act, under the full foreground
+        # kill (ws_keep = 0) or the no-fill flag
+        cw_live = (emov > CW_ACT_THR) & (emov > es) & ~hl_act & (ws_keep > F32(0.0)) & np.bool_((flags & 8) == 0)
+        cw_pre = cw
+        cw = np.where(cw_live, cw, F32(0.0))
         if wp.get("vis_fill"):   # cloud-report idea: fill from the visible side (the real frame that matches the warp) instead of a blend
             dmsc, dmsp = diff3(mov, sc), diff3(mov, sp)
             fillc = np.where((dmsc < dmsp)[..., None], sc, sp)
@@ -503,8 +556,25 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
                 cutpx = (sc if t >= 0.5 else sp)
                 m = (emov > F32(cut_emov))[..., None]
                 out0 = np.where(m, cutpx, out0)
-        elif cutn > cut_thr:
-            out0 = (sc if t >= 0.5 else sp).copy()
+        elif wp.get("cut_rule") is not None:   # experiment: compare the scene-change rules on one grid scale
+            rule = wp["cut_rule"]
+            frac = float(nby * nbx) / F32(8160.0)
+            thr = (wp.get("cut_thr_full", 8160 if rule == "none" else (5600 if rule == "shader" else 3264))) * frac
+            if rule != "none" and cutn > thr:
+                cutpx = (sc if t >= 0.5 else sp)
+                if rule == "shader":
+                    m = ((emov > F32(0.35)) & (es > F32(0.30)))[..., None]
+                    out0 = np.where(m, cutpx, out0)
+                else:
+                    out0 = cutpx.copy()
+        elif wp.get("cut_full"):              # experiment: the pre-2.x rule, whole frame replaced above 3264 blocks
+            if cutn > (flags_cut_thr if flags_cut_thr else 3264):
+                out0 = (sc if t >= 0.5 else sp).copy()
+        elif cutn > (flags_cut_thr if flags_cut_thr else 5600):
+            # warp8.ll: above the threshold (default 5600 of 8160 blocks), only pixels where both the motion and the
+            # static samples disagree take the real frame
+            m = ((emov > F32(0.35)) & (es > F32(0.30)))[..., None]
+            out0 = np.where(m, sc if t >= 0.5 else sp, out0)
         fbt = wp.get("fb_emov")
         if fbt is not None:   # experiment: low-confidence pixels (the two compensated samples disagree) fall back to a real frame
             fbp = sc if wp.get("fb", "cur") == "cur" else (stat if wp.get("fb") == "stat" else (sc * F32(0.5) + sp * F32(0.5)))
@@ -513,7 +583,7 @@ def warp8(tp, tc, F, GK, cutn, t=0.5, hud_packed=0, flags=0, dbg=None, flags_cut
         crop = slice(core0 - y0, core1 - y0)
         out[core0:core1] = out0[crop]
         if dbg is not None:
-            for k, val in (("coh", coh), ("es", es), ("ws", ws), ("cw", cw), ("bg3", bg3), ("mov", mov), ("stat", stat), ("emov", emov)):
+            for k, val in (("coh", coh), ("es", es), ("ws", ws), ("cw", cw), ("cw_pre", cw_pre), ("cw_live", cw_live), ("bg3", bg3), ("mov", mov), ("stat", stat), ("emov", emov)):
                 dbg.setdefault(k, []).append(val[crop])
     return out
 
@@ -532,13 +602,58 @@ def rcas_con(sharp_pct):
     return F32(con)
 
 
-def rcas8(mid, con, emode):
+RCP255 = F32(1.0) / F32(255.0)   # 0x3F70101020000000 in rcas8.ll unpack_rgb
+
+
+def rcas_weight(lM, lN, lS, lW, lE, mn5, mx5, rng5, tex_gate, s4l, con):
+    """RCAS adaptive lobe weight of rcas8 (block rcas_w of rcas8.ll; only run when con != 0)"""
+    eps = F32(2.0 ** -14)
+    hmin = mn5 / ((mx5 + eps) * F32(4.0))
+    hmax = (F32(1.0) - mx5) / ((mn5 - F32(1.0)) * F32(4.0) - eps)
+    lobe = np.maximum(np.maximum(-hmin, hmax), -F32(con))
+    w_karis = F32(1.0) / (F32(1.0) + mx5)
+    w0 = np.minimum(lobe, F32(0.0)) * w_karis
+    nz = sat(np.abs(s4l * F32(0.25) - lM) / (rng5 + eps))
+    dn = sat(F32(1.0) - nz * F32(0.85)) * tex_gate
+    w_sharp = w0 * dn
+    w_shim = (F32(1.0) - tex_gate) * sat((nz - F32(0.45)) * F32(2.0)) * F32(0.10) * w_karis * sat(F32(con) * F32(8.0))
+    return w_sharp + w_shim
+
+
+def static_px(tp, tc):
+    """warp8's static-pixel flag, written to the mid's alpha (1.0 / 254/255): P == C in RGB at the pixel (es == 0)"""
+    return diff3_k(tp.astype(F32), tc.astype(F32)) == F32(0.0)
+
+
+def rcas8_real(cur, prev, con, emode, dbg=None):
+    """rcas8 cur pass with rcas flag bit 5 (real frame post-processed in place, the next pair's P): no AA where warp8
+    flagged the pixel static (static_px(prev, cur), carried over from the mid pass of the same workgroup), and the
+    lane is written back raw (store skipped) where its AA result already equals prev's stored code: the pixel is
+    static but P holds last frame's AA of it, so it would never compare static again. Returns the stored frame."""
+    cur = cur.astype(F32)
+    st = static_px(prev, cur)
+    out = rcas8(cur, con, emode, skip=st, dbg=dbg)
+    q = lambda x: np.rint(np.clip(x, 0, 1) * F32(255.0))
+    same = (q(out) == q(prev.astype(F32))).all(-1)
+    return np.where(same[..., None], cur, out).astype(F32)
+
+
+def rcas8(mid, con, emode, force_apply=False, skip=None, dbg=None, still=None):
     """mid (H, W, 3) float32 (already quantised like the T# store). Neighbour colours come from the 8-bit LDS copy,
-    luma from the full precision value."""
+    luma from the full precision value. con == 0 (Sharpness 0) skips the RCAS weight and the RCAS apply, as rcas8.ll
+    does: the weight is +-0 there, so the apply returns base_c bit for bit. force_apply runs the full apply anyway
+    (tests prove the identity with it). skip (H, W) bool: warp8's static flag (rcas flag bit 4, mid pass); those
+    pixels take the rcas_only path (no AA, RCAS as with Enhance off). Lanes with edge_ramp == 0 take that path in
+    rcas8.ll too, which is the identity here (wAA == 0, w_eff == w_rcas). dbg: dict, receives edge_ramp.
+    still (H, W) bool: warp8's static flag on the mid pass of rcas8.ll (flag bit 4): the real frames around the
+    mid show those pixels raw, so the mid keeps them raw too (no AA and no sharpening: out = the 8-bit texel);
+    sharpening only the mid there alternated at 30 Hz like the AA did. A wave whose 64 lanes are all still skips
+    the whole pass after the tile load."""
     H, W = mid.shape[:2]
     c = mid.astype(F32)
     luma = c[..., 1] * F32(0.5) + (c[..., 0] + c[..., 2]) * F32(0.25)
-    c8 = np.floor(np.clip(c, 0, 1) * F32(255.0) + F32(0.5)) / F32(255.0)
+    # LDS unpack of rcas8.ll: v_cvt_f32_ubyte * 1/255 (float constant), not a division (126 of 256 codes differ by 1 ulp)
+    c8 = np.floor(np.clip(c, 0, 1) * F32(255.0) + F32(0.5)) * RCP255
     Lp = np.pad(luma, 2, mode='edge')
     Cp = np.pad(c8, ((2, 2), (2, 2), (0, 0)), mode='edge')
 
@@ -564,22 +679,16 @@ def rcas8(mid, con, emode):
     dCard = np.maximum(dNS, dWE)
     dDiag = np.maximum(np.abs(lNE - lSW), np.abs(lNW - lSE)) * F32(0.5)
     tex_gate = sat((dCard + dDiag) / rng9e * F32(1.5))
-    hmin = mn5 / ((mx5 + eps) * F32(4.0))
-    hmax = (F32(1.0) - mx5) / ((mn5 - F32(1.0)) * F32(4.0) - eps)
-    lobe = np.maximum(np.maximum(-hmin, hmax), -F32(con))
-    w_karis = F32(1.0) / (F32(1.0) + mx5)
-    w0 = np.minimum(lobe, F32(0.0)) * w_karis
+    sharp = F32(con) != F32(0.0)
     s4l = (lN + lW) + (lE + lS)
-    nz = sat(np.abs(s4l * F32(0.25) - lM) / (rng5 + eps))
-    dn = sat(F32(1.0) - nz * F32(0.85)) * tex_gate
-    w_sharp = w0 * dn
-    w_shim = (F32(1.0) - tex_gate) * sat((nz - F32(0.45)) * F32(2.0)) * F32(0.10) * w_karis * sat(F32(con) * F32(8.0))
-    w_rcas = w_sharp + w_shim
+    w_rcas = rcas_weight(lM, lN, lS, lW, lE, mn5, mx5, rng5, tex_gate, s4l, con) if sharp else np.zeros_like(lM)
     if emode > 0:
         is_str = emode >= 2
         thr_abs, thr_rel = (F32(0.015625), F32(0.0625)) if is_str else (F32(0.0234375), F32(0.09375))
         ethr = np.maximum(thr_abs, mx9 * thr_rel)
         edge_ramp = sat((rng9 - ethr) * F32(32.0))
+        if dbg is not None:
+            dbg['edge_ramp'] = edge_ramp
         edgeH = np.abs(lNW + lSW - lW * 2) + np.abs(lN + lS - lM * 2) * 2 + np.abs(lNE + lSE - lE * 2)
         edgeV = np.abs(lNW + lNE - lN * 2) + np.abs(lW + lE - lM * 2) * 2 + np.abs(lSW + lSE - lS * 2)
         horz = edgeH >= edgeV
@@ -642,8 +751,15 @@ def rcas8(mid, con, emode):
         wAA = edge_ramp * wClp * r_gate
         base_c = M + (rgbTarget - M) * wAA[..., None]
         w_eff = w_rcas * (F32(1.0) - edge_ramp)
+        if skip is not None:
+            base_c = np.where(skip[..., None], M, base_c)
+            w_eff = np.where(skip, w_rcas, w_eff)
     else:
         base_c, w_eff = M, w_rcas
+    if still is not None:
+        base_c = np.where(still[..., None], M, base_c)
+    if not sharp and not force_apply:
+        return base_c.astype(F32)
     a_ns0 = (dNS * F32(2.0)) / (dNS + dWE + eps)
     a_we0 = F32(2.0) - a_ns0
     is_sh = w_eff < F32(0.0)
@@ -654,7 +770,8 @@ def rcas8(mid, con, emode):
     res0 = num * (F32(1.0) / (F32(1.0) + w_eff * F32(4.0)))[..., None]
     c_mn = np.minimum(np.minimum(np.minimum(N, Wc), np.minimum(E, S)), base_c)
     c_mx = np.maximum(np.maximum(np.maximum(N, Wc), np.maximum(E, S)), base_c)
-    return np.minimum(np.maximum(res0, c_mn), c_mx).astype(F32)
+    out = np.minimum(np.maximum(res0, c_mn), c_mx).astype(F32)
+    return out if still is None else np.where(still[..., None], M, out).astype(F32)
 
 
 def boxf(e, n):

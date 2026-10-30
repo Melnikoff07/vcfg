@@ -205,7 +205,8 @@ static inline void ycocg420_decompress_frame(const uint32_t *ycocg_in, uint32_t 
 #define W8_FA  0x151000u   // 120x68 float2, full-res px, mid grid (ping-pong: current / previous frame)
 #define W8_FB  0x161000u
 #define W8_MISC 0x171000u  // [0] scene-change count, [1] t, [2..3] luma sums by parity, [4..5] dominant motion (gm8),
-                           // [6] foreground L2 blocks (fgs8), [7] fade decision (me1)
+                           // [6] foreground L2 blocks (fgs8), [7] fade decision (me1), [8..9] scene-change count of
+                           // the pair that wrote F of that parity (phase8: F prev cleared after a scene change)
 #define W8_S2  0x172000u   // 60x34 u32: L2 SAD of the best | SAD of the zero vector << 16 (me2)
 #define W8_GK  0x174000u   // 120x68 u32: foreground splat keys (fgs8; zeroed by pyr8)
 #define W8_FT  0x17C000u   // 120x68 float2: raw me1 field, filtered by mf8 into F cur (8.3)
@@ -216,6 +217,8 @@ static inline void ycocg420_decompress_frame(const uint32_t *ycocg_in, uint32_t 
 // from the previous frame's cur pyramid buffers via ping-pong descriptor swap (0 B extra DirectMemory),
 // and pyr8.ll skips all T#prev texture fetches and V#L1prev..L3prev buffer stores (-50% pyr8 bandwidth & ALU).
 #define FG8_FLAG_PYR_WARM 0x1000u
+// consts.flags bit 13: option fade_hi in me1.ll (a luma-sum change above 8 % is a fade whatever the camera vector).
+#define FG8_FLAG_FADE_HI 0x2000u
 
 // table read by the mode 8 shaders (offsets are hard-coded in shaders/*8.ll and me*.ll)
 #define WA(off) ((uint64_t)(uintptr_t)(work + (off)))
@@ -230,7 +233,7 @@ static inline void fill_table8_wh(uint32_t *tb, uint64_t P, uint64_t C, uint64_t
     tb[24] = 2u | (2u << 3) | (2u << 6) | (1u << 15); tb[25] = 0; tb[26] = (1u << 20) | (1u << 22); tb[27] = 0;
     // +0x70 consts; tb[29] holds mid_idx | (t_override_q16 << 16); flags: bit 0 adaptive phase, bit 1 FG off,
     // bit 2 debug marker, bit 3 'k', bit 4 'g', bit 5 'L', bit 6 'T', bit 7 'M', bit 8 'G', bit 9 'P', bit 10 'S', bit 11 'b',
-    // bit 12 FG8_FLAG_PYR_WARM (single-frame warm pyramid fast path)
+    // bit 12 FG8_FLAG_PYR_WARM (single-frame warm pyramid fast path), bit 13 FG8_FLAG_FADE_HI (me1 fade above 8 %)
     tb[28] = r; tb[29] = mid_idx; tb[30] = flags; tb[31] = g_hud_packed;
     if (work) {
         // buffers get 16 bytes of slack: me*.ll read 12 bytes at an aligned-down row start
@@ -244,7 +247,7 @@ static inline void fill_table8_wh(uint32_t *tb, uint64_t P, uint64_t C, uint64_t
         make_v(tb + 60, WA(W8_V2), 60 * 34 * 4);                        // +0xF0 V2
         make_v(tb + 64, WA(r ? W8_FB : W8_FA), 120 * 68 * 8);           // +0x100 F cur
         make_v(tb + 68, WA(r ? W8_FA : W8_FB), 120 * 68 * 8);           // +0x110 F prev
-        make_v(tb + 72, WA(W8_MISC), 32);                               // +0x120 misc
+        make_v(tb + 72, WA(W8_MISC), 48);                               // +0x120 misc
         make_v(tb + 80, WA(W8_S2), 60 * 34 * 4);                        // +0x140 S2
         make_v(tb + 84, WA(W8_GK), 120 * 68 * 4);                       // +0x150 GK
         make_v(tb + 96, WA(W8_FT), 120 * 68 * 8);                       // +0x180 FT: raw me1 field (me1 -> mf8)
