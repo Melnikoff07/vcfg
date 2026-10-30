@@ -699,6 +699,7 @@ static void shrink_early_mem_to_ex(size_t keep, int mark_tight)
         g_pre_mem_phys = new_phys;
         g_pre_size = keep;
         if (mark_tight) g_mem_tight = 1;
+        if (mark_tight) s14_reserve_now(keep, "valve");   // not the RegisterBuffers trim to nm buffers
     } else {
         if (um == 0) {
             g_own_alloc++;
@@ -708,6 +709,7 @@ static void shrink_early_mem_to_ex(size_t keep, int mark_tight)
         g_pre_mem = NULL;
         g_pre_mem_phys = 0;
         g_pre_size = 0;
+        s14_reserve_now(0, "valve remap failed");
     }
 }
 
@@ -807,6 +809,7 @@ static int relocate_early_mem_outside(long avoid_s, long avoid_e)
                     STAGE("memory valve: trimmed overlapping tail of g_pre_mem in-place 0x%zx->0x%zx (kept phys=0x%lx..0x%lx, freed 0x%lx..0x%lx for 0x%lx..0x%lx)",
                           g_pre_size, keep_prefix, pm_s, rel_phys, rel_phys, pm_e, avoid_s, avoid_e);
                     g_pre_size = keep_prefix;
+                    s14_reserve_now(keep_prefix, "trimmed for a fixed-range request");
                     if (keep_prefix < 0x2000000u) g_mem_tight = 1;
                     return 1;
                 }
@@ -847,6 +850,7 @@ static int relocate_early_mem_outside(long avoid_s, long avoid_e)
             g_pre_mem = new_va;
             g_pre_mem_phys = new_phys;
             g_pre_size = keep;
+            s14_reserve_now(keep, "relocated for a fixed-range request");
             if (keep < 0x2000000u) g_mem_tight = 1;
             return 1;
         }
@@ -983,6 +987,26 @@ static int32_t shave_game_alloc(long s, long e, size_t len, size_t align, int ty
         if (!flex_ok) {
             return (int32_t)0x80020023u;
         }
+        // shave14 FlexibleMemory budget. With an 8 MiB reserve this tail would be need_tail - S14_EXTRA (at least 0) and,
+        // where today's history buffer is full size, the plugin would then take 8 MiB of FlexibleMemory for it
+        // (alloc_pbuf_history: full buffer only with >= 0x1800000 free). With shave14 the tail grows by up to S14_EXTRA
+        // and the history buffer is never taken, so the game keeps the same FlexibleMemory exactly when today's history
+        // buffer would be the full one: flex_av - (need_tail - S14_EXTRA) >= 0x1800000, i.e.
+        // flex_av >= need_tail + 0x1800000 - S14_EXTRA = need_tail + S14_FLEX_FLOOR. A query error or a shorter pool
+        // falls back: step 5 shrinks the reserve to 8 MiB and shaves as without shave14. Only a real shave (not the
+        // synthetic tail-only chunk) uses it.
+        if (g_s14_state == 1 && g_pre_size >= S14_KEEP) {
+            int s14_ok = boot_phase && fq == 0 && flex_av >= need_tail + S14_FLEX_FLOOR &&
+                         shave_av >= 0x4000u && (len >= 0x100000u || has_large_arena_shave) &&
+                         !(is_desc_probe && len > 0x400000u && shave_av >= 0x40000u);
+            if (!s14_ok) {
+                g_s14_state = -1;
+                STAGE("shave14: FlexibleMemory 0x%zx (q=0x%08x) for tail 0x%zx + floor 0x%x, real part 0x%zx -> back to the "
+                      "8 MiB display reserve and today's shave", flex_av, (unsigned)fq, need_tail, S14_FLEX_FLOOR, shave_av);
+                return (int32_t)0x80020023u;
+            }
+            g_s14_flex_before = flex_av;
+        }
         if (shave_av >= 0x4000u && (len >= 0x100000u || has_large_arena_shave) &&
             !(is_desc_probe && len > 0x400000u && shave_av >= 0x40000u)) {
             int32_t sr = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
@@ -990,6 +1014,12 @@ static int32_t shave_game_alloc(long s, long e, size_t len, size_t align, int ty
             if (sr == 0 && phys) {
                 record_shave_entry(*phys, shave_av, len, type);
                 g_mem_tight = 1;
+                if (g_s14_state == 1) {
+                    g_s14_tail_extra = (len - shave_av) < S14_EXTRA ? (len - shave_av) : S14_EXTRA;
+                    STAGE("shave14: arena tail 0x%zx = 0x%zx with an 8 MiB reserve + 0x%zx for the 2nd buffer; flex_av "
+                          "0x%zx before the tail (needs tail + 0x%x)", len - shave_av, (len - shave_av) - g_s14_tail_extra,
+                          g_s14_tail_extra, g_s14_flex_before, S14_FLEX_FLOOR);
+                }
                 STAGE("arena shave #%d OK%s: game asked len=0x%zx, allocated 0x%zx at phys=0x%lx (shaved 0x%zx, reserve=0x%zx)",
                       g_shave_n, post_menu_world_arena ? " (post-menu world arena)" : "",
                       len, shave_av, *phys, len - shave_av, reserve);
@@ -1142,9 +1172,18 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
         // Step 3: For sub-1GB allocations or any arena that fits in real DirectMemory once g_pre_mem is shrunk to 8 MB
         // (e.g. CUSA04529/CUSA10249/CUSA07820/CUSA00341 4th arena on both Base PS4 0x2a000000 and PS4 Pro 0x50c00000),
         // shrink g_pre_mem 32 MB -> 8 MB and retry unshaved FIRST so the arena succeeds 100% in real DirectMemory.
+        // shave14 (opt-in, S14_KEEP in main.c): the first such shrink at boot keeps two buffers (16 MiB); the shave
+        // below then takes the extra 8 MiB from the arena, or falls back (step 5 shrinks to 8 MiB as without it).
         if ((uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && g_pre_mem && g_pre_size > 0x800000u &&
             (len < 0x40000000u || dm_avail_range(s, e, eff_align, NULL) + (g_pre_size - 0x800000u) >= len)) {
-            shrink_early_mem_to(0x800000u);
+            size_t keep = 0x800000u;
+            if (g_s14_on && g_s14_state == 0 && boot_phase && g_pre_size >= S14_KEEP) {
+                keep = S14_KEEP;
+                g_s14_state = 1;
+                STAGE("shave14: display reserve 0x%zx -> 0x%zx (two generated-frame buffers) for the game's len=0x%zx",
+                      g_pre_size, keep, len);
+            }
+            shrink_early_mem_to(keep);
             r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                               s, e, len, align, type, phys);
         }
