@@ -118,6 +118,29 @@ HOOKS_CORE = extract_between(
     "static size_t dm_avail_range(",
     "static void debug_hooks_install(void)",
 )
+# The game BatchMap path (shaved arena entries backed by FlexibleMemory), split at call_orig_batch_map so the simulated
+# raw sceKernelBatchMap can use OrbisBatchMapEntry.
+HOOKS_BATCH_TYPES = re.sub(
+    r"^static Detour \w+;\n",
+    "",
+    extract_between(
+        HOOKS_H,
+        "typedef struct {\n    void *start;\n    off_t offset;",
+        "static int32_t call_orig_batch_map(",
+    ),
+    flags=re.M,
+)
+HOOKS_BATCH_CORE = extract_between(
+    HOOKS_H,
+    "static int32_t call_orig_batch_map(",
+    "int32_t sceKernelBatchMap_hook(",
+)
+# cfg_apply_title_defaults value for the CUSA02299 family, so the replay mirror follows main.c.
+_C02299_REG_M = re.search(
+    r'vcfg_in_family\(g_title_id, "CUSA02299"\)\) \{.*?c->reg_mode = (\d);', MAIN_C, re.S
+)
+assert _C02299_REG_M is not None, "CUSA02299 reg_mode default not found in classic/source/main.c"
+CUSA02299_REG_MODE = int(_C02299_REG_M.group(1))
 FAMILIES_BODY = FAMILIES_H.replace("#pragma once", "").replace("#include <string.h>", "")
 
 HARNESS_C = r"""
@@ -233,7 +256,7 @@ typedef struct {
     int in_use;
 } SimDmBlock;
 
-#define MAX_FLEX_BLOCKS 512
+#define MAX_FLEX_BLOCKS 2048
 typedef struct {
     uintptr_t va;
     size_t len;
@@ -640,8 +663,10 @@ static void apply_title_defaults_sim(const char *tid)
         g_cfg.pace_order = 3;
     } else if (vcfg_in_family(g_title_id, "CUSA08519")) {
         g_cfg.shave_mode = 1;
-    } else if (vcfg_in_family(g_title_id, "CUSA16734") || vcfg_in_family(g_title_id, "CUSA02299")) {
+    } else if (vcfg_in_family(g_title_id, "CUSA16734")) {
         g_cfg.reg_mode = 1;
+    } else if (vcfg_in_family(g_title_id, "CUSA02299")) {
+        g_cfg.reg_mode = __CUSA02299_REG_MODE__;
     } else if (vcfg_in_family(g_title_id, "CUSA09311") ||
                vcfg_in_family(g_title_id, "CUSA18534") ||
                vcfg_in_family(g_title_id, "CUSA10123")) {
@@ -849,7 +874,171 @@ static void replay_register_buffers(int start_idx, int num_buf, uint32_t bw, uin
 }
 """.replace("__PCOPY_HAS_MAX_EXTRA__", str(PCOPY_GATE_HAS_MAX_EXTRA)).replace(
     "__HAS_CUSA10249_AUDIO_FIX__", str(HAS_CUSA10249_AUDIO_FIX)
+).replace(
+    "__CUSA02299_REG_MODE__", str(CUSA02299_REG_MODE)
 )
+
+# Game BatchMap replay: debug_hooks.h handle_game_batch_map over a simulated sceKernelBatchMap that maps
+# MAP_DIRECT entries only over allocated simulated DirectMemory (the console returns 0x80020010 otherwise).
+BATCH_HARNESS_C = (
+    "static volatile uint32_t g_dbg_batch_maps = 0, g_dbg_batch_fail = 0;\n"
+    + HOOKS_BATCH_TYPES
+    + r"""
+static int g_sim_batch_calls = 0;
+static int32_t raw_sceKernelBatchMap(void *entries, int numEntries, int *numOut, int flags)
+{
+    (void)flags;
+    g_sim_batch_calls++;
+    OrbisBatchMapEntry *ent = (OrbisBatchMapEntry *)entries;
+    int done = 0;
+    for (int i = 0; i < numEntries; i++) {
+        if (ent[i].operation == 0 && !sim_dm_is_allocated_range((long)ent[i].offset, ent[i].length)) {
+            if (numOut) *numOut = done;
+            return (int32_t)0x80020010u;
+        }
+        done++;
+    }
+    if (numOut) *numOut = done;
+    return 0;
+}
+static int32_t raw_sceKernelBatchMap2(void *entries, int numEntries, int *numOut, int flags)
+{
+    return raw_sceKernelBatchMap(entries, numEntries, numOut, flags);
+}
+
+/* Is [va, va + len) inside one simulated FlexibleMemory mapping (e.g. the shaved arena tail)? */
+static int sim_flex_covers(const void *va, size_t len)
+{
+    uintptr_t s = (uintptr_t)va, e = s + len;
+    for (int i = 0; i < MAX_FLEX_BLOCKS; i++) {
+        if (g_sim_flex[i].in_use && g_sim_flex[i].is_flex && s >= g_sim_flex[i].va && e <= g_sim_flex[i].va + g_sim_flex[i].len)
+            return 1;
+    }
+    return 0;
+}
+"""
+    + HOOKS_BATCH_CORE
+)
+
+
+CUSA02299_TRACE_KEY = "CUSA02299_0x13b400000"
+CUSA02299_POOL_LEN = 0x10000000
+CUSA02299_POOL_VA = 0x1900000000
+CUSA02299_PAGE = 0x4000
+CUSA02299_BATCH = 2048  # entries per game BatchMap call (the console boot shows up to 1864)
+
+
+def generate_cusa02299_pool_c(traces: list[dict]) -> list[str]:
+    """Replay of the CUSA02299 base PS4 boot (console 2.35-custom, dm=0x13b400000): every game allocation lands at the
+    console's physical address, then the 0x10000000 type 0 pool the console refused (0x80020023) must succeed and the
+    game's 16 KiB BatchMap pages over it at 0x1900000000 must all map. FlexibleMemory budgets:
+      flex16: 0x1000000, below the 0x1a00000 tail the early-registered reserve needs (reproduces the console refusal
+              without the fix): the reserve shrinks to 8 MB, the pool gets 0xf800000 real + an 8 MB FlexibleMemory tail,
+              and room for the GPU/work buffers stays free for frame 120;
+      flex6:  0x600000, below the 8 MB tail: the reserve is given back, the pool is all real DirectMemory, and frame 120
+              finds no 8 MB display block (safe_try_activate refuses NO DISPLAY MEM, the game stays native)."""
+    tr = next((t for t in traces if t["trace_key"] == CUSA02299_TRACE_KEY), None)
+    if tr is None:
+        return []
+    dm = int(tr["dm_size"], 16)
+    pre_occ = int(tr["pre_occupied_low"], 16)
+    pool_ev = [e for e in tr["events"] if e["op"] == "alloc" and int(e["len"], 16) == CUSA02299_POOL_LEN]
+    assert len(pool_ev) == 1 and pool_ev[0]["orig_ret"] == "0x80020023", "CUSA02299 trace must end on the refused pool"
+    out: list[str] = []
+    for case, flex in (("flex16", 0x1000000), ("flex6", 0x600000)):
+        tag = f"{CUSA02299_TRACE_KEY}_pool_{case}"
+        out += [
+            f"    /* {tag}: boot-CUSA02299.txt (2.35-custom), pool 0x10000000 at BatchMap va 0x1900000000 */",
+            "    {",
+            '        apply_title_defaults_sim("CUSA02299");',
+            # plugin_load on the console: display 0x139400000 (32 MB), gpu 0x1393e0000 and work 0x139200000, both in the
+            # 2 MB page below the display. setup_plugin_load_early would put them in the sub-2MB region next to the
+            # pre-occupied 0x10000 (where the game's own 0x10000..0x140000 allocations land on the console), so the low
+            # block is occupied after the plugin_load placement instead; the simulator packs gpu and work in the other
+            # order inside the same 2 MB page.
+            f"        setup_plugin_load_early({hex(dm)}ULL, 0LL);",
+            "        { long lo = 0; g_own_alloc++; raw_sceKernelAllocateDirectMemory(0, " + hex(pre_occ) + "LL, " + hex(pre_occ) + "u, 0x4000u, 0, &lo); g_own_alloc--; }",
+            f'        ASSERT_MSG(g_pre_mem_phys == 0x139400000LL && g_pre_size == 0x2000000ULL && (g_pre_gpu_phys & ~0x1FFFFFLL) == 0x139200000LL && (g_pre_work_phys & ~0x1FFFFFLL) == 0x139200000LL, "{tag}", 1, g_pre_mem_phys);',
+            f"        g_sim_flex_avail = {hex(flex)}u;",
+            "        size_t flex_boot = g_sim_flex_avail;",
+        ]
+        for step_i, ev in enumerate(tr["events"], 2):
+            if ev["op"] == "reg_buffers":
+                out.append(f"        replay_register_buffers({ev['start']}, {ev['num']}, {ev['w']}u, {ev['h']}u, {ev['pitch']}u);")
+                continue
+            if ev["op"] != "alloc" or ev["orig_ret"] != "0x0":
+                continue
+            out += [
+                "        {",
+                "            long p = 0;",
+                f"            int32_t r = sceKernelAllocateDirectMemory({ev['s']}LL, {ev['e']}LL, {ev['len']}ULL, {ev['align']}ULL, {ev['type']}, &p);",
+                f'            ASSERT_MSG(r == 0 && p == {ev["orig_phys"]}LL, "{tag}", {step_i}, p);',
+                "        }",
+            ]
+        pe = pool_ev[0]
+        out += [
+            "        long pool_phys = 0;",
+            "        {",
+            f"            int32_t r = sceKernelAllocateDirectMemory({pe['s']}LL, {pe['e']}LL, {pe['len']}ULL, {pe['align']}ULL, {pe['type']}, &pool_phys);",
+            f'            ASSERT_MSG(r == 0, "{tag}", 50, (uint32_t)r);',
+            "        }",
+            f'        ASSERT_MSG(pool_phys == 0x12ae00000LL && g_mbuf_state != 1, "{tag}", 51, pool_phys);',
+        ]
+        if case == "flex16":
+            out += [
+                f'        ASSERT_MSG(g_shave_n == 1 && g_shaves[0].phys == pool_phys && g_shaves[0].orig_len == {hex(CUSA02299_POOL_LEN)}ULL && g_shaves[0].real_len == 0xf800000ULL, "{tag}", 52, g_shaves[0].real_len);',
+                f'        ASSERT_MSG(g_pre_mem != NULL && g_pre_size == 0x800000ULL && g_pre_mem_phys == 0x13ac00000LL && sim_dm_is_allocated_range(g_pre_mem_phys, g_pre_size), "{tag}", 53, g_pre_mem_phys);',
+            ]
+        else:
+            out += [
+                f'        ASSERT_MSG(g_shave_n == 0 && g_pre_mem == NULL && sim_dm_is_allocated_range(pool_phys, {hex(CUSA02299_POOL_LEN)}ULL), "{tag}", 52, g_shave_n);',
+            ]
+        # The game maps the pool page by page at 0x1900000000 (BatchMap, MAP_DIRECT, 16 KiB entries).
+        out += [
+            "        int pages_ok = 0;",
+            "        {",
+            f"            static OrbisBatchMapEntry ent[{CUSA02299_BATCH}];",
+            "            size_t flex_before = g_sim_flex_avail;",
+            f"            for (size_t off = 0; off < {hex(CUSA02299_POOL_LEN)}ULL; off += {CUSA02299_BATCH}u * {hex(CUSA02299_PAGE)}u) {{",
+            f"                for (int k = 0; k < {CUSA02299_BATCH}; k++) {{",
+            f"                    size_t o = off + (size_t)k * {hex(CUSA02299_PAGE)}u;",
+            f"                    ent[k].start = (void *)(uintptr_t)({hex(CUSA02299_POOL_VA)}ULL + o);",
+            "                    ent[k].offset = (off_t)(pool_phys + (long)o);",
+            f"                    ent[k].length = {hex(CUSA02299_PAGE)}u;",
+            "                    ent[k].protection = 0x32;",
+            "                    ent[k].type = 0;",
+            "                    ent[k].reserved = 0;",
+            "                    ent[k].operation = 0;",
+            "                }",
+            "                int n_out = 0;",
+            f"                int32_t br = handle_game_batch_map(ent, {CUSA02299_BATCH}, &n_out, 0, 0, NULL);",
+            f'                ASSERT_MSG(br == 0 && n_out == {CUSA02299_BATCH}, "{tag}", 60, off);',
+            "                pages_ok += n_out;",
+            "            }",
+            f'            ASSERT_MSG(pages_ok == {CUSA02299_POOL_LEN // CUSA02299_PAGE}, "{tag}", 61, pages_ok);',
+        ]
+        if case == "flex16":
+            out += [
+                f'            ASSERT_MSG(flex_before - g_sim_flex_avail == 0x800000u && sim_flex_covers((void *)(uintptr_t)({hex(CUSA02299_POOL_VA)}ULL + 0xf800000ULL), {hex(CUSA02299_PAGE)}u) && sim_flex_covers((void *)(uintptr_t)({hex(CUSA02299_POOL_VA + CUSA02299_POOL_LEN - CUSA02299_PAGE)}ULL), {hex(CUSA02299_PAGE)}u) && !sim_flex_covers((void *)(uintptr_t)({hex(CUSA02299_POOL_VA)}ULL + 0xf7fc000ULL), {hex(CUSA02299_PAGE)}u), "{tag}", 62, flex_before - g_sim_flex_avail);',
+                # frame 120: the GPU and work buffers (released at the pool request) still find real DirectMemory
+                f'            ASSERT_MSG(dm_avail(0x10000u) >= (size_t)WORK_SZ_8 + (size_t)GPU_SZ_BASE, "{tag}", 63, dm_avail(0x10000u));',
+                "        }",
+                f'        ASSERT_MSG(on_sub() >= 0, "{tag}", 1000, 0);',
+                '        printf("CUSA02299 pool replay (flex 0x%zx): 0x10000000 at phys 0x%zx = 0x%zx real + 0x%zx FlexibleMemory tail, display 0x%zx at 0x%zx, %d pages mapped, flex left 0x%zx\\n",',
+                "               flex_boot, (size_t)pool_phys, g_shaves[0].real_len, g_shaves[0].orig_len - g_shaves[0].real_len, g_pre_size, (size_t)g_pre_mem_phys, pages_ok, g_sim_flex_avail);",
+            ]
+        else:
+            out += [
+                f'            ASSERT_MSG(flex_before == g_sim_flex_avail, "{tag}", 62, flex_before - g_sim_flex_avail);',
+                # frame 120: safe_try_activate needs one 8 MB display block plus 4 MB (n == 1) -> refuses NO DISPLAY MEM
+                f'            ASSERT_MSG(dm_avail(0x200000u) < 0x800000u + 0x400000u, "{tag}", 63, dm_avail(0x200000u));',
+                "        }",
+                f'        ASSERT_MSG(on_sub() >= 0, "{tag}", 1000, 0);',
+                '        printf("CUSA02299 pool replay (flex 0x%zx): 0x10000000 at phys 0x%zx all real, display reserve given back, %d pages mapped, largest 2 MB-aligned block left 0x%zx (FG stays off at frame 120)\\n",',
+                "               flex_boot, (size_t)pool_phys, pages_ok, dm_avail(0x200000u));",
+            ]
+        out.append("    }")
+    return out
 
 
 def generate_trace_c(traces: list[dict]) -> str:
@@ -1246,6 +1435,7 @@ def generate_trace_c(traces: list[dict]) -> str:
                     lines.append(f'        ASSERT_MSG(g_pbuf != NULL && g_pbuf_ycocg == 1 && g_shave_n == 1, "{tkey}_af0", 997, g_pbuf_sz);')
                 lines.append(f'        ASSERT_MSG(on_sub() >= 0, "{tkey}_af{extra_af}", 1000, 0);')
                 lines.append("    }")
+    lines.extend(generate_cusa02299_pool_c(traces))
     lines.append('    printf("real hardware traces replay: %d/%d CUSAxxxxx boot traces passed 100%%\\n", passed, passed);')
     lines.append("    return 0;")
     lines.append("}")
@@ -1286,6 +1476,8 @@ def main() -> None:
         + HOOKS_CORE
         + "\n"
         + MAIN_ALLOC_PART2
+        + "\n"
+        + BATCH_HARNESS_C
         + "\n"
         + replay_c
         + "\n"

@@ -1,0 +1,263 @@
+# console run c1-xbudget-sp-pb0-r1 (30/10), lines kept: STAT gnm, GPU time, PASSES split, FRAMES, post budget, config, options effective
+# phase still0 199 209
+# phase spin 209 235
+# phase still1 235 243
+# phase move 243 253
+# phase still2 253 260
+   5.06 config (init): framegen=1 mode=8 preset=2 sharpness=70 enhance=2 hud_protect=1 game_vectors=0 fps_lock=30 overlay=1 opacity=80% below30=0 shallow_queue=1
+   5.07 options effective: framegen=on(inert: 60fps native (fg off)) preset=sharp below30=off shallow_queue=on(inert: fg inert) sharpness=70(inert: no post shader) enhance=strong(inert: no post shad
+   5.39 STAT gnm: 54.7 flips/s, max dt 238.0 ms (window 2.2s)
+   5.39 post budget: on (option post_budget)
+   7.25 options effective: framegen=on(active) preset=sharp below30=off shallow_queue=on(ready: needs game < 30 ms) sharpness=70(applied: generated+real) enhance=strong(applied: generated+real) gen_
+   7.32 STAT gnm: 29.8 flips/s, max dt 41.4 ms (window 2.0s)
+   7.86 config (hot-reload): framegen=1 mode=8 preset=2 sharpness=70 enhance=2 hud_protect=1 game_vectors=0 fps_lock=30 overlay=1 opacity=80% below30=0 shallow_queue=1
+   8.35 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 5.17 = 6.17 ms (+ fence wait 0.00) | game span avg 27.1 max 35.2 ms
+   8.35 PASSES split ms: warp8 1.37 rcas8+osd 3.83 pcopy8 0.00 (frames 89) | rcas8 3.83 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+   9.32 STAT gnm: 30.0 flips/s, max dt 33.5 ms (window 2.0s)
+  11.32 STAT gnm: 30.0 flips/s, max dt 33.5 ms (window 2.0s)
+  11.36 FRAMES 90: unmatched blocks avg 52 max 1190, scene-cut frames 0, fade frames 32 | foreground: in 1 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+  11.36 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 5.19 = 6.17 ms (+ fence wait 0.00) | game span avg 27.2 max 27.5 ms
+  11.36 PASSES split ms: warp8 1.37 rcas8+osd 3.81 pcopy8 0.00 (frames 90) | rcas8 3.80 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  13.34 STAT gnm: 29.2 flips/s, max dt 57.6 ms (window 2.0s)
+  14.41 FRAMES 90: unmatched blocks avg 57 max 1224, scene-cut frames 0, fade frames 8 | foreground: in 68 frames, avg 48.7 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+  14.41 GPU time of our passes: pyramid 0.16 + motion 0.84 + warp/post 5.30 = 6.29 ms (+ fence wait 0.00) | game span avg 27.6 max 51.3 ms
+  14.41 PASSES split ms: warp8 1.48 rcas8+osd 3.81 pcopy8 0.00 (frames 90) | rcas8 3.80 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  15.34 STAT gnm: 30.0 flips/s, max dt 33.8 ms (window 2.0s)
+  17.36 STAT gnm: 29.7 flips/s, max dt 42.7 ms (window 2.0s)
+  17.43 FRAMES 90: unmatched blocks avg 267 max 4709, scene-cut frames 0, fade frames 21 | foreground: in 28 frames, avg 202.3 L2 blocks | camera 0,1 L2 px | log lines dropped 4
+  17.43 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 6.03 = 7.02 ms (+ fence wait 0.00) | game span avg 26.6 max 35.3 ms
+  17.43 PASSES split ms: warp8 1.96 rcas8+osd 4.06 pcopy8 0.00 (frames 90) | rcas8 4.05 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  19.36 STAT gnm: 30.0 flips/s, max dt 33.7 ms (window 2.0s)
+  20.43 FRAMES 90: unmatched blocks avg 339 max 3536, scene-cut frames 0, fade frames 2 | foreground: in 47 frames, avg 71.7 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+  20.43 GPU time of our passes: pyramid 0.15 + motion 0.84 + warp/post 6.28 = 7.27 ms (+ fence wait 0.00) | game span avg 26.1 max 27.4 ms
+  20.43 PASSES split ms: warp8 2.29 rcas8+osd 3.98 pcopy8 0.00 (frames 90) | rcas8 3.97 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  21.37 STAT gnm: 30.0 flips/s, max dt 33.6 ms (window 2.0s)
+  23.38 STAT gnm: 28.2 flips/s, max dt 74.9 ms (window 2.0s)
+  23.55 FRAMES 90: unmatched blocks avg 113 max 7950, scene-cut frames 1, fade frames 0 | foreground: in 10 frames, avg 0.4 L2 blocks | camera 0,-2 L2 px | log lines dropped 4
+  23.55 GPU time of our passes: pyramid 0.15 + motion 0.82 + warp/post 5.32 = 6.30 ms (+ fence wait 0.00) | game span avg 28.4 max 68.6 ms
+  23.55 PASSES split ms: warp8 1.53 rcas8+osd 3.78 pcopy8 0.00 (frames 90) | rcas8 3.77 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  25.39 STAT gnm: 30.0 flips/s, max dt 33.5 ms (window 2.0s)
+  26.55 GPU time of our passes: pyramid 0.15 + motion 0.83 + warp/post 6.27 = 7.26 ms (+ fence wait 0.00) | game span avg 26.1 max 26.3 ms
+  26.56 FRAMES 90: unmatched blocks avg 2 max 214, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,-2 L2 px | log lines dropped 4
+  26.56 PASSES split ms: warp8 2.44 rcas8+osd 3.83 pcopy8 0.00 (frames 90) | rcas8 3.82 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  27.40 STAT gnm: 29.7 flips/s, max dt 52.3 ms (window 2.0s)
+ 156.92 FRAMES 90: unmatched blocks avg 2 max 4, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 156.92 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 3.56 = 4.55 ms (+ fence wait 0.00) | game span avg 28.8 max 29.1 ms
+ 156.92 PASSES split ms: warp8 1.32 rcas8+osd 0.01 pcopy8 2.23 (frames 90) | rcas8 0.00 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 157.16 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 159.16 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 159.92 FRAMES 90: unmatched blocks avg 1 max 6, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 159.92 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 3.56 = 4.54 ms (+ fence wait 0.00) | game span avg 28.8 max 29.1 ms
+ 159.92 PASSES split ms: warp8 1.32 rcas8+osd 0.01 pcopy8 2.22 (frames 90) | rcas8 0.00 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 161.16 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 162.93 FRAMES 90: unmatched blocks avg 7 max 21, scene-cut frames 0, fade frames 0 | foreground: in 4 frames, avg 0.1 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 162.93 GPU time of our passes: pyramid 0.16 + motion 0.82 + warp/post 3.58 = 4.56 ms (+ fence wait 0.00) | game span avg 28.8 max 29.4 ms
+ 162.93 PASSES split ms: warp8 1.34 rcas8+osd 0.01 pcopy8 2.23 (frames 90) | rcas8 0.00 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 163.16 STAT gnm: 30.0 flips/s, max dt 34.8 ms (window 2.0s)
+ 165.16 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 165.93 FRAMES 90: unmatched blocks avg 5 max 22, scene-cut frames 0, fade frames 0 | foreground: in 5 frames, avg 0.1 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 165.93 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 3.54 = 4.52 ms (+ fence wait 0.00) | game span avg 28.9 max 29.2 ms
+ 165.93 PASSES split ms: warp8 1.33 rcas8+osd 0.01 pcopy8 2.19 (frames 90) | rcas8 0.00 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 167.17 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 168.93 FRAMES 90: unmatched blocks avg 7 max 16, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 168.93 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 3.54 = 4.53 ms (+ fence wait 0.00) | game span avg 28.8 max 29.3 ms
+ 168.93 PASSES split ms: warp8 1.34 rcas8+osd 0.01 pcopy8 2.19 (frames 90) | rcas8 0.00 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 169.17 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 171.17 STAT gnm: 29.5 flips/s, max dt 66.9 ms (window 2.0s)
+ 171.97 FRAMES 90: unmatched blocks avg 10 max 19, scene-cut frames 0, fade frames 0 | foreground: in 23 frames, avg 0.5 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 171.97 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 3.60 = 4.59 ms (+ fence wait 0.00) | game span avg 29.1 max 61.1 ms
+ 171.97 PASSES split ms: warp8 1.37 rcas8+osd 0.01 pcopy8 2.22 (frames 90) | rcas8 0.00 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 173.17 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 174.97 FRAMES 90: unmatched blocks avg 10 max 22, scene-cut frames 0, fade frames 0 | foreground: in 32 frames, avg 0.8 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 174.97 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 3.63 = 4.61 ms (+ fence wait 0.00) | game span avg 28.8 max 29.0 ms
+ 174.97 PASSES split ms: warp8 1.38 rcas8+osd 0.01 pcopy8 2.23 (frames 90) | rcas8 0.00 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 175.17 STAT gnm: 30.0 flips/s, max dt 34.6 ms (window 2.0s)
+ 177.18 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 177.98 FRAMES 90: unmatched blocks avg 4 max 12, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 177.98 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 3.54 = 4.53 ms (+ fence wait 0.00) | game span avg 28.8 max 29.7 ms
+ 177.98 PASSES split ms: warp8 1.33 rcas8+osd 0.01 pcopy8 2.19 (frames 90) | rcas8 0.00 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 179.18 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 180.98 FRAMES 90: unmatched blocks avg 8 max 23, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 180.98 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 3.56 = 4.55 ms (+ fence wait 0.00) | game span avg 28.8 max 29.1 ms
+ 180.98 PASSES split ms: warp8 1.34 rcas8+osd 0.01 pcopy8 2.21 (frames 90) | rcas8 0.00 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 181.18 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 183.18 STAT gnm: 30.0 flips/s, max dt 34.6 ms (window 2.0s)
+ 183.98 FRAMES 90: unmatched blocks avg 23 max 149, scene-cut frames 0, fade frames 0 | foreground: in 57 frames, avg 5.2 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 183.98 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 3.68 = 4.67 ms (+ fence wait 0.00) | game span avg 28.7 max 29.0 ms
+ 183.98 PASSES split ms: warp8 1.45 rcas8+osd 0.01 pcopy8 2.21 (frames 90) | rcas8 0.00 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 185.18 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 186.98 FRAMES 90: unmatched blocks avg 7 max 14, scene-cut frames 0, fade frames 0 | foreground: in 32 frames, avg 0.6 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 186.98 GPU time of our passes: pyramid 0.16 + motion 0.82 + warp/post 3.62 = 4.60 ms (+ fence wait 0.00) | game span avg 28.8 max 29.0 ms
+ 186.98 PASSES split ms: warp8 1.36 rcas8+osd 0.01 pcopy8 2.24 (frames 90) | rcas8 0.00 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 187.19 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 188.88 config (hot-reload): framegen=1 mode=8 preset=2 sharpness=70 enhance=2 hud_protect=1 game_vectors=0 fps_lock=30 overlay=1 opacity=80% below30=0 shallow_queue=1
+ 189.19 STAT gnm: 30.0 flips/s, max dt 34.6 ms (window 2.0s)
+ 189.19 post budget: level 2 -> 0 (Sharpness 70, Enhance AA strong as set): frames not generated, menu, FG Fast or below 30
+ 189.99 FRAMES 90: unmatched blocks avg 1 max 4, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 189.99 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 4.18 = 5.17 ms (+ fence wait 0.00) | game span avg 28.2 max 29.3 ms
+ 189.99 PASSES split ms: warp8 1.32 rcas8+osd 1.17 pcopy8 1.68 (frames 90) | rcas8 1.17 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 191.19 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 192.99 FRAMES 90: unmatched blocks avg 3 max 31, scene-cut frames 0, fade frames 0 | foreground: in 9 frames, avg 0.3 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 192.99 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 6.12 = 7.10 ms (+ fence wait 0.00) | game span avg 26.3 max 26.6 ms
+ 192.99 PASSES split ms: warp8 1.33 rcas8+osd 4.78 pcopy8 0.00 (frames 90) | rcas8 4.77 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 193.19 STAT gnm: 30.0 flips/s, max dt 34.5 ms (window 2.0s)
+ 195.19 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 195.99 FRAMES 90: unmatched blocks avg 11 max 28, scene-cut frames 0, fade frames 0 | foreground: in 46 frames, avg 0.9 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 195.99 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 6.18 = 7.16 ms (+ fence wait 0.00) | game span avg 26.2 max 26.7 ms
+ 195.99 PASSES split ms: warp8 1.37 rcas8+osd 4.79 pcopy8 0.00 (frames 90) | rcas8 4.79 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 197.19 STAT gnm: 30.0 flips/s, max dt 34.8 ms (window 2.0s)
+ 199.00 FRAMES 90: unmatched blocks avg 5 max 20, scene-cut frames 0, fade frames 0 | foreground: in 9 frames, avg 0.1 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 199.00 GPU time of our passes: pyramid 0.16 + motion 0.82 + warp/post 6.18 = 7.16 ms (+ fence wait 0.00) | game span avg 26.2 max 26.4 ms
+ 199.00 PASSES split ms: warp8 1.34 rcas8+osd 4.83 pcopy8 0.00 (frames 90) | rcas8 4.82 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 199.20 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 201.20 STAT gnm: 30.0 flips/s, max dt 34.8 ms (window 2.0s)
+ 202.00 FRAMES 90: unmatched blocks avg 1 max 5, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 202.00 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 6.11 = 7.10 ms (+ fence wait 0.00) | game span avg 26.3 max 26.5 ms
+ 202.00 PASSES split ms: warp8 1.32 rcas8+osd 4.78 pcopy8 0.00 (frames 90) | rcas8 4.78 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 203.20 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 205.00 FRAMES 90: unmatched blocks avg 2 max 6, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 205.00 GPU time of our passes: pyramid 0.16 + motion 0.83 + warp/post 6.13 = 7.11 ms (+ fence wait 0.00) | game span avg 26.3 max 26.5 ms
+ 205.00 PASSES split ms: warp8 1.32 rcas8+osd 4.80 pcopy8 0.00 (frames 90) | rcas8 4.79 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 205.20 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 207.21 STAT gnm: 30.0 flips/s, max dt 34.9 ms (window 2.0s)
+ 208.00 FRAMES 90: unmatched blocks avg 7 max 21, scene-cut frames 0, fade frames 0 | foreground: in 5 frames, avg 0.1 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 208.00 GPU time of our passes: pyramid 0.16 + motion 0.82 + warp/post 6.19 = 7.17 ms (+ fence wait 0.00) | game span avg 26.2 max 26.6 ms
+ 208.00 PASSES split ms: warp8 1.34 rcas8+osd 4.84 pcopy8 0.00 (frames 90) | rcas8 4.83 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 209.21 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 211.02 FRAMES 90: unmatched blocks avg 50 max 222, scene-cut frames 0, fade frames 0 | foreground: in 48 frames, avg 261.3 L2 blocks | camera 45,0 L2 px | log lines dropped 4
+ 211.02 GPU time of our passes: pyramid 0.16 + motion 0.84 + warp/post 6.67 = 7.67 ms (+ fence wait 0.00) | game span avg 25.9 max 40.0 ms
+ 211.02 PASSES split ms: warp8 1.99 rcas8+osd 4.67 pcopy8 0.00 (frames 90) | rcas8 4.66 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 211.23 STAT gnm: 29.7 flips/s, max dt 48.0 ms (window 2.0s)
+ 213.23 STAT gnm: 30.0 flips/s, max dt 35.2 ms (window 2.0s)
+ 214.03 FRAMES 90: unmatched blocks avg 85 max 261, scene-cut frames 0, fade frames 0 | foreground: in 88 frames, avg 479.4 L2 blocks | camera -22,0 L2 px | log lines dropped 4
+ 214.03 GPU time of our passes: pyramid 0.17 + motion 0.86 + warp/post 7.26 = 8.29 ms (+ fence wait 0.00) | game span avg 25.1 max 26.0 ms
+ 214.03 PASSES split ms: warp8 2.69 rcas8+osd 4.56 pcopy8 0.00 (frames 90) | rcas8 4.55 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 215.24 STAT gnm: 30.0 flips/s, max dt 35.3 ms (window 2.0s)
+ 217.03 FRAMES 90: unmatched blocks avg 97 max 317, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 479.6 L2 blocks | camera -44,0 L2 px | log lines dropped 4
+ 217.03 GPU time of our passes: pyramid 0.16 + motion 0.86 + warp/post 7.21 = 8.24 ms (+ fence wait 0.00) | game span avg 25.1 max 26.5 ms
+ 217.03 PASSES split ms: warp8 2.68 rcas8+osd 4.52 pcopy8 0.00 (frames 90) | rcas8 4.52 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 217.24 STAT gnm: 30.0 flips/s, max dt 35.3 ms (window 2.0s)
+ 219.24 STAT gnm: 30.0 flips/s, max dt 34.9 ms (window 2.0s)
+ 220.04 FRAMES 90: unmatched blocks avg 81 max 279, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 488.1 L2 blocks | camera 15,0 L2 px | log lines dropped 4
+ 220.04 GPU time of our passes: pyramid 0.16 + motion 0.86 + warp/post 7.27 = 8.29 ms (+ fence wait 0.00) | game span avg 25.1 max 26.8 ms
+ 220.04 PASSES split ms: warp8 2.70 rcas8+osd 4.56 pcopy8 0.00 (frames 90) | rcas8 4.55 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 221.24 STAT gnm: 30.0 flips/s, max dt 35.2 ms (window 2.0s)
+ 223.04 FRAMES 90: unmatched blocks avg 75 max 262, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 515.5 L2 blocks | camera -36,0 L2 px | log lines dropped 4
+ 223.04 GPU time of our passes: pyramid 0.16 + motion 0.86 + warp/post 7.28 = 8.31 ms (+ fence wait 0.00) | game span avg 25.1 max 26.0 ms
+ 223.04 PASSES split ms: warp8 2.69 rcas8+osd 4.58 pcopy8 0.00 (frames 90) | rcas8 4.58 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 223.24 STAT gnm: 30.0 flips/s, max dt 35.0 ms (window 2.0s)
+ 225.24 STAT gnm: 30.0 flips/s, max dt 35.2 ms (window 2.0s)
+ 226.04 FRAMES 90: unmatched blocks avg 100 max 307, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 440.9 L2 blocks | camera -26,-1 L2 px | log lines dropped 4
+ 226.04 GPU time of our passes: pyramid 0.16 + motion 0.86 + warp/post 7.27 = 8.29 ms (+ fence wait 0.00) | game span avg 25.1 max 26.6 ms
+ 226.04 PASSES split ms: warp8 2.72 rcas8+osd 4.54 pcopy8 0.00 (frames 90) | rcas8 4.53 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 227.24 STAT gnm: 30.0 flips/s, max dt 35.0 ms (window 2.0s)
+ 229.05 FRAMES 90: unmatched blocks avg 79 max 311, scene-cut frames 0, fade frames 0 | foreground: in 89 frames, avg 492.8 L2 blocks | camera 24,0 L2 px | log lines dropped 4
+ 229.05 GPU time of our passes: pyramid 0.17 + motion 0.86 + warp/post 7.25 = 8.27 ms (+ fence wait 0.00) | game span avg 25.1 max 26.4 ms
+ 229.05 PASSES split ms: warp8 2.64 rcas8+osd 4.60 pcopy8 0.00 (frames 90) | rcas8 4.59 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 229.24 STAT gnm: 30.0 flips/s, max dt 34.9 ms (window 2.0s)
+ 231.25 STAT gnm: 30.0 flips/s, max dt 34.9 ms (window 2.0s)
+ 232.05 FRAMES 90: unmatched blocks avg 88 max 278, scene-cut frames 0, fade frames 0 | foreground: in 89 frames, avg 483.3 L2 blocks | camera -44,0 L2 px | log lines dropped 4
+ 232.05 GPU time of our passes: pyramid 0.16 + motion 0.86 + warp/post 7.25 = 8.28 ms (+ fence wait 0.00) | game span avg 25.1 max 26.1 ms
+ 232.05 PASSES split ms: warp8 2.67 rcas8+osd 4.57 pcopy8 0.00 (frames 90) | rcas8 4.57 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 233.25 STAT gnm: 30.0 flips/s, max dt 35.1 ms (window 2.0s)
+ 235.05 GPU time of our passes: pyramid 0.16 + motion 0.86 + warp/post 7.35 = 8.38 ms (+ fence wait 0.00) | game span avg 25.0 max 26.6 ms
+ 242.83 FRAMES 90: unmatched blocks avg 12 max 21, scene-cut frames 0, fade frames 0 | foreground: in 27 frames, avg 0.6 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 242.83 FRAMES 90: unmatched blocks avg 16 max 50, scene-cut frames 0, fade frames 0 | foreground: in 46 frames, avg 1.2 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 242.83 FRAMES 90: unmatched blocks avg 81 max 254, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 449.3 L2 blocks | camera 0,0 L2 px | log lines dropped 4
+ 242.83 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.22 = 7.22 ms (+ fence wait 0.00) | game span avg 26.2 max 26.4 ms
+ 242.83 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.23 = 7.24 ms (+ fence wait 0.00) | game span avg 26.1 max 26.4 ms
+ 242.83 PASSES split ms: warp8 1.41 rcas8+osd 4.80 pcopy8 0.00 (frames 90) | rcas8 4.79 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 242.83 PASSES split ms: warp8 1.42 rcas8+osd 4.80 pcopy8 0.00 (frames 90) | rcas8 4.79 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 242.83 PASSES split ms: warp8 2.72 rcas8+osd 4.62 pcopy8 0.00 (frames 90) | rcas8 4.61 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 242.83 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 242.83 STAT gnm: 30.0 flips/s, max dt 35.1 ms (window 2.0s)
+ 243.26 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 244.06 FRAMES 90: unmatched blocks avg 17 max 140, scene-cut frames 0, fade frames 0 | foreground: in 10 frames, avg 3.3 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 244.06 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.23 = 7.23 ms (+ fence wait 0.00) | game span avg 26.1 max 26.4 ms
+ 244.06 PASSES split ms: warp8 1.45 rcas8+osd 4.77 pcopy8 0.00 (frames 90) | rcas8 4.76 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 245.26 STAT gnm: 29.9 flips/s, max dt 34.8 ms (window 2.0s)
+ 247.06 FRAMES 90: unmatched blocks avg 2 max 10, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 247.06 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.16 = 7.17 ms (+ fence wait 0.00) | game span avg 26.2 max 26.5 ms
+ 247.06 PASSES split ms: warp8 1.37 rcas8+osd 4.78 pcopy8 0.00 (frames 90) | rcas8 4.78 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 247.27 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 249.27 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 250.07 FRAMES 90: unmatched blocks avg 17 max 38, scene-cut frames 0, fade frames 0 | foreground: in 49 frames, avg 1.7 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 250.07 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.24 = 7.25 ms (+ fence wait 0.00) | game span avg 26.1 max 26.4 ms
+ 250.07 PASSES split ms: warp8 1.43 rcas8+osd 4.81 pcopy8 0.00 (frames 90) | rcas8 4.80 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 251.26 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 253.07 FRAMES 90: unmatched blocks avg 10 max 20, scene-cut frames 0, fade frames 0 | foreground: in 45 frames, avg 1.1 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 253.07 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.22 = 7.22 ms (+ fence wait 0.00) | game span avg 26.1 max 26.5 ms
+ 253.07 PASSES split ms: warp8 1.42 rcas8+osd 4.79 pcopy8 0.00 (frames 90) | rcas8 4.79 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 253.27 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 255.27 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 256.07 FRAMES 90: unmatched blocks avg 2 max 8, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 256.07 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.16 = 7.16 ms (+ fence wait 0.00) | game span avg 26.2 max 26.7 ms
+ 256.07 PASSES split ms: warp8 1.37 rcas8+osd 4.78 pcopy8 0.00 (frames 90) | rcas8 4.77 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 257.27 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 259.08 FRAMES 90: unmatched blocks avg 8 max 19, scene-cut frames 0, fade frames 0 | foreground: in 20 frames, avg 0.4 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 259.08 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.20 = 7.20 ms (+ fence wait 0.00) | game span avg 26.2 max 26.8 ms
+ 259.08 PASSES split ms: warp8 1.39 rcas8+osd 4.80 pcopy8 0.00 (frames 90) | rcas8 4.80 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 259.27 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 261.27 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 262.08 FRAMES 90: unmatched blocks avg 14 max 35, scene-cut frames 0, fade frames 0 | foreground: in 44 frames, avg 1.0 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 262.08 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.25 = 7.25 ms (+ fence wait 0.00) | game span avg 26.1 max 26.4 ms
+ 262.08 PASSES split ms: warp8 1.42 rcas8+osd 4.82 pcopy8 0.00 (frames 90) | rcas8 4.81 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 263.28 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 265.08 FRAMES 90: unmatched blocks avg 5 max 13, scene-cut frames 0, fade frames 0 | foreground: in 1 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 265.08 GPU time of our passes: pyramid 0.16 + motion 0.84 + warp/post 6.20 = 7.20 ms (+ fence wait 0.00) | game span avg 26.2 max 26.4 ms
+ 265.08 PASSES split ms: warp8 1.37 rcas8+osd 4.82 pcopy8 0.00 (frames 90) | rcas8 4.81 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 265.28 STAT gnm: 30.0 flips/s, max dt 34.6 ms (window 2.0s)
+ 267.28 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 268.08 FRAMES 90: unmatched blocks avg 4 max 26, scene-cut frames 0, fade frames 0 | foreground: in 1 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 268.08 GPU time of our passes: pyramid 0.16 + motion 0.84 + warp/post 6.16 = 7.17 ms (+ fence wait 0.00) | game span avg 26.2 max 26.6 ms
+ 268.08 PASSES split ms: warp8 1.37 rcas8+osd 4.78 pcopy8 0.00 (frames 90) | rcas8 4.78 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 269.29 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 271.08 FRAMES 90: unmatched blocks avg 4 max 47, scene-cut frames 0, fade frames 0 | foreground: in 2 frames, avg 0.1 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 271.08 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.18 = 7.18 ms (+ fence wait 0.00) | game span avg 26.2 max 26.4 ms
+ 271.08 PASSES split ms: warp8 1.37 rcas8+osd 4.79 pcopy8 0.00 (frames 90) | rcas8 4.79 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 271.28 STAT gnm: 29.9 flips/s, max dt 34.8 ms (window 2.0s)
+ 273.29 STAT gnm: 30.0 flips/s, max dt 34.8 ms (window 2.0s)
+ 274.09 FRAMES 90: unmatched blocks avg 15 max 136, scene-cut frames 0, fade frames 0 | foreground: in 10 frames, avg 3.1 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 274.09 GPU time of our passes: pyramid 0.16 + motion 0.84 + warp/post 6.26 = 7.27 ms (+ fence wait 0.00) | game span avg 26.1 max 26.4 ms
+ 274.09 PASSES split ms: warp8 1.46 rcas8+osd 4.80 pcopy8 0.00 (frames 90) | rcas8 4.79 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 275.29 STAT gnm: 30.0 flips/s, max dt 34.8 ms (window 2.0s)
+ 277.09 FRAMES 90: unmatched blocks avg 1 max 3, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 277.09 GPU time of our passes: pyramid 0.16 + motion 0.84 + warp/post 6.17 = 7.18 ms (+ fence wait 0.00) | game span avg 26.2 max 26.5 ms
+ 277.09 PASSES split ms: warp8 1.37 rcas8+osd 4.80 pcopy8 0.00 (frames 90) | rcas8 4.79 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 277.29 STAT gnm: 30.0 flips/s, max dt 34.8 ms (window 2.0s)
+ 279.30 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 280.09 FRAMES 90: unmatched blocks avg 1 max 9, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 280.09 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.16 = 7.17 ms (+ fence wait 0.00) | game span avg 26.2 max 26.5 ms
+ 280.09 PASSES split ms: warp8 1.37 rcas8+osd 4.79 pcopy8 0.00 (frames 90) | rcas8 4.78 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 281.29 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 283.10 FRAMES 90: unmatched blocks avg 9 max 21, scene-cut frames 0, fade frames 0 | foreground: in 25 frames, avg 0.4 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 283.10 GPU time of our passes: pyramid 0.16 + motion 0.84 + warp/post 6.20 = 7.21 ms (+ fence wait 0.00) | game span avg 26.2 max 27.0 ms
+ 283.10 PASSES split ms: warp8 1.41 rcas8+osd 4.79 pcopy8 0.00 (frames 90) | rcas8 4.78 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 283.30 STAT gnm: 30.0 flips/s, max dt 34.8 ms (window 2.0s)
+ 285.30 STAT gnm: 30.0 flips/s, max dt 34.8 ms (window 2.0s)
+ 286.10 FRAMES 90: unmatched blocks avg 10 max 28, scene-cut frames 0, fade frames 0 | foreground: in 5 frames, avg 0.1 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 286.10 GPU time of our passes: pyramid 0.16 + motion 0.84 + warp/post 6.20 = 7.21 ms (+ fence wait 0.00) | game span avg 26.2 max 26.4 ms
+ 286.10 PASSES split ms: warp8 1.39 rcas8+osd 4.80 pcopy8 0.00 (frames 90) | rcas8 4.80 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 287.30 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 289.10 FRAMES 90: unmatched blocks avg 6 max 11, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 289.10 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.19 = 7.19 ms (+ fence wait 0.00) | game span avg 26.2 max 26.5 ms
+ 289.10 PASSES split ms: warp8 1.37 rcas8+osd 4.81 pcopy8 0.00 (frames 90) | rcas8 4.80 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 289.30 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 291.30 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 292.11 FRAMES 90: unmatched blocks avg 13 max 28, scene-cut frames 0, fade frames 0 | foreground: in 27 frames, avg 1.0 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 292.11 GPU time of our passes: pyramid 0.16 + motion 0.84 + warp/post 6.22 = 7.23 ms (+ fence wait 0.00) | game span avg 26.1 max 26.4 ms
+ 292.11 PASSES split ms: warp8 1.40 rcas8+osd 4.81 pcopy8 0.00 (frames 90) | rcas8 4.81 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 293.31 STAT gnm: 30.0 flips/s, max dt 34.8 ms (window 2.0s)
+ 295.11 FRAMES 90: unmatched blocks avg 11 max 24, scene-cut frames 0, fade frames 0 | foreground: in 58 frames, avg 1.4 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 295.11 GPU time of our passes: pyramid 0.16 + motion 0.84 + warp/post 6.22 = 7.22 ms (+ fence wait 0.00) | game span avg 26.1 max 26.6 ms
+ 295.11 PASSES split ms: warp8 1.42 rcas8+osd 4.79 pcopy8 0.00 (frames 90) | rcas8 4.78 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 295.31 STAT gnm: 30.0 flips/s, max dt 34.8 ms (window 2.0s)
+ 297.31 STAT gnm: 30.0 flips/s, max dt 34.7 ms (window 2.0s)
+ 298.11 FRAMES 90: unmatched blocks avg 5 max 18, scene-cut frames 0, fade frames 0 | foreground: in 5 frames, avg 0.1 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 298.11 GPU time of our passes: pyramid 0.17 + motion 0.84 + warp/post 6.18 = 7.18 ms (+ fence wait 0.00) | game span avg 26.2 max 26.5 ms
+ 298.11 PASSES split ms: warp8 1.38 rcas8+osd 4.79 pcopy8 0.00 (frames 90) | rcas8 4.79 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 299.32 STAT gnm: 30.0 flips/s, max dt 34.6 ms (window 2.0s)
+ 301.11 FRAMES 90: unmatched blocks avg 6 max 31, scene-cut frames 0, fade frames 0 | foreground: in 15 frames, avg 0.4 L2 blocks | camera 0,0 L2 px | log lines dropped 10
+ 301.11 GPU time of our passes: pyramid 0.16 + motion 0.84 + warp/post 6.21 = 7.21 ms (+ fence wait 0.00) | game span avg 26.2 max 26.4 ms
+ 301.11 PASSES split ms: warp8 1.40 rcas8+osd 4.80 pcopy8 0.00 (frames 90) | rcas8 4.80 rest 0.01 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+ 301.31 STAT gnm: 30.0 flips/s, max dt 35.0 ms (window 2.0s)

@@ -1,0 +1,410 @@
+VCFG trace
+version: 2.35
+engine: classic
+title: CUSA02299
+firmware: 13.508.001
+log lines: 6019
+seconds since start: 1232
+---- first lines ----
+   0.00 RegisterBuffers handle=1309737216 start=0 num=2
+   0.00   attr: fmt=0x88000000 (supported=1) tiling=0 aspect=0 1920x1080 pitch=1920 option=0
+   0.00   buf[0]=1084220000
+   0.00   buf[1]=1084a18000
+   0.00 SetFlipRate handle=1309737216 rate=0
+   3.08 WAIT_API status caller=179fa5c arg=-1 buf=-1 pending=0 count=0
+   3.10 WAIT_API status caller=179fa5c arg=-1 buf=-1 pending=0 count=0
+   3.10 first SubmitAndFlip: count=1 flipMode=1 title=CUSA02299
+   3.10 CLASSIC_BUILD version=2.35 test=0 target=0 two_buffer=1 status_hook=1
+   3.10 gnm #1 t=0.000s dt=0.00ms idx=0 mode=1
+   3.11 WAIT_API status caller=179fa5c arg=0 buf=0 pending=0 count=1
+   3.11 gnm #2 t=0.013s dt=13.01ms idx=1 mode=1
+   3.13 gnm #3 t=0.029s dt=16.09ms idx=0 mode=1
+   3.14 gnm #4 t=0.046s dt=16.42ms idx=1 mode=1
+   3.16 gnm #5 t=0.062s dt=16.69ms idx=0 mode=1
+   3.18 gnm #6 t=0.079s dt=16.68ms idx=1 mode=1
+   3.19 gnm #7 t=0.096s dt=16.66ms idx=0 mode=1
+   3.21 gnm #8 t=0.112s dt=16.71ms idx=1 mode=1
+   3.23 gnm #9 t=0.129s dt=16.75ms idx=0 mode=1
+   3.24 gnm #10 t=0.146s dt=16.59ms idx=1 mode=1
+   3.26 gnm #11 t=0.162s dt=16.72ms idx=0 mode=1
+   3.28 gnm #12 t=0.179s dt=16.63ms idx=1 mode=1
+   3.29 gnm #13 t=0.196s dt=16.69ms idx=0 mode=1
+   3.31 gnm #14 t=0.212s dt=16.76ms idx=1 mode=1
+   3.33 gnm #15 t=0.229s dt=16.60ms idx=0 mode=1
+   3.34 gnm #16 t=0.246s dt=16.69ms idx=1 mode=1
+   3.36 gnm #17 t=0.262s dt=16.73ms idx=0 mode=1
+   3.38 gnm #18 t=0.279s dt=16.71ms idx=1 mode=1
+   3.39 gnm #19 t=0.296s dt=16.61ms idx=0 mode=1
+   3.41 gnm #20 t=0.312s dt=16.67ms idx=1 mode=1
+   3.43 gnm #21 t=0.329s dt=16.82ms idx=0 mode=1
+   3.44 gnm #22 t=0.346s dt=16.56ms idx=1 mode=1
+   3.46 gnm #23 t=0.363s dt=16.70ms idx=0 mode=1
+   3.48 gnm #24 t=0.379s dt=16.75ms idx=1 mode=1
+   3.49 gnm #25 t=0.396s dt=16.72ms idx=0 mode=1
+   3.51 gnm #26 t=0.413s dt=16.57ms idx=1 mode=1
+   3.53 gnm #27 t=0.429s dt=16.72ms idx=0 mode=1
+   3.54 gnm #28 t=0.446s dt=16.66ms idx=1 mode=1
+   3.56 gnm #29 t=0.463s dt=16.68ms idx=0 mode=1
+   3.58 gnm #30 t=0.479s dt=16.70ms idx=1 mode=1
+   4.11 auto-detect: game runs at 59.9 fps (48..75 fps) -> FrameGen auto-disabled (60 Hz output limit)
+   5.08 config (init): framegen=1 mode=8 preset=0 sharpness=0 enhance=0 hud_protect=1 game_vectors=0 fps_lock=30 overlay=0 opacity=80% below30=0 shallow_queue=0
+   5.08 options effective: framegen=on(inert: 60fps native (fg off)) preset=quality below30=off shallow_queue=off sharpness=0 enhance=off gen_buffers=0 game_vectors=off hud_protect=1(inert: fg inert
+   5.30 onegroup: one group, slot 0, indices 0..2 (ours from 2)
+   5.30 safe mode: activated at frame 120 (base=2, extra=1, SetFlipRate(0)=0x00000000)
+   5.30 injection mode 8 (gnm_flip, title CUSA02299, known=1, fg_off=0, preset=0, sharpness=0%, enhance=0, overlay=0, inert=''), work memory garlic
+   5.30 console: neo=0 (T# alt_tile_mode t[6]=0x00000000), output 1920x1080 pitch 1920 tiling 0, tile index 10, overlay bitmaps 10
+   5.30 tile index: override -1, sweep -1 (sweep default off; L3 + D-pad Left/Right changes the index in game)
+   5.30 cpu cuts: monev=0 iolazy=0 nospin=0 tracelite=0 quietlog=0 (files /data/bb_probe/<cut>_CUSA02299)
+   5.30 fast pace: 0 (FG Fast: queue cut 2.25 refreshes, phases 1/3 2/3 1/2; file /data/bb_probe/fastpace_CUSA02299)
+   5.38 io thread started: 0x00000000
+   5.38 pad poll thread started: 0x00000000
+   5.38 cadence monitor thread: 0x00000000
+   5.38 hud file: /data/bb_probe/hud_CUSA02299 (none)
+   5.38 gpu_init: mode 8 + rcas8/osd8 shaders ok, end 0x16900
+   5.38 gpu_init: velocity shaders ok, end 0x1b300 (limit 0x1c000)
+   5.38 gpu_init: ok at 881a60000 (early), work 881a80000
+   5.38 STAT gnm: 54.6 flips/s, max dt 233.4 ms (window 2.2s)
+   5.38 pacing: timer (auto for pcopy/CUSA02299)
+   5.39 scene-change threshold: 5600 blocks (default)
+   5.39 fence (mode 8): 0x00000000
+   5.39 submit args #121: count=1 ccb=7eedefeb0 ccbSz=7eedefeac handle=1309737216 index=0 flipMode=1 flipArg=0
+   5.39   [0] dcb=118000ccec sz=356  ccb=0 sz=0
+   5.41 mode4 #121: gnm flip(mid idx 2)=0x00000000, gnm flip(cur idx 0)=0x00000000
+   5.41 submit args #122: count=1 ccb=7eedefeb0 ccbSz=7eedefeac handle=1309737216 index=1 flipMode=1 flipArg=0
+   5.41   [0] dcb=118040d26c sz=356  ccb=0 sz=0
+   5.41 mode4 #122: gnm flip(mid idx 2)=0x00000000, gnm flip(cur idx 1)=0x00000000
+   5.41 mode4 #123: gnm flip(mid idx 2)=0x00000000, gnm flip(cur idx 0)=0x00000000
+   5.42 mode4 #124: gnm flip(mid idx 2)=0x00000000, gnm flip(cur idx 1)=0x00000000
+   5.45 mode4 #125: gnm flip(mid idx 2)=0x00000000, gnm flip(cur idx 0)=0x00000000
+   5.48 mode4 #126: gnm flip(mid idx 2)=0x00000000, gnm flip(cur idx 1)=0x00000000
+   5.51 mode4 #127: gnm flip(mid idx 2)=0x00000000, gnm flip(cur idx 0)=0x00000000
+   5.55 mode4 #128: gnm flip(mid idx 2)=0x00000000, gnm flip(cur idx 1)=0x00000000
+   5.58 mode4 #129: gnm flip(mid idx 2)=0x00000000, gnm flip(cur idx 0)=0x00000000
+   5.61 mode4 #130: gnm flip(mid idx 2)=0x00000000, gnm flip(cur idx 1)=0x00000000
+   5.65 mode4 #131: gnm flip(mid idx 2)=0x00000000, gnm flip(cur idx 0)=0x00000000
+   5.81 rate change: 60 -> 30 fps class at flip 136 (30.0 fps, detected_60=1)
+   6.31 GV start: title CUSA02299 version 01.19, profile /data/bb_probe/profiles/CUSA02299.ini
+   6.31 auto-detect: game dropped to 30.0 fps (30 fps class) -> FrameGen auto-enabled
+   7.28 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.2 | pending 2 pll 0
+   7.29 options effective: framegen=on(active) preset=quality below30=off shallow_queue=off sharpness=0 enhance=off gen_buffers=1 game_vectors=off hud_protect=1(active: no hud file) fps_lock=30 pres
+   7.29 pad poll: user 426155271 handle 62260992
+   7.31 STAT gnm: 30.0 flips/s, max dt 40.2 ms (window 2.0s)
+   7.38 LATENCY real frame hand-over -> on screen: avg 32.9 max 33.1 ms (61 frames) | FG on preset 0 | pending max 2
+   7.38 CADENCE (vblanks on screen) mid 1:6 2:0 3:0 4+:0 | real 1:6 2:54 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 54 (gaps 54) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+   7.38 WAIT_EXIT pending 183/0/0/0/0/0/0/0 gcq 183/0/0/0/0/0/0/0 | given pending 183/0/0/0/0/0/0/0 gcq 183/0/0/0/0/0/0/0 | virt 63 polls 184
+   8.38 GPU time of our passes: pyramid 0.18 + motion 0.79 + warp/post 3.13 = 4.10 ms (+ fence wait 0.00) | game span avg 29.3 max 37.6 ms
+   8.38 PASSES ms: pyr8 0.18 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.27 mf8 0.19 fence 0.00 phase8 0.01 warp8+rcas+osd 3.12
+   8.38 PASS RAW last frame: ts 135313283094 135313301054 135313380478 135313380550 135313691402 | t2 135313311738 135313317430 135313334362 135313360938 135313381398 135313503934 135313691398
+   8.38 PASSES split ms: warp8 1.23 rcas8+osd 0.00 pcopy8 1.89 (frames 90) | rcas8 0.00 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+   8.38 FRAMES 90: unmatched blocks avg 2 max 116, scene-cut frames 0, fade frames 18 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+   8.58 config (hot-reload): framegen=1 mode=8 preset=0 sharpness=0 enhance=0 hud_protect=1 game_vectors=0 fps_lock=30 overlay=0 opacity=80% below30=0 shallow_queue=0
+   8.58 options effective: framegen=on(active) preset=quality below30=off shallow_queue=off sharpness=0 enhance=off gen_buffers=1 game_vectors=off hud_protect=1(active: no hud file) fps_lock=30 pres
+   9.28 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.2 | pending 2 pll 0
+   9.32 STAT gnm: 30.0 flips/s, max dt 33.7 ms (window 2.0s)
+   9.42 LATENCY real frame hand-over -> on screen: avg 33.0 max 33.1 ms (59 frames) | FG on preset 0 | pending max 2
+   9.42 CADENCE (vblanks on screen) mid 1:9 2:0 3:0 4+:0 | real 1:9 2:50 3:0 4+:1 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 53 (gaps 51) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+   9.42 WAIT_EXIT pending 61/0/0/0/0/0/0/0 gcq 61/0/0/0/0/0/0/0 | given pending 61/0/0/0/0/0/0/0 gcq 61/0/0/0/0/0/0/0 | virt 61 polls 61
+  11.29 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.1 | pending 2 pll 0
+  11.32 STAT gnm: 30.0 flips/s, max dt 33.6 ms (window 2.0s)
+  11.39 GPU time of our passes: pyramid 0.17 + motion 0.78 + warp/post 3.13 = 4.08 ms (+ fence wait 0.00) | game span avg 29.3 max 29.8 ms
+  11.39 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.15 me1 0.27 mf8 0.19 fence 0.00 phase8 0.01 warp8+rcas+osd 3.12
+  11.39 PASS RAW last frame: ts 135612851194 135612869530 135612944622 135612944730 135613271938 | t2 135612880330 135612885826 135612898166 135612925198 135612945614 135613070098 135613271934
+  11.39 PASSES split ms: warp8 1.23 rcas8+osd 0.00 pcopy8 1.89 (frames 90) | rcas8 0.00 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  11.39 FRAMES 90: unmatched blocks avg 52 max 1190, scene-cut frames 0, fade frames 32 | foreground: in 1 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+  11.42 LATENCY real frame hand-over -> on screen: avg 33.0 max 33.1 ms (60 frames) | FG on preset 0 | pending max 2
+  11.42 CADENCE (vblanks on screen) mid 1:8 2:0 3:0 4+:0 | real 1:8 2:52 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 52 (gaps 52) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+  11.42 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+  13.34 STAT gnm: 29.2 flips/s, max dt 58.8 ms (window 2.0s)
+  13.34 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.9 total 1.1 | game own 33.0 | pending 2 pll 0
+  13.44 LATENCY real frame hand-over -> on screen: avg 32.8 max 36.3 ms (56 frames) | FG on preset 0 | pending max 2
+  13.44 CADENCE (vblanks on screen) mid 1:7 2:0 3:1 4+:0 | real 1:7 2:47 3:2 4+:1 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 53 (gaps 50) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+  13.44 WAIT_EXIT pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | given pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | virt 60 polls 60
+  14.46 GPU time of our passes: pyramid 0.17 + motion 0.79 + warp/post 3.20 = 4.16 ms (+ fence wait 0.00) | game span avg 29.8 max 54.6 ms
+  14.46 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.27 mf8 0.20 fence 0.00 phase8 0.01 warp8+rcas+osd 3.19
+  14.47 PASS RAW last frame: ts 135917531980 135917550360 135917629096 135917629160 135917941180 | t2 135917560936 135917566516 135917582788 135917609636 135917630036 135917747912 135917941172
+  14.47 PASSES split ms: warp8 1.33 rcas8+osd 0.00 pcopy8 1.86 (frames 90) | rcas8 0.00 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  14.47 FRAMES 90: unmatched blocks avg 58 max 1224, scene-cut frames 0, fade frames 8 | foreground: in 68 frames, avg 48.8 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+  15.34 STAT gnm: 30.0 flips/s, max dt 33.8 ms (window 2.0s)
+  15.34 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.2 | pending 1 pll 0
+  15.44 LATENCY real frame hand-over -> on screen: avg 32.7 max 32.8 ms (59 frames) | FG on preset 0 | pending max 2
+  15.44 CADENCE (vblanks on screen) mid 1:12 2:0 3:0 4+:0 | real 1:11 2:47 3:1 4+:0 | refresh 59.939 Hz | pending max 2 gcq max 2 | missed 49 (gaps 48) | pace timeouts 0 resync 0 fix 0 | game cpu re
+  15.44 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+  17.34 STAT gnm: 29.5 flips/s, max dt 47.7 ms (window 2.0s)
+  17.38 HOOK ms per FG frame: build 0.1 submit 0.1 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.3 | pending 2 pll 0
+  17.45 LATENCY real frame hand-over -> on screen: avg 32.3 max 38.1 ms (59 frames) | FG on preset 0 | pending max 2
+  17.45 CADENCE (vblanks on screen) mid 1:11 2:0 3:0 4+:0 | real 1:11 2:46 3:2 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 48 (gaps 48) | pace timeouts 0 resync 0 fix 0 | game cpu re
+  17.45 WAIT_EXIT pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | given pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | virt 59 polls 59
+  17.48 GPU time of our passes: pyramid 0.17 + motion 0.78 + warp/post 3.60 = 4.55 ms (+ fence wait 0.00) | game span avg 29.2 max 42.1 ms
+  17.48 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.27 mf8 0.19 fence 0.00 phase8 0.01 warp8+rcas+osd 3.59
+  17.48 PASS RAW last frame: ts 136220438668 136220455976 136220536676 136220536736 136221002612 | t2 136220466520 136220472316 136220488448 136220516820 136220537600 136220819200 136221002608
+  17.48 PASSES split ms: warp8 1.76 rcas8+osd 0.00 pcopy8 1.83 (frames 90) | rcas8 0.00 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  17.48 FRAMES 90: unmatched blocks avg 276 max 4709, scene-cut frames 0, fade frames 21 | foreground: in 29 frames, avg 209.3 L2 blocks | camera 1,2 L2 px | log lines dropped 0
+  19.34 STAT gnm: 29.0 flips/s, max dt 88.1 ms (window 2.0s)
+  19.44 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.3 | pending 2 pll 0
+  19.45 LATENCY real frame hand-over -> on screen: avg 32.4 max 41.5 ms (58 frames) | FG on preset 0 | pending max 2
+  19.45 CADENCE (vblanks on screen) mid 1:9 2:0 3:0 4+:0 | real 1:9 2:47 3:1 4+:1 | refresh 59.937 Hz | pending max 2 gcq max 2 | missed 49 (gaps 49) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+  19.45 WAIT_EXIT pending 58/0/0/0/0/0/0/0 gcq 58/0/0/0/0/0/0/0 | given pending 58/0/0/0/0/0/0/0 gcq 58/0/0/0/0/0/0/0 | virt 60 polls 60
+  20.54 GPU time of our passes: pyramid 0.16 + motion 0.78 + warp/post 3.77 = 4.72 ms (+ fence wait 0.00) | game span avg 29.4 max 80.7 ms
+  20.55 PASSES ms: pyr8 0.16 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.27 mf8 0.19 fence 0.00 phase8 0.01 warp8+rcas+osd 3.76
+  20.55 PASS RAW last frame: ts 136526615332 136526630996 136526707800 136526707860 136527000956 | t2 136526641524 136526646804 136526662100 136526688776 136526708708 136526827632 136527000948
+  20.55 PASSES split ms: warp8 1.97 rcas8+osd 0.00 pcopy8 1.79 (frames 90) | rcas8 0.00 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  20.55 FRAMES 90: unmatched blocks avg 322 max 3536, scene-cut frames 0, fade frames 2 | foreground: in 45 frames, avg 63.3 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+  21.35 STAT gnm: 30.0 flips/s, max dt 33.6 ms (window 2.0s)
+  21.45 inject #600: count 1->2, our DCB 469 dw, out buf[1]=1084a18000
+  21.45 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.2 | pending 2 pll 0
+  21.45 LATENCY real frame hand-over -> on screen: avg 32.7 max 32.8 ms (60 frames) | FG on preset 0 | pending max 2
+  21.45 CADENCE (vblanks on screen) mid 1:12 2:0 3:0 4+:0 | real 1:12 2:48 3:0 4+:0 | refresh 59.943 Hz | pending max 2 gcq max 2 | missed 48 (gaps 48) | pace timeouts 0 resync 0 fix 0 | game cpu re
+  21.45 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+  23.36 STAT gnm: 29.7 flips/s, max dt 37.9 ms (window 2.0s)
+  23.46 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.6 | pending 2 pll 0
+  23.47 LATENCY real frame hand-over -> on screen: avg 32.5 max 37.4 ms (60 frames) | FG on preset 0 | pending max 2
+  23.47 CADENCE (vblanks on screen) mid 1:7 2:0 3:0 4+:0 | real 1:6 2:54 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 53 (gaps 53) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+  23.47 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+  23.56 GPU time of our passes: pyramid 0.16 + motion 0.76 + warp/post 2.98 = 3.90 ms (+ fence wait 0.00) | game span avg 29.7 max 34.6 ms
+  23.57 PASSES ms: pyr8 0.16 me3 0.11 me2 0.05 gm8+fgs8 0.15 me1 0.27 mf8 0.19 fence 0.00 phase8 0.01 warp8+rcas+osd 2.97
+  23.57 PASS RAW last frame: ts 136827837810 136827854262 136827928878 136827928942 136828237650 | t2 136827864950 136827870490 136827882514 136827909622 136827929870 136828051890 136828237642
+  23.57 PASSES split ms: warp8 1.22 rcas8+osd 0.00 pcopy8 1.75 (frames 90) | rcas8 0.00 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  23.57 FRAMES 90: unmatched blocks avg 112 max 7974, scene-cut frames 1, fade frames 1 | foreground: in 11 frames, avg 0.4 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+  25.37 STAT gnm: 30.0 flips/s, max dt 33.6 ms (window 2.0s)
+  25.47 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.2 | pending 2 pll 0
+  25.47 LATENCY real frame hand-over -> on screen: avg 32.7 max 32.8 ms (60 frames) | FG on preset 0 | pending max 2
+  25.47 CADENCE (vblanks on screen) mid 1:10 2:0 3:0 4+:0 | real 1:10 2:50 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 50 (gaps 50) | pace timeouts 0 resync 0 fix 0 | game cpu re
+  25.47 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+  26.57 GPU time of our passes: pyramid 0.17 + motion 0.78 + warp/post 3.14 = 4.09 ms (+ fence wait 0.00) | game span avg 29.3 max 29.6 ms
+  26.57 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.27 mf8 0.19 fence 0.00 phase8 0.01 warp8+rcas+osd 3.13
+  26.57 PASS RAW last frame: ts 137127395463 137127412559 137127491979 137127492051 137127798379 | t2 137127423311 137127428975 137127445507 137127472543 137127492947 137127614443 137127798371
+  26.57 PASSES split ms: warp8 1.22 rcas8+osd 0.00 pcopy8 1.91 (frames 90) | rcas8 0.00 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  26.57 FRAMES 90: unmatched blocks avg 3 max 249, scene-cut frames 0, fade frames 1 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+  27.37 STAT gnm: 30.0 flips/s, max dt 33.6 ms (window 2.0s)
+  27.47 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.2 | pending 2 pll 0
+  27.47 LATENCY real frame hand-over -> on screen: avg 32.7 max 32.8 ms (60 frames) | FG on preset 0 | pending max 2
+  27.47 CADENCE (vblanks on screen) mid 1:12 2:0 3:0 4+:0 | real 1:12 2:48 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 48 (gaps 48) | pace timeouts 0 resync 0 fix 0 | game cpu re
+  27.47 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+  29.39 STAT gnm: 29.2 flips/s, max dt 53.4 ms (window 2.0s)
+  29.49 LATENCY real frame hand-over -> on screen: avg 32.9 max 41.1 ms (57 frames) | FG on preset 0 | pending max 2
+  29.49 CADENCE (vblanks on screen) mid 1:13 2:0 3:0 4+:0 | real 1:12 2:44 3:1 4+:1 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 47 (gaps 45) | pace timeouts 0 resync 0 fix 0 | game cpu re
+  29.49 WAIT_EXIT pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | given pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | virt 60 polls 60
+  29.52 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.3 total 0.5 | game own 33.7 | pending 2 pll 0
+  29.62 GPU time of our passes: pyramid 0.17 + motion 0.78 + warp/post 3.22 = 4.16 ms (+ fence wait 0.00) | game span avg 29.8 max 49.6 ms
+  29.63 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.15 me1 0.27 mf8 0.19 fence 0.00 phase8 0.01 warp8+rcas+osd 3.21
+  29.63 PASS RAW last frame: ts 137432304050 137432320154 137432398726 137432398786 137432832670 | t2 137432330622 137432336222 137432351378 137432379354 137432399606 137432675342 137432832662
+  29.63 PASSES split ms: warp8 1.41 rcas8+osd 0.00 pcopy8 1.80 (frames 90) | rcas8 0.00 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  29.63 FRAMES 90: unmatched blocks avg 1 max 34, scene-cut frames 0, fade frames 5 | foreground: in 9 frames, avg 1.3 L2 blocks | camera 0,-8 L2 px | log lines dropped 0
+  32.21 STAT gnm: 29.7 flips/s, max dt 44.9 ms (window 2.0s)
+  32.24 LATENCY real frame hand-over -> on screen: avg 32.7 max 37.9 ms (60 frames) | FG on preset 0 | pending max 2
+  32.24 CADENCE (vblanks on screen) mid 1:9 2:0 3:0 4+:0 | real 1:9 2:50 3:1 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 51 (gaps 51) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+  32.24 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+  32.25 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.3 | pending 2 pll 0
+  32.64 GPU time of our passes: pyramid 0.16 + motion 0.78 + warp/post 3.05 = 3.99 ms (+ fence wait 0.00) | game span avg 29.5 max 38.3 ms
+  32.65 PASSES ms: pyr8 0.16 me3 0.11 me2 0.05 gm8+fgs8 0.16 me1 0.27 mf8 0.19 fence 0.00 phase8 0.01 warp8+rcas+osd 3.04
+  32.65 PASS RAW last frame: ts 137733537482 137733553458 137733631394 137733631462 137733899642 | t2 137733564022 137733569378 137733585566 137733612122 137733632278 137733754738 137733899638
+  32.65 PASSES split ms: warp8 1.50 rcas8+osd 0.00 pcopy8 1.54 (frames 90) | rcas8 0.00 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+  32.65 FRAMES 90: unmatched blocks avg 21 max 298, scene-cut frames 0, fade frames 2 | foreground: in 21 frames, avg 8.8 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+  33.41 STAT gnm: 30.0 flips/s, max dt 39.5 ms (window 2.0s)
+  33.51 LATENCY real frame hand-over -> on screen: avg 32.5 max 32.7 ms (60 frames) | FG on preset 0 | pending max 2
+  33.51 CADENCE (vblanks on screen) mid 1:12 2:0 3:0 4+:0 | real 1:12 2:48 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 48 (gaps 48) | pace timeouts 0 resync 0 fix 0 | game cpu re
+  33.51 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+  33.55 HOOK ms per FG frame: build 0.2 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.1 | pending 2 pll 0
+  35.51 LATENCY real frame hand-over -> on screen: avg 32.3 max 34.4 ms (45 frames) | FG on preset 0 | pending max 2
+---- last lines (5619 skipped before) ----
+1188.72 FRAMES 90: unmatched blocks avg 119 max 396, scene-cut frames 0, fade frames 0 | foreground: in 81 frames, avg 356.9 L2 blocks | camera 0,-2 L2 px | log lines dropped 0
+1189.63 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.2 total 0.4 | game own 33.3 | pending 2 pll 0
+1189.64 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1189.80 LATENCY real frame hand-over -> on screen: avg 31.0 max 31.4 ms (52 frames) | FG on preset 2 | pending max 2
+1189.80 CADENCE (vblanks on screen) mid 1:0 2:0 3:0 4+:0 | real 1:0 2:52 3:0 4+:4 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 64 (gaps 56) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1189.80 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+1189.87 STAT gnm: 29.7 flips/s, max dt 50.2 ms (window 2.0s)
+1191.67 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.1 total 0.2 | game own 33.1 | pending 2 pll 0
+1191.67 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1191.77 GPU time of our passes: pyramid 0.18 + motion 0.82 + warp/post 7.19 = 8.19 ms (+ fence wait 0.00) | game span avg 25.7 max 38.7 ms
+1191.77 PASSES ms: pyr8 0.18 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.29 mf8 0.21 fence 0.00 phase8 0.01 warp8+rcas+osd 7.19
+1191.77 PASS RAW last frame: ts 253359604931 253359622223 253359703911 253359703983 253360432335 | t2 253359633171 253359638771 253359654483 253359683415 253359704879 253359967939 253360432327
+1191.77 PASSES split ms: warp8 2.70 rcas8+osd 4.48 pcopy8 0.00 (frames 90) | rcas8 4.48 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1191.77 FRAMES 90: unmatched blocks avg 159 max 1013, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 396.9 L2 blocks | camera 0,-1 L2 px | log lines dropped 0
+1191.81 LATENCY real frame hand-over -> on screen: avg 31.6 max 47.7 ms (55 frames) | FG on preset 2 | pending max 2
+1191.81 CADENCE (vblanks on screen) mid 1:0 2:0 3:0 4+:0 | real 1:0 2:53 3:2 4+:2 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 61 (gaps 57) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1191.81 WAIT_EXIT pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | given pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | virt 59 polls 59
+1191.87 STAT gnm: 29.5 flips/s, max dt 50.1 ms (window 2.0s)
+1193.79 inject #34200: count 1->2, our DCB 514 dw, out buf[1]=1084a18000
+1193.79 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.2 | pending 2 pll 0
+1193.79 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1193.83 LATENCY real frame hand-over -> on screen: avg 31.1 max 44.6 ms (52 frames) | FG on preset 2 | pending max 2
+1193.83 CADENCE (vblanks on screen) mid 1:1 2:0 3:0 4+:0 | real 1:1 2:47 3:1 4+:3 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 67 (gaps 51) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1193.83 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+1193.92 STAT gnm: 29.7 flips/s, max dt 47.1 ms (window 2.0s)
+1194.81 GPU time of our passes: pyramid 0.18 + motion 0.83 + warp/post 7.16 = 8.17 ms (+ fence wait 0.00) | game span avg 25.6 max 40.5 ms
+1194.81 PASSES ms: pyr8 0.18 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.29 mf8 0.21 fence 0.00 phase8 0.01 warp8+rcas+osd 7.15
+1194.81 PASS RAW last frame: ts 253662352227 253662370047 253662452419 253662452539 253663135015 | t2 253662380927 253662386587 253662402643 253662431815 253662453391 253662698683 253663135007
+1194.81 PASSES split ms: warp8 2.72 rcas8+osd 4.43 pcopy8 0.00 (frames 90) | rcas8 4.43 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1194.81 FRAMES 90: unmatched blocks avg 100 max 471, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 292.6 L2 blocks | camera 3,2 L2 px | log lines dropped 0
+1195.82 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 34.6 | pending 2 pll 0
+1195.83 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1195.83 LATENCY real frame hand-over -> on screen: avg 31.0 max 31.2 ms (29 frames) | FG on preset 2 | pending max 2
+1195.83 CADENCE (vblanks on screen) mid 1:2 2:1 3:0 4+:0 | real 1:1 2:24 3:1 4+:8 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 81 (gaps 34) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1195.83 WAIT_EXIT pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | given pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | virt 59 polls 59
+1195.99 STAT gnm: 29.5 flips/s, max dt 50.0 ms (window 2.0s)
+1197.77 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.5 | pending 2 pll 0
+1197.77 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1197.83 LATENCY real frame hand-over -> on screen: avg 31.1 max 47.2 ms (55 frames) | FG on preset 2 | pending max 2
+1197.84 CADENCE (vblanks on screen) mid 1:4 2:0 3:0 4+:0 | real 1:4 2:48 3:2 4+:1 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 59 (gaps 51) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1197.84 WAIT_EXIT pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | given pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | virt 59 polls 59
+1197.86 GPU time of our passes: pyramid 0.17 + motion 0.83 + warp/post 7.13 = 8.14 ms (+ fence wait 0.00) | game span avg 25.8 max 39.6 ms
+1197.86 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.30 mf8 0.21 fence 0.00 phase8 0.01 warp8+rcas+osd 7.12
+1197.86 PASS RAW last frame: ts 253967056304 253967073572 253967159444 253967159560 253967855892 | t2 253967084468 253967090308 253967107708 253967138268 253967160436 253967399636 253967855884
+1197.86 PASSES split ms: warp8 2.64 rcas8+osd 4.49 pcopy8 0.00 (frames 90) | rcas8 4.49 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1197.86 FRAMES 90: unmatched blocks avg 57 max 487, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 671.5 L2 blocks | camera -1,-12 L2 px | log lines dropped 0
+1197.90 STAT gnm: 29.5 flips/s, max dt 50.1 ms (window 2.0s)
+1199.76 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.2 | pending 2 pll 0
+1199.76 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1199.83 LATENCY real frame hand-over -> on screen: avg 30.9 max 31.2 ms (60 frames) | FG on preset 2 | pending max 2
+1199.83 CADENCE (vblanks on screen) mid 1:0 2:0 3:0 4+:0 | real 1:0 2:60 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 60 (gaps 60) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1199.83 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+1199.90 STAT gnm: 30.0 flips/s, max dt 34.4 ms (window 2.0s)
+1200.89 GPU time of our passes: pyramid 0.18 + motion 0.86 + warp/post 7.18 = 8.21 ms (+ fence wait 0.00) | game span avg 25.3 max 38.9 ms
+1200.89 PASSES ms: pyr8 0.18 me3 0.11 me2 0.06 gm8+fgs8 0.17 me1 0.31 mf8 0.22 fence 0.00 phase8 0.01 warp8+rcas+osd 7.17
+1200.89 PASS RAW last frame: ts 254268118395 254268135367 254268216227 254268216351 254268933831 | t2 254268146247 254268151815 254268167363 254268196007 254268217207 254268493735 254268933823
+1200.89 PASSES split ms: warp8 2.74 rcas8+osd 4.43 pcopy8 0.00 (frames 90) | rcas8 4.43 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1200.89 FRAMES 90: unmatched blocks avg 126 max 333, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 585.8 L2 blocks | camera 1,-1 L2 px | log lines dropped 0
+1201.78 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.3 total 0.5 | game own 32.8 | pending 2 pll 0
+1201.78 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1201.85 LATENCY real frame hand-over -> on screen: avg 31.2 max 47.4 ms (56 frames) | FG on preset 2 | pending max 2
+1201.85 CADENCE (vblanks on screen) mid 1:0 2:0 3:0 4+:0 | real 1:0 2:55 3:1 4+:2 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 62 (gaps 58) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1201.85 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+1201.91 STAT gnm: 29.7 flips/s, max dt 49.7 ms (window 2.0s)
+1203.78 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.4 total 0.6 | game own 32.6 | pending 0 pll 0
+1203.78 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1203.88 GPU time of our passes: pyramid 0.17 + motion 0.83 + warp/post 7.12 = 8.13 ms (+ fence wait 0.00) | game span avg 25.2 max 26.4 ms
+1203.88 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.30 mf8 0.21 fence 0.00 phase8 0.01 warp8+rcas+osd 7.12
+1203.88 PASS RAW last frame: ts 254567741607 254567758991 254567840523 254567840595 254568526775 | t2 254567769859 254567775387 254567791311 254567820155 254567841475 254568101863 254568526771
+1203.88 PASSES split ms: warp8 2.74 rcas8+osd 4.37 pcopy8 0.00 (frames 90) | rcas8 4.37 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1203.88 FRAMES 90: unmatched blocks avg 108 max 280, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 390.0 L2 blocks | camera 0,3 L2 px | log lines dropped 0
+1203.88 LATENCY real frame hand-over -> on screen: avg 30.8 max 31.1 ms (51 frames) | FG on preset 2 | pending max 2
+1203.88 CADENCE (vblanks on screen) mid 1:0 2:0 3:0 4+:0 | real 1:0 2:50 3:0 4+:3 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 69 (gaps 53) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1203.88 WAIT_EXIT pending 61/0/0/0/0/0/0/0 gcq 61/0/0/0/0/0/0/0 | given pending 61/0/0/0/0/0/0/0 gcq 61/0/0/0/0/0/0/0 | virt 61 polls 61
+1203.98 STAT gnm: 30.0 flips/s, max dt 33.9 ms (window 2.0s)
+1205.90 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.1 total 0.3 | game own 33.5 | pending 2 pll 0
+1205.90 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1205.90 LATENCY real frame hand-over -> on screen: avg 31.7 max 47.6 ms (44 frames) | FG on preset 2 | pending max 2
+1205.90 CADENCE (vblanks on screen) mid 1:1 2:0 3:0 4+:0 | real 1:0 2:40 3:0 4+:8 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 69 (gaps 48) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1205.90 WAIT_EXIT pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | given pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | virt 59 polls 59
+1205.93 STAT gnm: 29.2 flips/s, max dt 50.1 ms (window 2.0s)
+1207.20 GPU time of our passes: pyramid 0.17 + motion 0.83 + warp/post 7.14 = 8.14 ms (+ fence wait 0.00) | game span avg 26.0 max 38.5 ms
+1207.20 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.29 mf8 0.21 fence 0.00 phase8 0.01 warp8+rcas+osd 7.13
+1207.20 PASS RAW last frame: ts 254874001939 254874020131 254874103887 254874104015 254874796451 | t2 254874030963 254874036815 254874052831 254874082987 254874104899 254874358235 254874796447
+1207.20 PASSES split ms: warp8 2.70 rcas8+osd 4.43 pcopy8 0.00 (frames 90) | rcas8 4.43 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1207.20 FRAMES 90: unmatched blocks avg 113 max 591, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 290.9 L2 blocks | camera -2,-8 L2 px | log lines dropped 0
+1208.12 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.1 total 0.3 | game own 34.5 | pending 2 pll 0
+1208.12 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1208.12 STAT gnm: 29.2 flips/s, max dt 50.1 ms (window 2.0s)
+1208.12 LATENCY real frame hand-over -> on screen: avg 32.0 max 47.5 ms (27 frames) | FG on preset 2 | pending max 2
+1208.12 CADENCE (vblanks on screen) mid 1:1 2:0 3:0 4+:0 | real 1:0 2:22 3:2 4+:8 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 97 (gaps 32) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1208.12 WAIT_EXIT pending 65/0/0/0/0/0/0/0 gcq 65/0/0/0/0/0/0/0 | given pending 65/0/0/0/0/0/0/0 gcq 65/0/0/0/0/0/0/0 | virt 65 polls 65
+1209.96 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.1 total 0.3 | game own 34.3 | pending 2 pll 0
+1209.96 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1209.96 STAT gnm: 29.5 flips/s, max dt 49.9 ms (window 2.0s)
+1210.09 GPU time of our passes: pyramid 0.17 + motion 0.82 + warp/post 7.03 = 8.03 ms (+ fence wait 0.00) | game span avg 26.1 max 39.0 ms
+1210.09 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.29 mf8 0.21 fence 0.00 phase8 0.01 warp8+rcas+osd 7.02
+1210.09 PASS RAW last frame: ts 255180099703 255180119215 255180200099 255180200215 255180883391 | t2 255180130191 255180135747 255180151911 255180180003 255180201091 255180459363 255180883383
+1210.09 PASSES split ms: warp8 2.67 rcas8+osd 4.36 pcopy8 0.00 (frames 90) | rcas8 4.36 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1210.09 FRAMES 90: unmatched blocks avg 120 max 256, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 334.5 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+1210.12 LATENCY real frame hand-over -> on screen: avg 30.9 max 31.1 ms (9 frames) | FG on preset 2 | pending max 2
+1210.12 CADENCE (vblanks on screen) mid 1:0 2:0 3:0 4+:0 | real 1:0 2:3 3:0 4+:11 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 104 (gaps 14) | pace timeouts 0 resync 0 fix 0 | game cpu rel
+1210.12 WAIT_EXIT pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | given pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | virt 59 polls 59
+1211.97 STAT gnm: 29.2 flips/s, max dt 49.7 ms (window 2.0s)
+1212.00 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.6 total 0.8 | game own 31.7 | pending 2 pll 0
+1212.00 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1212.15 LATENCY real frame hand-over -> on screen: avg 31.4 max 47.3 ms (51 frames) | FG on preset 2 | pending max 2
+1212.15 CADENCE (vblanks on screen) mid 1:2 2:0 3:0 4+:0 | real 1:2 2:45 3:2 4+:3 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 64 (gaps 50) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1212.15 WAIT_EXIT pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | given pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | virt 59 polls 59
+1213.08 GPU time of our passes: pyramid 0.18 + motion 0.84 + warp/post 7.12 = 8.14 ms (+ fence wait 0.00) | game span avg 25.8 max 39.4 ms
+1213.08 PASSES ms: pyr8 0.18 me3 0.11 me2 0.06 gm8+fgs8 0.17 me1 0.30 mf8 0.21 fence 0.00 phase8 0.01 warp8+rcas+osd 7.11
+1213.08 PASS RAW last frame: ts 255484717356 255484735236 255484818832 255484818948 255485506596 | t2 255484746088 255484752000 255484769152 255484797896 255484819888 255485059480 255485506588
+1213.08 PASSES split ms: warp8 2.68 rcas8+osd 4.43 pcopy8 0.00 (frames 90) | rcas8 4.43 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1213.08 FRAMES 90: unmatched blocks avg 131 max 1079, scene-cut frames 0, fade frames 0 | foreground: in 90 frames, avg 634.1 L2 blocks | camera 21,2 L2 px | log lines dropped 0
+1213.98 STAT gnm: 30.0 flips/s, max dt 33.9 ms (window 2.0s)
+1213.98 inject #34800: count 1->2, our DCB 514 dw, out buf[1]=1084a18000
+1213.98 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 1.9 total 2.1 | game own 31.3 | pending 2 pll 0
+1213.98 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1214.15 LATENCY real frame hand-over -> on screen: avg 31.0 max 31.2 ms (60 frames) | FG on preset 2 | pending max 2
+1214.15 CADENCE (vblanks on screen) mid 1:1 2:0 3:0 4+:0 | real 1:1 2:59 3:0 4+:0 | refresh 59.939 Hz | pending max 2 gcq max 2 | missed 59 (gaps 59) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1214.15 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+1216.00 STAT gnm: 29.2 flips/s, max dt 56.8 ms (window 2.0s)
+1216.03 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 1.3 total 1.5 | game own 33.5 | pending 1 pll 0
+1216.03 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1216.13 GPU time of our passes: pyramid 0.18 + motion 0.82 + warp/post 6.43 = 7.43 ms (+ fence wait 0.00) | game span avg 26.5 max 50.1 ms
+1216.13 PASSES ms: pyr8 0.18 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.28 mf8 0.20 fence 0.00 phase8 0.01 warp8+rcas+osd 6.42
+1216.13 PASS RAW last frame: ts 255789213022 255789230026 255789310002 255789310070 255789828010 | t2 255789240886 255789246454 255789262322 255789289758 255789310938 255789438286 255789828006
+1216.13 PASSES split ms: warp8 2.05 rcas8+osd 4.37 pcopy8 0.00 (frames 90) | rcas8 4.37 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1216.13 FRAMES 90: unmatched blocks avg 103 max 2885, scene-cut frames 0, fade frames 1 | foreground: in 70 frames, avg 158.4 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+1216.17 LATENCY real frame hand-over -> on screen: avg 31.1 max 41.0 ms (59 frames) | FG on preset 2 | pending max 2
+1216.17 CADENCE (vblanks on screen) mid 1:11 2:0 3:0 4+:0 | real 1:11 2:46 3:1 4+:1 | refresh 59.941 Hz | pending max 2 gcq max 2 | missed 48 (gaps 48) | pace timeouts 0 resync 0 fix 0 | game cpu re
+1216.17 WAIT_EXIT pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | given pending 59/0/0/0/0/0/0/0 gcq 59/0/0/0/0/0/0/0 | virt 59 polls 59
+1218.00 STAT gnm: 30.0 flips/s, max dt 34.6 ms (window 2.0s)
+1218.03 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.2 | pending 2 pll 0
+1218.03 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1218.17 LATENCY real frame hand-over -> on screen: avg 32.0 max 32.3 ms (60 frames) | FG on preset 2 | pending max 2
+1218.17 CADENCE (vblanks on screen) mid 1:12 2:0 3:0 4+:0 | real 1:12 2:48 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 48 (gaps 48) | pace timeouts 0 resync 0 fix 0 | game cpu re
+1218.17 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+1219.13 GPU time of our passes: pyramid 0.17 + motion 0.80 + warp/post 4.97 = 5.95 ms (+ fence wait 0.00) | game span avg 27.4 max 28.2 ms
+1219.13 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.28 mf8 0.20 fence 0.00 phase8 0.01 warp8+rcas+osd 4.96
+1219.13 PASS RAW last frame: ts 256088779019 256088796691 256088876155 256088876223 256089379911 | t2 256088807595 256088813039 256088828847 256088856379 256088877075 256089003291 256089379903
+1219.13 PASSES split ms: warp8 1.27 rcas8+osd 3.69 pcopy8 0.00 (frames 90) | rcas8 3.69 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1219.13 FRAMES 90: unmatched blocks avg 0 max 28, scene-cut frames 0, fade frames 0 | foreground: in 6 frames, avg 0.1 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+1220.00 STAT gnm: 29.9 flips/s, max dt 34.5 ms (window 2.0s)
+1220.03 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.2 | pending 2 pll 0
+1220.03 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1220.17 LATENCY real frame hand-over -> on screen: avg 31.6 max 32.3 ms (60 frames) | FG on preset 2 | pending max 2
+1220.17 CADENCE (vblanks on screen) mid 1:20 2:0 3:0 4+:0 | real 1:20 2:40 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 40 (gaps 40) | pace timeouts 0 resync 0 fix 0 | game cpu re
+1220.17 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+1222.00 STAT gnm: 30.0 flips/s, max dt 34.6 ms (window 2.0s)
+1222.04 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.1 | pending 2 pll 0
+1222.04 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1222.14 GPU time of our passes: pyramid 0.17 + motion 0.80 + warp/post 4.95 = 5.93 ms (+ fence wait 0.00) | game span avg 27.4 max 27.8 ms
+1222.14 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.28 mf8 0.20 fence 0.00 phase8 0.01 warp8+rcas+osd 4.94
+1222.14 PASS RAW last frame: ts 256388336912 256388354372 256388433896 256388433964 256388938364 | t2 256388365272 256388370712 256388386400 256388414000 256388434784 256388560732 256388938356
+1222.14 PASSES split ms: warp8 1.27 rcas8+osd 3.68 pcopy8 0.00 (frames 90) | rcas8 3.68 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1222.14 FRAMES 90: unmatched blocks avg 0 max 0, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+1222.17 LATENCY real frame hand-over -> on screen: avg 32.0 max 32.3 ms (60 frames) | FG on preset 2 | pending max 2
+1222.17 CADENCE (vblanks on screen) mid 1:21 2:0 3:0 4+:0 | real 1:21 2:39 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 39 (gaps 39) | pace timeouts 0 resync 0 fix 0 | game cpu re
+1222.17 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+1224.00 STAT gnm: 29.9 flips/s, max dt 34.6 ms (window 2.0s)
+1224.04 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.2 | pending 2 pll 0
+1224.04 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1224.18 LATENCY real frame hand-over -> on screen: avg 31.6 max 32.3 ms (60 frames) | FG on preset 2 | pending max 2
+1224.18 CADENCE (vblanks on screen) mid 1:18 2:0 3:0 4+:0 | real 1:18 2:42 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 42 (gaps 42) | pace timeouts 0 resync 0 fix 0 | game cpu re
+1224.18 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+1225.14 GPU time of our passes: pyramid 0.17 + motion 0.81 + warp/post 4.99 = 5.97 ms (+ fence wait 0.00) | game span avg 27.4 max 27.8 ms
+1225.14 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.28 mf8 0.20 fence 0.00 phase8 0.01 warp8+rcas+osd 4.98
+1225.14 PASS RAW last frame: ts 256687826473 256687842297 256687922545 256687922609 256688436937 | t2 256687853149 256687858673 256687874897 256687902297 256687923477 256688050349 256688436929
+1225.14 PASSES split ms: warp8 1.27 rcas8+osd 3.71 pcopy8 0.00 (frames 90) | rcas8 3.71 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1225.14 FRAMES 90: unmatched blocks avg 0 max 0, scene-cut frames 0, fade frames 0 | foreground: in 0 frames, avg 0.0 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+1226.00 STAT gnm: 30.0 flips/s, max dt 36.0 ms (window 2.0s)
+1226.04 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.2 | pending 1 pll 0
+1226.04 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1226.17 LATENCY real frame hand-over -> on screen: avg 31.7 max 32.6 ms (60 frames) | FG on preset 2 | pending max 2
+1226.17 CADENCE (vblanks on screen) mid 1:20 2:0 3:0 4+:0 | real 1:20 2:40 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 40 (gaps 40) | pace timeouts 0 resync 0 fix 0 | game cpu re
+1226.17 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+1228.01 STAT gnm: 30.0 flips/s, max dt 33.7 ms (window 2.0s)
+1228.04 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.1 | pending 2 pll 0
+1228.04 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1228.15 GPU time of our passes: pyramid 0.17 + motion 0.82 + warp/post 6.15 = 7.14 ms (+ fence wait 0.00) | game span avg 26.3 max 28.3 ms
+1228.15 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.28 mf8 0.20 fence 0.00 phase8 0.01 warp8+rcas+osd 6.14
+1228.15 PASS RAW last frame: ts 256987479306 256987495714 256987576642 256987576710 256988304374 | t2 256987506502 256987512046 256987528110 256987556254 256987577582 256987844710 256988304366
+1228.15 PASSES split ms: warp8 1.77 rcas8+osd 4.38 pcopy8 0.00 (frames 90) | rcas8 4.38 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1228.15 FRAMES 90: unmatched blocks avg 67 max 2320, scene-cut frames 0, fade frames 0 | foreground: in 49 frames, avg 223.1 L2 blocks | camera -1,0 L2 px | log lines dropped 0
+1228.22 LATENCY real frame hand-over -> on screen: avg 30.9 max 31.1 ms (60 frames) | FG on preset 2 | pending max 2
+1228.22 CADENCE (vblanks on screen) mid 1:3 2:0 3:0 4+:0 | real 1:3 2:57 3:0 4+:0 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 57 (gaps 57) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1228.22 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+1230.01 STAT gnm: 30.0 flips/s, max dt 34.6 ms (window 2.0s)
+1230.04 HOOK ms per FG frame: build 0.1 submit 0.0 hold 0.0 flip2 0.0 pace 0.0 total 0.2 | game own 33.1 | pending 2 pll 0
+1230.04 QUEUE shallow off: on in 0 of 60 frames, wait avg 0.00 max 0.00 ms, timeouts 0 (on below 30.0 ms own for 120 frames, off above 32.0)
+1230.18 LATENCY real frame hand-over -> on screen: avg 31.3 max 32.3 ms (54 frames) | FG on preset 2 | pending max 2
+1230.18 CADENCE (vblanks on screen) mid 1:8 2:0 3:0 4+:0 | real 1:8 2:46 3:0 4+:3 | refresh 59.940 Hz | pending max 2 gcq max 2 | missed 55 (gaps 49) | pace timeouts 0 resync 0 fix 0 | game cpu rele
+1230.18 WAIT_EXIT pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | given pending 60/0/0/0/0/0/0/0 gcq 60/0/0/0/0/0/0/0 | virt 60 polls 60
+1231.14 GPU time of our passes: pyramid 0.17 + motion 0.82 + warp/post 6.03 = 7.02 ms (+ fence wait 0.00) | game span avg 26.3 max 27.3 ms
+1231.14 PASSES ms: pyr8 0.17 me3 0.11 me2 0.06 gm8+fgs8 0.16 me1 0.29 mf8 0.21 fence 0.00 phase8 0.01 warp8+rcas+osd 6.02
+1231.14 PASS RAW last frame: ts 257286949233 257286966573 257287047613 257287047681 257287615533 | t2 257286977481 257286983053 257286999557 257287027313 257287048537 257287174969 257287615525
+1231.14 PASSES split ms: warp8 1.52 rcas8+osd 4.50 pcopy8 0.00 (frames 90) | rcas8 4.50 rest 0.00 | G2 frames 0: osd+wait 0.00 phase8+warp8 0.00 rcas8+osd 0.00
+1231.14 FRAMES 90: unmatched blocks avg 31 max 228, scene-cut frames 0, fade frames 0 | foreground: in 23 frames, avg 68.5 L2 blocks | camera 0,0 L2 px | log lines dropped 0
+1232.01 STAT gnm: 30.0 flips/s, max dt 34.6 ms (window 2.0s)
+---- end of trace ----
