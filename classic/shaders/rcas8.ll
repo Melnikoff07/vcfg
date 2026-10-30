@@ -11,10 +11,13 @@
 ;        no sharpening, no store) and a wave whose 64 lanes are all static skips the pass after the tile load,
 ;        bit 5 = with bits 0, 1 and 4: the real frame (processed in place, the next pair's P) skips the AA where the
 ;        mid pass of the same lane found the static flag, and is written back raw where its AA result equals the
-;        texel of T#prev (+0x00): static, but P holds last frame's AA of it)}.
+;        texel of T#prev (+0x00): static, but P holds last frame's AA of it,
+;        bit 6 = before each store, add back the centre texel's residual against the 8-bit LDS copy
+;        (texel - unpack(pack(texel))): a non 8_8_8_8 surface (2_10_10_10) keeps its low bits; 0 on 8_8_8_8)}.
 target triple = "amdgcn--"
 declare <4 x float> @llvm.amdgcn.image.load.2d.v4f32.i32(i32 immarg, i32, i32, <8 x i32>, i32 immarg, i32 immarg)
 declare void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float>, i32 immarg, i32, i32, <8 x i32>, i32 immarg, i32 immarg)
+declare <4 x float> @llvm.floor.v4f32(<4 x float>)
 declare void @llvm.amdgcn.s.barrier()
 declare i64 @llvm.amdgcn.ballot.i64(i1)
 declare i32 @llvm.smax.i32(i32, i32)
@@ -104,6 +107,22 @@ define internal <4 x float> @unpack_rgb(i32 %pk) alwaysinline {
   %v3 = insertelement <4 x float> %v2, float %af0, i32 3
   %res = call <4 x float> @scale4(<4 x float> %v3, float 0x3F70101020000000) ; 1.0 / 255.0
   ret <4 x float> %res
+}
+
+; bit 6: full-precision centre minus its 8-bit LDS copy, RGB only. Same value as unpack_rgb(pack_rgba(f)): a unorm load is
+; already in [0, 1] (q8's sat is the identity), floor(f * 255 + 0.5) is the integer q8 truncates to, and the product
+; with the same 1/255 constant is unpack's. The lane's own texel is written only by this lane, so loading it here
+; returns what lds_put read.
+define internal <4 x float> @resid8(<8 x i32> %t, i32 %x, i32 %y) alwaysinline {
+  %f = call <4 x float> @llvm.amdgcn.image.load.2d.v4f32.i32(i32 15, i32 %x, i32 %y, <8 x i32> %t, i32 0, i32 0)
+  %s = fmul <4 x float> %f, <float 255.0, float 255.0, float 255.0, float 255.0>
+  %r = fadd <4 x float> %s, <float 0.5, float 0.5, float 0.5, float 0.5>
+  %i = call <4 x float> @llvm.floor.v4f32(<4 x float> %r)
+  %q = fmul <4 x float> %i, <float 0x3F70101020000000, float 0x3F70101020000000, float 0x3F70101020000000, float 0x3F70101020000000>
+  %d = fsub <4 x float> %f, %q
+  ; alpha: 2_10_10_10 keeps 2 bits, which the 8-bit copy holds exactly (k / 3 -> 85 k / 255), so its residual is 0
+  %d3 = insertelement <4 x float> %d, float 0.0, i32 3
+  ret <4 x float> %d3
 }
 
 define internal void @lds_put(<8 x i32> %t, i32 %bx0, i32 %by0, i32 %wm1, i32 %hm1, i32 %idx) alwaysinline {
@@ -578,6 +597,8 @@ entry:
   %use_st = icmp ne i32 %stb, 0
   %rsb = and i32 %rfl, 32
   %real_s1 = icmp ne i32 %rsb, 0
+  %prb = and i32 %rfl, 64
+  %prec = icmp ne i32 %prb, 0
   ; con == 0 (Sharpness 0): the RCAS weight is +-0 everywhere, so rcas_apply returns base_c bit for bit; skip it
   %conabs = and i32 %conb, 2147483647
   %sharp = icmp ne i32 %conabs, 0
@@ -597,9 +618,16 @@ pass_mid:
   %pto = getelementptr i8, ptr addrspace(4) %tbl, i64 64
   %to = load <8 x i32>, ptr addrspace(4) %pto, align 32, !invariant.load !0
   %omr = call { <4 x float>, i1, i1 } @eval_tile(<8 x i32> %to, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 %use_st, i1 false)
-  %om = extractvalue { <4 x float>, i1, i1 } %omr, 0
+  %om0 = extractvalue { <4 x float>, i1, i1 } %omr, 0
   %omc = extractvalue { <4 x float>, i1, i1 } %omr, 1
   %oms = extractvalue { <4 x float>, i1, i1 } %omr, 2
+  br i1 %prec, label %mid_prec, label %mid_sel
+mid_prec:
+  %mres = call <4 x float> @resid8(<8 x i32> %to, i32 %x, i32 %y)
+  %omp = fadd <4 x float> %om0, %mres
+  br label %mid_sel
+mid_sel:
+  %om = phi <4 x float> [ %omp, %mid_prec ], [ %om0, %pass_mid ]
   %om_st = or i1 %omc, %keep_all
   br i1 %om_st, label %st_mid, label %mid_join
 st_mid:
@@ -618,8 +646,15 @@ pass_cur:
   %ptc = getelementptr i8, ptr addrspace(4) %tbl, i64 32
   %tc = load <8 x i32>, ptr addrspace(4) %ptc, align 32, !invariant.load !0
   %ocr = call { <4 x float>, i1, i1 } @eval_tile(<8 x i32> %tc, i32 %tid, i32 %bxp, i32 %byp, i32 %lx, i32 %ly, float %con, i32 %emode, i1 %sharp, i1 false, i1 %cur_st)
-  %oc = extractvalue { <4 x float>, i1, i1 } %ocr, 0
+  %oc0 = extractvalue { <4 x float>, i1, i1 } %ocr, 0
   %occ = extractvalue { <4 x float>, i1, i1 } %ocr, 1
+  br i1 %prec, label %cur_prec, label %cur_sel
+cur_prec:
+  %cres = call <4 x float> @resid8(<8 x i32> %tc, i32 %x, i32 %y)
+  %ocp = fadd <4 x float> %oc0, %cres
+  br label %cur_sel
+cur_sel:
+  %oc = phi <4 x float> [ %ocp, %cur_prec ], [ %oc0, %pass_cur ]
   %oc_st = or i1 %occ, %keep_all
   br i1 %oc_st, label %wb_sel, label %done
 wb_sel:

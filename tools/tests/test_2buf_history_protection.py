@@ -114,6 +114,7 @@ FN_SAFE_STRIDE = extract_function(MAIN_C, "safe_surface_stride")
 FN_CALC_RCAS = extract_function(MAIN_C, "calc_rcas_params")
 FN_REAL_AA = extract_function(MAIN_C, "real_aa_on")   # called by rcas_static_flag (bit 5)
 FN_RCAS_STATIC = extract_function(MAIN_C, "rcas_static_flag")
+FN_RCAS_PRECISE = extract_function(MAIN_C, "rcas_precise_flag")   # rcas bit 6 (CUSA02299, 10-bit)
 FN_BUILD_FLOW8 = extract_function(MAIN_C, "build_dcb_flow8")
 
 HARNESS_C = f"""
@@ -476,7 +477,8 @@ static uint32_t g_mon_backing[4];
 static volatile uint32_t *g_mon = g_mon_backing;
 
 static uint32_t cut_blocks8(void) {{ return 0; }}
-static int post_mid_only(void) {{ return 1; }}
+static int g_test_post_both = 0;   /* 1: post-process real and generated frames (post_mid = 2) */
+static int post_mid_only(void) {{ return !g_test_post_both; }}
 static void osd_build_slot(uint8_t *p, uint32_t *x, uint32_t *w, uint32_t flags)
 {{
     (void)p; (void)flags;
@@ -509,6 +511,7 @@ static int vcfg_in_family(const char *t, const char *f) {{ return strcmp(t, f) =
 {FN_CALC_RCAS}
 {FN_REAL_AA}
 {FN_RCAS_STATIC}
+{FN_RCAS_PRECISE}
 {FN_BUILD_FLOW8}
 
 // Simulate GPU pcopy8 execution on the descriptor table built at slotb + OSD_SLOT_OFF
@@ -779,7 +782,58 @@ int main(void)
     test_suite1_auto_2buf_detection();
     test_suite2_lowmem_flex_and_ycocg_fallback();
     test_suite3_prev_overwrite_protection_and_ycocg_psnr();
-    printf("2-buffer history protection & YCoCg-R 16-bit unit tests: all 3 suites passed\\n");
+    // Test 4: pass order of the history copy. With Sharpness / Enhance AA on the real frame too (post_mid = 2) the
+    // history buffer must take C after the warp read P and before RCAS filters C in place, or the next generated frame
+    // is built from an already filtered P and filtered again. With the generated frame only it stays after RCAS.
+    {{
+        uint32_t saved_off[17];
+        memcpy(saved_off, g_sh8_off, sizeof(saved_off));
+        int saved_sharp = g_cfg.sharpness, saved_tight = g_mem_tight;
+        for (int i = 0; i < 17; i++) g_sh8_off[i] = (uint32_t)(i + 1) * 0x100u;
+        g_cfg.sharpness = 60;
+        g_mem_tight = 0;
+        uint32_t nop64[64];
+        memset(nop64, 0, sizeof(nop64));
+        if (!g_pbuf) {{
+            g_sim_flex_avail = 0x2000000ULL;
+            on_register_buffers_2buf(2, 0x800000u);
+        }}
+        ASSERT(g_pbuf != NULL);
+        char saved_tid[16];
+        memcpy(saved_tid, g_title_id, sizeof(saved_tid));
+        for (int both = 0; both < 3; both++) {{
+            // 0: generated frame only, 1: both frames on CUSA02299, 2: both frames on another title (order unchanged)
+            g_test_post_both = both ? 1 : 0;
+            memcpy(g_title_id, both == 2 ? "CUSA08519" : "CUSA02299", 10);
+            uint32_t *mt = (uint32_t *)(g_gpu + DCB8_OFF);
+            uint32_t n = build_dcb_flow8(mt, g_buf[0], g_buf[1], g_buf[2], g_buf[2], 1920,
+                                         10u, 1920 * 1080 * 4u, 0u, 140u + (uint32_t)both, nop64, g_handle, 2u, 2u,
+                                         32768u, 32768u, 0, 0, 0ull, 0u);
+            int pos_warp = -1, pos_rcas = -1, pos_pcopy = -1, k = 0;
+            uint32_t base = 0;
+            for (uint32_t i = 0; i + 2 < n; i++) {{
+                if (mt[i] == PKT3(0x76, 3, 1) && mt[i + 1] == 0x20Cu) {{
+                    if (!base) base = mt[i + 2] - 1u;   // the first pass is pyr8, g_sh8_off[0] = 0x100
+                    uint32_t id = mt[i + 2] - base;      // i + 1 for g_sh8_off[i]
+                    if (id == 6u && pos_warp < 0) pos_warp = k;
+                    if (id == 15u && pos_rcas < 0) pos_rcas = k;
+                    if (id == 17u && pos_pcopy < 0) pos_pcopy = k;
+                    k++;
+                }}
+            }}
+            printf("pass order %s post_mid=%s: warp8 #%d, pcopy8 #%d, rcas8 #%d\\n", g_title_id, both ? "2" : "1", pos_warp, pos_pcopy, pos_rcas);
+            ASSERT(pos_warp >= 0 && pos_rcas >= 0 && pos_pcopy >= 0);
+            if (both == 1) ASSERT(pos_warp < pos_pcopy && pos_pcopy < pos_rcas);
+            else ASSERT(pos_rcas < pos_pcopy);
+        }}
+        g_test_post_both = 0;
+        memcpy(g_title_id, saved_tid, sizeof(saved_tid));
+        memcpy(g_sh8_off, saved_off, sizeof(saved_off));
+        g_cfg.sharpness = saved_sharp;
+        g_mem_tight = saved_tight;
+    }}
+
+    printf("2-buffer history protection & YCoCg-R 16-bit unit tests: all 4 suites passed\\n");
     return 0;
 }}
 """
