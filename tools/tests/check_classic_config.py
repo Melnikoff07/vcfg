@@ -93,11 +93,14 @@ int main(void) {
     // Verify INI override still takes precedence over per-family default:
     input="game_vectors=1\\n"; parse_ini_file("title", &c, 0);
     if (c.game_vectors != 1) return 14;
-    // Verify audio_fix defaults to 1 on CUSA10249 and 0 on all other titles, and parses 0/1/2:
+    // Verify audio_fix defaults to 1 on CUSA10249/CUSA07820 and 0 on all other titles, and parses 0/1/2:
     set_title("CUSA07408"); cfg_defaults(&c);
     if (c.audio_fix != 0) return 15;
     set_title("CUSA10249"); cfg_defaults(&c);
     if (c.audio_fix != 1) return 16;
+    set_title("CUSA07820"); cfg_defaults(&c);
+    if (c.audio_fix != 1) return 19;
+    set_title("CUSA10249"); cfg_defaults(&c);
     input="audio_fix = 2\\n"; parse_ini_file("title", &c, 0);
     if (c.audio_fix != 2) return 17;
     input="audio_fix=0\\n"; parse_ini_file("title", &c, 0);

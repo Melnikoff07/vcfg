@@ -631,7 +631,7 @@ static void apply_title_defaults_sim(const char *tid)
     g_cfg.shave_mode = 0;
     g_cfg.reg_mode = 0;
     g_cfg.pace_order = 0;
-    g_cfg.audio_fix = (strcmp(g_title_id, "CUSA10249") == 0) ? 1 : 0;
+    g_cfg.audio_fix = (strcmp(g_title_id, "CUSA10249") == 0 || strcmp(g_title_id, "CUSA07820") == 0) ? 1 : 0;
     if (vcfg_in_family(g_title_id, "CUSA11456")) {
         g_cfg.present_copy = 2;
         g_cfg.two_buffer = 0;
@@ -667,7 +667,7 @@ static void setup_plugin_load_early(size_t dm_sz, long pre_occ)
         }
     }
     if (g_cfg.shave_mode == 2) return;
-    int skip_gpu_work = (__HAS_CUSA10249_AUDIO_FIX__ && strcmp(g_title_id, "CUSA10249") == 0 && (g_cfg.audio_fix == 1 || g_cfg.audio_fix == 2));
+    int skip_gpu_work = (__HAS_CUSA10249_AUDIO_FIX__ && (strcmp(g_title_id, "CUSA10249") == 0 || strcmp(g_title_id, "CUSA07820") == 0) && (g_cfg.audio_fix == 1 || g_cfg.audio_fix == 2));
     long top_e = (long)(dm_sz & ~(size_t)0x1FFFFFu);
     size_t want_pre = skip_gpu_work ? 0x800000u : 0x2000000u;
     long top_s = top_e - (long)want_pre;
@@ -850,6 +850,10 @@ static void replay_register_buffers(int start_idx, int num_buf, uint32_t bw, uin
 """.replace("__PCOPY_HAS_MAX_EXTRA__", str(PCOPY_GATE_HAS_MAX_EXTRA)).replace(
     "__HAS_CUSA10249_AUDIO_FIX__", str(HAS_CUSA10249_AUDIO_FIX)
 )
+
+
+# CUSA07820 replays the identical Base PS4 DirectMemory trace as CUSA10249, so both run under audio_fix=1/2/0:
+AUDIO_FIX_BASE_TRACES = ("CUSA10249_0x137200000", "CUSA07820_0x137200000")
 
 
 def generate_trace_c(traces: list[dict]) -> str:
@@ -1097,7 +1101,7 @@ def generate_trace_c(traces: list[dict]) -> str:
         lines.append(f"        setup_plugin_load_early({dm_sz}ULL, {pre_occ}LL);")
         if tkey in ("CUSA13323_0x13ca00000", "CUSA11456_0x13ca00000"):
             lines.append("        g_sim_flex_avail = 0x2C00000u;")
-        elif tkey == "CUSA10249_0x137200000":
+        elif tkey in AUDIO_FIX_BASE_TRACES:
             lines.append("        g_sim_flex_avail = 0xE00000u;")
         elif tkey == "CUSA13323_0x164a00000":
             lines.append("        g_sim_flex_avail = 0x2000000u;")
@@ -1149,8 +1153,14 @@ def generate_trace_c(traces: list[dict]) -> str:
                     lines.append(f"            if (r == 0) sceKernelReleaseDirectMemory(p, {elen}ULL);")
                     lines.append("        }")
         if tid in ("CUSA07820", "CUSA00341", "CUSA07737"):
+            # CUSA07820 audio_fix=1 (C) is the only partial shave allowed: Arena 2 0x15800000 -> 0x15200000.
+            af_ok = " || (g_shaves[si].orig_len == 0x15800000ULL && g_shaves[si].real_len == 0x15200000ULL)" if tid == "CUSA07820" else ""
             lines.append(
-                f'        for (int si = 0; si < g_shave_n; si++) ASSERT_MSG(g_shaves[si].real_len == 0, "{tkey}", 999, g_shaves[si].orig_len);'
+                f'        for (int si = 0; si < g_shave_n; si++) ASSERT_MSG(g_shaves[si].real_len == 0{af_ok}, "{tkey}", 999, g_shaves[si].orig_len);'
+            )
+        if tkey == "CUSA07820_0x15f200000":
+            lines.append(
+                f'        ASSERT_MSG(g_pbuf == NULL && g_pre_mem != NULL && g_shave_n == 1 && g_dbg_alloc_fail == 0 && id_phys[10] == 0x15e400000LL && sim_dm_is_allocated_range((uint64_t)id_phys[10], 0x600000ULL), "{tkey}", 997, id_phys[10]);'
             )
         if tid in ("CUSA13323", "CUSA11456"):
             lines.append(
@@ -1160,7 +1170,7 @@ def generate_trace_c(traces: list[dict]) -> str:
             lines.append(f'        ASSERT_MSG(g_shave_n == 1 && g_pre_mem != NULL && g_pbuf == NULL, "{tkey}", 997, g_shave_n);')
         if tkey == "CUSA11456_0x13ca00000":
             lines.append(f'        ASSERT_MSG(g_pre_mem != NULL && g_pbuf == NULL && g_dbg_alloc_fail == 0, "{tkey}", 997, g_dbg_alloc_fail);')
-        if tkey == "CUSA10249_0x137200000":
+        if tkey in AUDIO_FIX_BASE_TRACES:
             lines.append(
                 f'        ASSERT_MSG(g_pbuf == NULL && g_pre_mem != NULL && g_pre_size == 0x800000ULL && g_shave_n == 1 && g_shaves[0].orig_len == 0x15800000ULL && g_shaves[0].real_len == 0x15200000ULL && id_phys[5] == 0x136400000LL && sim_dm_is_allocated_range((uint64_t)id_phys[5], 0x600000ULL), "{tkey}", 997, id_phys[5]);'
             )
@@ -1183,7 +1193,7 @@ def generate_trace_c(traces: list[dict]) -> str:
         lines.append(f'        ASSERT_MSG(on_sub() >= 0, "{tkey}", 1000, 0);')
         lines.append("        passed++;")
         lines.append("    }")
-        if tkey == "CUSA10249_0x137200000":
+        if tkey in AUDIO_FIX_BASE_TRACES:
             for extra_af in (2, 0):
                 lines.append("    {")
                 lines.append(f'        apply_title_defaults_sim("{tid}");')

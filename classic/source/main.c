@@ -67,7 +67,7 @@ typedef struct {
     int manual_mode;     // 0 = auto (algorithm), 1 = manual dev overrides active in config-<TITLE>.ini
     int vout_path;       // 0 = auto, 1 = decoupled sceVideoOutSubmitFlip path learned at runtime
     int gv_conv;         // -1 = auto/uncalibrated, 0..15 = learned motion-vector convention
-    int audio_fix;       // CUSA10249 audio DirectMemory variant: 0 = c87af66, 1 = Variant C (default for CUSA10249), 2 = Variant D
+    int audio_fix;       // CUSA10249/CUSA07820 audio DirectMemory variant: 0 = c87af66, 1 = Variant C (default for CUSA10249/CUSA07820), 2 = Variant D
 } fg_config_t;
 
 static char g_title_id[16] = "UNKNOWN";
@@ -1566,7 +1566,7 @@ static uint32_t fnv1a_bytes(uint32_t h, const void *data, size_t n)
 static void cfg_apply_title_defaults(fg_config_t *c)
 {
     if (!g_title_id[0]) return;
-    if (strcmp(g_title_id, "CUSA10249") == 0) {
+    if (strcmp(g_title_id, "CUSA10249") == 0 || strcmp(g_title_id, "CUSA07820") == 0) {
         c->audio_fix = 1;
     }
     if (vcfg_in_family(g_title_id, "CUSA11456")) {
@@ -3273,7 +3273,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
             }
         }
         if (dcb_valid && g_gpu_state == 0) gpu_init();
-        if (strcmp(g_title_id, "CUSA10249") == 0 && (g_flips == INJECT_AFTER_FLIPS || g_flips == 600u))
+        if (audio_fix_title() && (g_flips == INJECT_AFTER_FLIPS || g_flips == 600u))
             a10249_log_budget(g_flips == INJECT_AFTER_FLIPS ? "f:120" : "f:600");
         if (dcb_valid && g_gpu_state == 1) {
             uint32_t last = count - 1;
@@ -4824,7 +4824,7 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
     STAGE("plugin_load enter: title=%s (family=%s) version=" VCFG_TRACE_VERSION " engine=classic neo=%d dm=0x%zx shave_mode=%d reg_mode=%d pace_order=%d post_mid=%d",
           g_title_id, vcfg_title_family(g_title_id), (int)g_is_neo, (size_t)sceKernelGetDirectMemorySize(),
           g_cfg.shave_mode, g_cfg.reg_mode, g_cfg.pace_order, g_cfg.post_mid);
-    if (strcmp(g_title_id, "CUSA10249") == 0) {
+    if (audio_fix_title()) {
         STAGE("audio_fix=%d", g_cfg.audio_fix);
     }
 #if VCFG_BENCH
@@ -4975,7 +4975,7 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
                         klog("[bb_probe] dump memory: %p\n", (void *)g_dump_mem);
                     }
                 }
-                if (strcmp(g_title_id, "CUSA10249") == 0) {
+                if (audio_fix_title()) {
                     a10249_log_budget("plugin_load");
                 }
             }

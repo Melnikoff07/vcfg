@@ -78,9 +78,16 @@ static uintptr_t g_c10249_arena_vs = 0;
 static uintptr_t g_c10249_arena_ve = 0;
 static long g_c10249_arena_phys = 0;
 
+// CUSA07820 replays the exact same DirectMemory arena layout as CUSA10249 (identical Base PS4 hardware trace),
+// so both Title IDs share the audio_fix arena pre-shave and Alloc 5 handling.
+static inline int audio_fix_title(void)
+{
+    return strcmp(g_title_id, "CUSA10249") == 0 || strcmp(g_title_id, "CUSA07820") == 0;
+}
+
 static inline int cusa10249_audio_fix(void)
 {
-    return (strcmp(g_title_id, "CUSA10249") == 0 && (g_cfg.audio_fix == 1 || g_cfg.audio_fix == 2)) ? g_cfg.audio_fix : 0;
+    return (audio_fix_title() && (g_cfg.audio_fix == 1 || g_cfg.audio_fix == 2)) ? g_cfg.audio_fix : 0;
 }
 
 // ---- Lock-free API flight ring buffer (dumped on crash) ----
@@ -606,7 +613,7 @@ static size_t dm_avail_range(long s, long e, size_t align, off_t *start_out)
 
 static void a10249_log_budget(const char *tag)
 {
-    if (strcmp(g_title_id, "CUSA10249") != 0) return;
+    if (!audio_fix_title()) return;
     size_t flex_av = 0;
     ((int32_t (*)(size_t *))(void *)sceKernelAvailableFlexibleMemorySize)(&flex_av);
     size_t dm_sz = sceKernelGetDirectMemorySize();
@@ -1234,7 +1241,7 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
         if (r != 0 || (early_boot && (len >= 0x100000u || acnt <= 48u)))
             STAGE("game AllocateDirectMemory(len=0x%zx align=0x%zx type=%d range=0x%lx..0x%lx) = 0x%08x phys=0x%lx caller=%p",
                   len, align, type, s, e, (unsigned)r, (r == 0 && phys) ? *phys : 0L, caller);
-        if (strcmp(g_title_id, "CUSA10249") == 0 && len == 0x600000u && type == 0) {
+        if (audio_fix_title() && len == 0x600000u && type == 0) {
             long got_phys = (r == 0 && phys) ? *phys : 0L;
             int is_syn = 0;
             for (int si = 0; si < g_shave_n; si++) {
@@ -1371,7 +1378,7 @@ static int32_t map_shaved_flex_tail(void *want_va, size_t tail_part, long shave_
 static void cusa10249_apply_deferred_tail_if_needed(void) __attribute__((unused));
 static void cusa10249_apply_deferred_tail_if_needed(void)
 {
-    if (strcmp(g_title_id, "CUSA10249") != 0) return;
+    if (!audio_fix_title()) return;
     g_c10249_first_reg_done = 1;
     if (!g_c10249_tail_pending) return;
     g_c10249_tail_pending = 0;
@@ -1607,7 +1614,7 @@ static int32_t handle_game_map_inner(void **addr, size_t len, int type, int prot
         if (r != 0 || (early_boot && (len >= 0x100000u || mcnt <= 48u)))
             STAGE("game %s(phys=0x%lx len=0x%zx prot=0x%x flags=0x%x align=0x%zx in=%p) = 0x%08x va=%p caller=%p",
                   mname, dmStart, len, prot, flags, maxPageSize, orig_addr_in, (unsigned)r, (void *)va_out, caller);
-        if (strcmp(g_title_id, "CUSA10249") == 0 && len == 0x2a000000u)
+        if (audio_fix_title() && len == 0x2a000000u)
             a10249_log_budget("after_arenas");
     }
     return r;

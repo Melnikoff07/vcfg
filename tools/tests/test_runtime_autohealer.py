@@ -500,7 +500,7 @@ int main(void) {{
     load_early_adapt_cfg();
     if (g_adapt_early_crashes != 0 || g_cfg.framegen != 1 || g_fg_off != 0) return 58;
 
-    // Test 15: CUSA10249 audio_fix per-game INI key in load_early_adapt_cfg (default=1 for CUSA10249, 0 for others; override 0/1/2 via config-CUSA10249.ini):
+    // Test 15: CUSA10249 audio_fix per-game INI key in load_early_adapt_cfg (default=1 for CUSA10249/CUSA07820, 0 for others; override 0/1/2 via config-CUSA10249.ini):
     reset_runtime_state("CUSA00552");
     load_early_adapt_cfg();
     if (g_cfg.audio_fix != 0) return 59;
@@ -518,6 +518,10 @@ int main(void) {{
     snprintf(vfs_config, sizeof(vfs_config), "audio_fix = 0\\n");
     load_early_adapt_cfg();
     if (g_cfg.audio_fix != 0) return 62;
+
+    reset_runtime_state("CUSA07820");
+    load_early_adapt_cfg();
+    if (g_cfg.audio_fix != 1) return 63;
 
     return 0;
 }}
