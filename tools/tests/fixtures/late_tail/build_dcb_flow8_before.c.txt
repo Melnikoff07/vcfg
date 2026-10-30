@@ -1,5 +1,5 @@
-// build_dcb_flow8 of classic/source/main.c before option late_tail (the TAIL row commit), extracted literally: the DCB the mode-8 gnm flip path
-// submitted before option late_tail existed. tools/tests/test_late_tail.py compiles it next to the current function and
+// build_dcb_flow8 of classic/source/main.c before option late_tail (the TAIL row commit), extracted literally, plus
+// the fade_hi table flag: the DCB the mode-8 gnm flip path submits with late_tail off. tools/tests/test_late_tail.py compiles it next to the current function and
 // compares their output word for word with late_tail off. Regenerate only together with a deliberate DCB change.
 static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M1, uint64_t M2,
                                 uint32_t pitch, uint32_t tidx, uint32_t nbytes, uint32_t slot, uint32_t seq,
@@ -26,7 +26,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
                         | (g_opt_nocf ? 8u : 0u) | (g_opt_nofgk ? 16u : 0u) | (g_opt_noanc ? 32u : 0u)
                         | (g_opt_notp ? 64u : 0u) | (g_opt_nomf ? 128u : 0u) | (g_opt_notex ? 256u : 0u)
                         | (g_opt_notpg ? 512u : 0u) | (g_opt_sharp ? 1024u : 0u) | (g_opt_nostr ? 2048u : 0u)
-                        | (pyr_warm ? FG8_FLAG_PYR_WARM : 0u)
+                        | (pyr_warm ? FG8_FLAG_PYR_WARM : 0u) | (g_fade_hi ? FG8_FLAG_FADE_HI : 0u)
                         | (cut_blocks8() << 16);
     uint32_t mid1_packed = (mid1_idx & 0x7FFFu) | ((t1_q16 & 0xFFFFu) << 16);
     // History copy on a 3-buffer ring (every title; proven on CUSA18723): a game that flips its buffers in turn leaves

@@ -2,8 +2,8 @@
 """Option late_tail (classic/source/late_tail.h): build_dcb_flow8 compiled from the source and executed.
 
 The current build_dcb_flow8 of classic/source/main.c and the one the DCB had before the option
-(fixtures/late_tail/build_dcb_flow8_before.c.txt, extracted literally) are compiled into one C harness, with the real
-fg8_table.h, fg_res.h, shaders.h, late_tail.h and the rcas8 flag helpers of main.c, and run on the same inputs:
+(fixtures/late_tail/build_dcb_flow8_before.c.txt, extracted literally, plus the fade_hi table flag) are compiled into one
+C harness, with the real fg8_table.h, fg_res.h, shaders.h, late_tail.h and the rcas8 flag helpers of main.c, and run on the same inputs:
 
 1. late_tail off (g_lt_req = 0), and on for frames it does not apply to (3-slot pair, present copy to the screen,
    no history copy, frame dump, rcas8 bit 5): the DCB words, the whole GPU slot memory and the history state are
@@ -84,6 +84,7 @@ static cfg_t g_cfg;
 static char g_title_id[16] = "CUSA02299";
 static int g_mem_tight = 0, g_runtime_2buf = 0, g_ngame = 2, g_fg_off = 0, g_bench_offscreen = 0;
 static int g_dump_req = 0, g_fence_logged = 0, g_pb_level = 0;
+static volatile int g_fade_hi = 1;   // option fade_hi, default on (both functions set FG8_FLAG_FADE_HI)
 static uint8_t *g_dump_mem = NULL;
 static uint32_t g_dump_frame = 0;
 static uint32_t g_bw = 1920, g_bh = 1080;
@@ -493,7 +494,7 @@ class TestLateTail(unittest.TestCase):
 """ + combo + fam + r"""
 static char g_dir[512];
 #define LOG_DIR "%s"
-static int g_known_game, g_detected_60fps, g_tile_override = -1, g_tile_sweep, g_t6_bit_override = -1, g_adapt_early_crashes = 0, g_post_budget = 1, g_late_tail = 1;
+static int g_known_game, g_detected_60fps, g_tile_override = -1, g_tile_sweep, g_t6_bit_override = -1, g_adapt_early_crashes = 0, g_post_budget = 1, g_late_tail = 1, g_fade_hi = 1;
 static int g_is_neo = 0;
 static char g_title_id[16] = "CUSA02299";
 static char g_family_id[16] = "CUSA02299";

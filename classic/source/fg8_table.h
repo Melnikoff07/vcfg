@@ -217,6 +217,8 @@ static inline void ycocg420_decompress_frame(const uint32_t *ycocg_in, uint32_t 
 // from the previous frame's cur pyramid buffers via ping-pong descriptor swap (0 B extra DirectMemory),
 // and pyr8.ll skips all T#prev texture fetches and V#L1prev..L3prev buffer stores (-50% pyr8 bandwidth & ALU).
 #define FG8_FLAG_PYR_WARM 0x1000u
+// consts.flags bit 13: option fade_hi in me1.ll (a luma-sum change above 8 % is a fade whatever the camera vector).
+#define FG8_FLAG_FADE_HI 0x2000u
 
 // table read by the mode 8 shaders (offsets are hard-coded in shaders/*8.ll and me*.ll)
 #define WA(off) ((uint64_t)(uintptr_t)(work + (off)))
@@ -231,7 +233,7 @@ static inline void fill_table8_wh(uint32_t *tb, uint64_t P, uint64_t C, uint64_t
     tb[24] = 2u | (2u << 3) | (2u << 6) | (1u << 15); tb[25] = 0; tb[26] = (1u << 20) | (1u << 22); tb[27] = 0;
     // +0x70 consts; tb[29] holds mid_idx | (t_override_q16 << 16); flags: bit 0 adaptive phase, bit 1 FG off,
     // bit 2 debug marker, bit 3 'k', bit 4 'g', bit 5 'L', bit 6 'T', bit 7 'M', bit 8 'G', bit 9 'P', bit 10 'S', bit 11 'b',
-    // bit 12 FG8_FLAG_PYR_WARM (single-frame warm pyramid fast path)
+    // bit 12 FG8_FLAG_PYR_WARM (single-frame warm pyramid fast path), bit 13 FG8_FLAG_FADE_HI (me1 fade above 8 %)
     tb[28] = r; tb[29] = mid_idx; tb[30] = flags; tb[31] = g_hud_packed;
     if (work) {
         // buffers get 16 bytes of slack: me*.ll read 12 bytes at an aligned-down row start

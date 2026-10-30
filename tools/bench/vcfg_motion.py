@@ -392,6 +392,14 @@ def _equi(m, c, p):
     return np.clip(o, -0.5, 0.5).astype(np.float32)
 
 
+# me1 global fade rule: a frame luma-sum change above FADE_LO of the previous sum is a fade while the camera (gm8)
+# moves at most 1 L2 px and fg_blocks <= 32; with the option fade_hi (consts.flags bit 13, plugin default on) a change
+# above FADE_HI is a fade whatever gm8 and the foreground count say (mp['fade_hi'] = 0 turns it off here).
+FADE_LO = np.float32(0.02)
+FADE_HI = np.float32(0.08)
+FADE_HI_DEFAULT = 1
+
+
 def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None, fgcnt=None):
     mp = mp or {}
     """raw field FT (68, 120, 2) float32 (full-res px, mid grid), the unmatched-block count and the fade flag"""
@@ -533,8 +541,10 @@ def me1(L1p, L1c, V2, GK, gm, lumasum_cur, lumasum_prev, prevF=None, mp=None, fg
     zero0 = (r5 <= r0 + 48) & ~isfgk & still
     fsc, fsp = np.float32(lumasum_cur), np.float32(lumasum_prev)
     fad = np.abs(fsc - fsp)
-    fade0 = fad > fsp * np.float32(0.02)
+    fade0 = fad > fsp * FADE_LO
     fade = bool(fade0 and (max(abs(gmx), abs(gmy)) <= 1) and fg_still)
+    if mp.get("fade_hi", FADE_HI_DEFAULT):   # consts.flags bit 13: above 8 % a fade whatever the camera vector
+        fade = fade or bool(fad > fsp * FADE_HI)
     zero_all = zero0 | fade
     FT = np.stack([np.where(zero_all, 0, vx), np.where(zero_all, 0, vy)], -1).astype(np.float32).reshape(nby, nbx, 2)
     cthr = fad * np.float32(0.0019753087) + np.float32(384.0)

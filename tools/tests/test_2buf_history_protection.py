@@ -493,6 +493,7 @@ static int gv_warp_active(void) {{ return 0; }}
 static int gv_viz_active(void) {{ return 0; }}
 static volatile int g_pb_level = 0;   /* post budget level (post_budget.h): 0 = the player's settings */
 #include "post_budget.h"
+static volatile int g_fade_hi = 1;   /* option fade_hi, default on (build_dcb_flow8 sets FG8_FLAG_FADE_HI) */
 
 #include "shaders.h"
 #include "fg_res.h"
