@@ -97,6 +97,7 @@ typedef struct {
 } fg_config_t;
 
 static char g_title_id[16] = "CUSA00552";
+static int vcfg_in_family(const char *tid, const char *fam) { (void)tid; (void)fam; return 0; }
 static fg_config_t g_cfg = { 0 };
 static int g_dm_hooks = 1;
 static volatile int g_own_alloc = 0;

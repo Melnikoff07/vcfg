@@ -126,7 +126,11 @@ static int mem_ok(uintptr_t a, size_t n, int32_t need)
             en = vq.unk02;
             // Trust vq.unk04 directly: a committed guard page has isCommitted==1 and unk04==0 (PROT_NONE),
             // whereas sceKernelQueryMemoryProtection can return the parent arena's 0x33 protection.
-            prot = vq.isCommitted ? (int32_t)vq.unk04 : 0;
+            // Reject CPU-only 'anon:' pages lacking PROT_GPU_READ (e.g. CUSA44732 volatile CPU thread heaps).
+            prot = (vq.isCommitted &&
+                    !(!vq.isDirectMemory && !vq.isFlexibleMemory &&
+                      strncmp(vq.name, "anon:", 5) == 0 && !(vq.unk04 & PROT_GPU_READ)))
+                   ? (int32_t)vq.unk04 : 0;
         } else if (sceKernelQueryMemoryProtection((void *)cur, &s, &en, &prot) != 0 ||
                    (uintptr_t)s > cur || (uintptr_t)en <= cur) {
             // Cache negative dword at cur so repeated checks of the same unmapped pointer do not repeat syscalls

@@ -74,6 +74,20 @@ def _norm_sad(sad_in, avg_sum, t_avg, t_min, ztex, zsum):
     return np.minimum(sad_i + esc_pen, 65535)
 
 
+def _norm_sad_mf8(sad_in, avg_sum, t_avg, t_min, ztex, zsum, zm_le512=True):
+    """F2_mf8 texture-confidence normalization: bidirectional infl [8..64] when zm_le512 & (t_min > num) + gated luma_jump (ztex > 128)."""
+    num = np.maximum(ztex, 96)
+    den = np.maximum(t_avg, 96)
+    lo = np.where(zm_le512 & (t_min > num), 8, 16)
+    infl_num = np.clip((num * 16) // den, lo, 64)
+    sad_i = (sad_in * infl_num) >> 4
+    tex_loss = np.maximum(ztex - t_avg - 48, 0)
+    luma_jump = np.where(ztex > 128, np.maximum(np.abs(avg_sum - zsum) - 384, 0) >> 2, 0)
+    smooth_sky = np.clip(128 - t_min, 0, 128)
+    esc_pen = ((tex_loss + luma_jump) * smooth_sky) >> 7
+    return np.minimum(sad_i + esc_pen, 65535)
+
+
 def sad_bilateral(prev, cur, X, Y, dx, dy, dc_comp=True):
     """me1 bsad: prev block at X + ceil(d/2), cur block at X - floor(d/2) with displacement-preserving border clamp.
     Returns (dc_compensated_sad, (sum_prev + sum_cur) >> 1)."""
@@ -338,10 +352,15 @@ def fgs8(L2p, L2c, V2, S2, gm, anchor_hist=None):
     rm = 2 * sb <= texm
     f1 = good & dev & istex
     fg0 = f1 & mov & rm
-    slw = (vv <= 2) & (4 * vv <= gmv)
+    h = np.zeros(N, np.int64) if anchor_hist is None else anchor_hist.astype(np.int64)
+    has_h = h > 0
+    vv_thr = np.where(has_h, 9, 2)
+    slw = (vv <= vv_thr) & (4 * vv <= gmv)
     inb = (bxq >= 1) & (bxq <= 58) & (byq >= 1) & (byq <= 32)
     an0 = np.where(stl, istex & (4 * vv <= 4) & rm, f1 & slw & rm) & inb
-    need = fg0 | an0
+    nstl = ~stl
+    ank_pre = has_h & nstl & istex & rm & slw & inb
+    need = fg0 | an0 | ank_pre
 
     def nbok(ox, oy):
         nx, ny = bxq + ox, byq + oy
@@ -353,15 +372,19 @@ def fgs8(L2p, L2c, V2, S2, gm, anchor_hist=None):
     nb_cnt = np.zeros(N, np.int64)
     if need.any():
         nb0, nb1, nb2, nb3 = nbok(-1, 0), nbok(1, 0), nbok(0, -1), nbok(0, 1)
-        nbk = nb0 | nb1 | nb2 | nb3
-        nb_cnt = nb0.astype(np.int64) + nb1.astype(np.int64) + nb2.astype(np.int64) + nb3.astype(np.int64)
+        nbk = (nb0 | nb1 | nb2 | nb3) & need
+        nb_cnt = np.where(
+            need,
+            nb0.astype(np.int64) + nb1.astype(np.int64) + nb2.astype(np.int64) + nb3.astype(np.int64),
+            0,
+        )
     isfg, isa0 = fg0 & nbk, an0 & nbk
+    ank = ank_pre & nbk
     global _LAST_FGCNT
     _LAST_FGCNT = int(isfg.sum())
-    h = np.zeros(N, np.int64) if anchor_hist is None else anchor_hist.astype(np.int64)
-    hn = np.where(isa0, np.minimum(h + 1, 255), 0)
-    strong_an = (~stl) & (nb_cnt >= 2) & (gdif >= 160)
-    isan = isa0 & ((hn >= 2) | strong_an)
+    hn = np.minimum(np.where(isa0, h + 2, np.maximum(h - 1, 0)), 5)
+    strong_an = nstl & (nb_cnt >= 2) & (gdif >= 160)
+    isan = (isa0 | ank) & ((hn >= 3) | strong_an)
     doit = isfg | isan
     prio = np.where(isfg, _isqrt(np.minimum(q >> 2, 16760836)) + 1, 0)
     GK = np.zeros((68, 120), np.int64)
@@ -585,7 +608,7 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
     still = np.bool_((gmx | gmy) == 0)
     gmx4, gmy4 = np.float32(gmx * 4), np.float32(gmy * 4)
     av = V2.reshape(-1, 2)[gk & 4095].astype(np.int64) * 2
-    cap = np.where(nfgk, mp.get("cap", 32), 8)
+    cap = np.where(nfgk, mp.get("cap", 64), 8)
     lsh = np.where(nfgk, mp.get("lsh", 2), 1)
     h1, w1 = L1c.shape
     wm8, hm8 = w1 - 8, h1 - 8
@@ -594,11 +617,15 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
     # Midpoint (0, 0) block texture and luma sum (clamped to [0, wm8] x [0, hm8] matching @mid_zinfo / @bsad)
     p0_blk = _blocks(L1p, np.clip(X, 0, wm8), np.clip(Y, 0, hm8)[:, None] + r_idx)
     c0_blk = _blocks(L1c, np.clip(X, 0, wm8), np.clip(Y, 0, hm8)[:, None] + r_idx)
+    zraw_s = np.abs(p0_blk - c0_blk).sum(axis=(1, 2))
     ztex_p = _block_tex_8x8(p0_blk)
     ztex_c = _block_tex_8x8(c0_blk)
-    ztex = (ztex_p + ztex_c) >> 1
+    ztex0 = (ztex_p + ztex_c) >> 1
     ztex_min = np.minimum(ztex_p, ztex_c)
     ztex_diff = np.abs(ztex_p - ztex_c)
+    zm2 = np.minimum(ztex0, ztex_min * 2)
+    zm_le512 = ztex_min <= 512
+    ztex = np.where(zm_le512, np.maximum(zm2 - zraw_s, 0), zm2)
     zsum = (p0_blk.sum(axis=(1, 2)) + c0_blk.sum(axis=(1, 2))) >> 1
 
     def ldT(ox, oy):
@@ -679,7 +706,7 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
         qtrim = qexc - (qexc >> 2)
         allow_qtrim = (qmin <= 88) & ~((ztex > 140) & (tex_min < 96))
         sad_t = np.minimum(sad0 - np.where(allow_qtrim, qtrim, 0), 65535)
-        sad = _norm_sad(sad_t, avg_sum, tex_avg, tex_min, ztex, zsum)
+        sad = _norm_sad_mf8(sad_t, avg_sum, tex_avg, tex_min, ztex, zsum, zm_le512=zm_le512)
         bias = np.where(hasfg & ((sc > 3) | (sm0 < 16)), 96, 0) if sub == 0 else 0
         apen = np.where(ap, 512, 0)
         xc_0 = Xu - (cx >> 1)
@@ -708,6 +735,9 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
         cand_ap.append(ap)
         cand_val.append(np.full(N, sub == 0) if fade else np.ones(N, bool))
 
+    if not mp.get("sub8", True):
+        return winv.reshape(nby, nbx, 2)
+
     # Pass 2: Dual-layer 8x8 quadrant contour refinement across all 16 lanes (sub = 0..15)
     best2 = np.full(N, BIG, np.int64)
     win_mask = np.zeros(N, np.int64)
@@ -715,6 +745,10 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
     win_cy2 = np.zeros(N, np.int64)
     sc1 = np.abs(wincx - gmx2) + np.abs(wincy - gmy2)
     winq_max = winq.max(axis=-1)
+    gm_mag = np.abs(gmx2) + np.abs(gmy2)
+    fast_gm = gm_mag >= 22
+    zm_le160 = ~(ztex_min > 160)
+    zm_le112 = ztex_min <= 112
     for sub in range(16):
         cx, cy = cand_cx[sub], cand_cy[sub]
         qs = cand_q[sub]
@@ -730,7 +764,13 @@ def mf8(L1p, L1c, FT, GK, V2, gm, fade, mp=None, prevF=None):
                 (q_win[:, 1].astype(np.int64) << 1) |
                 (q_win[:, 2].astype(np.int64) << 2) |
                 (q_win[:, 3].astype(np.int64) << 3))
-        ok = cand_val[sub] & (~cand_ap[sub]) & (d12 >= 3) & (mask > 0) & (mask < 15) & qmin_ok
+        per_esc = (d12 >= 16) & (sc >= 16)
+        dy_ge16 = np.abs(cy - gmy2) >= 16
+        thin_esc1 = zm_le160 & (zm_le112 | dy_ge16)
+        thin_esc = thin_esc1 | per_esc
+        sc1_g = (sc1 <= 3) | (per_esc & (sc1 <= 16))
+        fast_thin_bg = (~hasfg) & sc1_g & fast_gm & thin_esc
+        ok = cand_val[sub] & (~cand_ap[sub]) & (d12 >= 3) & (mask > 0) & (mask < 15) & qmin_ok & (~fast_thin_bg)
         c2 = qmin + 256
         k2 = np.where(ok, (c2 << 8) | sub, BIG)
         b2 = k2 < best2

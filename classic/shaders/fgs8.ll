@@ -416,9 +416,16 @@ go:
   %f1 = and i1 %f1a, %istex
   %fg0a = and i1 %f1, %mov
   %fg0 = and i1 %fg0a, %rm
-  ; ---- 8.5 anchor: quasi-static screen-fixed object (|V2|^2 <= 2 and 4|V2|^2 <= |gm|^2), inner block, letter 'L' off
+  ; ---- 8.5 anchor: quasi-static screen-fixed object (|V2|^2 <= 2 [9 with history] and 4|V2|^2 <= |gm|^2), inner block, letter 'L' off
+  %pv3 = getelementptr i8, ptr addrspace(4) %tbl, i64 224
+  %vv3 = load <4 x i32>, ptr addrspace(4) %pv3, align 16, !invariant.load !0
+  %hoff = add i32 %i, 2048
+  %h8 = call i8 @llvm.amdgcn.raw.buffer.load.i8(<4 x i32> %vv3, i32 %hoff, i32 0, i32 0)
+  %h = zext i8 %h8 to i32
+  %has_h = icmp ugt i32 %h, 0
+  %vv_thr = select i1 %has_h, i32 9, i32 2
   %vv4 = shl i32 %vv, 2
-  %slw0 = icmp ule i32 %vv, 2
+  %slw0 = icmp ule i32 %vv, %vv_thr
   %slw1 = icmp ule i32 %vv4, %gmv
   %slw = and i1 %slw0, %slw1
   %bxm = add i32 %bxq, -1
@@ -440,7 +447,15 @@ go:
   %an1 = select i1 %stl, i1 %as1, i1 %anm
   %an2 = and i1 %an1, %inb
   %an0 = and i1 %an2, %aon
-  %need = or i1 %fg0, %an0
+  %nstl = xor i1 %stl, true
+  %ank0 = and i1 %has_h, %nstl
+  %ank1 = and i1 %ank0, %istex
+  %ank2 = and i1 %ank1, %rm
+  %ank3 = and i1 %ank2, %slw
+  %ank4 = and i1 %ank3, %inb
+  %ank_pre = and i1 %ank4, %aon
+  %need0 = or i1 %fg0, %an0
+  %need = or i1 %need0, %ank_pre
   br i1 %need, label %nbc, label %hist
 nbc:
   ; 4 cardinal neighbours (in bounds) with |dV|_1 <= 4
@@ -463,24 +478,22 @@ hist:
   %nb2k = phi i1 [ false, %go ], [ %nb2ok, %nbc ]
   %isfg = and i1 %fg0, %nbk
   %isa0 = and i1 %an0, %nbk
-  ; anchor history: consecutive frames with the anchor condition (u8 per L2 block, V3 + 2048, zeroed at allocation)
-  %pv3 = getelementptr i8, ptr addrspace(4) %tbl, i64 224
-  %vv3 = load <4 x i32>, ptr addrspace(4) %pv3, align 16, !invariant.load !0
-  %hoff = add i32 %i, 2048
-  %h8 = call i8 @llvm.amdgcn.raw.buffer.load.i8(<4 x i32> %vv3, i32 %hoff, i32 0, i32 0)
-  %h = zext i8 %h8 to i32
-  %h1 = add i32 %h, 1
-  %h1c = call i32 @llvm.umin.i32(i32 %h1, i32 255)
-  %hn = select i1 %isa0, i32 %h1c, i32 0
-  %hn8 = trunc i32 %hn to i8
+  %ank = and i1 %ank_pre, %nbk
+  ; anchor history: step +2 on isa0, decay -1 when !isa0 (capped to 5, threshold >= 3 -> max 2-frame hold)
+  %hp = add i32 %h, 2
+  %hm0 = sub i32 %h, 1
+  %hm = call i32 @llvm.smax.i32(i32 %hm0, i32 0)
+  %hn = select i1 %isa0, i32 %hp, i32 %hm
+  %hn_c = call i32 @llvm.smin.i32(i32 %hn, i32 5)
+  %hn8 = trunc i32 %hn_c to i8
   call void @llvm.amdgcn.raw.buffer.store.i8(i8 %hn8, <4 x i32> %vv3, i32 %hoff, i32 0, i32 0)
-  %nstl = xor i1 %stl, true
   %g160 = icmp sge i32 %gdif, 160
   %sa0 = and i1 %nstl, %nb2k
   %strong_an = and i1 %sa0, %g160
-  %hok0 = icmp uge i32 %hn, 2
+  %hok0 = icmp uge i32 %hn_c, 3
   %hok = or i1 %hok0, %strong_an
-  %isan = and i1 %isa0, %hok
+  %isa_eff = or i1 %isa0, %ank
+  %isan = and i1 %isa_eff, %hok
   %doit = or i1 %isfg, %isan
   br i1 %doit, label %splat, label %exit
 splat:

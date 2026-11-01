@@ -168,6 +168,7 @@ static const VcfgTitleAlias k_vcfg_title_aliases[] = {
     // CUSA36842 family
     { "CUSA36842", "CUSA36842" },
     { "CUSA36843", "CUSA36842" },
+    { "CUSA36848", "CUSA36842" },
 
     // CUSA01015 family
     { "CUSA01015", "CUSA01015" },

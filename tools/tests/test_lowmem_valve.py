@@ -130,6 +130,13 @@ static VoAttr g_attr = { 0x80000000u };
 static int g_ngame = 2, g_game_idx_hi = 6, g_detected_60fps = 0, g_fmt_supported = 1;
 static uint64_t g_buf[16];
 static int g_mbase = 3, g_nbuf = 0, g_pcopy_avail = 0, g_pcopy_k = 2, g_nmid = 1;
+static volatile int g_pcopy_on = 0;
+static int g_vq_on = 0, g_runtime_2buf = 0;
+static inline void __attribute__((unused)) reset_mbuf_on_early_release(void)
+{
+    g_mbase = 16; g_nmid = 0; g_pcopy_avail = 0; g_pcopy_on = 0; g_vq_on = 0; g_runtime_2buf = 0;
+}
+#define VCFG_HAS_RESET_MBUF_ON_EARLY_RELEASE 1
 static char g_inert_reason[64];
 static char g_last_safe_refuse[64];
 static void safe_refuse(const char *why)
@@ -141,12 +148,75 @@ static void safe_refuse(const char *why)
 static int fg_res_supported(uint32_t w, uint32_t h) { return w >= 640 && h >= 360; }
 static int vcfg_in_family(const char *tid, const char *fam) { (void)tid; (void)fam; return 0; }
 static int gv_armed(void) { return 0; }
+// VideoOut calls of safe_try_activate, recorded in order: {1 = RegisterBuffers, start, count, addresses[count - 1] >> 20,
+// returned slot or error}, {2 = UnregisterBuffers, slot, 0, 0, rc} or {3 = SubmitFlip, index, 0, 0, 0}.
+// Attribute slots are handed out like VideoOut does, lowest free first (g_vo_slots: bit = slot in use; the game's own
+// group holds slot 0). g_vo_fail_count: a RegisterBuffers of that many buffers is refused; g_vo_fail2_left: the next
+// RegisterBuffers of 2 buffers are refused that many times; g_vo_force_n3: a RegisterBuffers of 3 buffers gets that slot;
+// g_vo_unreg_fail_slot: UnregisterBuffers of that slot is refused (busy).
+static int32_t g_vo_log[16][5];
+static int g_vo_log_n = 0, g_vo_fail_count = 0, g_vo_fail2_left = 0, g_vo_force_n3 = -1, g_vo_unreg_fail_slot = -1;
+static uint32_t g_vo_slots = 1u;
+static void vo_log(int k, int32_t a, int32_t b, int32_t c, int32_t rc)
+{
+    if (g_vo_log_n < 16) {
+        g_vo_log[g_vo_log_n][0] = k; g_vo_log[g_vo_log_n][1] = a; g_vo_log[g_vo_log_n][2] = b; g_vo_log[g_vo_log_n][3] = c;
+        g_vo_log[g_vo_log_n][4] = rc;
+        g_vo_log_n++;
+    }
+}
 static int32_t raw_sceVideoOutRegisterBuffers(int32_t h, int32_t s, void *const *a, int32_t n, const VoAttr *attr)
 {
-    (void)h; (void)s; (void)a; (void)n; (void)attr;
-    return 1;
+    (void)h; (void)attr;
+    int32_t c = (a && n > 0) ? (int32_t)((uintptr_t)a[n - 1] >> 20) : 0;
+    int32_t rc = -1;
+    if (g_vo_fail_count && n == g_vo_fail_count) rc = (int32_t)0x80290001;
+    else if (n == 2 && g_vo_fail2_left > 0) { g_vo_fail2_left--; rc = (int32_t)0x80290001; }
+    else if (n == 3 && g_vo_force_n3 >= 0) rc = g_vo_force_n3;
+    else for (int sl = 0; sl < 4 && rc < 0; sl++) if (!(g_vo_slots & (1u << sl))) rc = sl;
+    if (rc >= 0) g_vo_slots |= 1u << rc;
+    vo_log(1, s, n, c, rc);
+    return rc;
 }
-static int32_t sceVideoOutUnregisterBuffers(int32_t h, int32_t idx) { (void)h; (void)idx; return 0; }
+static int32_t sceVideoOutUnregisterBuffers(int32_t h, int32_t idx)
+{
+    (void)h;
+    int32_t rc = (idx == g_vo_unreg_fail_slot) ? (int32_t)0x80290009 : 0;
+    if (rc == 0 && idx >= 0 && idx < 32) g_vo_slots &= ~(1u << idx);
+    vo_log(2, idx, 0, 0, rc);
+    return rc;
+}
+typedef struct {
+    uint64_t count, processTime, tsc;
+    int64_t flipArg;
+    uint64_t submitTsc, reserved0;
+    int32_t gcQueueNum, flipPendingNum, currentBuffer;
+    uint32_t reserved1;
+} VoFlipStatus;
+static int g_fs_pending_polls = 0, g_fs_polls = 0;   // polls that still report one pending flip
+static int32_t g_fs_cur = 0;                         // buffer on screen (-1 blank), moved by a CPU flip below
+static uint64_t g_fs_count = 100;                    // flips completed
+static int32_t read_flip_status(int32_t h, VoFlipStatus *st)
+{
+    (void)h;
+    g_fs_polls++;
+    st->flipPendingNum = g_fs_pending_polls > 0 ? 1 : 0;
+    if (g_fs_pending_polls > 0) g_fs_pending_polls--;
+    st->currentBuffer = g_fs_cur;
+    st->count = g_fs_count;
+    return 0;
+}
+// CPU flips of the one display group; g_sf_stall: the flip never completes.
+static int g_sf_stall = 0;
+static int32_t raw_sceVideoOutSubmitFlip(int32_t h, int32_t idx, uint32_t mode, int64_t arg)
+{
+    (void)h; (void)mode; (void)arg;
+    vo_log(3, idx, 0, 0, 0);
+    if (!g_sf_stall) { g_fs_cur = idx; g_fs_count++; }
+    return 0;
+}
+static int g_og2_copy_ok = 1, g_og2_copies = 0;
+static int og2_copy(void *dst, const void *src, size_t n) { (void)dst; (void)src; (void)n; g_og2_copies++; return g_og2_copy_ok; }
 static int32_t raw_sceVideoOutSetFlipRate(int32_t h, int32_t r) { (void)h; (void)r; return 0; }
 #define lg(...) stage_nop(__VA_ARGS__)
 #define snprintf(b, s, ...) stage_nop(__VA_ARGS__)
@@ -222,6 +292,7 @@ static SimFlexBlock g_sim_flex[MAX_FLEX_BLOCKS];
 static int g_sim_force_misaligned_flex = 0;
 static int g_sim_map_dm_calls = 0;
 static int g_sim_map_flex_calls = 0;
+static int g_sim_checked_release_dm_calls = 0;
 static int g_sim_last_flex_flags = 0;
 static uintptr_t g_sim_fake_va_cursor = 0x330000000000ULL;
 
@@ -269,6 +340,7 @@ static void sim_reset(size_t dm_total)
     g_sim_force_misaligned_flex = 0;
     g_sim_map_dm_calls = 0;
     g_sim_map_flex_calls = 0;
+    g_sim_checked_release_dm_calls = 0;
     g_sim_last_flex_flags = 0;
     g_sim_fake_va_cursor = 0x330000000000ULL;
 
@@ -425,6 +497,13 @@ static int32_t raw_sceKernelReleaseDirectMemory(long phys, size_t len)
     return -1;
 }
 
+#define VCFG_HAS_RAW_CHECKED_RELEASE_DM 1
+static int32_t __attribute__((unused)) raw_sceKernelCheckedReleaseDirectMemory(long phys, size_t len)
+{
+    g_sim_checked_release_dm_calls++;
+    return raw_sceKernelReleaseDirectMemory(phys, len);
+}
+
 static int32_t sceKernelUsleep(uint32_t usec)
 {
     (void)usec;
@@ -534,6 +613,7 @@ static int32_t raw_sceVideoOutClose(int32_t h) { (void)h; return 0; }
 int32_t sceKernelAvailableDirectMemorySize_hook(off_t s, off_t e, size_t align, off_t *startOut, size_t *sizeOut);
 int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t align, int type, long *phys);
 int32_t sceKernelReleaseDirectMemory_hook(off_t start, size_t len);
+__attribute__((weak)) int32_t sceKernelCheckedReleaseDirectMemory_hook(off_t start, size_t len) { (void)start; (void)len; return -1; }
 int32_t sceKernelMapDirectMemory_hook(void **addr, size_t len, int prot, int flags, long dmStart, size_t maxPageSize);
 int32_t sceKernelMapNamedDirectMemory_hook(void **addr, size_t len, int prot, int flags, long dmStart, size_t maxPageSize, const char *name);
 
@@ -570,6 +650,11 @@ static void reset_shave_state(void)
     g_shave_last_probe_len = 0;
     g_flex_vmap_n = 0;
     memset(g_flex_gpu_slots, 0, sizeof(g_flex_gpu_slots));
+    g_c10249_tail_pending = 0;
+    g_c10249_first_reg_done = 0;
+    g_af_main_t0_len = 0;
+    g_af_t3_arenas = 0;
+    g_af_preshave_len = 0;
 }
 
 static void setup_early_buffers_top_first(void)
@@ -994,6 +1079,8 @@ static void test_runtime_streaming_and_batchmap_guards(void)
     // 4K (3840x2160, surf_sz = 0x1FE0000 = 31.875 MB, half_sz = 0x1020000 = 16.125 MB, reserve = 0x800000):
     // When flex_av = 0x2000000 (32 MB, CUSA03041 f7670bbd50 / CUSA08519 05f48e9f0b / CUSA09175 4f8fe31922) or 0x2500000 (37 MB, CUSA08519 fa2a9f81fa),
     // alloc_pbuf_history MUST select half_sz = 0x1020000 (16.125 MB, leaving 15.875..20.875 MB) instead of full_sz = 0x1FE0000 (which leaves 128 KB -> SIGBUS):
+    const char *t03041 = "CUSA03041";
+    for (int i = 0; i < 10; i++) g_title_id[i] = t03041[i];
     g_sim_flex_avail = 0x2000000u;
     ASSERT(alloc_pbuf_history(0x1FE0000u) != NULL && g_pbuf_sz == 0x1020000u && g_pbuf_ycocg == 1);
     ASSERT(g_sim_flex_avail == 0xFE0000u);
@@ -1005,6 +1092,8 @@ static void test_runtime_streaming_and_batchmap_guards(void)
     // 4K below half_sz + reserve (0x1020000 + 0x800000 = 0x1820000): flex_av = 0x1800000 (24 MB) -> skip (NULL):
     g_sim_flex_avail = 0x1800000u;
     ASSERT(alloc_pbuf_history(0x1FE0000u) == NULL && g_pbuf == NULL);
+    const char *t13323_8 = "CUSA13323";
+    for (int i = 0; i < 10; i++) g_title_id[i] = t13323_8[i];
     // CUSA13323 (23c9c334dc) / CUSA11456 (0c84be5483) boot sequence:
     // At t=2.62s (RegisterBuffers num=2), flex_av = 0x2C00000 (44 MB) allocates g_pbuf = 0x800000 (8 MB).
     // By t=4.61s (AllocateDirectMemory len=0x4000000, need_tail=0x800000), the game has consumed Flex down to 0x500000 (5 MB).
@@ -1068,6 +1157,163 @@ static void test_runtime_streaming_and_batchmap_guards(void)
     ASSERT(g_safe_active == 1 && g_mbuf_state == 1 && g_pre_work != NULL && g_pre_gpu != NULL && g_pbuf == NULL);
     g_cfg.shave_mode = 0;
     g_sim_flex_avail = 0x10000000u;
+
+    // 9c. One display group (CUSA02299, g_og2): the game's buffer goes off the screen before its group is dropped.
+    //     sc 0: temporary group (ours alone at 15, a copy of the game's buffer on screen), CPU flip to it, drop the game's
+    //           slot, one group 0..2, flip the game's buffer back, drop the temporary slot.
+    //     sc 1: the one group is refused twice: blank flip, temporary slot dropped, refused again, the game's group back
+    //           alone and ours alone at 15 as before.
+    //     sc 2: the copy cannot be made: blank flip, drop, one group, game's buffer back; no temporary group.
+    //     sc 3: the temporary flip never completes: the temporary group stays as our separate group, nothing dropped.
+    //     sc 4: flips still pending after 100 ms: nothing tried, ours alone at 15 in one call.
+    //     sc 5: another title (g_og2 0): exactly the single call of the separate group, no flip-status read.
+    //     sc 6: the copy cannot be made and the blank flip never completes: nothing dropped, ours alone at 15.
+    //     sc 7: the game's group cannot be dropped (step 3 refused): the temporary group stays as our separate group.
+    //     sc 8: the one group is refused twice and the game's group back alone once: the retry puts it back, ours at 15.
+    //     sc 9: the one group gets slot 2, not the game's slot 0: undone (slot 2 dropped, the game's group back alone at
+    //           slot 0), the temporary group stays as our separate group.
+    //     sc 10: as sc 8 with the game's group refused twice: both tries logged, ours still alone at 15.
+    //     sc 11: one group, then the game drops its slot and registers 0..1 again: ours registered alone at 15.
+    //     sc 12: as sc 11 with ours refused: frame generation stops (g_mbuf_state -1), no index past the game's.
+    for (int sc = 0; sc < 13; sc++) {
+        sim_reset(0x40000000u);
+        reset_shave_state();
+        g_cfg.shave_mode = 2;
+        g_safe_done = 0; g_safe_active = 0; g_last_safe_refuse[0] = 0; g_mbuf_state = 0;
+        g_pre_gpu = NULL; g_pre_work = NULL; g_pre_mem = NULL; g_pbuf = NULL; g_pcopy_avail = 0;
+        g_bw = 1920; g_bh = 1080; g_pitch = 1920;
+        g_fmt_supported = 1; g_ngame = 2; g_game_idx_hi = 2;
+        memset(g_buf, 0, sizeof(g_buf));
+        g_buf[0] = 0x100000000ULL;
+        g_buf[1] = 0x100800000ULL;
+        g_own_alloc++;
+        ASSERT(raw_sceKernelAllocateDirectMemory(0x3F800000L, 0x40000000L, 0x800000u, 0x200000u, 3, &g_pre_mem_phys) == 0);
+        ASSERT(raw_sceKernelMapDirectMemory(&g_pre_mem, 0x800000u, 0x33, 0, g_pre_mem_phys, 0x200000u) == 0);
+        g_pre_size = 0x800000u;
+        long fill_9c = 0;
+        ASSERT(raw_sceKernelAllocateDirectMemory(0x1D0000L, 0x3F800000L, 0x3F630000u, 0x10000u, 3, &fill_9c) == 0);
+        g_own_alloc--;
+        g_sim_flex_avail = 0x400000u;
+        uintptr_t mid_va = (uintptr_t)g_pre_mem;
+        g_og2 = (sc == 5) ? 0 : 1;
+        g_og2_active = 0;
+        g_og2_copy_ok = (sc != 2 && sc != 6);
+        g_og2_copies = 0;
+        g_og2_pend_slot = -1;
+        g_sf_stall = (sc == 3 || sc == 6);
+        g_game_attr_slot = 0;
+        g_vo_slots = 1u;   // the game's group holds slot 0
+        g_vo_fail_count = (sc == 1 || sc == 8 || sc == 10) ? 3 : 0;
+        g_vo_fail2_left = (sc == 8) ? 1 : (sc == 10) ? 2 : 0;
+        g_vo_force_n3 = (sc == 9) ? 2 : -1;
+        g_vo_unreg_fail_slot = (sc == 7) ? 0 : -1;
+        g_fs_pending_polls = (sc == 4) ? 1000 : 0; g_fs_polls = 0; g_fs_cur = 1; g_fs_count = 100;
+        g_vo_log_n = 0;
+        safe_try_activate(1u);
+        ASSERT(g_safe_active == 1 && g_mbuf_state == 1 && g_nbuf - g_mbase == 1 && g_buf[g_mbase] == (uint64_t)mid_va);
+        ASSERT(g_og2_copies == ((sc == 4 || sc == 5) ? 0 : 1));   // the game's buffer on screen (1) copied into ours once
+        if (sc == 0 || sc == 11 || sc == 12) {
+            ASSERT(g_vo_log_n == 6);
+            ASSERT(g_vo_log[0][0] == 1 && g_vo_log[0][1] == 15 && g_vo_log[0][2] == 1 && g_vo_log[0][3] == (int32_t)(mid_va >> 20));
+            ASSERT(g_vo_log[1][0] == 3 && g_vo_log[1][1] == 15);
+            ASSERT(g_vo_log[2][0] == 2 && g_vo_log[2][1] == 0);
+            ASSERT(g_vo_log[3][0] == 1 && g_vo_log[3][1] == 0 && g_vo_log[3][2] == 3 && g_vo_log[3][3] == (int32_t)(mid_va >> 20));
+            ASSERT(g_vo_log[4][0] == 3 && g_vo_log[4][1] == 1);
+            ASSERT(g_vo_log[0][4] == 1 && g_vo_log[3][4] == 0);   // temporary group slot 1, one group the game's slot 0
+            ASSERT(g_vo_log[5][0] == 2 && g_vo_log[5][1] == 1);   // the temporary slot (1), after the game's buffer is back
+            ASSERT(g_mbase == 2 && g_nbuf == 3 && g_ext_attr_slot == -1 && g_og2_pend_slot == -1);
+            ASSERT(g_og2_active == 1 && g_game_attr_slot == 0 && g_vo_slots == 1u);
+            if (sc == 0) {
+                g_og2_pend_slot = 1;            // a temporary group that was still on screen: dropped on a later flip
+                g_vo_log_n = 0;
+                og2_tick(1);
+                ASSERT(g_og2_pend_slot == -1 && g_vo_log_n == 1 && g_vo_log[0][0] == 2 && g_vo_log[0][1] == 1);
+                og2_tick(1);                    // nothing pending: no call
+                ASSERT(g_vo_log_n == 1);
+            } else {
+                // the game drops its slot (ours go with it) and registers 0..1 again; the hook restored g_buf[2]
+                g_vo_log_n = 0;
+                ASSERT(sceVideoOutUnregisterBuffers(1, 0) == 0);
+                void *game2[2] = { (void *)(uintptr_t)g_buf[0], (void *)(uintptr_t)g_buf[1] };
+                ASSERT(raw_sceVideoOutRegisterBuffers(1, 0, game2, 2, &g_attr) == 0);
+                g_buf[2] = (uint64_t)mid_va; g_nbuf = 3;
+                g_vo_fail_count = (sc == 12) ? 1 : 0;
+                int rg = og2_game_reregistered(1, NULL, 2);
+                ASSERT(g_vo_log_n == 3 && g_vo_log[2][0] == 1 && g_vo_log[2][1] == 15 && g_vo_log[2][2] == 1);
+                ASSERT(g_og2_active == 0 && g_buf[2] == 0);
+                if (sc == 11) {
+                    ASSERT(rg == 1 && g_vo_log[2][4] == 1 && g_mbase == 15 && g_nbuf == 16 && g_buf[15] == (uint64_t)mid_va);
+                    ASSERT(g_ext_attr_slot == 1 && g_mbuf_state == 1);
+                } else {
+                    ASSERT(rg == 0 && g_mbuf_state == -1 && g_nbuf == 2 && g_ext_attr_slot == -1);
+                }
+                ASSERT(og2_game_reregistered(1, NULL, 2) == 0 && g_vo_log_n == 3);   // once only
+            }
+        } else if (sc == 1) {
+            ASSERT(g_vo_log_n == 9);
+            ASSERT(g_vo_log[0][0] == 1 && g_vo_log[0][1] == 15);
+            ASSERT(g_vo_log[1][0] == 3 && g_vo_log[1][1] == 15);
+            ASSERT(g_vo_log[2][0] == 2 && g_vo_log[2][1] == 0);
+            ASSERT(g_vo_log[3][0] == 1 && g_vo_log[3][1] == 0 && g_vo_log[3][2] == 3);
+            ASSERT(g_vo_log[4][0] == 3 && g_vo_log[4][1] == -1);
+            ASSERT(g_vo_log[5][0] == 2 && g_vo_log[5][1] == 1);
+            ASSERT(g_vo_log[6][0] == 1 && g_vo_log[6][1] == 0 && g_vo_log[6][2] == 3);
+            ASSERT(g_vo_log[7][0] == 1 && g_vo_log[7][1] == 0 && g_vo_log[7][2] == 2 && g_vo_log[7][3] == (int32_t)(0x100800000ULL >> 20));
+            ASSERT(g_vo_log[8][0] == 1 && g_vo_log[8][1] == 15 && g_vo_log[8][2] == 1);
+            ASSERT(g_mbase == 15 && g_nbuf == 16 && g_ext_attr_slot == 1);
+        } else if (sc == 2) {
+            ASSERT(g_vo_log_n == 4);
+            ASSERT(g_vo_log[0][0] == 3 && g_vo_log[0][1] == -1);
+            ASSERT(g_vo_log[1][0] == 2 && g_vo_log[1][1] == 0);
+            ASSERT(g_vo_log[2][0] == 1 && g_vo_log[2][1] == 0 && g_vo_log[2][2] == 3 && g_vo_log[2][3] == (int32_t)(mid_va >> 20));
+            ASSERT(g_vo_log[3][0] == 3 && g_vo_log[3][1] == 1);
+            ASSERT(g_mbase == 2 && g_nbuf == 3 && g_ext_attr_slot == -1);
+        } else if (sc == 3) {
+            ASSERT(g_vo_log_n == 2);
+            ASSERT(g_vo_log[0][0] == 1 && g_vo_log[0][1] == 15 && g_vo_log[0][2] == 1);
+            ASSERT(g_vo_log[1][0] == 3 && g_vo_log[1][1] == 15);
+            ASSERT(g_mbase == 15 && g_nbuf == 16 && g_ext_attr_slot == 1);
+        } else if (sc == 6) {
+            ASSERT(g_vo_log_n == 2);
+            ASSERT(g_vo_log[0][0] == 3 && g_vo_log[0][1] == -1);
+            ASSERT(g_vo_log[1][0] == 1 && g_vo_log[1][1] == 15 && g_vo_log[1][2] == 1 && g_vo_log[1][4] == 1);
+            ASSERT(g_mbase == 15 && g_nbuf == 16 && g_ext_attr_slot == 1 && g_og2_active == 0);
+        } else if (sc == 7) {
+            ASSERT(g_vo_log_n == 3);
+            ASSERT(g_vo_log[0][0] == 1 && g_vo_log[0][1] == 15 && g_vo_log[0][4] == 1);
+            ASSERT(g_vo_log[1][0] == 3 && g_vo_log[1][1] == 15);
+            ASSERT(g_vo_log[2][0] == 2 && g_vo_log[2][1] == 0 && g_vo_log[2][4] != 0);
+            ASSERT(g_mbase == 15 && g_nbuf == 16 && g_ext_attr_slot == 1 && g_og2_active == 0 && g_vo_slots == 3u);
+        } else if (sc == 8 || sc == 10) {
+            ASSERT(g_vo_log_n == 10);
+            ASSERT(g_vo_log[3][0] == 1 && g_vo_log[3][2] == 3 && g_vo_log[3][4] < 0);
+            ASSERT(g_vo_log[4][0] == 3 && g_vo_log[4][1] == -1);
+            ASSERT(g_vo_log[5][0] == 2 && g_vo_log[5][1] == 1);
+            ASSERT(g_vo_log[6][0] == 1 && g_vo_log[6][2] == 3 && g_vo_log[6][4] < 0);
+            ASSERT(g_vo_log[7][0] == 1 && g_vo_log[7][1] == 0 && g_vo_log[7][2] == 2 && g_vo_log[7][4] < 0);
+            ASSERT(g_vo_log[8][0] == 1 && g_vo_log[8][1] == 0 && g_vo_log[8][2] == 2);
+            ASSERT(g_vo_log[9][0] == 1 && g_vo_log[9][1] == 15 && g_vo_log[9][2] == 1);
+            if (sc == 8) ASSERT(g_vo_log[8][4] == 0 && g_game_attr_slot == 0 && g_vo_log[9][4] == 1);
+            else ASSERT(g_vo_log[8][4] < 0 && g_vo_log[9][4] == 0);   // the game has no group: ours took slot 0
+            ASSERT(g_mbase == 15 && g_nbuf == 16 && g_og2_active == 0);
+        } else if (sc == 9) {
+            ASSERT(g_vo_log_n == 6);
+            ASSERT(g_vo_log[3][0] == 1 && g_vo_log[3][1] == 0 && g_vo_log[3][2] == 3 && g_vo_log[3][4] == 2);
+            ASSERT(g_vo_log[4][0] == 2 && g_vo_log[4][1] == 2 && g_vo_log[4][4] == 0);
+            ASSERT(g_vo_log[5][0] == 1 && g_vo_log[5][1] == 0 && g_vo_log[5][2] == 2 && g_vo_log[5][4] == 0);
+            ASSERT(g_mbase == 15 && g_nbuf == 16 && g_ext_attr_slot == 1 && g_game_attr_slot == 0 && g_og2_active == 0);
+            ASSERT(g_vo_slots == 3u);   // the game's group at 0, ours (the temporary group) at 1
+        } else {                // sc 4 and 5: the separate group in one call, our buffer alone at index 15
+            ASSERT(g_fs_polls == (sc == 4 ? 101 : 0));
+            ASSERT(g_vo_log_n == 1);
+            ASSERT(g_vo_log[0][0] == 1 && g_vo_log[0][1] == 15 && g_vo_log[0][2] == 1);
+            ASSERT(g_mbase == 15 && g_nbuf == 16 && g_ext_attr_slot == 1);
+        }
+        g_cfg.shave_mode = 0;
+        g_sim_flex_avail = 0x10000000u;
+    }
+    g_og2 = 0; g_og2_active = 0; g_sf_stall = 0; g_og2_copy_ok = 1; g_fs_cur = 0; g_vo_fail_count = 0; g_fs_pending_polls = 0;
+    g_vo_fail2_left = 0; g_vo_force_n3 = -1; g_vo_unreg_fail_slot = -1; g_vo_slots = 1u;
 
     // 10. CUSA12605 (9ca764c82f) / CUSA10213 (784c644c00) partial top-tail ReleaseDirectMemory + VirtualQuery q_va < ave:
     //     When the game releases a sub-range at the top end of a shaved tail (Case B) and later queries VirtualQuery(q_va)
@@ -1152,6 +1398,303 @@ static void test_runtime_streaming_and_batchmap_guards(void)
     ASSERT(shave_game_alloc(0, 0x40000000L, 0x1000000u, 0x10000u, 3, &p_chunk5, 0, 0) == (int32_t)0x80020023u);
     ASSERT(g_shave_n == 4 && total_shaved_bytes() == 0x4000000u);
     g_flips = 0;
+
+    // 12. F4 (CUSA26967 c1598ba781 / 2acabc4f20, CUSA31580 5b6bd169b5):
+    //     (a) When a tiny 16 KB (0x4000) fragmentation hole sits in the middle of DirectMemory at runtime (!boot_phase)
+    //         followed by live game blocks, a 16 MB (0x1000000) streaming allocation MUST NOT straddle-shave over the
+    //         0x4000 hole (which would make [phys+0x4000, phys+0x1000000) overlap live game blocks); it must use a
+    //         tail-only synthetic shave (real_len == 0) at base_syn.
+    //     (b) Releasing shaved chunks via sceKernelCheckedReleaseDirectMemory_hook must unmap flex_vmap and clear the
+    //         shave entry so total_shaved_bytes() returns to 0.
+    //     (c) For CUSA26967 / CUSA31580 with ample FlexibleMemory, max_total_shave allows up to 96 MB (6 x 16 MB).
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    const char *t26967 = "CUSA26967";
+    for (int i = 0; i < 10; i++) g_title_id[i] = t26967[i];
+    setup_early_buffers_top_first();
+    release_early_gpu();
+    release_early_work();
+    shrink_early_mem_to(0x800000u);
+    g_mbuf_state = 1;
+    g_flips = 500;
+    g_sim_flex_avail = 0x20000000u;
+    g_own_alloc++;
+    long fill_lo_26967 = 0, fill_hi_26967 = 0;
+    ASSERT(raw_sceKernelAllocateDirectMemory(0, 0x10000000L, 0x10000000u, 0x4000u, 3, &fill_lo_26967) == 0);
+    // Leave a 16 KB (0x4000) hole at [0x10000000, 0x10004000) and occupy [0x10004000, 0x3F800000):
+    ASSERT(raw_sceKernelAllocateDirectMemory(0x10004000L, 0x3F800000L, 0x2F7FC000u, 0x4000u, 3, &fill_hi_26967) == 0);
+    g_own_alloc--;
+    ASSERT(dm_avail(0x4000u) == 0x4000u);
+    long p_26967 = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x1000000u, 0x4000u, 3, &p_26967) == 0);
+    ASSERT(g_shave_n == 1 && g_shaves[0].real_len == 0 && g_shaves[0].orig_len == 0x1000000u);
+    ASSERT(p_26967 >= g_pre_mem_phys);
+    void *va_26967 = (void *)0x215000000ULL;
+    ASSERT(sceKernelMapDirectMemory(&va_26967, 0x1000000u, 0x33, 0, p_26967, 0x4000u) == 0);
+    ASSERT(sceKernelCheckedReleaseDirectMemory_hook(p_26967, 0x1000000u) == 0);
+    ASSERT(total_shaved_bytes() == 0);
+    // Verify 6 x 16 MB (96 MB = 0x6000000) concurrent shaves succeed for CUSA26967:
+    for (int k = 0; k < 6; k++) {
+        long pc = 0;
+        ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x1000000u, 0x10000u, 3, &pc) == 0);
+    }
+    ASSERT(total_shaved_bytes() == 0x6000000u);
+    // Verify sceKernelCheckedReleaseDirectMemory_hook invokes HOOK_CONTINUE(sceKernelCheckedReleaseDirectMemory, ...):
+    int crel_before = g_sim_checked_release_dm_calls;
+    ASSERT(sceKernelCheckedReleaseDirectMemory_hook(fill_lo_26967, 0x10000000u) == 0);
+    ASSERT(g_sim_checked_release_dm_calls == crel_before + 1);
+    // Verify that on a non-CUSA26967/CUSA31580 title (e.g. CUSA06548) at runtime (!boot_phase) even when a 0x4000
+    // hole exists in [0, 0x40000000), max_total_shave remains capped at 0x4000000 (64 MB = 4 x 16 MB), NOT 0x6000000:
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    const char *t06548 = "CUSA06548";
+    for (int i = 0; i < 10; i++) g_title_id[i] = t06548[i];
+    setup_early_buffers_top_first();
+    release_early_gpu();
+    release_early_work();
+    shrink_early_mem_to(0x800000u);
+    g_mbuf_state = 1;
+    g_flips = 500;
+    g_sim_flex_avail = 0x20000000u;
+    g_own_alloc++;
+    long fill_lo_06548 = 0, fill_hi_06548 = 0;
+    ASSERT(raw_sceKernelAllocateDirectMemory(0, 0x10000000L, 0x10000000u, 0x4000u, 3, &fill_lo_06548) == 0);
+    ASSERT(raw_sceKernelAllocateDirectMemory(0x10004000L, 0x3F800000L, 0x2F7FC000u, 0x4000u, 3, &fill_hi_06548) == 0);
+    g_own_alloc--;
+    ASSERT(dm_avail(0x4000u) == 0x4000u);
+    for (int k = 0; k < 4; k++) {
+        long pc4 = 0;
+        ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x1000000u, 0x10000u, 3, &pc4) == 0);
+    }
+    ASSERT(total_shaved_bytes() == 0x4000000u);
+    long pc5_06548 = 0;
+    ASSERT(shave_game_alloc(0, 0x40000000L, 0x1000000u, 0x10000u, 3, &pc5_06548, 0, 0) == (int32_t)0x80020023u);
+    ASSERT(total_shaved_bytes() == 0x4000000u);
+    const char *t00000 = "CUSA00000";
+    for (int i = 0; i < 10; i++) g_title_id[i] = t00000[i];
+    g_flips = 0;
+
+    // 13. F3 (CUSA12555 a494321adc):
+    //     During boot_phase (g_flips == 0 && g_gpu_state == 0), after a large arena shave (has_large_arena_shave == 1)
+    //     leaves shave_av == 0, a small sub-1MB allocation (len = 0x20000, type = 3) MUST NOT be given a 100% synthetic
+    //     tail-only shave (real_len == 0) in CPU FlexibleMemory; shave_game_alloc must refuse it so Step 5 yields
+    //     g_pre_mem and allocates the 0x20000 GPU table in real DirectMemory.
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    g_flips = 0;
+    g_gpu_state = 0;
+    g_mbuf_state = 0;
+    long p_12555_arena = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x40000000u, 0x10000u, 3, &p_12555_arena) == 0);
+    ASSERT(g_shave_n == 1 && g_shaves[0].real_len == 0x3E000000u && g_shaves[0].orig_len == 0x40000000u);
+    ASSERT(dm_avail(0x4000u) == 0);
+    long p_12555_small = 0;
+    ASSERT(shave_game_alloc(0, 0x40000000L, 0x20000u, 0x10000u, 3, &p_12555_small, 1, 0) == (int32_t)0x80020023u);
+    ASSERT(g_shave_n == 1);
+
+    // 14. Item 9 (CUSA44372 61a14a79dd / CUSA13323 Pro a9afe8f15e early g_pbuf deferral & boot Step 5 release,
+    //     and Step 6 runtime UAF guard when g_mbuf_state == 1):
+    // 14a: For CUSA44372 (0x800000) and CUSA13323 Pro 4K (a9afe8f15e, surf_sz = 0x1FE0000 = 31.875 MB,
+    //      half_sz = 0x1020000 = 16.125 MB) at f=0 (g_flips < 120), alloc_pbuf_history returns NULL to preserve
+    //      FlexibleMemory during boot, and succeeds once g_flips >= 120:
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    const char *t44372 = "CUSA44372";
+    for (int i = 0; i < 10; i++) g_title_id[i] = t44372[i];
+    g_flips = 0;
+    g_vo_submit_flips = 0;
+    g_sim_flex_avail = 0x2000000u;
+    ASSERT(alloc_pbuf_history(0x800000u) == NULL && g_pbuf == NULL);
+    g_flips = 120;
+    ASSERT(alloc_pbuf_history(0x800000u) != NULL && g_pbuf != NULL);
+    release_pbuf();
+
+    const char *t13323 = "CUSA13323";
+    for (int i = 0; i < 10; i++) g_title_id[i] = t13323[i];
+    g_flips = 0;
+    g_vo_submit_flips = 0;
+    g_sim_flex_avail = 0x2DF0000u;
+    ASSERT(alloc_pbuf_history(0x1FE0000u) == NULL && g_pbuf == NULL);
+    ASSERT(g_sim_flex_avail == 0x2DF0000u);
+
+    // Replay CUSA13323 Pro a9afe8f15e (dm_total = 0x164a00000):
+    // RegisterBuffers(start=0, num=2, 3840x2160) runs at 1.504s (f=0) setting g_mbuf_state = 1,
+    // and at 1.998s (f=0, boot_phase == 1) the game requests AllocDM(len=0x4000000, align=0x10000, type=0)
+    // when 0x2000000 (32 MB) is free below g_pre_mem (0x162a00000..0x164a00000) and flex_av = 0x1BE0000 (< 32 MB).
+    // Step 5 MUST release g_pre_mem (32 MB) at boot_phase (f=0) and reset g_mbuf_state = -1, g_mbase = 16,
+    // g_nmid = 0, g_pcopy_avail = 0, g_pcopy_on = 0, g_vq_on = 0, g_runtime_2buf = 0 so the 64 MB allocation
+    // succeeds at phys = 0x160a00000 in real DirectMemory:
+    sim_reset(0x164a00000ULL);
+    reset_shave_state();
+    for (int i = 0; i < 10; i++) g_title_id[i] = t13323[i];
+    g_own_alloc++;
+    ASSERT(raw_sceKernelAllocateDirectMemory(0x162a00000L, 0x164a00000L, 0x2000000u, 0x200000u, 3, &g_pre_mem_phys) == 0);
+    ASSERT(raw_sceKernelMapDirectMemory(&g_pre_mem, 0x2000000u, 0x33, 0, g_pre_mem_phys, 0x200000u) == 0);
+    g_pre_size = 0x2000000u;
+    ASSERT(raw_sceKernelAllocateDirectMemory(0x1629e0000L, 0x162a00000L, 0x20000u, 0x20000u, 0, &g_pre_gpu_phys) == 0);
+    ASSERT(raw_sceKernelMapDirectMemory(&g_pre_gpu, 0x20000u, 0x33, 0, g_pre_gpu_phys, 0x20000u) == 0);
+    ASSERT(raw_sceKernelAllocateDirectMemory(0x162800000L, 0x1629e0000L, 0x190000u, 0x10000u, 3, &g_pre_work_phys) == 0);
+    ASSERT(raw_sceKernelMapDirectMemory(&g_pre_work, 0x190000u, 0x33, 0, g_pre_work_phys, 0x10000u) == 0);
+    g_pre_work_sz = 0x190000u;
+    long fill_a9a = 0;
+    ASSERT(raw_sceKernelAllocateDirectMemory(0, 0x160a00000L, 0x160a00000ULL, 0x10000u, 3, &fill_a9a) == 0);
+    g_own_alloc--;
+    g_flips = 0;
+    g_vo_submit_flips = 0;
+    g_gpu_state = 0;
+    g_mbuf_state = 1;
+    g_mbase = 15;
+    g_nmid = 1;
+    g_pcopy_avail = 0;
+    g_pcopy_on = 0;
+    g_vq_on = 1;
+    g_runtime_2buf = 1;
+    g_sim_flex_avail = 0x1BE0000u;
+    long p_a9a_64m = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x164a00000L, 0x4000000u, 0x10000u, 0, &p_a9a_64m) == 0);
+    ASSERT(p_a9a_64m == 0x160a00000L);
+    ASSERT(g_pre_mem == NULL && g_mbuf_state == -1);
+    ASSERT(g_mbase == 16 && g_nmid == 0 && g_pcopy_avail == 0 && g_pcopy_on == 0 && g_vq_on == 0 && g_runtime_2buf == 0);
+
+    // 14b: At runtime (!boot_phase, g_flips = 536) when g_mbuf_state == 1 (g_pre_mem is registered as active
+    //      VideoOut scanout mid-buffers), Step 6 MUST NOT release/unmap g_pre_mem (preventing scanout UAF):
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    const char *t02636 = "CUSA02636";
+    for (int i = 0; i < 10; i++) g_title_id[i] = t02636[i];
+    setup_early_buffers_top_first();
+    release_early_gpu();
+    release_early_work();
+    shrink_early_mem_to(0x800000u);
+    g_mbuf_state = 1;
+    g_flips = 536;
+    g_own_alloc++;
+    long fill_02636 = 0;
+    ASSERT(raw_sceKernelAllocateDirectMemory(0, 0x3F800000L, 0x3F800000u, 0x200000u, 3, &fill_02636) == 0);
+    g_own_alloc--;
+    g_sim_flex_avail = 0; // no flex for shaving
+    long p_lump = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x40000u, 0x10000u, 3, &p_lump) == (int32_t)0x80020023u);
+    ASSERT(g_pre_mem != NULL && g_mbuf_state == 1);
+    long p_16m = 0;
+    ASSERT(sceKernelAllocateDirectMemory(0, 0x40000000L, 0x1000000u, 0x10000u, 3, &p_16m) == (int32_t)0x80020023u);
+    ASSERT(g_pre_mem != NULL && g_mbuf_state == 1);
+    g_sim_flex_avail = 0x10000000u;
+    g_flips = 0;
+    for (int i = 0; i < 10; i++) g_title_id[i] = t13323[i];
+
+    // 15. Blocker #1 (T3c / 7a63890): free_dm_block must only cascade-free g_pbuf when freeing g_pre_mem or g_pre_work
+    //     (va == &g_pre_mem || va == &g_pre_work), matching 41753df 1:1 for all non-CUSA06782 games and CUSA06782.
+    //     Calling release_early_gpu() (including via Step 1 yield_early_dm_in_range) or release_early_dump() must NEVER
+    //     destroy a live g_pbuf or clear g_pbuf_valid/g_pbuf_ycocg/g_pbuf_last_seq/g_pbuf_prev_va.
+    const char *t_check_ids[2] = { "CUSA00552", "CUSA06782" };
+    for (int ti = 0; ti < 2; ti++) {
+        sim_reset(0x40000000u);
+        reset_shave_state();
+        for (int i = 0; i < 10; i++) g_title_id[i] = t_check_ids[ti][i];
+        setup_early_buffers_top_first();
+        g_flips = 200;
+        g_sim_flex_avail = 0x4000000u;
+        ASSERT(alloc_pbuf_history(0x800000u) != NULL && g_pbuf != NULL);
+        void *saved_pbuf = g_pbuf;
+        g_pbuf_ycocg = 1;
+        g_pbuf_valid = 1;
+        g_pbuf_last_seq = 77u;
+        g_pbuf_prev_va = 0x1122334455ULL;
+
+        // (a) release_early_gpu() (and Step 1 yield_early_dm_in_range on g_pre_gpu) must NOT free g_pbuf:
+        ASSERT(g_pre_gpu != NULL);
+        ASSERT(yield_early_dm_in_range(g_pre_gpu_phys, g_pre_gpu_phys + (long)g_gpu_sz, 0x20000u) == 1);
+        ASSERT(g_pre_gpu == NULL);
+        ASSERT(g_pbuf == saved_pbuf && g_pbuf_valid == 1 && g_pbuf_ycocg == 1 &&
+               g_pbuf_last_seq == 77u && g_pbuf_prev_va == 0x1122334455ULL);
+
+        // (b) release_early_dump() must NOT free g_pbuf:
+        g_own_alloc++;
+        void *dump_va = NULL;
+        ASSERT(raw_sceKernelAllocateDirectMemory(0, 0x20000000L, DUMP_SZ, 0x200000u, 0, &g_dump_phys) == 0);
+        ASSERT(raw_sceKernelMapDirectMemory(&dump_va, DUMP_SZ, 0x33, 0, g_dump_phys, 0x200000u) == 0);
+        g_own_alloc--;
+        g_dump_mem = (uint8_t *)dump_va;
+        release_early_dump();
+        ASSERT(g_dump_mem == NULL);
+        ASSERT(g_pbuf == saved_pbuf && g_pbuf_valid == 1 && g_pbuf_ycocg == 1 &&
+               g_pbuf_last_seq == 77u && g_pbuf_prev_va == 0x1122334455ULL);
+
+        // (c) release_early_work() MUST cascade-free g_pbuf (1:1 with 41753df):
+        release_early_work();
+        ASSERT(g_pre_work == NULL);
+        ASSERT(g_pbuf == NULL && g_pbuf_valid == 0 && g_pbuf_ycocg == 0 &&
+               g_pbuf_last_seq == 0 && g_pbuf_prev_va == 0);
+
+        // (d) Re-allocate g_pbuf and verify release_early_mem() ALSO cascade-frees g_pbuf (1:1 with 41753df):
+        ASSERT(alloc_pbuf_history(0x800000u) != NULL && g_pbuf != NULL);
+        g_pbuf_ycocg = 1;
+        g_pbuf_valid = 1;
+        g_pbuf_last_seq = 88u;
+        g_pbuf_prev_va = 0x9988776655ULL;
+        release_early_mem();
+        ASSERT(g_pre_mem == NULL);
+        ASSERT(g_pbuf == NULL && g_pbuf_valid == 0 && g_pbuf_ycocg == 0 &&
+               g_pbuf_last_seq == 0 && g_pbuf_prev_va == 0);
+    }
+    g_flips = 0;
+
+    // 16. T21 Item 1 (CUSA10249 neo=0 audio_fix=1 libkernel top-down sliding-window probe, fc652ded39 / 68251a79b8):
+    //     When libkernel.sprx allocates two 0x400000 blocks at the top of DirectMemory (0x136e00000 and 0x136a00000),
+    //     relocating g_pre_mem (0x800000) to 0x200000..0xa00000, and then allocates the 4 main arenas under audio_fix=1
+    //     (Arena 2 0x15800000 pre-shaved to 0x15200000, Arena 4 0x2a000000 shaved to 0x29800000 with reserve=0x600000),
+    //     [0x136400000, 0x136a00000) = 0x600000 (6 MB) of real DirectMemory remains free.
+    //     When libkernel's top-down sliding-window allocator probes len=0x600000, align=0x200000, type=0 in window
+    //     0x136600000..0x137200000 (which overlaps only 0x400000 of the 0x600000 free hole), shave_game_alloc MUST NOT
+    //     partially shave the 0x600000 request into 0x400000 real + 0x200000 deferred Flex tail (which leaves 0x40400000
+    //     unmapped before RegisterBuffers and crashes in memset with SIGSEGV); it must return 0x80020023 so the next
+    //     sliding-window step (0x135a00000..0x137200000) claims the full 0x600000 real DirectMemory at phys=0x136400000!
+    {
+        sim_reset(0x137200000ULL);
+        reset_shave_state();
+        const char *t10249 = "CUSA10249";
+        for (int i = 0; i < 10; i++) g_title_id[i] = t10249[i];
+        g_cfg.audio_fix = 1;
+        g_own_alloc++;
+        long pre_low = 0;
+        ASSERT(raw_sceKernelAllocateDirectMemory(0, 0x200000L, 0x200000u, 0x4000u, 0, &pre_low) == 0);
+        ASSERT(raw_sceKernelAllocateDirectMemory(0x136a00000L, 0x137200000L, 0x800000u, 0x200000u, 3, &g_pre_mem_phys) == 0);
+        ASSERT(raw_sceKernelMapDirectMemory(&g_pre_mem, 0x800000u, 0x33, 0, g_pre_mem_phys, 0x200000u) == 0);
+        g_pre_size = 0x800000u;
+        g_own_alloc--;
+        g_sim_flex_avail = 0xE00000u;
+
+        // Two early 0x400000 top-down blocks from libkernel.sprx:
+        long top1 = 0, top2 = 0;
+        ASSERT(sceKernelAllocateDirectMemory(0x136e00000L, 0x137200000L, 0x400000u, 0x200000u, 3, &top1) == 0);
+        ASSERT(top1 == 0x136e00000L && g_pre_mem_phys == 0x200000L && g_pre_size == 0x800000u);
+        ASSERT(sceKernelAllocateDirectMemory(0x136a00000L, 0x137200000L, 0x400000u, 0x200000u, 3, &top2) == 0);
+        ASSERT(top2 == 0x136a00000L);
+
+        // Four main arenas:
+        long a1 = 0, a2 = 0, a3 = 0, a4 = 0;
+        ASSERT(sceKernelAllocateDirectMemory(0, 0x137200000L, 0x8e200000u, 0x200000u, 0, &a1) == 0 && a1 == 0xa00000L);
+        ASSERT(sceKernelAllocateDirectMemory(0, 0x137200000L, 0x15800000u, 0x200000u, 0, &a2) == 0 && a2 == 0x8ec00000L);
+        ASSERT(sceKernelAllocateDirectMemory(0, 0x137200000L, 0x68e00000u, 0x200000u, 3, &a3) == 0 && a3 == 0xa3e00000L);
+        ASSERT(sceKernelAllocateDirectMemory(0, 0x137200000L, 0x2a000000u, 0x200000u, 3, &a4) == 0 && a4 == 0x10cc00000L);
+        ASSERT(g_shave_n == 2);
+        ASSERT(g_shaves[0].orig_len == 0x15800000u && g_shaves[0].real_len == 0x15200000u);
+        ASSERT(g_shaves[1].orig_len == 0x2a000000u && g_shaves[1].real_len == 0x29800000u);
+
+        // Top-down sliding-window probe for 0x600000 (type=0) before RegisterBuffers:
+        long p_win1 = 0, p_win2 = 0, p_win3 = 0;
+        ASSERT(sceKernelAllocateDirectMemory(0x136c00000L, 0x137200000L, 0x600000u, 0x200000u, 0, &p_win1) == (int32_t)0x80020023u);
+        ASSERT(sceKernelAllocateDirectMemory(0x136600000L, 0x137200000L, 0x600000u, 0x200000u, 0, &p_win2) == (int32_t)0x80020023u);
+        ASSERT(g_shave_n == 2);
+        ASSERT(sceKernelAllocateDirectMemory(0x135a00000L, 0x137200000L, 0x600000u, 0x200000u, 0, &p_win3) == 0);
+        ASSERT(p_win3 == 0x136400000L && g_shave_n == 2);
+        ASSERT(sim_dm_is_allocated_range(0x136400000L, 0x600000u) == 1);
+
+        g_cfg.audio_fix = 0;
+        for (int i = 0; i < 10; i++) g_title_id[i] = t13323[i];
+    }
 }
 
 int main(void)

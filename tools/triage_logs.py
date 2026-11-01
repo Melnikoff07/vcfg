@@ -681,10 +681,16 @@ def analyze_report_text(
             has_fatal_enomem = True
             sig = "ENOMEM"
 
-    has_inert_no_mbuf = "INERT: NO MBUF" in text
+    has_inert_no_mbuf = "INERT: NO MBUF" in text or bool(
+        re.search(r"options effective:\s+framegen=on\(inert:\s*no mbuf", text, re.I)
+    )
     has_inert = bool(
         has_inert_no_mbuf
-        or re.search(r"inert='INERT:[^']+'|INERT:\s*SAFE|safe mode(?:\s+frame\s+\d+)?:\s*refused", text, re.I)
+        or re.search(
+            r"inert='INERT:[^']+'|INERT:\s*SAFE|safe mode(?:\s+frame\s+\d+)?:\s*refused|options effective:\s+framegen=on\(inert",
+            text,
+            re.I,
+        )
     )
 
     fg_disabled = bool(

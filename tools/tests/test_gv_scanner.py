@@ -24,6 +24,7 @@ extern void *memcpy(void *, const void *, size_t);
 extern int memcmp(const void *, const void *, size_t);
 extern char *strstr(const char *, const char *);
 extern int strcmp(const char *, const char *);
+extern int strncmp(const char *, const char *, size_t);
 extern char *strcpy(char *, const char *);
 extern size_t strlen(const char *);
 """,
@@ -81,6 +82,8 @@ typedef struct {
     void *unk02;
     uint64_t offset;
     int32_t unk04;
+    unsigned isFlexibleMemory : 1;
+    unsigned isDirectMemory : 1;
     int32_t isCommitted;
     char name[32];
 } OrbisKernelVirtualQueryInfo;
@@ -88,6 +91,7 @@ typedef struct {
 typedef struct {
     uintptr_t s, e;
     int32_t prot, committed;
+    const char *name;
 } mock_vma_t;
 
 static mock_vma_t g_vmas[16];
@@ -106,6 +110,7 @@ static int32_t sceKernelVirtualQuery(const void *addr, int flags, OrbisKernelVir
             info->unk02 = (void *)g_vmas[i].e;
             info->unk04 = g_vmas[i].prot;
             info->isCommitted = g_vmas[i].committed;
+            if (g_vmas[i].name) strcpy(info->name, g_vmas[i].name);
             return 0;
         }
     }
@@ -376,6 +381,30 @@ static int test_pm4_traversal_and_safety(void)
     g_gv_neo = 1;
     if (!mk_t_target(t_out, addr_depth_z24, &rt_z24->d, 1920, 1080)) return 23;
     if (((t_out[1] >> 20) & 0x3Fu) != 20u || (t_out[6] & (1u << 24)) == 0) return 24;
+
+    // F2a (CUSA44732): CPU-only 'anon:' page without PROT_GPU_READ must be rejected by mem_ok / pm4_readable,
+    // while non-'anon:' pages with PROT_CPU_READ and 'anon:' pages with PROT_GPU_READ remain readable:
+    g_vmas[g_nvmas++] = (mock_vma_t){ 0x2005ab0000ull, 0x2005ac0000ull, PROT_CPU_READ, 1, "anon:000001b027ef" };
+    g_vmas[g_nvmas++] = (mock_vma_t){ 0x2005ad0000ull, 0x2005ae0000ull, PROT_CPU_READ, 1, "flex_staging" };
+    g_vmas[g_nvmas++] = (mock_vma_t){ 0x2005af0000ull, 0x2005b00000ull, PROT_CPU_READ | PROT_GPU_READ, 1, "anon:000001b02800" };
+    g_mcn = 0;
+    if (mem_ok(0x2005ab1f80ull, 32, PROT_CPU_READ) != 0) return 25;
+    if (mem_ok(0x2005ad1000ull, 32, PROT_CPU_READ) != 1) return 26;
+    if (mem_ok(0x2005af1000ull, 32, PROT_CPU_READ) != 1) return 27;
+
+    // F2a (CUSA44732): tsharp_match must reject out-of-range base (< 0x100000ull or >= (1ull << 44)) and non-canonical t[1] bits 19:8 before matching f.rt[]:
+    uint32_t bad_t[8];
+    build_tsharp(bad_t, 0x00080000ull, 5, 7, 1920, 1080, 1920, 14, 0);
+    f.rt[0].base = 0x00080000ull;
+    f.rt[0].draws = 10u;
+    uint32_t hits_before = f.tsharp_hits;
+    tsharp_match(&f, bad_t, 0);
+    if (f.tsharp_hits != hits_before) return 28;
+    build_tsharp(bad_t, 0x120000000ull, 5, 7, 1920, 1080, 1920, 14, 0);
+    bad_t[1] |= (1u << 12); // non-zero garbage in t[1] bits 19:8
+    f.rt[0].base = 0x120000000ull;
+    tsharp_match(&f, bad_t, 0);
+    if (f.tsharp_hits != hits_before) return 29;
 
     return 0;
 }

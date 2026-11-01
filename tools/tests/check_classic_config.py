@@ -38,6 +38,7 @@ extern size_t strlen(const char *);
 extern void *memcpy(void *, const void *, size_t);
 ''' + families_h + '''
 static int g_known_game, g_detected_60fps, g_tile_override = -1, g_tile_sweep, g_t6_bit_override = -1, g_adapt_early_crashes = 0;
+static int g_is_neo = 0;
 static char g_title_id[16] = "CUSA00000";
 static char g_family_id[16] = "CUSA00000";
 static void tile_load(int idx) { (void)idx; }
@@ -102,6 +103,37 @@ int main(void) {
     if (c.audio_fix != 2) return 17;
     input="audio_fix=0\\n"; parse_ini_file("title", &c, 0);
     if (c.audio_fix != 0) return 18;
+    // The rest of the CUSA04529 family: audio_fix=1 on base PS4, 0 on PS4 Pro (CUSA10249 defaults to 1 on both base PS4 and PS4 Pro;
+    // audio_fix=2 is opt-in via config-CUSA10249.ini).
+    set_title("CUSA00341"); cfg_defaults(&c);
+    if (c.audio_fix != 1) return 19;
+    set_title("CUSA07737"); cfg_defaults(&c);
+    if (c.audio_fix != 1) return 20;
+    input="audio_fix=0\\n"; parse_ini_file("title", &c, 0);
+    if (c.audio_fix != 0) return 21;
+    g_is_neo = 1;
+    set_title("CUSA00341"); cfg_defaults(&c);
+    if (c.audio_fix != 0) return 22;
+    input="audio_fix=1\\n"; parse_ini_file("title", &c, 0);
+    if (c.audio_fix != 1) return 23;
+    set_title("CUSA10249"); cfg_defaults(&c);
+    if (c.audio_fix != 1) return 24;
+    input="audio_fix=2\\n"; parse_ini_file("title", &c, 0);
+    if (c.audio_fix != 2) return 25;
+    set_title("CUSA07408"); cfg_defaults(&c);
+    if (c.audio_fix != 0) return 26;
+    g_is_neo = 0;
+    // post_mid=3 in config-<TITLE>.ini must be preserved even when manual_mode=0 (AUTO mode):
+    cfg_defaults(&c);
+    input="manual_mode=0\\npost_mid=3\\n"; parse_ini_file("title", &c, 0);
+    if (c.manual_mode != 0 || c.post_mid != 3) return 27;
+    // T22a debug recording options default to 0 and parse 0/1 in config-<TITLE>.ini:
+    set_title("CUSA00411"); cfg_defaults(&c);
+    if (c.dbg_mark_gen != 0 || c.dbg_rec_shift != 0) return 28;
+    input="dbg_mark_gen=1\\ndbg_rec_shift=1\\n"; parse_ini_file("title", &c, 0);
+    if (c.dbg_mark_gen != 1 || c.dbg_rec_shift != 1) return 29;
+    input="dbg_mark_gen=0\\ndbg_rec_shift=0\\n"; parse_ini_file("title", &c, 0);
+    if (c.dbg_mark_gen != 0 || c.dbg_rec_shift != 0) return 30;
     return 0;
 }
 ''', encoding='utf-8')

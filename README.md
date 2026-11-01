@@ -68,6 +68,9 @@ regenerates `classic/source/shaders.h` on every build.
 3. Pick a game (cross toggles FG, triangle opens its settings, square launches it). Other games appear as
    EXPERIMENTAL and are off until you switch them on.
 4. Start the game, wait ~20 s, hold **L3+R3 for 3 s** for the in-game menu (the buttons can be changed in the app: OVERLAY tab, "Menu hotkey"; takes effect at the next game start).
+   Rows that cannot act under the other settings are hidden (Below 30 FPS needs Quality or Sharp, in the app too). An
+   option that can be inert shows what it does now (ACTIVE, READY, INERT or LIMITED) and the header gives the reason of
+   the selected row; `probe.log` gets an `options effective:` line at start, at each change and when a state changes.
 
 **Disable / clean reset (v2.34):** in **04 PLUGIN**, Square (**TURN OFF**) and R2 twice (**WIPE ALL**) both remove
 VCFG plugin files, VCFG `plugins.ini` entries/backups, and VCFG settings, adaptation and profiles. They keep logs in

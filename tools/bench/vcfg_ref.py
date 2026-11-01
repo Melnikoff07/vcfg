@@ -19,6 +19,7 @@ PARAMS = dict(
     qmax=1023.0,            # scanout format code range (1023 for 2_10_10_10, 255 for 8888)
     sharpness=40,           # profile sharpness, percent
     enhance=1,              # profile Enhance AA mode 0 / 1 / 2
+    aa_static_skip=True,    # rcas8 flag bit 4: no AA where warp8 flags the pixel static (P == C), as main.c sets it
     prev_luma_sum=0,        # None = sum of the previous frame's L3 (normal play); 0 = capture build
     t=0.5,
 )
@@ -65,7 +66,24 @@ def motion(A, B, params=None):
     sum_a = int(L3a.sum()) if p['prev_luma_sum'] is None else p['prev_luma_sum']
     FT, cutn, fade = vm.me1(L1a, L1b, V2, GK, gm, sum_b, sum_a, prevF, p.get('mp'))
     F = vm.mf8(L1a, L1b, FT, GK, V2, gm, fade, p.get('mp'), prevF=prevF)
-    return dict(V3=V3, V2=V2, S2=S2, gm=gm, GK=GK, FT=FT, F=F, cutn=cutn, fade=fade, prevF=prevF)
+    return dict(V3=V3, V2=V2, S2=S2, gm=gm, GK=GK, FT=FT, F=F, cutn=cutn, fade=fade,
+                prevF=warp_prevF(prevF, p.get('prev_cutn'), p.get('cut_thr', 0)))
+
+
+def cut_threshold(cut_thr=0):
+    """scene-change threshold in unmatched blocks of 8160 (consts.flags bits 16..31 = blocks / 8; 0 = default 5600)"""
+    return int(cut_thr) if cut_thr else 5600
+
+
+def warp_prevF(prevF, prev_cutn, cut_thr=0):
+    """the previous field as warp8 sees it. prev_cutn = unmatched blocks of the pair that wrote prevF (phase8 keeps it
+    in misc dword 8 + parity). When that pair was a scene change, phase8 clears F prev after the motion stages used it
+    as a candidate source, so warp8's quadratic trajectory offset gets no motion of the old scene (zero field = the
+    same frame as no history). A count above 8160 blocks is uninitialised memory (no reset); prev_cutn None = no chain
+    information: prevF unchanged."""
+    if prevF is None or prev_cutn is None or not cut_threshold(cut_thr) < int(prev_cutn) <= 8160:
+        return prevF
+    return np.zeros_like(prevF)
 
 
 def render(A, B, st, params=None, return_all=False):
@@ -75,7 +93,8 @@ def render(A, B, st, params=None, return_all=False):
         p.update(params)
     mid = vw.warp8(A, B, st['F'], st['GK'], st['cutn'], t=p['t'], flags=p.get('warp_flags', 0), flags_cut_thr=p.get('cut_thr', 0), cut_emov=p.get('cut_emov', 0.3), wp=p.get('wp'), prevF=st.get('prevF', p.get('prevF')))
     mid_q = quant(mid, p['qmax'])
-    out = quant(vw.rcas8(mid_q, vw.rcas_con(p['sharpness']), p['enhance']) if (p['sharpness'] > 0 or p['enhance'] > 0) else mid_q,
+    skip = vw.static_px(A, B) if p.get('aa_static_skip', True) else None
+    out = quant(vw.rcas8(mid_q, vw.rcas_con(p['sharpness']), p['enhance'], skip=skip) if (p['sharpness'] > 0 or p['enhance'] > 0) else mid_q,
                 p['qmax'])
     if return_all:
         return out, dict(st, pre=mid_q)

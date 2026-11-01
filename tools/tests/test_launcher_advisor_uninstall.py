@@ -77,6 +77,8 @@ class Settings(ctypes.Structure):
         ("sharp", ctypes.c_int),
         ("enhance", ctypes.c_int),
         ("overlay", ctypes.c_int),
+        ("b30", ctypes.c_int),
+        ("shq", ctypes.c_int),
     ]
 
 
@@ -197,6 +199,12 @@ def _extract_launcher_core_c() -> str:
     if s_idx < 0 or e_idx < 0 or e_idx <= s_idx:
         raise RuntimeError("Failed to slice launcher/src/main.c markers")
     core_slice = src[s_idx:e_idx]
+
+    sum_start = src.find("typedef struct { char *b; size_t n, cap; } Buf;", e_idx)
+    sum_end = src.find("// Every trace-<TITLE>[.prev].txt", sum_start)
+    if sum_start < 0 or sum_end < 0:
+        raise RuntimeError("Failed to slice summarize block from launcher/src/main.c")
+    summarize_slice = src[sum_start:sum_end]
 
     startup_start = src.find("    load_settings(a);\n    a->debug_log = file_exists(")
     startup_end = src.find("    check_auto_send_crashes(a);", startup_start)
@@ -362,6 +370,17 @@ static unsigned char *stbi_load(const char *p, int *w, int *h, int *ch, int req)
 
 {core_slice}
 
+{summarize_slice}
+
+static char g_sum_buf[4096];
+const char *harness_summarize(const char *id, const char *which, const char *t)
+{{
+    g_sum_buf[0] = 0;
+    Buf r = {{ g_sum_buf, 0, sizeof(g_sum_buf) }};
+    summarize(&r, id, which, t);
+    return g_sum_buf;
+}}
+
 static void do_debug_toggle(App *a) {{ (void)a; }}
 static void do_telemetry_toggle(App *a) {{ (void)a; }}
 static void do_report(App *a) {{ (void)a; }}
@@ -416,7 +435,7 @@ const char *harness_outside_removed(void)
 void harness_init_app(App *a)
 {{
     memset(a, 0, sizeof(*a));
-    a->defaults = (Settings){{ 1, 0, 40, 1, 0 }};
+    a->defaults = SETTINGS_DEFAULT;
     a->overlay_pos = 4;
     a->overlay_opacity = 80;
     a->menu_combo = MENU_COMBO_DEFAULT;
@@ -536,6 +555,14 @@ class LauncherHarness:
         self.lib.harness_ini_update.restype = ctypes.c_void_p
         self.lib.harness_free.argtypes = [ctypes.c_void_p]
         self.lib.harness_free.restype = None
+        self.lib.harness_summarize.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+        self.lib.harness_summarize.restype = ctypes.c_char_p
+
+    def summarize(self, title_id: str, which: str, trace_text: str) -> str:
+        raw = self.lib.harness_summarize(
+            title_id.encode("utf-8"), which.encode("utf-8"), trace_text.encode("utf-8")
+        )
+        return raw.decode("utf-8", errors="replace") if raw else ""
 
     def draw_screen(self, app: App, tab: int, detail: int = 0, dev_expand: int = 0) -> str:
         raw = self.lib.harness_draw_screen(ctypes.byref(app), tab, detail, dev_expand)
@@ -728,6 +755,30 @@ def test_has_shave_log_matches_real_boot_and_crash_strings(h: LauncherHarness) -
         )
         h.lib.harness_refresh_dev_status(ctypes.byref(g))
         assert g.dev.rec_shave_mode == 1, f"CUSA07408 with shave=12 expected rec_shave_mode=1, got {g.dev.rec_shave_mode}"
+
+
+def test_alloc_dm_retry_recovered_is_not_oom(h: LauncherHarness) -> None:
+    # Real boot log (CUSA18723, PS4 base, 2.34-custom): the first range near the display
+    # reserve fails, the full-range retry succeeds and gpu_init completes. That is not OOM.
+    retry_lines = (
+        "8.890 [t:104643 f:120] gpu_init enter pre_gpu=0 pre_work=0\n"
+        "8.890 [t:104643 f:120] alloc_dm FAILED at allocate: len=0x20000 align=0x20000 type=0 range=0x127600000..0x127800000 r=0x80020023 largest free=0x1c0000\n"
+        "8.890 [t:104643 f:120] alloc_dm ok: len=0x20000 align=0x20000 type=0 range=0x0..0x128000000 phys=0x40000 va=881120000\n"
+        "8.891 [t:104643 f:120] alloc_dm FAILED at allocate: len=0x190000 align=0x10000 type=3 range=0x127600000..0x127800000 r=0x80020023 largest free=0x1a0000\n"
+        "8.891 [t:104643 f:120] alloc_dm ok: len=0x190000 align=0x10000 type=3 range=0x0..0x128000000 phys=0x60000 va=882200000\n"
+    )
+    with Sandbox(h) as sb:
+        g = sb.select_game("CUSA18723", experimental=True)
+        sb.write_cfg("boot-CUSA18723.txt", retry_lines + "8.891 [t:104643 f:120] gpu_init ok at 881120000 work 882200000\n")
+        h.lib.harness_refresh_dev_status(ctypes.byref(g))
+        assert g.dev.diag_kind != DIAG_OOM_BOOT, "recovered alloc_dm retry reported as OOM"
+
+    # Same lines without gpu_init ok: the allocation never recovered, so it stays OOM.
+    with Sandbox(h) as sb:
+        g = sb.select_game("CUSA18723", experimental=True)
+        sb.write_cfg("boot-CUSA18723.txt", retry_lines.split("8.890 [t:104643 f:120] alloc_dm ok")[0])
+        h.lib.harness_refresh_dev_status(ctypes.byref(g))
+        assert g.dev.diag_kind == DIAG_OOM_BOOT, g.dev.diag_kind
 
 
 def test_do_apply_advice_removes_adapt_ini_on_manual_mode(h: LauncherHarness) -> None:
@@ -1199,12 +1250,222 @@ def test_turned_off_banner_and_no_save_while_off(h: LauncherHarness) -> None:
         assert "VCFG IS TURNED OFF" not in drawn_after, f"Banner still shown after ACT_INSTALL:\n{drawn_after}"
 
 
+def test_reset_and_advice_clear_b30_shq_and_auto_preserves_post_mid_3(h: LauncherHarness) -> None:
+    """Task T5.3 (Risk 2):
+    - do_reset_dev and do_apply_advice must reset below30 (b30) and shallow_queue (shq).
+    - save_settings in AUTO mode (manual_mode=0) must not overwrite post_mid=3 set in config-<TITLE>.ini.
+    """
+    with Sandbox(h) as sb:
+        g = sb.select_game("CUSA06548", experimental=False)
+        g.s.b30 = 1
+        g.s.shq = 1
+        g.dev.manual_mode = 1
+        g.dev.shave_mode = 1
+        h.lib.harness_do_reset_dev(ctypes.byref(sb.app))
+        assert g.s.b30 == 0 and g.s.shq == 0, f"do_reset_dev did not clear b30/shq: b30={g.s.b30}, shq={g.s.shq}"
+        cfg_txt = (sb.cfgdir / "config-CUSA06548.ini").read_text(encoding="utf-8")
+        assert "below30=0\n" in cfg_txt and "shallow_queue=0\n" in cfg_txt, cfg_txt
+
+        # do_apply_advice on a crash log with b30=1, shq=1
+        g.s.b30 = 1
+        g.s.shq = 1
+        sb.write_cfg(
+            "crash-CUSA06548.txt",
+            "SIGNAL: 11 (SIGSEGV) si_code=1 fault_addr=0x20\n"
+            "STAGE:  flips=50 in_submit=1 reg=1 gv=0 alloc_fail=0 shave=0\n",
+        )
+        h.lib.harness_do_apply_advice(ctypes.byref(sb.app))
+        assert g.s.b30 == 0 and g.s.shq == 0, f"do_apply_advice did not clear b30/shq: b30={g.s.b30}, shq={g.s.shq}"
+        cfg_txt = (sb.cfgdir / "config-CUSA06548.ini").read_text(encoding="utf-8")
+        assert "below30=0\n" in cfg_txt and "shallow_queue=0\n" in cfg_txt, cfg_txt
+
+        # do_apply_advice when rec_applied is already 1, but b30/shq was enabled
+        (sb.cfgdir / "crash-CUSA06548.txt").unlink()
+        h.lib.harness_do_reset_dev(ctypes.byref(sb.app))
+        g.s.b30 = 1
+        g.s.shq = 1
+        h.lib.harness_do_apply_advice(ctypes.byref(sb.app))
+        assert g.s.b30 == 0 and g.s.shq == 0, f"do_apply_advice skipped clearing b30/shq when rec_applied=1"
+
+        # post_mid=3 set manually in config-<TITLE>.ini with manual_mode=0 must survive load_settings + save_settings
+        sb.write_cfg(
+            "config-CUSA06548.ini",
+            "framegen=1\npreset=0\nsharpness=40\nenhance=1\noverlay=0\nmanual_mode=0\npost_mid=3\n",
+        )
+        h.lib.harness_load_settings(ctypes.byref(sb.app))
+        assert g.dev.manual_mode == 0, g.dev.manual_mode
+        assert g.dev.post_mid == 3, f"load_settings dropped post_mid=3 in AUTO mode: got {g.dev.post_mid}"
+        g.s.sharp = 30
+        h.lib.harness_save_settings(ctypes.byref(sb.app))
+        cfg_txt = (sb.cfgdir / "config-CUSA06548.ini").read_text(encoding="utf-8")
+        assert "manual_mode=0\n" in cfg_txt and "post_mid=3\n" in cfg_txt, (
+            f"save_settings in AUTO mode clobbered post_mid=3:\n{cfg_txt}"
+        )
+
+        # Even if post_mid=3 was written to config-<TITLE>.ini on disk while g.dev.post_mid==0 in RAM, save_settings in AUTO preserves it
+        g.dev.post_mid = 0
+        sb.write_cfg(
+            "config-CUSA06548.ini",
+            "framegen=1\npreset=0\nsharpness=30\nenhance=1\noverlay=0\nmanual_mode=0\npost_mid=3\n",
+        )
+        h.lib.harness_save_settings(ctypes.byref(sb.app))
+        cfg_txt = (sb.cfgdir / "config-CUSA06548.ini").read_text(encoding="utf-8")
+        assert "post_mid=3\n" in cfg_txt, f"save_settings overwrote disk post_mid=3:\n{cfg_txt}"
+
+
+def test_do_install_clears_t4_markers_while_normal_startup_keeps_them(h: LauncherHarness) -> None:
+    """Task T5.4 (Risk 3):
+    - do_install() (PKG install/update) must clean stale T4 opt-in marker files (shave14_, monev_, iolazy_, nospin_, tracelite_, quietlog_)
+      alongside adapt-, safe-, tile_, etc.
+    - When the plugin is already installed (plugin_state == 1), launching the app (harness_startup) must NOT delete opt-in markers placed
+      manually by the user for testing.
+    """
+    t4_markers = [
+        "shave14_CUSA06548",
+        "monev_CUSA06548",
+        "iolazy_CUSA06548",
+        "nospin_CUSA06548",
+        "tracelite_CUSA06548",
+        "quietlog_CUSA06548",
+    ]
+    with Sandbox(h) as sb:
+        sb.select_game("CUSA06548", experimental=False)
+        for m in t4_markers:
+            sb.write_cfg(m, "1\n")
+        sb.write_cfg("trace-CUSA06548.txt", "VCFG trace\n")
+
+        # 1. PKG install / update runs do_install() and clears stale markers from previous install
+        h.lib.harness_do_install(ctypes.byref(sb.app))
+        for m in t4_markers:
+            assert not (sb.cfgdir / m).exists(), f"do_install() did not clean stale marker {m}"
+        assert (sb.cfgdir / "trace-CUSA06548.txt").exists(), "do_install() removed trace log!"
+
+        # 2. User places opt-in markers manually while plugin is installed (plugin_state == 1):
+        #    normal app startup must keep them intact.
+        assert h.lib.harness_plugin_state() == 1
+        for m in t4_markers:
+            sb.write_cfg(m, "1\n")
+        h.lib.harness_startup(ctypes.byref(sb.app))
+        for m in t4_markers:
+            assert (sb.cfgdir / m).exists(), f"Normal startup unexpectedly deleted user opt-in marker {m}"
+
+
+def test_advisor_quietlog_without_cadence_does_not_claim_healthy(h: LauncherHarness) -> None:
+    """Task T5.5 (Risk 1):
+    When trace-<TITLE>.txt has no CADENCE line (e.g. under quietlog), Advisor must not silently report DIAG_OK
+    ("LAST SESSION RAN NORMALLY"), and instead show that the trace log is truncated (quietlog).
+    When CADENCE is present and healthy, DIAG_OK is still reported.
+    """
+    with Sandbox(h) as sb:
+        g = sb.select_game("CUSA06548", experimental=False)
+        sb.write_cfg(
+            "trace-CUSA06548.txt",
+            "VCFG trace\nversion: 2.35\nengine: classic\ntitle: CUSA06548\n"
+            "---- first lines ----\n"
+            "0.50 cpu cuts: monev=0 iolazy=0 nospin=0 tracelite=0 quietlog=1\n"
+            "5.00 mode4 #1: flip submitted\n"
+            "---- end of trace ----\n",
+        )
+        h.lib.harness_refresh_dev_status(ctypes.byref(g))
+        assert g.dev.diag_kind != DIAG_OK, f"Expected non-DIAG_OK when CADENCE is absent (quietlog), got {g.dev.diag_kind} ({g.dev.diag_cause!r})"
+        assert b"QUIETLOG" in g.dev.diag_cause.upper() or b"QUIETLOG" in g.dev.diag_detail.upper(), (
+            f"Expected quietlog notice, got cause={g.dev.diag_cause!r} detail={g.dev.diag_detail!r}"
+        )
+
+        # With CADENCE present and healthy, DIAG_OK is reported as usual:
+        sb.write_cfg(
+            "trace-CUSA06548.txt",
+            "VCFG trace\nversion: 2.35\nengine: classic\ntitle: CUSA06548\n"
+            "---- first lines ----\n"
+            "5.00 mode4 #1: flip submitted\n"
+            "10.00 CADENCE: 300 real, 300 mids shown | pace timeouts 0, missed 0\n"
+            "---- end of trace ----\n",
+        )
+        h.lib.harness_refresh_dev_status(ctypes.byref(g))
+        assert g.dev.diag_kind == DIAG_OK, f"Expected DIAG_OK when CADENCE is present, got {g.dev.diag_kind}"
+        assert b"LAST SESSION RAN NORMALLY" in g.dev.diag_cause, g.dev.diag_cause
+
+
+def test_summarize_strips_trailing_spaces_on_tracelite_header(h: LauncherHarness) -> None:
+    """Task T5.6 (Risk 5):
+    summarize() must strip trailing spaces from fixed-width tracelite header fields ("seconds since start: %-10llu").
+    """
+    tracelite_sample = (
+        "VCFG trace\n"
+        "version: 2.35\n"
+        "engine: classic\n"
+        "title: CUSA18723\n"
+        "firmware: 13.508.001\n"
+        "log lines: 25        \n"
+        "seconds since start: 42        \n"
+        "---- first lines ----\n"
+        "0.01 first SubmitAndFlip\n"
+        "0.02 gpu_init: ok\n"
+        "1.00 mode4 #1\n"
+        "---- end of trace ----\n"
+    )
+    out = h.summarize("CUSA18723", "current", tracelite_sample)
+    assert "| seconds since start: 42 | first frame yes" in out, f"Trailing spaces not stripped in summarize():\n{out!r}"
+
+
+def test_options_effective_inert_does_not_false_positive_advisor_or_summarize(h: LauncherHarness) -> None:
+    """PR #29 integration check:
+    1. 'options effective:' lines with non-FG inert tokens (e.g. below30=on(inert: no 2nd buffer) or
+       shallow_queue=on(inert: no timer pacing)) must NOT trigger DIAG_2BUF_NEEDED in refresh_dev_status()
+       or mark FG frames as 'no' / emit a false 'reason?' line in summarize().
+    2. When 'options effective:' explicitly has 'framegen=on(inert: ...)', both Advisor and summarize()
+       still treat framegen as inert.
+    """
+    with Sandbox(h) as sb:
+        g = sb.select_game("CUSA90003", experimental=True)
+        sb.write_cfg("boot-CUSA90003.txt", "0.00 [BOOT] 0.00 s: RegisterBuffers enter: handle=1 start=0 num=2\n")
+        sb.write_cfg(
+            "trace-CUSA90003.txt",
+            "0.01 options effective: framegen=on(ready: starting) preset=quality below30=on(inert: no 2nd buffer) "
+            "shallow_queue=on(inert: no timer pacing) game_vectors=on(ready: fg starting) hud_protect=1(ready: fg starting) | init\n",
+        )
+        h.lib.harness_refresh_dev_status(ctypes.byref(g))
+        assert g.dev.diag_kind != DIAG_2BUF_NEEDED, (
+            f"Non-FG inert token on options effective line falsely triggered DIAG_2BUF_NEEDED: {g.dev.diag_cause!r}"
+        )
+
+        # If framegen itself is inert on options effective line, DIAG_2BUF_NEEDED does trigger on 2-buf log:
+        sb.write_cfg(
+            "trace-CUSA90003.txt",
+            "2.00 options effective: framegen=on(inert: no mbuf) preset=quality | frame 120\n",
+        )
+        h.lib.harness_refresh_dev_status(ctypes.byref(g))
+        assert g.dev.diag_kind == DIAG_2BUF_NEEDED, f"Expected DIAG_2BUF_NEEDED when framegen=on(inert: ...), got {g.dev.diag_kind}"
+
+    # Check summarize() on Mode 8 trace with non-FG inert options on options effective line:
+    mode8_active_trace = (
+        "VCFG trace\n"
+        "version: 2.36\n"
+        "seconds since start: 60\n"
+        "0.01 first SubmitAndFlip\n"
+        "0.02 gpu_init: ok\n"
+        "0.03 2 extra buffer(s)\n"
+        "0.05 options effective: framegen=on(active) preset=quality below30=on(inert: no 2nd buffer) shallow_queue=on(inert: no timer pacing)\n"
+        "1.00 inject #1: count=1\n"
+        "---- end of trace ----\n"
+    )
+    out_active = h.summarize("CUSA18723", "current", mode8_active_trace)
+    assert "FG frames yes" in out_active, f"summarize() falsely reported FG frames no on non-FG inert option:\n{out_active}"
+    assert "reason?" not in out_active, f"summarize() emitted false reason? for non-FG inert option:\n{out_active}"
+
+    mode8_fg_inert_trace = mode8_active_trace.replace("framegen=on(active)", "framegen=on(inert: 60 fps game)")
+    out_inert = h.summarize("CUSA18723", "current", mode8_fg_inert_trace)
+    assert "FG frames no" in out_inert, f"summarize() missed framegen=on(inert: ...):\n{out_inert}"
+    assert "reason? 0.05 options effective: framegen=on(inert: 60 fps game)" in out_inert, out_inert
+
+
 def main() -> int:
     h = LauncherHarness()
     try:
         test_harness_baseline(h)
         test_shave2_never_recommended_after_shave2_crash_or_failed(h)
         test_has_shave_log_matches_real_boot_and_crash_strings(h)
+        test_alloc_dm_retry_recovered_is_not_oom(h)
         test_do_apply_advice_removes_adapt_ini_on_manual_mode(h)
         test_inert_checked_before_safe_state_and_safe_no_work_mem(h)
         test_no_false_is_2b_log_on_3buf_games_with_splash_num2(h)
@@ -1212,6 +1473,11 @@ def main() -> int:
         test_third_party_prx_fault_any_module_and_nonzero_afail(h)
         test_uninstall_and_plugins_ini_preserves_logs_and_foreign_plugins(h)
         test_turned_off_banner_and_no_save_while_off(h)
+        test_reset_and_advice_clear_b30_shq_and_auto_preserves_post_mid_3(h)
+        test_do_install_clears_t4_markers_while_normal_startup_keeps_them(h)
+        test_advisor_quietlog_without_cadence_does_not_claim_healthy(h)
+        test_summarize_strips_trailing_spaces_on_tracelite_header(h)
+        test_options_effective_inert_does_not_false_positive_advisor_or_summarize(h)
     finally:
         h.close()
     print("OK: launcher test harness checks passed")

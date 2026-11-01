@@ -205,7 +205,8 @@ static inline void ycocg420_decompress_frame(const uint32_t *ycocg_in, uint32_t 
 #define W8_FA  0x151000u   // 120x68 float2, full-res px, mid grid (ping-pong: current / previous frame)
 #define W8_FB  0x161000u
 #define W8_MISC 0x171000u  // [0] scene-change count, [1] t, [2..3] luma sums by parity, [4..5] dominant motion (gm8),
-                           // [6] foreground L2 blocks (fgs8), [7] fade decision (me1)
+                           // [6] foreground L2 blocks (fgs8), [7] fade decision (me1), [8..9] scene-change count of
+                           // the pair that wrote F of that parity (phase8: F prev cleared after a scene change)
 #define W8_S2  0x172000u   // 60x34 u32: L2 SAD of the best | SAD of the zero vector << 16 (me2)
 #define W8_GK  0x174000u   // 120x68 u32: foreground splat keys (fgs8; zeroed by pyr8)
 #define W8_FT  0x17C000u   // 120x68 float2: raw me1 field, filtered by mf8 into F cur (8.3)
@@ -216,6 +217,13 @@ static inline void ycocg420_decompress_frame(const uint32_t *ycocg_in, uint32_t 
 // from the previous frame's cur pyramid buffers via ping-pong descriptor swap (0 B extra DirectMemory),
 // and pyr8.ll skips all T#prev texture fetches and V#L1prev..L3prev buffer stores (-50% pyr8 bandwidth & ALU).
 #define FG8_FLAG_PYR_WARM 0x1000u
+// consts.flags (tb[30], offset +0x78) bit 15: FG Fast preset (preset == 1) wave-uniform shader skips
+// (calm-block Phase 2 skip in me1.ll, uniform-neighbourhood skip in mf8.ll, and @cr skip in warp8.ll).
+#define FG8_FLAG_FAST     0x8000u
+#ifndef VCFG_OPT_FAST_DEFINED
+#define VCFG_OPT_FAST_DEFINED
+static volatile int g_opt_fast __attribute__((unused)) = 0;
+#endif
 
 // table read by the mode 8 shaders (offsets are hard-coded in shaders/*8.ll and me*.ll)
 #define WA(off) ((uint64_t)(uintptr_t)(work + (off)))
@@ -244,7 +252,7 @@ static inline void fill_table8_wh(uint32_t *tb, uint64_t P, uint64_t C, uint64_t
         make_v(tb + 60, WA(W8_V2), 60 * 34 * 4);                        // +0xF0 V2
         make_v(tb + 64, WA(r ? W8_FB : W8_FA), 120 * 68 * 8);           // +0x100 F cur
         make_v(tb + 68, WA(r ? W8_FA : W8_FB), 120 * 68 * 8);           // +0x110 F prev
-        make_v(tb + 72, WA(W8_MISC), 32);                               // +0x120 misc
+        make_v(tb + 72, WA(W8_MISC), 48);                               // +0x120 misc
         make_v(tb + 80, WA(W8_S2), 60 * 34 * 4);                        // +0x140 S2
         make_v(tb + 84, WA(W8_GK), 120 * 68 * 4);                       // +0x150 GK
         make_v(tb + 96, WA(W8_FT), 120 * 68 * 8);                       // +0x180 FT: raw me1 field (me1 -> mf8)
@@ -318,13 +326,33 @@ static const uint32_t g_font8x8[192] = {
     0x006CD870u, 0x00000000u, /* 0x7E '~' */ 0x7E7E7E7Eu, 0x007E7E7Eu  /* 0x7F block */
 };
 
+// T22a debug generated-frame marker (dbg_mark_gen=1):
+// Uses 1040 bytes of unused g_gpu memory at 0x0900..0x0D0F (between FONT8_OFF + 0x300 = 0x0900 and MON_OFF = 0x0E00).
+// When OSD_FLAG_DBG_MARK (bit 2 of out_flags in osd_wh >> 24) is set, fill_table8_ext initializes a 4-entry palette
+// at DBG_MARK_PAL_OFF (pal[1] = 0xFFFF00FF bright opaque magenta) and a 32x32 8-bit bitmap of 1s at DBG_MARK_PIX_OFF,
+// and points V#palette (tb+128) and V#pixels (tb+132) at them. When dbg_mark_gen=0, 0x0900..0x0DFF is untouched.
+#define DBG_MARK_PAL_OFF  0x0900u
+#define DBG_MARK_PIX_OFF  0x0910u
+#define OSD_FLAG_DBG_MARK 4u
+
 static inline void fill_table8_ext(uint32_t *tb, uint8_t *gpu, uint8_t *slotb,
                                    uint32_t rcas_con_bits, uint32_t rcas_flags,
                                    uint32_t osd_xy, uint32_t osd_wh)
 {
-    (void)gpu; (void)slotb;
-    make_v(tb + 128, (uint64_t)(uintptr_t)vov_pal_ptr(), VOV_PAL_SZ);          // +0x200 V#palette (overlay/vov.c)
-    make_v(tb + 132, (uint64_t)(uintptr_t)vov_pix_ptr(), VOV_PIX_SZ);          // +0x210 V#pixels
+    (void)slotb;
+    if (((osd_wh >> 24) & OSD_FLAG_DBG_MARK) != 0u && gpu != 0) {
+        uint32_t *pal = (uint32_t *)(gpu + DBG_MARK_PAL_OFF);
+        uint8_t  *pix = gpu + DBG_MARK_PIX_OFF;
+        if (pal[1] != 0xFFFF00FFu) {
+            pal[0] = 0u; pal[1] = 0xFFFF00FFu; pal[2] = 0u; pal[3] = 0u;
+            for (int i = 0; i < 1024; i++) pix[i] = 1u;
+        }
+        make_v(tb + 128, (uint64_t)(uintptr_t)pal, 16u);
+        make_v(tb + 132, (uint64_t)(uintptr_t)pix, 1024u);
+    } else {
+        make_v(tb + 128, (uint64_t)(uintptr_t)vov_pal_ptr(), VOV_PAL_SZ);          // +0x200 V#palette (overlay/vov.c)
+        make_v(tb + 132, (uint64_t)(uintptr_t)vov_pix_ptr(), VOV_PIX_SZ);          // +0x210 V#pixels
+    }
     tb[136] = rcas_con_bits;                                                  // +0x220 rcas_con (float bits)
     tb[137] = rcas_flags;                                                     // +0x224 rcas_flags (bit 0=mid, 1=cur, 2..3=enh_mode)
     tb[138] = osd_xy;                                                         // +0x228 osd_xy (x0 | y0 << 16)

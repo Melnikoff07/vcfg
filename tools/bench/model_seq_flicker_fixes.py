@@ -119,8 +119,159 @@ def patch_noop(src: str) -> str:
     return src
 
 
+def _normalize_fgs8_to_base(src: str) -> str:
+    """Normalize fgs8.ll to the pre-T8 (2d032b1) baseline so patch_v1_fgs8 / patch_v5_fgs8 work before and after T8."""
+    t8_block = """  ; ---- 8.5 anchor: quasi-static screen-fixed object (|V2|^2 <= 2 [9 with history] and 4|V2|^2 <= |gm|^2), inner block, letter 'L' off
+  %pv3 = getelementptr i8, ptr addrspace(4) %tbl, i64 224
+  %vv3 = load <4 x i32>, ptr addrspace(4) %pv3, align 16, !invariant.load !0
+  %hoff = add i32 %i, 2048
+  %h8 = call i8 @llvm.amdgcn.raw.buffer.load.i8(<4 x i32> %vv3, i32 %hoff, i32 0, i32 0)
+  %h = zext i8 %h8 to i32
+  %has_h = icmp ugt i32 %h, 0
+  %vv_thr = select i1 %has_h, i32 9, i32 2
+  %vv4 = shl i32 %vv, 2
+  %slw0 = icmp ule i32 %vv, %vv_thr
+  %slw1 = icmp ule i32 %vv4, %gmv
+  %slw = and i1 %slw0, %slw1
+  %bxm = add i32 %bxq, -1
+  %inbx = icmp ult i32 %bxm, 58
+  %bym = add i32 %byq, -1
+  %inby = icmp ult i32 %bym, 32
+  %inb = and i1 %inbx, %inby
+  %pcn = getelementptr i8, ptr addrspace(4) %tbl, i64 112
+  %cn = load <4 x i32>, ptr addrspace(4) %pcn, align 16, !invariant.load !0
+  %flg = extractelement <4 x i32> %cn, i32 2
+  %noab = and i32 %flg, 32
+  %aon = icmp eq i32 %noab, 0
+  ; 8.6: camera still (|gm|^2 <= 4): textured, own SAD <= texture / 2, |V2|^2 <= 1 (4 |V2|^2 <= 4)
+  %vvs = icmp ule i32 %vv4, 4
+  %as0 = and i1 %istex, %vvs
+  %as1 = and i1 %as0, %rm
+  %anm0 = and i1 %f1, %slw
+  %anm = and i1 %anm0, %rm
+  %an1 = select i1 %stl, i1 %as1, i1 %anm
+  %an2 = and i1 %an1, %inb
+  %an0 = and i1 %an2, %aon
+  %nstl = xor i1 %stl, true
+  %ank0 = and i1 %has_h, %nstl
+  %ank1 = and i1 %ank0, %istex
+  %ank2 = and i1 %ank1, %rm
+  %ank3 = and i1 %ank2, %slw
+  %ank4 = and i1 %ank3, %inb
+  %ank_pre = and i1 %ank4, %aon
+  %need0 = or i1 %fg0, %an0
+  %need = or i1 %need0, %ank_pre
+  br i1 %need, label %nbc, label %hist
+nbc:
+  ; 4 cardinal neighbours (in bounds) with |dV|_1 <= 4
+  %nb0 = call i1 @nbok(<4 x i32> %v2, i32 %bxq, i32 %byq, i32 -1, i32 0, i32 %vx, i32 %vy)
+  %nb1 = call i1 @nbok(<4 x i32> %v2, i32 %bxq, i32 %byq, i32 1, i32 0, i32 %vx, i32 %vy)
+  %nb2 = call i1 @nbok(<4 x i32> %v2, i32 %bxq, i32 %byq, i32 0, i32 -1, i32 %vx, i32 %vy)
+  %nb3 = call i1 @nbok(<4 x i32> %v2, i32 %bxq, i32 %byq, i32 0, i32 1, i32 %vx, i32 %vy)
+  %nb0i = zext i1 %nb0 to i32
+  %nb1i = zext i1 %nb1 to i32
+  %nb2i = zext i1 %nb2 to i32
+  %nb3i = zext i1 %nb3 to i32
+  %nbc01 = add i32 %nb0i, %nb1i
+  %nbc23 = add i32 %nb2i, %nb3i
+  %nb_cnt = add i32 %nbc01, %nbc23
+  %fg = icmp uge i32 %nb_cnt, 1
+  %nb2ok = icmp uge i32 %nb_cnt, 2
+  br label %hist
+hist:
+  %nbk = phi i1 [ false, %go ], [ %fg, %nbc ]
+  %nb2k = phi i1 [ false, %go ], [ %nb2ok, %nbc ]
+  %isfg = and i1 %fg0, %nbk
+  %isa0 = and i1 %an0, %nbk
+  %ank = and i1 %ank_pre, %nbk
+  ; anchor history: step +2 on isa0, decay -1 when !isa0 (capped to 5, threshold >= 3 -> max 2-frame hold)
+  %hp = add i32 %h, 2
+  %hm0 = sub i32 %h, 1
+  %hm = call i32 @llvm.smax.i32(i32 %hm0, i32 0)
+  %hn = select i1 %isa0, i32 %hp, i32 %hm
+  %hn_c = call i32 @llvm.smin.i32(i32 %hn, i32 5)
+  %hn8 = trunc i32 %hn_c to i8
+  call void @llvm.amdgcn.raw.buffer.store.i8(i8 %hn8, <4 x i32> %vv3, i32 %hoff, i32 0, i32 0)
+  %g160 = icmp sge i32 %gdif, 160
+  %sa0 = and i1 %nstl, %nb2k
+  %strong_an = and i1 %sa0, %g160
+  %hok0 = icmp uge i32 %hn_c, 3
+  %hok = or i1 %hok0, %strong_an
+  %isa_eff = or i1 %isa0, %ank
+  %isan = and i1 %isa_eff, %hok"""
+    base_block = """  ; ---- 8.5 anchor: quasi-static screen-fixed object (|V2|^2 <= 2 and 4|V2|^2 <= |gm|^2), inner block, letter 'L' off
+  %vv4 = shl i32 %vv, 2
+  %slw0 = icmp ule i32 %vv, 2
+  %slw1 = icmp ule i32 %vv4, %gmv
+  %slw = and i1 %slw0, %slw1
+  %bxm = add i32 %bxq, -1
+  %inbx = icmp ult i32 %bxm, 58
+  %bym = add i32 %byq, -1
+  %inby = icmp ult i32 %bym, 32
+  %inb = and i1 %inbx, %inby
+  %pcn = getelementptr i8, ptr addrspace(4) %tbl, i64 112
+  %cn = load <4 x i32>, ptr addrspace(4) %pcn, align 16, !invariant.load !0
+  %flg = extractelement <4 x i32> %cn, i32 2
+  %noab = and i32 %flg, 32
+  %aon = icmp eq i32 %noab, 0
+  ; 8.6: camera still (|gm|^2 <= 4): textured, own SAD <= texture / 2, |V2|^2 <= 1 (4 |V2|^2 <= 4)
+  %vvs = icmp ule i32 %vv4, 4
+  %as0 = and i1 %istex, %vvs
+  %as1 = and i1 %as0, %rm
+  %anm0 = and i1 %f1, %slw
+  %anm = and i1 %anm0, %rm
+  %an1 = select i1 %stl, i1 %as1, i1 %anm
+  %an2 = and i1 %an1, %inb
+  %an0 = and i1 %an2, %aon
+  %need = or i1 %fg0, %an0
+  br i1 %need, label %nbc, label %hist
+nbc:
+  ; 4 cardinal neighbours (in bounds) with |dV|_1 <= 4
+  %nb0 = call i1 @nbok(<4 x i32> %v2, i32 %bxq, i32 %byq, i32 -1, i32 0, i32 %vx, i32 %vy)
+  %nb1 = call i1 @nbok(<4 x i32> %v2, i32 %bxq, i32 %byq, i32 1, i32 0, i32 %vx, i32 %vy)
+  %nb2 = call i1 @nbok(<4 x i32> %v2, i32 %bxq, i32 %byq, i32 0, i32 -1, i32 %vx, i32 %vy)
+  %nb3 = call i1 @nbok(<4 x i32> %v2, i32 %bxq, i32 %byq, i32 0, i32 1, i32 %vx, i32 %vy)
+  %nb0i = zext i1 %nb0 to i32
+  %nb1i = zext i1 %nb1 to i32
+  %nb2i = zext i1 %nb2 to i32
+  %nb3i = zext i1 %nb3 to i32
+  %nbc01 = add i32 %nb0i, %nb1i
+  %nbc23 = add i32 %nb2i, %nb3i
+  %nb_cnt = add i32 %nbc01, %nbc23
+  %fg = icmp uge i32 %nb_cnt, 1
+  %nb2ok = icmp uge i32 %nb_cnt, 2
+  br label %hist
+hist:
+  %nbk = phi i1 [ false, %go ], [ %fg, %nbc ]
+  %nb2k = phi i1 [ false, %go ], [ %nb2ok, %nbc ]
+  %isfg = and i1 %fg0, %nbk
+  %isa0 = and i1 %an0, %nbk
+  ; anchor history: consecutive frames with the anchor condition (u8 per L2 block, V3 + 2048, zeroed at allocation)
+  %pv3 = getelementptr i8, ptr addrspace(4) %tbl, i64 224
+  %vv3 = load <4 x i32>, ptr addrspace(4) %pv3, align 16, !invariant.load !0
+  %hoff = add i32 %i, 2048
+  %h8 = call i8 @llvm.amdgcn.raw.buffer.load.i8(<4 x i32> %vv3, i32 %hoff, i32 0, i32 0)
+  %h = zext i8 %h8 to i32
+  %h1 = add i32 %h, 1
+  %h1c = call i32 @llvm.umin.i32(i32 %h1, i32 255)
+  %hn = select i1 %isa0, i32 %h1c, i32 0
+  %hn8 = trunc i32 %hn to i8
+  call void @llvm.amdgcn.raw.buffer.store.i8(i8 %hn8, <4 x i32> %vv3, i32 %hoff, i32 0, i32 0)
+  %nstl = xor i1 %stl, true
+  %g160 = icmp sge i32 %gdif, 160
+  %sa0 = and i1 %nstl, %nb2k
+  %strong_an = and i1 %sa0, %g160
+  %hok0 = icmp uge i32 %hn, 2
+  %hok = or i1 %hok0, %strong_an
+  %isan = and i1 %isa0, %hok"""
+    if t8_block in src:
+        src = src.replace(t8_block, base_block, 1)
+    return src
+
+
 def patch_v1_fgs8(src: str) -> str:
     """V1b/V2/V3/V4 fgs8.ll patch: +1 on %isa0, hold max(h,2) on %isfg (%an2|%isa0 with %slw |V2|^2<=2), -1 decay."""
+    src = _normalize_fgs8_to_base(src)
     old = """  %h1 = add i32 %h, 1
   %h1c = call i32 @llvm.umin.i32(i32 %h1, i32 255)
   %hn = select i1 %isa0, i32 %h1c, i32 0
@@ -157,6 +308,7 @@ def patch_v1_fgs8(src: str) -> str:
 
 def patch_v5_fgs8(src: str) -> str:
     """V5 fgs8.ll patch: +2 on %isa0 (cap 7), hold max(h,2) on %isfg (%an2|%isa0 with %slw |V2|^2<=2), -1 decay."""
+    src = _normalize_fgs8_to_base(src)
     old = """  %h1 = add i32 %h, 1
   %h1c = call i32 @llvm.umin.i32(i32 %h1, i32 255)
   %hn = select i1 %isa0, i32 %h1c, i32 0
@@ -192,7 +344,58 @@ def patch_v5_fgs8(src: str) -> str:
 
 
 def _normalize_warp8_to_base(src: str) -> str:
-    """Normalize warp8.ll to the pre-V5b baseline so all patch_v*_warp8 functions work before and after V5b is applied."""
+    """Normalize warp8.ll to the pre-V5b baseline so all patch_v*_warp8 functions work before and after V5b/H1 is applied."""
+    fill_branch = """  ; fill weight: cw is exactly 0 when emov <= 0.025 (residual and every base term off), when emov <= es
+  ; (gcw = 0), on hl_act, under the full foreground kill (ws_keep = 0) or with the no-fill flag; then movc = mov
+  ; and the wave skips the fill block
+  %cwa = fcmp ogt float %emov, 0x3F999999A0000000 ; 0.025
+  %cwg = fcmp ogt float %emov, %es
+  %cwl0 = and i1 %cwa, %cwg
+  %nhlact = xor i1 %hl_act, true
+  %wsk_pos = fcmp ogt float %ws_keep, 0.0
+  %nfgkill = and i1 %nhlact, %wsk_pos
+  %nnocf = xor i1 %nocf, true
+  %cwl1 = and i1 %cwl0, %nfgkill
+  %cw_live = and i1 %cwl1, %nnocf
+  br i1 %cw_live, label %fill, label %fdone
+fill:
+  %wom0 = fsub float %spr, 12.0
+  %wom1 = fmul float %wom0, 0.5
+  %w_om_s = call float @sat(float %wom1)
+  %wom_es0 = fsub float %es, 0x3FE99999A0000000 ; 0.80
+  %wom_es1 = fmul float %wom_es0, 4.0
+  %w_om_es = call float @sat(float %wom_es1)
+  %wom_em0 = fsub float 0x3FD3D70A40000000, %emov ; 0.31
+  %wom_em1 = fmul float %wom_em0, 4.0
+  %w_om_em = call float @sat(float %wom_em1)
+  %w_om01 = fmul float %w_om_s, %w_om_es
+  %w_occ_m = fmul float %w_om01, %w_om_em"""
+    if fill_branch in src:
+        wom_block = """  %is_wire_fol = fcmp oge float %hl_mov, 4.0
+  %wom0 = fsub float %spr, 12.0
+  %wom1 = fmul float %wom0, 0.5
+  %w_om_s = call float @sat(float %wom1)
+  %wom_es0 = fsub float %es, 0x3FE99999A0000000 ; 0.80
+  %wom_es1 = fmul float %wom_es0, 4.0
+  %w_om_es = call float @sat(float %wom_es1)
+  %wom_em0 = fsub float 0x3FD3D70A40000000, %emov ; 0.31
+  %wom_em1 = fmul float %wom_em0, 4.0
+  %w_om_em = call float @sat(float %wom_em1)
+  %w_om01 = fmul float %w_om_s, %w_om_es
+  %w_occ_m = fmul float %w_om01, %w_om_em"""
+        src = src.replace("  %is_wire_fol = fcmp oge float %hl_mov, 4.0", wom_block, 1)
+        src = src.replace(fill_branch + "\n", "", 1)
+        src = src.replace(
+            "  %movf = call <4 x float> @lerp4(<4 x float> %mov, <4 x float> %fillc, float %cw)\n  br label %fdone\nfdone:\n  %movc = phi <4 x float> [ %mov, %merge ], [ %movf, %fill ]",
+            "  %movc = call <4 x float> @lerp4(<4 x float> %mov, <4 x float> %fillc, float %cw)",
+            1,
+        )
+        src = src.replace("[ false, %fdone ]", "[ false, %merge ]", 1)
+    src = src.replace(
+        "  %vmg_e = call float @llvm.maxnum.f32(float %vm4, float %vmp_k)",
+        "  %vmg_e = call float @llvm.maxnum.f32(float %vm_c, float %vmp_k)",
+        1,
+    )
     v5b_block1 = """  %vmp_k = fmul float %vm_p, 0x3FEE147AE0000000
   %vmg_e = call float @llvm.maxnum.f32(float %vm_c, float %vmp_k)
   %wv0 = fsub float %vmg_e, 4.0
@@ -1342,6 +1545,147 @@ def main():
             f"out_ws={vo['fgkill_ws_flips']:5d}"
         )
     return 0
+
+
+def _splat_l2_anchors_to_gk(gk_base: np.ndarray, isan_l2: np.ndarray, v2_s: np.ndarray) -> np.ndarray:
+    """Splat active L2 anchors (prio=0) onto the 68x120 GK grid matching fgs8.ll @put."""
+    gk_out = gk_base.copy()
+    bys, bxs = np.nonzero(isan_l2)
+    for by, bx in zip(bys.tolist(), bxs.tolist()):
+        idx = by * 60 + bx
+        vx = int(v2_s[by, bx, 0])
+        vy = int(v2_s[by, bx, 1])
+        cx = bx * 32 + 16 + 2 * vx
+        cy = by * 32 + 16 + 2 * vy
+        for gy in ((cy - 16) >> 4, cy >> 4, (cy + 15) >> 4):
+            for gx in ((cx - 16) >> 4, cx >> 4, (cx + 15) >> 4):
+                if 0 <= gx < 120 and 0 <= gy < 68:
+                    e = (cx - (gx * 16 + 8)) ** 2 + (cy - (gy * 16 + 8)) ** 2
+                    d4 = min(int(np.floor(np.sqrt(float(16 * e)))), 255)
+                    key = np.uint32(idx | ((255 - d4) << 12))
+                    if key > gk_out[gy, gx]:
+                        gk_out[gy, gx] = key
+    return gk_out
+
+
+def evaluate_b_sequence_models(seq_dir: pathlib.Path) -> dict[str, dict]:
+    """Candidate-independent head-hole and flip evaluation on a 32-step console capture (seq5 or seq4).
+    The metric function has zero candidate-specific branches: every variant supplies only its L2 anchor
+    selection `gk_eff` (from fgs8), and the exact same formula evaluates `GK==0` head cells, `fast&GK==0`
+    head hole cells, and 2d032b1 warp8 fgkill flips.
+    """
+    steps = [asf.parse_seq_step(bf.read_bytes()) for bf in sorted(seq_dir.glob("bench_seq_[0-9][0-9][0-9][0-9].bin"))]
+    m_steps = len(steps)
+    fgmask_seq = np.stack([s["fgmask"] for s in steps], axis=0)
+    gk_seq = np.stack([s["GK_u32"] for s in steps], axis=0)
+    anc_seq = np.stack([s["anchor_hist"] for s in steps], axis=0)
+    v2_seq = np.stack([s["V2"] for s in steps], axis=0).astype(np.int32)
+    fcrop_seq = np.stack([s["F_head_crop"] for s in steps], axis=0)
+    gms = np.array([(s["misc"]["fg_vx_sum"], s["misc"]["fg_vy_sum"]) for s in steps], dtype=np.int32)
+    gmv = (gms[:, 0] ** 2 + gms[:, 1] ** 2)[:, None, None]
+    nstl = ~(gmv <= 4)
+
+    gy0, gy1 = asf.FCROP_GY0, asf.FCROP_GY1
+    gx0, gx1 = asf.FCROP_GX0, asf.FCROP_GX1
+    by_grid = np.arange(gy0, gy1)[:, None] >> 1
+    bx_grid = np.arange(gx0, gx1)[None, :] >> 1
+
+    vv_l2 = v2_seq[..., 0] ** 2 + v2_seq[..., 1] ** 2
+    inb_l2 = np.zeros((34, 60), dtype=bool)
+    inb_l2[1:33, 1:59] = True
+
+    vx_l2, vy_l2 = v2_seq[..., 0], v2_seq[..., 1]
+    nbk_l2 = np.zeros((m_steps, 34, 60), dtype=bool)
+    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        ny = np.clip(np.arange(34)[:, None] + dy, 0, 33)
+        nx = np.clip(np.arange(60)[None, :] + dx, 0, 59)
+        valid_nb = (
+            (np.arange(34)[:, None] + dy >= 0)
+            & (np.arange(34)[:, None] + dy < 34)
+            & (np.arange(60)[None, :] + dx >= 0)
+            & (np.arange(60)[None, :] + dx < 60)
+        )
+        dist = np.abs(vx_l2[:, ny, nx] - vx_l2) + np.abs(vy_l2[:, ny, nx] - vy_l2)
+        nbk_l2 |= valid_nb[None, :, :] & (dist <= 4)
+
+    l2_in_gk = np.zeros((m_steps, 34, 60), dtype=bool)
+    for s in range(m_steps):
+        active_gk = gk_seq[s] > 0
+        srcs = gk_seq[s][active_gk] & 0xFFF
+        l2_in_gk[s].ravel()[srcs] = True
+
+    _, _, vmg_raw, _ = unpack_fcrop_flow(fcrop_seq)
+    vv_crop = vv_l2[:, by_grid, bx_grid]
+    ever_head = np.any(anc_seq[:, by_grid, bx_grid] > 0, axis=0)
+    head_mask = (vv_crop <= 6) & ever_head[None, :, :]
+    head_tot = int(np.count_nonzero(head_mask))
+
+    def measure_gk(gk_eff: np.ndarray) -> dict:
+        gk_c = gk_eff[:, gy0:gy1, gx0:gx1]
+        hasfg_c = gk_c != 0
+        hasfg_full = gk_eff != 0
+        unanc = int(np.count_nonzero(head_mask & (~hasfg_c)))
+        fast_unanc = int(np.count_nonzero(head_mask & (~hasfg_c) & (vmg_raw > 16.0)))
+
+        mfit_crop = (fgmask_seq[:, gy0:gy1, gx0:gx1] & asf.FGMASK_MFIT) != 0
+        vmg_hi_crop = (fgmask_seq[:, gy0:gy1, gx0:gx1] & asf.FGMASK_VMG_HI) != 0
+        mov_obj = hasfg_c | vmg_hi_crop
+        fgkill_ws = hasfg_c & mfit_crop
+        fgkill = mov_obj & mfit_crop
+
+        in_crop_mask = np.zeros((68, 120), dtype=bool)
+        in_crop_mask[gy0:gy1, gx0:gx1] = True
+        out_metrics = compute_outside_crop_metrics(
+            hasfg_full,
+            (fgmask_seq & asf.FGMASK_MFIT) != 0,
+            (fgmask_seq & asf.FGMASK_VMG_HI) != 0,
+            ~in_crop_mask,
+            vel_ramp_ws=False,
+        )
+        dec = compute_metrics_for_decision(
+            hasfg_c, mov_obj, fgkill_ws, fgkill, steps_data=steps, outside_crop=out_metrics
+        )
+        return {
+            "head_cells": head_tot,
+            "unanc_cells": unanc,
+            "unanc_pct": unanc / max(head_tot, 1) * 100.0,
+            "fast_unanc_hole_cells": fast_unanc,
+            "fast_unanc_hole_pct": fast_unanc / max(head_tot, 1) * 100.0,
+            "flips_tight": dec["head_tight"]["fgkill_flips"],
+            "flips_tight_ws": dec["head_tight"]["fgkill_ws_flips"],
+            "flips_crop": dec["f_head_crop_box"]["fgkill_flips"],
+            "flips_crop_ws": dec["f_head_crop_box"]["fgkill_ws_flips"],
+            "flips_outside_ws": out_metrics["fgkill_ws_flips"],
+        }
+
+    def run_b_sim(inc: int, thr: int, cap: int) -> np.ndarray:
+        gk_eff = gk_seq.copy()
+        h_sim = np.zeros_like(anc_seq, dtype=np.int32)
+        isa0_0 = anc_seq[0] > 0
+        h_sim[0] = np.where(isa0_0, np.minimum(inc, cap), 0)
+        for s in range(1, m_steps):
+            hp = h_sim[s - 1]
+            has_h = hp > 0
+            vv_thr = np.where(has_h, 9, 2)
+            slw_m = (vv_l2[s] <= vv_thr) & (4 * vv_l2[s] <= gmv[s])
+            isa0_s = (anc_seq[s] > 0) | (has_h & l2_in_gk[s] & slw_m & inb_l2 & nbk_l2[s])
+            ank_s = has_h & nstl[s] & slw_m & inb_l2 & nbk_l2[s]
+            hn = np.minimum(np.where(isa0_s, hp + inc, np.maximum(hp - 1, 0)), cap)
+            h_sim[s] = hn
+            isan_s = (isa0_s | ank_s) & (hn >= thr)
+            gk_eff[s] = _splat_l2_anchors_to_gk(gk_eff[s], isan_s, v2_seq[s])
+        return gk_eff
+
+    return {
+        "baseline_2d032b1": measure_gk(gk_seq),
+        "B_step1_N1": measure_gk(run_b_sim(inc=1, thr=2, cap=3)),
+        "B_step1_N2": measure_gk(run_b_sim(inc=1, thr=2, cap=4)),
+        "B_hold_N1": measure_gk(run_b_sim(inc=2, thr=3, cap=4)),
+        "B_hold_N2": measure_gk(run_b_sim(inc=2, thr=3, cap=5)),
+    }
+
+
+evaluate_t6_sequence_models = evaluate_b_sequence_models
 
 
 if __name__ == "__main__":

@@ -304,7 +304,7 @@ static void tsharp_match(pm4_frame_t *f, const uint32_t *t, int cs)
     // T# word 0/1: BASE_ADDRESS is 38 bits (address >> 8) = word 0 + word 1 bits 5:0; bits 7:6 are MTYPE_L2
     // (shadPS4 AmdGpu::Image), so they must not take part in the address compare
     uint64_t base = ((uint64_t)t[0] << 8) | ((uint64_t)(t[1] & 0x3Fu) << 40);
-    if (!base) return;
+    if (base < 0x100000ull || base >= (1ull << 44) || ((t[1] >> 8) & 0xFFFu) != 0u) return;
     int matched = 0;
     for (uint32_t i = 0; i < f->nrt; i++) {
         pm4_rt_t *r = &f->rt[i];

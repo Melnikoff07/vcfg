@@ -81,18 +81,20 @@ int32_t sceVideoOutGetFlipStatus_hook(int32_t h, VoFlipStatus *s)
 #endif
             __atomic_store_n(&g_tb_last_p, s->flipPendingNum, __ATOMIC_RELAXED);
             __atomic_store_n(&g_tb_last_g, s->gcQueueNum, __ATOMIC_RELAXED);
+            int on_our_buf = (g_mbuf_state == 1 && g_mbase > 0 && s->currentBuffer >= g_mbase && s->currentBuffer < g_nbuf);
             if (vq_active()) {   // one queue entry per real frame: our generated frame is not the game's
-                int on_our_buf = (g_mbuf_state == 1 && g_mbase > 0 && s->currentBuffer >= g_mbase && s->currentBuffer < g_nbuf);
-                if (on_our_buf && s->flipPendingNum == 1 && s->gcQueueNum == 0) {
-                    s->flipPendingNum = 0;
-                } else if (s->flipPendingNum > 0) {
-                    s->flipPendingNum = (s->flipPendingNum + 1) / 2;
-                }
-                if (s->gcQueueNum > 0) s->gcQueueNum = (s->gcQueueNum + 1) / 2;
-                if (on_our_buf && (g_ngame == 2 || g_runtime_2buf || g_vq_on)) {
-                    s->currentBuffer = (g_prev_idx < (uint32_t)g_ngame) ? (int32_t)g_prev_idx : 0;
+                if (strcmp(g_title_id, "CUSA00552") != 0) {
+                    if (on_our_buf && s->flipPendingNum == 1 && s->gcQueueNum == 0) {
+                        s->flipPendingNum = 0;
+                    } else if (s->flipPendingNum > 0) {
+                        s->flipPendingNum = (s->flipPendingNum + 1) / 2;
+                    }
+                    if (s->gcQueueNum > 0) s->gcQueueNum = (s->gcQueueNum + 1) / 2;
                 }
                 __atomic_add_fetch(&g_tb_virt_calls, 1u, __ATOMIC_RELAXED);
+            }
+            if (!g_fg_off && on_our_buf) {
+                s->currentBuffer = (g_prev_idx < (uint32_t)g_ngame) ? (int32_t)g_prev_idx : 0;
             }
             __atomic_store_n(&g_tb_last_vp, s->flipPendingNum, __ATOMIC_RELAXED);
             __atomic_store_n(&g_tb_last_vg, s->gcQueueNum, __ATOMIC_RELAXED);
@@ -102,6 +104,16 @@ int32_t sceVideoOutGetFlipStatus_hook(int32_t h, VoFlipStatus *s)
                (long long)s->flipArg, s->currentBuffer, s->flipPendingNum, (unsigned long long)s->count);
     }
     return r;
+}
+
+#define vq_on_cadence_window vcfg_vq_on_cadence_window
+static inline void vq_on_cadence_window(uint32_t mid_shown, uint32_t real_shown, uint32_t missed_flips)
+{
+    if (strcmp(g_title_id, "CUSA07408") == 0 && (g_ngame == 2 || g_runtime_2buf || g_vq_on) &&
+        real_shown >= 20u && mid_shown * 4u < real_shown && missed_flips * 2u >= real_shown) {
+        if (g_cfg.pace_order == 0) g_cfg.pace_order = 1;
+        g_vq_on = 0;
+    }
 }
 
 // Every 2 s from the monitor: the queue numbers at the poll that released the game's wait (raw | given to the game).

@@ -19,7 +19,7 @@ define internal float @lum(<8 x i32> %t, i32 %x, i32 %y) alwaysinline {
   ret float %l
 }
 
-define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 inreg %gy, i32 %tid) {
+define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 inreg %gy, i32 %tid) #0 {
   %ptc = getelementptr i8, ptr addrspace(4) %tbl, i64 32
   %tc = load <8 x i32>, ptr addrspace(4) %ptc, align 32, !invariant.load !0
   %pv = getelementptr i8, ptr addrspace(4) %tbl, i64 96
@@ -68,3 +68,5 @@ define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 inre
 }
 
 !0 = !{}
+
+attributes #0 = { "denormal-fp-math-f32"="preserve-sign,preserve-sign" }

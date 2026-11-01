@@ -27,7 +27,7 @@ import analyze_telemetry_corpus as atc  # noqa: E402
 
 
 def _extract_c_function(text: str, name: str) -> str:
-    m = re.search(r"^static [^\n]+\b" + re.escape(name) + r"\([^\n]*\)\n\{", text, re.M)
+    m = re.search(r"^(?:static\s+)?[^\n]+\b" + re.escape(name) + r"\([^;]*\)\s*\{", text, re.M)
     if not m:
         raise RuntimeError(f"Function {name} not found in classic/source/main.c")
     start = m.start()
@@ -64,7 +64,12 @@ def test_classic_adapt_ini_roundtrip() -> None:
         "read_mode_raw",
         "read_present_copy_raw",
         "read_two_buffer_raw",
+        "check_title_version_upgrade",
         "load_early_adapt_cfg",
+        "safe_path",
+        "safe_state_read",
+        "sceVideoOutSetFlipRate_hook",
+        "sceVideoOutRegisterBuffers_hook",
     ]
     hooks_text = (ROOT / "classic/source/debug_hooks.h").read_text(encoding="utf-8")
     launcher_text = (ROOT / "launcher/src/main.c").read_text(encoding="utf-8")
@@ -83,6 +88,8 @@ def test_classic_adapt_ini_roundtrip() -> None:
     crash_self_adapt_body = self_adapt_m.group(1)
     extracted_fns = (
         crash_mod_def
+        + "\n\n"
+        + _extract_c_function(hooks_text, "is_cusa06782")
         + "\n\n"
         + _extract_c_function(hooks_text, "is_third_party_prx_name")
         + "\n\n"
@@ -109,6 +116,7 @@ extern int vsprintf(char *, const char *, va_list);
 extern int strcmp(const char *, const char *);
 extern int strncmp(const char *, const char *, size_t);
 extern char *strstr(const char *, const char *);
+extern char *strchr(const char *, int);
 extern size_t strlen(const char *);
 extern void *memcpy(void *, const void *, size_t);
 extern void *memset(void *, int, size_t);
@@ -124,15 +132,23 @@ static int snprintf(char *buf, size_t sz, const char *fmt, ...)
 }}
 
 #define LOG_DIR "/data/bb_probe"
+#define VCFG_TRACE_VERSION "2.36"
 #define INJECT_AFTER_FLIPS 120
 #define STAGE(...) do {{}} while (0)
+#define lg(...) do {{}} while (0)
+
+typedef struct {{
+    uint32_t format, tilingMode, aspectRatio, width, height, pitchInPixel, option;
+    uint32_t _pad0;
+    uint64_t _pad1;
+}} VoAttr;
 
 {families_h}
 
 {struct_def}
 
 static char g_title_id[16] = "CUSA00552";
-static int g_known_game = 1, g_detected_60fps = 0;
+static int g_known_game = 1, g_detected_60fps = 0, g_is_neo = 1;
 static int g_tile_override = -1, g_tile_sweep = 0, g_t6_bit_override = -1;
 static volatile fg_config_t g_cfg = {{ 1, 8, 0, 40, 0, 100, 1, 0, 30, 3000, 80, 0, MENU_COMBO_DEFAULT, 0, 0, 0, 0, 0, 0, 0, 0, -1 }};
 static volatile int g_fg_off = 0;
@@ -152,6 +168,87 @@ static int g_game_idx_hi = 3;
 volatile int g_gv_cal_winner = -1;
 volatile int g_gv_cal_locked = 0;
 
+static int g_dbg_hooks = 0, g_bench_enabled = 0, g_safe = 0, g_safe_active = 0;
+static int32_t g_game_flip_rate = -1;
+static int32_t g_handle = 1;
+static VoAttr g_attr, g_ext_attr;
+static uint32_t g_bw = 1920, g_bh = 1080, g_pitch = 1920, g_t_dfmt = 10;
+static int g_fmt_supported = 1, g_mbuf_state = 0, g_mbase = 16, g_nmid = 0, g_nbuf = 0;
+static int g_pcopy_avail = 0, g_pcopy_on = 0, g_pcopy_k = 1;
+static uint64_t g_buf[16];
+static uint32_t g_prev_idx = 0, g_prev2_idx = 0;
+static void *g_ext_va[8];
+static int g_ext_nm = 0, g_ext_attr_slot = -1, g_game_attr_slot = -1, g_og2_active = 0, g_boot_preset = 0;
+static int g_status_hooked = 1, g_vq_on = 0;
+static size_t g_shave_orig_len = 0;
+static int g_mem_tight = 0;
+static uint32_t g_dbg_allocs = 0;
+static uint8_t g_fake_pre_mem[0x2000000];
+static void *g_pre_mem = NULL, *g_pre_gpu = NULL, *g_pre_work = NULL, *g_gpu = NULL, *g_work = NULL;
+static size_t g_pre_size = 0, g_gpu_sz = 0x20000, g_pre_work_sz = 0x190000;
+static long g_pre_mem_phys = 0, g_pre_gpu_phys = 0, g_pre_work_phys = 0;
+static int g_work_garlic = 1;
+static char g_inert_reason[48];
+static inline int cusa10249_audio_fix(void) {{
+    return (strcmp(g_title_id, "CUSA10249") == 0 && (g_cfg.audio_fix == 1 || g_cfg.audio_fix == 2)) ? g_cfg.audio_fix : 0;
+}}
+static void cusa10249_apply_deferred_tail_if_needed(void) {{}}
+static void flush_map_run(void) {{}}
+static void crash_handlers_install(void) {{}}
+static void pyr_cache_invalidate(void) {{}}
+static void vov_set_hdr(int h) {{ (void)h; }}
+static int fg_res_supported(uint32_t w, uint32_t h) {{ return w >= 960 && h >= 540; }}
+static void shrink_early_mem_to_ex(size_t k, int t) {{ (void)t; if (g_pre_size > k) g_pre_size = k; }}
+static void *alloc_dm_range(long s, long e, size_t l, size_t a, int t, long *p) {{ (void)s; (void)e; (void)l; (void)a; (void)t; (void)p; return NULL; }}
+static void free_dm_block(void **v, long *p, size_t *s, const char *w) {{ (void)v; (void)p; (void)s; (void)w; }}
+static void *alloc_mbufs(size_t s) {{ (void)s; return NULL; }}
+static size_t dm_avail(size_t a) {{ (void)a; return 0; }}
+static void gv_set_display(const uint64_t *b, int n, uint32_t w, uint32_t h) {{ (void)b; (void)n; (void)w; (void)h; }}
+static void on_register_buffers_2buf(int c, size_t s) {{ (void)c; (void)s; }}
+static void s14_after_register(int nm, size_t one, const uint8_t *m, int idx2) {{ (void)nm; (void)one; (void)m; (void)idx2; }}
+static int og2_game_reregistered(int32_t h, const VoAttr *a, int c) {{ (void)h; (void)a; (void)c; return 0; }}
+
+static int g_sim_slot_used[4];
+static int g_sim_slot_nbuf[4];
+static int g_sim_sfr_calls = 0;
+static int g_sim_reject_extend_over_3 = 0;
+static int g_sim_fail_top_group = 0;
+static struct {{ void *StubPtr; }} Detour_sceVideoOutSetFlipRate = {{ NULL }};
+
+static int32_t sceVideoOutUnregisterBuffers(int32_t handle, int32_t attrIdx) {{
+    (void)handle;
+    if (attrIdx >= 0 && attrIdx < 4) {{
+        g_sim_slot_used[attrIdx] = 0;
+        g_sim_slot_nbuf[attrIdx] = 0;
+    }}
+    return 0;
+}}
+static int32_t raw_sceVideoOutRegisterBuffers(int32_t handle, int32_t startIndex, void *const *addresses, int32_t bufferNum, const VoAttr *attr) {{
+    (void)handle; (void)addresses; (void)attr;
+    if (startIndex == 0) {{
+        if (g_sim_reject_extend_over_3 && bufferNum > 3) return (int32_t)0x80290013u;
+        if (g_sim_slot_used[0] && bufferNum <= g_sim_slot_nbuf[0]) return (int32_t)0x80290010u; // SLOT_OCCUPIED if not unregistered!
+        g_sim_slot_used[0] = 1;
+        g_sim_slot_nbuf[0] = bufferNum;
+        return 0;
+    }}
+    if (g_sim_fail_top_group) return (int32_t)0x80290012u;
+    for (int sl = 1; sl < 4; sl++) {{
+        if (!g_sim_slot_used[sl]) {{
+            g_sim_slot_used[sl] = 1;
+            g_sim_slot_nbuf[sl] = bufferNum;
+            return sl;
+        }}
+    }}
+    return (int32_t)0x80290010u;
+}}
+static int32_t raw_sceVideoOutSetFlipRate(int32_t handle, int32_t rate) {{
+    (void)handle; (void)rate;
+    g_sim_sfr_calls++;
+    return 0;
+}}
+#define HOOK_CONTINUE(sym, fn_t, ...) raw_##sym(__VA_ARGS__)
+
 static void init_title_id(void) {{}}
 
 // Simple in-memory virtual file table for /data/bb_probe/*.ini
@@ -159,6 +256,7 @@ static char vfs_adapt[1024];
 static char vfs_config[1024];
 static char vfs_global[1024];
 static char vfs_safe_state[16];
+static int vfs_safe_txt_unlinked = 0;
 static int g_last_open_kind = 0; // 1 = adapt, 2 = config, 3 = global, 4 = safe_state
 
 static int sceKernelMkdir(const char *p, int mode) {{ (void)p; (void)mode; return 0; }}
@@ -209,7 +307,11 @@ static long sceKernelWrite(int fd, const void *buf, size_t n) {{
     return (long)n;
 }}
 static int sceKernelClose(int fd) {{ (void)fd; return 0; }}
-static int sceKernelUnlink(const char *p) {{ (void)p; return 0; }}
+static int sceKernelUnlink(const char *p) {{
+    if (strstr(p, "safe-") && strstr(p, ".txt")) vfs_safe_txt_unlinked = 1;
+    if (strstr(p, "safe-") && strstr(p, ".state")) vfs_safe_state[0] = 0;
+    return 0;
+}}
 static void crash_write_both(int fd_c, int fd_b, const char *fmt, ...) {{ (void)fd_c; (void)fd_b; (void)fmt; }}
 
 {extracted_fns}
@@ -238,6 +340,8 @@ static void reset_runtime_state(const char *tid) {{
     g_gv_cal_winner = -1;
     g_gv_cal_locked = 0;
     g_crash_nmods = 0;
+    g_is_neo = 1;
+    g_sim_fail_top_group = 0;
     cfg_defaults((fg_config_t *)&g_cfg);
 }}
 
@@ -500,14 +604,19 @@ int main(void) {{
     load_early_adapt_cfg();
     if (g_adapt_early_crashes != 0 || g_cfg.framegen != 1 || g_fg_off != 0) return 58;
 
-    // Test 15: CUSA10249 audio_fix per-game INI key in load_early_adapt_cfg (default=1 for CUSA10249, 0 for others; override 0/1/2 via config-CUSA10249.ini):
+    // Test 15: CUSA10249 audio_fix per-game INI key in load_early_adapt_cfg (default=1 on base PS4 and PS4 Pro, 0 for others; override 0/1/2 via config-CUSA10249.ini):
     reset_runtime_state("CUSA00552");
     load_early_adapt_cfg();
     if (g_cfg.audio_fix != 0) return 59;
 
     reset_runtime_state("CUSA10249");
+    g_is_neo = 0;
     load_early_adapt_cfg();
     if (g_cfg.audio_fix != 1) return 60;
+
+    reset_runtime_state("CUSA10249");
+    load_early_adapt_cfg();
+    if (g_cfg.audio_fix != 1) return 61;
 
     reset_runtime_state("CUSA10249");
     snprintf(vfs_config, sizeof(vfs_config), "audio_fix = 2\\n");
@@ -518,6 +627,154 @@ int main(void) {{
     snprintf(vfs_config, sizeof(vfs_config), "audio_fix = 0\\n");
     load_early_adapt_cfg();
     if (g_cfg.audio_fix != 0) return 62;
+
+    // Test 16 (F6: CUSA10249 Pro repeated RegisterBuffers + overlapped_our_mbase startIndex=2,num=2 + CUSA07820 safe-*.txt + CUSA18534 SetFlipRate):
+    // 16a: CUSA10249 Pro (audio_fix=1): first RegisterBuffers(start=0, num=2, 1920x1080) then second RegisterBuffers(start=0, num=3, 2560x1440)
+    //      when extending slot 0 > 3 buffers fails with 0x80290013 must use reg_mode=1 (index 15) and succeed without 0x80290010!
+    reset_runtime_state("CUSA10249");
+    load_early_adapt_cfg();
+    memset(g_sim_slot_used, 0, sizeof(g_sim_slot_used));
+    memset(g_sim_slot_nbuf, 0, sizeof(g_sim_slot_nbuf));
+    g_sim_reject_extend_over_3 = 1;
+    g_pre_mem = g_fake_pre_mem;
+    g_pre_size = 0x800000u;
+    void *b2[3] = {{ (void *)0x810000000ULL, (void *)0x8107f0000ULL, (void *)0x8116f0000ULL }};
+    VoAttr attr1080 = {{ 0x80002200u, 0, 0, 1920, 1080, 1920, 0, 0, 0 }};
+    VoAttr attr1440 = {{ 0x88000000u, 0, 0, 2560, 1440, 2560, 0, 0, 0 }};
+    if (sceVideoOutRegisterBuffers_hook(1, 0, b2, 2, &attr1080) != 0) return 63;
+    if (g_mbuf_state != 1 || g_mbase != 15) return 64;
+    if (sceVideoOutRegisterBuffers_hook(1, 0, b2, 3, &attr1440) != 0) return 65;
+
+    // 16a2: CUSA10249 Base PS4 (g_is_neo=0, audio_fix=1): must NOT force reg_mode=1 (extends slot 0 to g_mbase=2, g_nbuf=3):
+    reset_runtime_state("CUSA10249");
+    g_is_neo = 0;
+    load_early_adapt_cfg();
+    memset(g_sim_slot_used, 0, sizeof(g_sim_slot_used));
+    memset(g_sim_slot_nbuf, 0, sizeof(g_sim_slot_nbuf));
+    g_sim_reject_extend_over_3 = 0;
+    g_pre_mem = g_fake_pre_mem;
+    g_pre_size = 0x800000u;
+    if (sceVideoOutRegisterBuffers_hook(1, 0, b2, 2, &attr1080) != 0) return 88;
+    if (g_mbuf_state != 1 || g_mbase != 2 || g_nbuf != 3) return 89;
+
+    // 16b: Even in reg_mode=0 (non-CUSA10249), if a first RegisterBuffers(start=0, num=2) extended slot 0 to 3 buffers
+    //      and a second RegisterBuffers(start=0, num=3) fails to extend to 4 (0x80290013), fallback must UnregisterBuffers(0)
+    //      so the native RegisterBuffers(start=0, num=3) succeeds (0) instead of returning 0x80290010 (SLOT_OCCUPIED):
+    reset_runtime_state("CUSA00552");
+    memset(g_sim_slot_used, 0, sizeof(g_sim_slot_used));
+    memset(g_sim_slot_nbuf, 0, sizeof(g_sim_slot_nbuf));
+    g_sim_reject_extend_over_3 = 1;
+    g_pre_mem = g_fake_pre_mem;
+    g_pre_size = 0x800000u;
+    if (sceVideoOutRegisterBuffers_hook(1, 0, b2, 2, &attr1080) != 0) return 66;
+    if (g_mbuf_state != 1 || g_mbase != 2) return 67;
+    if (sceVideoOutRegisterBuffers_hook(1, 0, b2, 3, &attr1440) != 0) return 68;
+
+    // 16c: overlapped_our_mbase with startIndex=2, bufferNum=2 after startIndex=0, bufferNum=2 must preserve g_ngame == 2 on CUSA07820,
+    //      while multi-group titles like CUSA13323 set g_ngame = g_game_idx_hi (4) and clear g_pcopy_avail:
+    reset_runtime_state("CUSA07820");
+    memset(g_sim_slot_used, 0, sizeof(g_sim_slot_used));
+    memset(g_sim_slot_nbuf, 0, sizeof(g_sim_slot_nbuf));
+    g_sim_reject_extend_over_3 = 0;
+    g_pre_mem = g_fake_pre_mem;
+    g_pre_size = 0x800000u;
+    if (sceVideoOutRegisterBuffers_hook(1, 0, b2, 2, &attr1080) != 0) return 69;
+    void *b2_hi[2] = {{ (void *)0x820000000ULL, (void *)0x8207f0000ULL }};
+    if (sceVideoOutRegisterBuffers_hook(1, 2, b2_hi, 2, &attr1080) < 0) return 70;
+    if (g_ngame != 2 || g_mbuf_state != 1 || g_mbase != 15) return 71;
+
+    reset_runtime_state("CUSA13323");
+    g_cfg.reg_mode = 0;
+    memset(g_sim_slot_used, 0, sizeof(g_sim_slot_used));
+    memset(g_sim_slot_nbuf, 0, sizeof(g_sim_slot_nbuf));
+    g_sim_reject_extend_over_3 = 0;
+    g_pre_mem = g_fake_pre_mem;
+    g_pre_size = 0x800000u;
+    if (sceVideoOutRegisterBuffers_hook(1, 0, b2, 2, &attr1080) != 0) return 90;
+    if (sceVideoOutRegisterBuffers_hook(1, 2, b2_hi, 2, &attr1080) < 0) return 91;
+    if (g_ngame != 4 || g_pcopy_avail != 0 || g_mbuf_state != 1 || g_mbase != 15) return 92;
+
+    // 16d: CUSA07820 stale safe-CUSA07820.txt / safe-CUSA07820.state: check_title_version_upgrade unlinks safe-CUSA07820.txt
+    //      and safe_state_read on CUSA07820 with g_adapt_early_crashes == 0 ignores state=2:
+    reset_runtime_state("CUSA07820");
+    vfs_safe_txt_unlinked = 0;
+    snprintf(vfs_safe_state, sizeof(vfs_safe_state), "2\\n");
+    if (safe_state_read() != 0) return 72;
+    check_title_version_upgrade();
+    if (!vfs_safe_txt_unlinked) return 73;
+
+    // 16e: CUSA18534 duplicate SetFlipRate(handle, 1) is skipped so render thread does not stall:
+    reset_runtime_state("CUSA18534");
+    g_game_flip_rate = -1;
+    g_sim_sfr_calls = 0;
+    sceVideoOutSetFlipRate_hook(1, 1);
+    sceVideoOutSetFlipRate_hook(1, 1);
+    if (g_sim_sfr_calls != 1) return 74;
+
+    // Test 17 (F5: CUSA10212, CUSA10213 [family CUSA10454], and CUSA01967):
+    // When RegisterBuffers(start=0, num=2, 1920x1080) runs with 32 MB g_pre_mem (0x2000000) and g_dbg_allocs < 32,
+    // cap_extra must be 1 so shrink_early_mem_to_ex shrinks g_pre_size to 8 MB (0x800000), freeing 24 MB of DirectMemory
+    // for post-RegisterBuffers streaming allocations (0x80000..0x4000).
+    // 17: F5 + Item 9 CUSA02636:
+    const char *f5_tids[4] = {{ "CUSA10212", "CUSA10213", "CUSA01967", "CUSA02636" }};
+    for (int ti = 0; ti < 4; ti++) {{
+        reset_runtime_state(f5_tids[ti]);
+        load_early_adapt_cfg();
+        memset(g_sim_slot_used, 0, sizeof(g_sim_slot_used));
+        memset(g_sim_slot_nbuf, 0, sizeof(g_sim_slot_nbuf));
+        g_sim_reject_extend_over_3 = 0;
+        g_dbg_allocs = 7;
+        g_pre_mem = g_fake_pre_mem;
+        g_pre_size = 0x2000000u;
+        if (sceVideoOutRegisterBuffers_hook(1, 0, b2, 2, &attr1080) != 0) return 75 + ti * 2;
+        if (g_pre_size != 0x800000u || g_ext_nm != 1 || g_nmid != 1) return 76 + ti * 2;
+    }}
+
+    // Test 18 (Table 2 Item 8: CUSA16734 & CUSA24653 dual-plugin start=14,num=2 guard + CUSA34386 0x80290013 reg_mode=1 fallback):
+    // 18a: CUSA34386 (d6d04d017b): RegisterBuffers(start=0, num=3) when slot 0 rejects > 3 buffers with 0x80290013
+    //      must automatically fall back to reg_mode=1 (game 0..2 in slot 0, our buffer at 16-nm in top group):
+    reset_runtime_state("CUSA34386");
+    load_early_adapt_cfg();
+    memset(g_sim_slot_used, 0, sizeof(g_sim_slot_used));
+    memset(g_sim_slot_nbuf, 0, sizeof(g_sim_slot_nbuf));
+    g_sim_reject_extend_over_3 = 1;
+    g_pre_mem = g_fake_pre_mem;
+    g_pre_size = 0x800000u;
+    if (sceVideoOutRegisterBuffers_hook(1, 0, b2, 3, &attr1080) != 0) return 81;
+    if (g_mbuf_state != 1 || g_mbase != 15 || g_nbuf != 16) return 82;
+
+    // 18b: CUSA16734 / CUSA24653 (a2f391e8ba, 1a8cb37a10): a second FG plugin calling RegisterBuffers(start=14, num=2)
+    //      must NOT inflate g_game_idx_hi to 16 and, when overlapping our g_mbase=15, must cleanly disarm to native
+    //      ("INERT: DUAL PLUGIN CONFLICT"):
+    void *b_dual[2] = {{ (void *)0x830000000ULL, (void *)0x830800000ULL }};
+    if (sceVideoOutRegisterBuffers_hook(1, 14, b_dual, 2, &attr1080) < 0) return 83;
+    if (g_game_idx_hi != 3 || g_mbuf_state != -1) return 84;
+    if (strncmp(g_inert_reason, "INERT: DUAL PLUGIN", 18) != 0) return 85;
+
+    // 18c: When 0x80290013 fallback runs and r0 >= 0 succeeds for the game's buffers in slot 0, but top-group
+    //      registration r1 fails (r1 < 0), sceVideoOutRegisterBuffers_hook must return r0 (0) AND atomically reset
+    //      g_mbuf_state = -1, g_mbase = 16, g_nmid = 0, g_pcopy_avail = 0, g_pcopy_on = 0 (not leaving dirty g_mbase = g_ngame):
+    reset_runtime_state("CUSA34386");
+    load_early_adapt_cfg();
+    memset(g_sim_slot_used, 0, sizeof(g_sim_slot_used));
+    memset(g_sim_slot_nbuf, 0, sizeof(g_sim_slot_nbuf));
+    g_sim_reject_extend_over_3 = 1;
+    g_sim_fail_top_group = 1;
+    g_pre_mem = g_fake_pre_mem;
+    g_pre_size = 0x800000u;
+    if (sceVideoOutRegisterBuffers_hook(1, 0, b2, 3, &attr1080) != 0) return 93;
+    if (g_mbuf_state != -1 || g_mbase != 16 || g_nmid != 0 || g_pcopy_avail != 0 || g_pcopy_on != 0) return 94;
+    g_sim_fail_top_group = 0;
+
+    // Test 19 (Item 10: CUSA00411 30f7bf5ec9 third-party mod menu zeroed Detour_sceVideoOutSetFlipRate.StubPtr guard):
+    reset_runtime_state("CUSA00411");
+    g_game_flip_rate = -1;
+    g_sim_sfr_calls = 0;
+    uint16_t zero_stub[4] = {{ 0, 0, 0, 0 }};
+    Detour_sceVideoOutSetFlipRate.StubPtr = (void *)zero_stub;
+    if (sceVideoOutSetFlipRate_hook(1, 1) != 0) return 86;
+    if (g_sim_sfr_calls != 0) return 87;
+    Detour_sceVideoOutSetFlipRate.StubPtr = NULL;
 
     return 0;
 }}

@@ -8,8 +8,16 @@
 ; Also copies the frame statistics misc dwords {0 = unmatched blocks (scene-change test), 4, 5 = dominant motion,
 ; 6 = foreground L2 blocks, 7 = fade decision of me1} to the slot's stats area unless bit 15 of consts dword 1
 ; (0x8000 = second mid frame in FG Fast 3-step pulldown) is set.
+; Scene-cut history: misc dword 8 + parity keeps the unmatched-block count of the pair that wrote the F buffer of that
+; parity (F cur of parity r is F prev of parity r ^ 1). When the pair that wrote this pair's F prev (+0x110) was a scene
+; change (count above the warp8 threshold, consts flags bits 16..31 = blocks / 8, 0 = 5600), the whole wave clears
+; F prev here, after the motion stages used it as a candidate source and before warp8 reads it for the quadratic
+; trajectory offset (zero field = no offset, the frame without history; vcfg_ref.warp_prevF). Not for the second mid
+; frame (bit 15): the first one already did it, and it must not overwrite the count.
 target triple = "amdgcn--"
 declare <4 x i32> @llvm.amdgcn.raw.buffer.load.v4i32(<4 x i32>, i32, i32, i32 immarg)
+declare i32 @llvm.amdgcn.raw.buffer.load.i32(<4 x i32>, i32, i32, i32 immarg)
+declare void @llvm.amdgcn.raw.buffer.store.i32(i32, <4 x i32>, i32, i32, i32 immarg)
 declare void @llvm.amdgcn.raw.buffer.store.f32(float, <4 x i32>, i32, i32, i32 immarg)
 declare void @llvm.amdgcn.raw.buffer.store.v4i32(<4 x i32>, <4 x i32>, i32, i32, i32 immarg)
 declare i32 @llvm.smax.i32(i32, i32)
@@ -19,13 +27,46 @@ declare float @llvm.minnum.f32(float, float)
 
 define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 %tid) #0 {
 entry:
-  %is0 = icmp eq i32 %tid, 0
-  br i1 %is0, label %go, label %exit
-go:
   %pcn = getelementptr i8, ptr addrspace(4) %tbl, i64 112
   %cn = load <4 x i32>, ptr addrspace(4) %pcn, align 16, !invariant.load !0
   %pm = getelementptr i8, ptr addrspace(4) %tbl, i64 288
   %vm = load <4 x i32>, ptr addrspace(4) %pm, align 16, !invariant.load !0
+  %h_mid = extractelement <4 x i32> %cn, i32 1
+  %h_skip0 = and i32 %h_mid, 32768
+  %h_skip = icmp ne i32 %h_skip0, 0
+  br i1 %h_skip, label %hist_done, label %hist
+hist:
+  ; unmatched blocks of the pair that wrote F prev: misc dword 8 + (parity ^ 1)
+  %h_par = extractelement <4 x i32> %cn, i32 0
+  %h_pq = xor i32 %h_par, 1
+  %h_o0 = shl i32 %h_pq, 2
+  %h_off = add i32 %h_o0, 32
+  %h_pc = call i32 @llvm.amdgcn.raw.buffer.load.i32(<4 x i32> %vm, i32 %h_off, i32 0, i32 0)
+  %h_fl = extractelement <4 x i32> %cn, i32 2
+  %h_cbk = lshr i32 %h_fl, 16
+  %h_cbk8 = shl i32 %h_cbk, 3
+  %h_cbz = icmp eq i32 %h_cbk, 0
+  %h_thr = select i1 %h_cbz, i32 5600, i32 %h_cbk8
+  %h_cut0 = icmp ugt i32 %h_pc, %h_thr
+  %h_vld = icmp ule i32 %h_pc, 8160       ; a count is at most 8160 blocks: anything else is uninitialised memory
+  %h_cut = and i1 %h_cut0, %h_vld
+  br i1 %h_cut, label %hz_pre, label %hist_done
+hz_pre:
+  %pfp = getelementptr i8, ptr addrspace(4) %tbl, i64 272
+  %vfp = load <4 x i32>, ptr addrspace(4) %pfp, align 16, !invariant.load !0
+  br label %hz
+hz:
+  ; F prev = 120 x 68 float2 = 4080 x 16 B, 64 lanes
+  %hz_i = phi i32 [ %tid, %hz_pre ], [ %hz_n, %hz ]
+  %hz_o = shl i32 %hz_i, 4
+  call void @llvm.amdgcn.raw.buffer.store.v4i32(<4 x i32> zeroinitializer, <4 x i32> %vfp, i32 %hz_o, i32 0, i32 0)
+  %hz_n = add i32 %hz_i, 64
+  %hz_c = icmp ult i32 %hz_n, 4080
+  br i1 %hz_c, label %hz, label %hist_done
+hist_done:
+  %is0 = icmp eq i32 %tid, 0
+  br i1 %is0, label %go, label %exit
+go:
   %pv = getelementptr i8, ptr addrspace(4) %tbl, i64 304
   %vv = load <4 x i32>, ptr addrspace(4) %pv, align 16, !invariant.load !0
   %mid_raw = extractelement <4 x i32> %cn, i32 1
@@ -79,6 +120,11 @@ wr_stats:
   %ps = getelementptr i8, ptr addrspace(4) %tbl, i64 368
   %vs = load <4 x i32>, ptr addrspace(4) %ps, align 16, !invariant.load !0
   %cutn = extractelement <4 x i32> %m0, i32 0
+  ; this pair's count for the pair that reads this F cur as F prev (misc dword 8 + parity)
+  %c_par = extractelement <4 x i32> %cn, i32 0
+  %c_o0 = shl i32 %c_par, 2
+  %c_off = add i32 %c_o0, 32
+  call void @llvm.amdgcn.raw.buffer.store.i32(i32 %cutn, <4 x i32> %vm, i32 %c_off, i32 0, i32 0)
   %st0 = shufflevector <4 x i32> %m1, <4 x i32> poison, <4 x i32> <i32 3, i32 0, i32 1, i32 2>
   %st = insertelement <4 x i32> %st0, i32 %cutn, i32 0
   call void @llvm.amdgcn.raw.buffer.store.v4i32(<4 x i32> %st, <4 x i32> %vs, i32 0, i32 0, i32 1)

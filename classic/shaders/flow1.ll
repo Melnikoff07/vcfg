@@ -48,7 +48,7 @@ done:
   ret float %sad1
 }
 
-define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 %tid) {
+define amdgpu_cs void @main(ptr addrspace(4) inreg %tbl, i32 inreg %gx, i32 %tid) #0 {
 entry:
   %pc = getelementptr i8, ptr addrspace(4) %tbl, i64 96
   %vc = load <4 x i32>, ptr addrspace(4) %pc, align 16, !invariant.load !0
@@ -116,3 +116,5 @@ exit:
 }
 
 !0 = !{}
+
+attributes #0 = { "denormal-fp-math-f32"="preserve-sign,preserve-sign" }

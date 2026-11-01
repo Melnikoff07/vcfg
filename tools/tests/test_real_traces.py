@@ -103,6 +103,8 @@ MAIN_ALLOC_PART2 = extract_between(
 )
 PCOPY_GATE_HAS_MAX_EXTRA = 1 if ("nm < 2 && max_extra >= 2" in MAIN_C or "nm < 2 && nm < max_extra" in MAIN_C) else 0
 HAS_CUSA10249_AUDIO_FIX = 1 if "cusa10249_audio_fix" in HOOKS_H else 0
+HAS_FAMILY_AUDIO_FIX = 1 if "cusa04529_audio_fix" in HOOKS_H else 0
+HAS_CUSA10249_PRO_DEFAULT_AF2 = 1 if "(g_is_neo > 0) ? 2 : 1" in MAIN_C else 0
 HOOKS_DECLS = extract_between(
     HOOKS_H,
     "#define SHAVE_MAX ",
@@ -118,6 +120,29 @@ HOOKS_CORE = extract_between(
     "static size_t dm_avail_range(",
     "static void debug_hooks_install(void)",
 )
+# The game BatchMap path (shaved arena entries backed by FlexibleMemory), split at call_orig_batch_map so the simulated
+# raw sceKernelBatchMap can use OrbisBatchMapEntry.
+HOOKS_BATCH_TYPES = re.sub(
+    r"^static Detour \w+;\n",
+    "",
+    extract_between(
+        HOOKS_H,
+        "typedef struct {\n    void *start;\n    off_t offset;",
+        "static int32_t call_orig_batch_map(",
+    ),
+    flags=re.M,
+)
+HOOKS_BATCH_CORE = extract_between(
+    HOOKS_H,
+    "static int32_t call_orig_batch_map(",
+    "int32_t sceKernelBatchMap_hook(",
+)
+# cfg_apply_title_defaults value for the CUSA02299 family, so the replay mirror follows main.c.
+_C02299_REG_M = re.search(
+    r'vcfg_in_family\(g_title_id, "CUSA02299"\)\) \{.*?c->reg_mode = (\d);', MAIN_C, re.S
+)
+assert _C02299_REG_M is not None, "CUSA02299 reg_mode default not found in classic/source/main.c"
+CUSA02299_REG_MODE = int(_C02299_REG_M.group(1))
 FAMILIES_BODY = FAMILIES_H.replace("#pragma once", "").replace("#include <string.h>", "")
 
 HARNESS_C = r"""
@@ -172,6 +197,7 @@ typedef struct {
 
 static char g_title_id[16] = "UNKNOWN";
 static int g_known_game = 0;
+static int g_sim_neo = 0;
 static fg_config_t g_cfg = { 1, 0, 0, 0, 0, 0, 0 };
 static int g_dm_hooks = 1;
 static volatile int g_own_alloc = 0;
@@ -233,7 +259,7 @@ typedef struct {
     int in_use;
 } SimDmBlock;
 
-#define MAX_FLEX_BLOCKS 512
+#define MAX_FLEX_BLOCKS 2048
 typedef struct {
     uintptr_t va;
     size_t len;
@@ -587,6 +613,13 @@ static int g_c10249_first_reg_done = 0;
 static inline int cusa10249_audio_fix(void) { return 0; }
 static inline void cusa10249_apply_deferred_tail_if_needed(void) {}
 #endif
+#if !__HAS_FAMILY_AUDIO_FIX__
+#define AUDIO_FIX_TAIL 0x600000u
+static size_t g_af_main_t0_len = 0;
+static int g_af_t3_arenas = 0;
+static size_t g_af_preshave_len = 0;
+static inline int cusa04529_audio_fix(void) { return cusa10249_audio_fix(); }
+#endif
 
 static void reset_shave_state(void)
 {
@@ -619,6 +652,9 @@ static void reset_shave_state(void)
     g_pbuf_valid = 0;
     g_c10249_tail_pending = 0;
     g_c10249_first_reg_done = 0;
+    g_af_main_t0_len = 0;
+    g_af_t3_arenas = 0;
+    g_af_preshave_len = 0;
 }
 
 static void apply_title_defaults_sim(const char *tid)
@@ -631,7 +667,10 @@ static void apply_title_defaults_sim(const char *tid)
     g_cfg.shave_mode = 0;
     g_cfg.reg_mode = 0;
     g_cfg.pace_order = 0;
-    g_cfg.audio_fix = (strcmp(g_title_id, "CUSA10249") == 0) ? 1 : 0;
+    /* cfg_apply_title_defaults: CUSA10249 defaults to 1 on both base PS4 and PS4 Pro (audio_fix=2 is opt-in via config-CUSA10249.ini),
+     * the rest of the CUSA04529 family defaults to 1 on base PS4 only. */
+    g_cfg.audio_fix = (strcmp(g_title_id, "CUSA10249") == 0) ? ((__HAS_CUSA10249_PRO_DEFAULT_AF2__ && g_sim_neo) ? 2 : 1) : 0;
+    if (__HAS_FAMILY_AUDIO_FIX__ && !g_cfg.audio_fix && vcfg_in_family(g_title_id, "CUSA04529") && !g_sim_neo) g_cfg.audio_fix = 1;
     if (vcfg_in_family(g_title_id, "CUSA11456")) {
         g_cfg.present_copy = 2;
         g_cfg.two_buffer = 0;
@@ -640,8 +679,10 @@ static void apply_title_defaults_sim(const char *tid)
         g_cfg.pace_order = 3;
     } else if (vcfg_in_family(g_title_id, "CUSA08519")) {
         g_cfg.shave_mode = 1;
-    } else if (vcfg_in_family(g_title_id, "CUSA16734") || vcfg_in_family(g_title_id, "CUSA02299")) {
+    } else if (vcfg_in_family(g_title_id, "CUSA16734")) {
         g_cfg.reg_mode = 1;
+    } else if (vcfg_in_family(g_title_id, "CUSA02299")) {
+        g_cfg.reg_mode = __CUSA02299_REG_MODE__;
     } else if (vcfg_in_family(g_title_id, "CUSA09311") ||
                vcfg_in_family(g_title_id, "CUSA18534") ||
                vcfg_in_family(g_title_id, "CUSA10123")) {
@@ -765,6 +806,32 @@ static void replay_register_buffers_fmt(int start_idx, int num_buf, uint32_t bw,
     }
 }
 
+/* What backs a game AllocateDirectMemory(len=AUDIO_FIX_TAIL) result, read right after the call:
+ * 0 real DirectMemory, 1 tail-only synthetic chunk (FlexibleMemory on map), 2 partial shave (FlexibleMemory tail),
+ * 3 not allocated in the simulated pool, 4 overlaps the display buffer. */
+static int sim_audio_kind(long p)
+{
+    for (int si = 0; si < g_shave_n; si++) {
+        if (!g_shaves[si].orig_len) continue;
+        if (g_shaves[si].real_len == 0 && p >= g_shaves[si].phys && p < g_shaves[si].phys + (long)g_shaves[si].orig_len) return 1;
+        if (g_shaves[si].phys == p && g_shaves[si].orig_len == AUDIO_FIX_TAIL && g_shaves[si].real_len < AUDIO_FIX_TAIL) return 2;
+    }
+    if (!sim_dm_is_allocated_range(p, AUDIO_FIX_TAIL)) return 3;
+    if (g_pre_mem && p < g_pre_mem_phys + (long)g_pre_size && p + (long)AUDIO_FIX_TAIL > g_pre_mem_phys) return 4;
+    return 0;
+}
+
+/* Is [va, va + len) inside one simulated FlexibleMemory mapping (e.g. the shaved arena tail)? */
+static int sim_flex_covers(const void *va, size_t len)
+{
+    uintptr_t s = (uintptr_t)va, e = s + len;
+    for (int i = 0; i < MAX_FLEX_BLOCKS; i++) {
+        if (g_sim_flex[i].in_use && g_sim_flex[i].is_flex && s >= g_sim_flex[i].va && e <= g_sim_flex[i].va + g_sim_flex[i].len)
+            return 1;
+    }
+    return 0;
+}
+
 static void replay_register_buffers(int start_idx, int num_buf, uint32_t bw, uint32_t bh, uint32_t pitch)
 {
     cusa10249_apply_deferred_tail_if_needed();
@@ -849,7 +916,446 @@ static void replay_register_buffers(int start_idx, int num_buf, uint32_t bw, uin
 }
 """.replace("__PCOPY_HAS_MAX_EXTRA__", str(PCOPY_GATE_HAS_MAX_EXTRA)).replace(
     "__HAS_CUSA10249_AUDIO_FIX__", str(HAS_CUSA10249_AUDIO_FIX)
+).replace("__HAS_FAMILY_AUDIO_FIX__", str(HAS_FAMILY_AUDIO_FIX)).replace(
+    "__HAS_CUSA10249_PRO_DEFAULT_AF2__", str(HAS_CUSA10249_PRO_DEFAULT_AF2)
+).replace(
+    "__CUSA02299_REG_MODE__", str(CUSA02299_REG_MODE)
 )
+
+# Game BatchMap replay: debug_hooks.h handle_game_batch_map over a simulated sceKernelBatchMap that maps
+# MAP_DIRECT entries only over allocated simulated DirectMemory (the console returns 0x80020010 otherwise).
+BATCH_HARNESS_C = (
+    "static volatile uint32_t g_dbg_batch_maps = 0, g_dbg_batch_fail = 0;\n"
+    + HOOKS_BATCH_TYPES
+    + r"""
+static int g_sim_batch_calls = 0;
+static int32_t raw_sceKernelBatchMap(void *entries, int numEntries, int *numOut, int flags)
+{
+    (void)flags;
+    g_sim_batch_calls++;
+    OrbisBatchMapEntry *ent = (OrbisBatchMapEntry *)entries;
+    int done = 0;
+    for (int i = 0; i < numEntries; i++) {
+        if (ent[i].operation == 0 && !sim_dm_is_allocated_range((long)ent[i].offset, ent[i].length)) {
+            if (numOut) *numOut = done;
+            return (int32_t)0x80020010u;
+        }
+        done++;
+    }
+    if (numOut) *numOut = done;
+    return 0;
+}
+static int32_t raw_sceKernelBatchMap2(void *entries, int numEntries, int *numOut, int flags)
+{
+    return raw_sceKernelBatchMap(entries, numEntries, numOut, flags);
+}
+"""
+    + HOOKS_BATCH_CORE
+)
+
+
+CUSA02299_TRACE_KEY = "CUSA02299_0x13b400000"
+CUSA02299_POOL_LEN = 0x10000000
+CUSA02299_POOL_VA = 0x1900000000
+CUSA02299_PAGE = 0x4000
+CUSA02299_BATCH = 2048  # entries per game BatchMap call (the console boot shows up to 1864)
+
+
+def generate_cusa02299_pool_c(traces: list[dict]) -> list[str]:
+    """Replay of the CUSA02299 base PS4 boot (console 2.35-custom, dm=0x13b400000): every game allocation lands at the
+    console's physical address, then the 0x10000000 type 0 pool the console refused (0x80020023) must succeed and the
+    game's 16 KiB BatchMap pages over it at 0x1900000000 must all map. FlexibleMemory budgets:
+      flex16: 0x1000000, below the 0x1a00000 tail the early-registered reserve needs (reproduces the console refusal
+              without the fix): the reserve shrinks to 8 MB, the pool gets 0xf800000 real + an 8 MB FlexibleMemory tail,
+              and room for the GPU/work buffers stays free for frame 120;
+      flex6:  0x600000, below the 8 MB tail: the reserve is given back, the pool is all real DirectMemory, and frame 120
+              finds no 8 MB display block (safe_try_activate refuses NO DISPLAY MEM, the game stays native)."""
+    tr = next((t for t in traces if t["trace_key"] == CUSA02299_TRACE_KEY), None)
+    if tr is None:
+        return []
+    dm = int(tr["dm_size"], 16)
+    pre_occ = int(tr["pre_occupied_low"], 16)
+    pool_ev = [e for e in tr["events"] if e["op"] == "alloc" and int(e["len"], 16) == CUSA02299_POOL_LEN]
+    assert len(pool_ev) == 1 and pool_ev[0]["orig_ret"] == "0x80020023", "CUSA02299 trace must end on the refused pool"
+    out: list[str] = []
+    for case, flex in (("flex16", 0x1000000), ("flex6", 0x600000)):
+        tag = f"{CUSA02299_TRACE_KEY}_pool_{case}"
+        out += [
+            f"    /* {tag}: boot-CUSA02299.txt (2.35-custom), pool 0x10000000 at BatchMap va 0x1900000000 */",
+            "    {",
+            '        apply_title_defaults_sim("CUSA02299");',
+            # plugin_load on the console: display 0x139400000 (32 MB), gpu 0x1393e0000 and work 0x139200000, both in the
+            # 2 MB page below the display. setup_plugin_load_early would put them in the sub-2MB region next to the
+            # pre-occupied 0x10000 (where the game's own 0x10000..0x140000 allocations land on the console), so the low
+            # block is occupied after the plugin_load placement instead; the simulator packs gpu and work in the other
+            # order inside the same 2 MB page.
+            f"        setup_plugin_load_early({hex(dm)}ULL, 0LL);",
+            "        { long lo = 0; g_own_alloc++; raw_sceKernelAllocateDirectMemory(0, " + hex(pre_occ) + "LL, " + hex(pre_occ) + "u, 0x4000u, 0, &lo); g_own_alloc--; }",
+            f'        ASSERT_MSG(g_pre_mem_phys == 0x139400000LL && g_pre_size == 0x2000000ULL && (g_pre_gpu_phys & ~0x1FFFFFLL) == 0x139200000LL && (g_pre_work_phys & ~0x1FFFFFLL) == 0x139200000LL, "{tag}", 1, g_pre_mem_phys);',
+            f"        g_sim_flex_avail = {hex(flex)}u;",
+            "        size_t flex_boot = g_sim_flex_avail;",
+        ]
+        for step_i, ev in enumerate(tr["events"], 2):
+            if ev["op"] == "reg_buffers":
+                out.append(f"        replay_register_buffers({ev['start']}, {ev['num']}, {ev['w']}u, {ev['h']}u, {ev['pitch']}u);")
+                continue
+            if ev["op"] != "alloc" or ev["orig_ret"] != "0x0":
+                continue
+            out += [
+                "        {",
+                "            long p = 0;",
+                f"            int32_t r = sceKernelAllocateDirectMemory({ev['s']}LL, {ev['e']}LL, {ev['len']}ULL, {ev['align']}ULL, {ev['type']}, &p);",
+                f'            ASSERT_MSG(r == 0 && p == {ev["orig_phys"]}LL, "{tag}", {step_i}, p);',
+                "        }",
+            ]
+        pe = pool_ev[0]
+        out += [
+            "        long pool_phys = 0;",
+            "        {",
+            f"            int32_t r = sceKernelAllocateDirectMemory({pe['s']}LL, {pe['e']}LL, {pe['len']}ULL, {pe['align']}ULL, {pe['type']}, &pool_phys);",
+            f'            ASSERT_MSG(r == 0, "{tag}", 50, (uint32_t)r);',
+            "        }",
+            f'        ASSERT_MSG(pool_phys == 0x12ae00000LL && g_mbuf_state != 1, "{tag}", 51, pool_phys);',
+        ]
+        if case == "flex16":
+            out += [
+                f'        ASSERT_MSG(g_shave_n == 1 && g_shaves[0].phys == pool_phys && g_shaves[0].orig_len == {hex(CUSA02299_POOL_LEN)}ULL && g_shaves[0].real_len == 0xf800000ULL, "{tag}", 52, g_shaves[0].real_len);',
+                f'        ASSERT_MSG(g_pre_mem != NULL && g_pre_size == 0x800000ULL && g_pre_mem_phys == 0x13ac00000LL && sim_dm_is_allocated_range(g_pre_mem_phys, g_pre_size), "{tag}", 53, g_pre_mem_phys);',
+            ]
+        else:
+            out += [
+                f'        ASSERT_MSG(g_shave_n == 0 && g_pre_mem == NULL && sim_dm_is_allocated_range(pool_phys, {hex(CUSA02299_POOL_LEN)}ULL), "{tag}", 52, g_shave_n);',
+            ]
+        # The game maps the pool page by page at 0x1900000000 (BatchMap, MAP_DIRECT, 16 KiB entries).
+        out += [
+            "        int pages_ok = 0;",
+            "        {",
+            f"            static OrbisBatchMapEntry ent[{CUSA02299_BATCH}];",
+            "            size_t flex_before = g_sim_flex_avail;",
+            f"            for (size_t off = 0; off < {hex(CUSA02299_POOL_LEN)}ULL; off += {CUSA02299_BATCH}u * {hex(CUSA02299_PAGE)}u) {{",
+            f"                for (int k = 0; k < {CUSA02299_BATCH}; k++) {{",
+            f"                    size_t o = off + (size_t)k * {hex(CUSA02299_PAGE)}u;",
+            f"                    ent[k].start = (void *)(uintptr_t)({hex(CUSA02299_POOL_VA)}ULL + o);",
+            "                    ent[k].offset = (off_t)(pool_phys + (long)o);",
+            f"                    ent[k].length = {hex(CUSA02299_PAGE)}u;",
+            "                    ent[k].protection = 0x32;",
+            "                    ent[k].type = 0;",
+            "                    ent[k].reserved = 0;",
+            "                    ent[k].operation = 0;",
+            "                }",
+            "                int n_out = 0;",
+            f"                int32_t br = handle_game_batch_map(ent, {CUSA02299_BATCH}, &n_out, 0, 0, NULL);",
+            f'                ASSERT_MSG(br == 0 && n_out == {CUSA02299_BATCH}, "{tag}", 60, off);',
+            "                pages_ok += n_out;",
+            "            }",
+            f'            ASSERT_MSG(pages_ok == {CUSA02299_POOL_LEN // CUSA02299_PAGE}, "{tag}", 61, pages_ok);',
+        ]
+        if case == "flex16":
+            out += [
+                f'            ASSERT_MSG(flex_before - g_sim_flex_avail == 0x800000u && sim_flex_covers((void *)(uintptr_t)({hex(CUSA02299_POOL_VA)}ULL + 0xf800000ULL), {hex(CUSA02299_PAGE)}u) && sim_flex_covers((void *)(uintptr_t)({hex(CUSA02299_POOL_VA + CUSA02299_POOL_LEN - CUSA02299_PAGE)}ULL), {hex(CUSA02299_PAGE)}u) && !sim_flex_covers((void *)(uintptr_t)({hex(CUSA02299_POOL_VA)}ULL + 0xf7fc000ULL), {hex(CUSA02299_PAGE)}u), "{tag}", 62, flex_before - g_sim_flex_avail);',
+                # frame 120: the GPU and work buffers (released at the pool request) still find real DirectMemory
+                f'            ASSERT_MSG(dm_avail(0x10000u) >= (size_t)WORK_SZ_8 + (size_t)GPU_SZ_BASE, "{tag}", 63, dm_avail(0x10000u));',
+                "        }",
+                f'        ASSERT_MSG(on_sub() >= 0, "{tag}", 1000, 0);',
+                '        printf("CUSA02299 pool replay (flex 0x%zx): 0x10000000 at phys 0x%zx = 0x%zx real + 0x%zx FlexibleMemory tail, display 0x%zx at 0x%zx, %d pages mapped, flex left 0x%zx\\n",',
+                "               flex_boot, (size_t)pool_phys, g_shaves[0].real_len, g_shaves[0].orig_len - g_shaves[0].real_len, g_pre_size, (size_t)g_pre_mem_phys, pages_ok, g_sim_flex_avail);",
+            ]
+        else:
+            out += [
+                f'            ASSERT_MSG(flex_before == g_sim_flex_avail, "{tag}", 62, flex_before - g_sim_flex_avail);',
+                # frame 120: safe_try_activate needs one 8 MB display block plus 4 MB (n == 1) -> refuses NO DISPLAY MEM
+                f'            ASSERT_MSG(dm_avail(0x200000u) < 0x800000u + 0x400000u, "{tag}", 63, dm_avail(0x200000u));',
+                "        }",
+                f'        ASSERT_MSG(on_sub() >= 0, "{tag}", 1000, 0);',
+                '        printf("CUSA02299 pool replay (flex 0x%zx): 0x10000000 at phys 0x%zx all real, display reserve given back, %d pages mapped, largest 2 MB-aligned block left 0x%zx (FG stays off at frame 120)\\n",',
+                "               flex_boot, (size_t)pool_phys, pages_ok, dm_avail(0x200000u));",
+            ]
+        out.append("    }")
+    return out
+
+
+FAMILY_04529 = set(re.findall(r'\{\s*"(CUSA\d{5})",\s*"CUSA04529"\s*\}', FAMILIES_H))
+AUDIO_LEN = 0x600000
+
+
+def expected_preshave(tr: dict, af: int) -> bool:
+    """Test oracle for audio_fix_preshave_arena: does a boot arena of this trace match the Variant C / D role?"""
+    main0, t3 = 0, 0
+    for ev in tr["events"]:
+        if ev["op"] != "alloc" or ev.get("flips", 0) != 0 or ev["orig_ret"] != "0x0":
+            continue
+        ln, ty = int(ev["len"], 16), ev["type"]
+        if af == 1 and ty == 0 and 0x4000000 <= ln <= 0x20000000 and main0 > ln:
+            return True
+        if af == 2 and ty == 3 and 0x10000000 <= ln <= 0x52000000 and t3 > 0:
+            return True
+        if ty == 0 and ln >= 0x40000000:
+            main0 = max(main0, ln)
+        if ty == 3 and ln >= 0x40000000:
+            t3 += 1
+    return False
+
+
+def generate_family_audio_c(traces: list[dict]) -> list[str]:
+    """CUSA04529-family audio_fix replays: every family trace, followed by the 0x600000 type 0 audio allocation (appended
+    at the end when the trace stops before it), under the per-title default on base PS4, audio_fix=2, the audio_fix=0
+    override and the PS4 Pro default; the console boots also with the audio allocation before the first RegisterBuffers
+    (boot-CUSA00341.prev.txt order). With the fix the audio allocation must be real DirectMemory (never the tail-only
+    synthetic chunk or a FlexibleMemory tail), mapped without FlexibleMemory, and the 8 MB display buffer must survive.
+    The Variant C arena tail is deferred to the first RegisterBuffers on CUSA10249 only; on every other family title it
+    is mapped (FlexibleMemory) by the arena map itself, so it never depends on a RegisterBuffers."""
+    lines: list[str] = ["    int family_audio_passed = 0;"]
+    for tr in traces:
+        tid = tr["title_id"]
+        if tid not in FAMILY_04529:
+            continue
+        tkey, dm_sz, pre_occ = tr["trace_key"], tr["dm_size"], tr["pre_occupied_low"]
+        events = list(tr["events"])
+        has_audio = any(ev["op"] == "alloc" and int(ev["len"], 16) == AUDIO_LEN and ev["type"] == 0 for ev in events)
+        if not has_audio:
+            last_flips = events[-1].get("flips", 0) if events else 0
+            events.append({"op": "alloc", "id": 255, "flips": last_flips, "s": "0x0", "e": dm_sz, "len": hex(AUDIO_LEN),
+                           "align": "0x200000", "type": 0, "orig_ret": "0x0", "orig_phys": "0x0"})
+        has_reg = any(ev["op"] == "reg_buffers" for ev in events)
+        console_boot = tkey.endswith("_v2.34")
+        modes = [("default", 0, None, events), ("af2", 0, 2, events), ("af0", 0, 0, events), ("neo", 1, None, events)]
+        if console_boot:
+            audio_i = next(i for i, ev in enumerate(events) if ev["op"] == "alloc" and int(ev["len"], 16) == AUDIO_LEN)
+            reg_i = next(i for i, ev in enumerate(events) if ev["op"] == "reg_buffers")
+            first = events[:reg_i] + [events[audio_i]] + [ev for i, ev in enumerate(events[reg_i:], reg_i) if i != audio_i]
+            modes.append(("audio_first", 0, None, first))
+        for mode, neo, af, evs in modes:
+            tag = f"{tkey}_audio_{mode}"
+            lines.append(f"    /* Family audio_fix: {tkey} [{mode}] */")
+            lines.append("    {")
+            lines.append(f"        g_sim_neo = {neo};")
+            lines.append(f'        apply_title_defaults_sim("{tid}");')
+            if af is not None:
+                lines.append(f"        g_cfg.audio_fix = {af};")
+            lines.append(f"        setup_plugin_load_early({dm_sz}ULL, {pre_occ}LL);")
+            if tkey == "CUSA10249_0x137200000":
+                lines.append("        g_sim_flex_avail = 0xE00000u;")
+            lines.append("        int flex_calls_boot = g_sim_map_flex_calls, flex_calls_pre_reg = -1;")
+            lines.append("        size_t flex_avail_boot = g_sim_flex_avail, flex_avail_pre_reg = 0;")
+            lines.append(
+                "        void *arena_tail_va = NULL; int tail_pending_at_arena = -1, tail_flex_at_arena = -1, n_tail_unmapped_at_arena = 0;"
+            )
+            lines.append("        int n_audio = 0, n_audio_real = 0, n_audio_syn = 0, n_audio_flex_map = 0, n_audio_failed = 0;")
+            lines.append("        long audio_p_last = -1;")
+            lines.append("        long id_phys[256]; size_t id_len[256];")
+            lines.append("        memset(id_phys, 0, sizeof(id_phys)); memset(id_len, 0, sizeof(id_len));")
+            for step_i, ev in enumerate(evs):
+                lines.append(f"        g_flips = {ev.get('flips', 0)}u;")
+                op = ev["op"]
+                if op == "release_id":
+                    rid = ev["id"]
+                    if 0 < rid < 256:
+                        lines.append(
+                            f"        if (id_len[{rid}] > 0) {{ sceKernelReleaseDirectMemory(id_phys[{rid}], id_len[{rid}]); id_len[{rid}] = 0; }}"
+                        )
+                elif op == "reg_buffers":
+                    lines.append(
+                        "        if (flex_calls_pre_reg < 0) { flex_calls_pre_reg = g_sim_map_flex_calls; flex_avail_pre_reg = g_sim_flex_avail; }"
+                    )
+                    lines.append(
+                        f"        replay_register_buffers({ev['start']}, {ev['num']}, {ev['w']}u, {ev['h']}u, {ev['pitch']}u);"
+                    )
+                elif op == "alloc":
+                    elen, aid = ev["len"], ev.get("id", 0)
+                    is_audio = int(elen, 16) == AUDIO_LEN and ev["type"] == 0
+                    lines.append("        {")
+                    if ev["orig_ret"] == "0x0" and is_audio:
+                        # Audio allocation: classified, never asserted to succeed here (see the per-mode checks below).
+                        lines.append("            long p = 0; void *va = NULL;")
+                        lines.append(
+                            f"            int32_t r = sceKernelAllocateDirectMemory({ev['s']}LL, {ev['e']}LL, {elen}ULL, {ev['align']}ULL, {ev['type']}, &p);"
+                        )
+                        lines.append("            n_audio++;")
+                        lines.append("            if (r != 0) {")
+                        lines.append("                n_audio_failed++;")
+                        lines.append("            } else {")
+                        lines.append("                int kind = sim_audio_kind(p), fc = g_sim_map_flex_calls;")
+                        lines.append(
+                            f"                int32_t mr = sceKernelMapDirectMemory(&va, {elen}ULL, 0x33, 0, p, {ev['align']}ULL);"
+                        )
+                        lines.append(f'                ASSERT_MSG(mr == 0 && va != NULL, "{tag}", {step_i}, {elen}ULL);')
+                        lines.append("                audio_p_last = p;")
+                        lines.append("                if (kind == 0) n_audio_real++;")
+                        lines.append("                if (kind == 1) n_audio_syn++;")
+                        lines.append("                if (g_sim_map_flex_calls != fc) n_audio_flex_map++;")
+                        if 0 < aid < 256:
+                            lines.append(f"                id_phys[{aid}] = p; id_len[{aid}] = {elen}ULL;")
+                        lines.append("            }")
+                    elif ev["orig_ret"] == "0x0":
+                        lines.append("            long p = 0; void *va = NULL;")
+                        lines.append(
+                            f"            int32_t r = sceKernelAllocateDirectMemory({ev['s']}LL, {ev['e']}LL, {elen}ULL, {ev['align']}ULL, {ev['type']}, &p);"
+                        )
+                        lines.append(f'            ASSERT_MSG(r == 0, "{tag}", {step_i}, {elen}ULL);')
+                        lines.append(
+                            f"            int32_t mr = sceKernelMapDirectMemory(&va, {elen}ULL, 0x33, 0, p, {ev['align']}ULL);"
+                        )
+                        lines.append(f'            ASSERT_MSG(mr == 0 && va != NULL, "{tag}", {step_i}, {elen}ULL);')
+                        if 0 < aid < 256:
+                            lines.append(f"            id_phys[{aid}] = p; id_len[{aid}] = {elen}ULL;")
+                        # An audio pre-shaved arena (the traces that release and reallocate it get a new pre-shave): state
+                        # of its 0x600000 tail right after the game maps it; first map and every map.
+                        lines.append(
+                            f"            if (g_af_preshave_len == {elen}ULL && g_shave_n >= 1 && g_shaves[0].orig_len == {elen}ULL && g_shaves[0].phys == p) {{"
+                        )
+                        lines.append(f"                arena_tail_va = (uint8_t *)va + ({elen}ULL - AUDIO_FIX_TAIL);")
+                        lines.append("                int tail_flex = sim_flex_covers(arena_tail_va, AUDIO_FIX_TAIL);")
+                        lines.append(
+                            "                if (tail_pending_at_arena < 0) { tail_pending_at_arena = g_c10249_tail_pending; tail_flex_at_arena = tail_flex; }"
+                        )
+                        lines.append("                if (g_c10249_tail_pending || !tail_flex) n_tail_unmapped_at_arena++;")
+                        lines.append("            }")
+                    else:
+                        lines.append("            long p = 0;")
+                        lines.append(
+                            f"            int32_t r = sceKernelAllocateDirectMemory({ev['s']}LL, {ev['e']}LL, {elen}ULL, {ev['align']}ULL, {ev['type']}, &p);"
+                        )
+                        lines.append(f"            if (r == 0) sceKernelReleaseDirectMemory(p, {elen}ULL);")
+                    lines.append("        }")
+            fix_on = mode in ("default", "af2", "audio_first") or (mode == "neo" and tid == "CUSA10249")
+            if fix_on:
+                variant = 2 if mode == "af2" else 1
+                engaged = expected_preshave(tr, variant)
+                lines.append(f'        ASSERT_MSG(cusa04529_audio_fix() == {variant}, "{tag}", 900, g_cfg.audio_fix);')
+                # With the fix active the audio allocation is never the synthetic chunk nor FlexibleMemory on map.
+                lines.append(
+                    f'        ASSERT_MSG(n_audio >= 1 && n_audio_syn == 0 && n_audio_flex_map == 0 && n_audio_real + n_audio_failed == n_audio, "{tag}", 901, n_audio_syn);'
+                )
+                if engaged or variant == 1:
+                    # ... and, with the role-matched arena pre-shaved, it is real DirectMemory.
+                    lines.append(f'        ASSERT_MSG(n_audio_failed == 0 && n_audio_real == n_audio, "{tag}", 908, n_audio_failed);')
+                if engaged or has_reg:
+                    # The display buffer (at least the 8 MB mid buffer) survives in real DirectMemory. (Without a pre-shave
+                    # and before any RegisterBuffers, the memory valve may still yield it to the audio allocation.)
+                    lines.append(
+                        f'        ASSERT_MSG(g_pre_mem != NULL && g_pre_size >= 0x800000ULL && sim_dm_is_allocated_range(g_pre_mem_phys, g_pre_size), "{tag}", 902, g_pre_size);'
+                    )
+                tail_at_arena = variant == 1 and engaged and tid != "CUSA10249"
+                if variant == 1 and engaged:
+                    if tail_at_arena:
+                        # Not CUSA10249: every pre-shaved arena map itself maps the FlexibleMemory tail (no deferred tail
+                        # pending, no RegisterBuffers needed), and the last one stays mapped up to the end of the replay.
+                        lines.append(
+                            f'        ASSERT_MSG(arena_tail_va != NULL && tail_pending_at_arena == 0 && tail_flex_at_arena == 1 && n_tail_unmapped_at_arena == 0 && g_c10249_tail_pending == 0 && sim_flex_covers(arena_tail_va, AUDIO_FIX_TAIL), "{tag}", 913, n_tail_unmapped_at_arena);'
+                        )
+                    else:
+                        # CUSA10249 keeps the Variant C deferral: after the arena map the tail is pending and unmapped.
+                        lines.append(
+                            f'        ASSERT_MSG(arena_tail_va != NULL && tail_pending_at_arena == 1 && tail_flex_at_arena == 0, "{tag}", 912, tail_pending_at_arena);'
+                        )
+                if has_reg:
+                    lines.append(f'        ASSERT_MSG(g_mbuf_state == 1 && IS_MID(g_mbase), "{tag}", 903, g_mbuf_state);')
+                    if tail_at_arena:
+                        # The arena tail (AUDIO_FIX_TAIL) is the only FlexibleMemory mapped before the first RegisterBuffers.
+                        lines.append(
+                            f'        ASSERT_MSG(flex_avail_boot - flex_avail_pre_reg == AUDIO_FIX_TAIL, "{tag}", 904, flex_avail_boot - flex_avail_pre_reg);'
+                        )
+                    else:
+                        # No FlexibleMemory is mapped before the first RegisterBuffers (CUSA10249: the Variant C tail is
+                        # deferred to it).
+                        lines.append(f'        ASSERT_MSG(flex_calls_pre_reg == flex_calls_boot, "{tag}", 904, flex_calls_pre_reg);')
+                    lines.append(f'        ASSERT_MSG(g_c10249_first_reg_done == 1 && g_c10249_tail_pending == 0, "{tag}", 905, g_c10249_tail_pending);')
+                if engaged:
+                    lines.append(
+                        f'        ASSERT_MSG(g_af_preshave_len != 0 && g_shave_n >= 1 && g_shaves[0].orig_len == g_af_preshave_len && g_shaves[0].orig_len - g_shaves[0].real_len == AUDIO_FIX_TAIL, "{tag}", 906, g_af_preshave_len);'
+                    )
+                    if variant == 2:
+                        lines.append(f'        ASSERT_MSG(g_sim_map_flex_calls == flex_calls_boot, "{tag}", 907, g_sim_map_flex_calls);')
+                if console_boot and mode in ("default", "audio_first"):
+                    # Console boot with the fix: the audio allocation sits right below the 8 MB display buffer at the top.
+                    top = int(dm_sz, 16) - 0x800000 - AUDIO_LEN
+                    lines.append(f'        ASSERT_MSG(audio_p_last == {hex(top)}LL && g_pre_mem_phys == {hex(top + AUDIO_LEN)}LL, "{tag}", 909, audio_p_last);')
+            else:
+                lines.append(f'        ASSERT_MSG(cusa04529_audio_fix() == 0 && g_af_preshave_len == 0, "{tag}", 910, g_cfg.audio_fix);')
+                if mode == "af0" and console_boot:
+                    # audio_fix=0 reproduces the console boot: the audio allocation lands on the synthetic chunk.
+                    audio_ev = next(ev for ev in events if ev["op"] == "alloc" and int(ev["len"], 16) == AUDIO_LEN and ev["type"] == 0)
+                    lines.append(f'        ASSERT_MSG(n_audio == 1 && n_audio_syn == 1 && audio_p_last == {audio_ev["orig_phys"]}LL, "{tag}", 911, audio_p_last);')
+            lines.append(f'        ASSERT_MSG(on_sub() >= 0, "{tag}", 1000, 0);')
+            lines.append("        (void)flex_avail_boot; (void)flex_avail_pre_reg; (void)arena_tail_va; (void)tail_pending_at_arena; (void)tail_flex_at_arena; (void)n_tail_unmapped_at_arena;")
+            lines.append("        (void)flex_calls_boot; (void)flex_calls_pre_reg; (void)n_audio; (void)n_audio_real; (void)n_audio_syn; (void)n_audio_flex_map; (void)n_audio_failed; (void)audio_p_last;")
+            lines.append("        family_audio_passed++;")
+            lines.append("    }")
+    lines.append(
+        '    printf("CUSA04529 family audio_fix replay: %d/%d cases passed (audio allocation in real DirectMemory, display buffer kept)\\n", family_audio_passed, family_audio_passed);'
+    )
+    return lines
+
+
+# CUSA00917 base PS4 (dm 0x120000000), plugin 2.34 with 84666e5: the boot order of boot-CUSA00917.txt (27/10). The four
+# arenas are mapped at the game's fixed VAs (flags 0x90), then VideoOutOpen (123.123 s) and the audio allocation
+# (126.470 s, phys 0x11f200000, mapped prot 0x2), with NO RegisterBuffers before the crash at 129.663 s: a SIGSEGV on the
+# arena 2 tail at 0x1107800000, left unmapped by the Variant C deferral.
+CUSA00917_CRASH_ARENAS = [  # (len, type, va, console phys)
+    (0x7BE00000, 0, 0x1000000000, 0x200000),
+    (0x7E00000, 0, 0x1100000000, 0x7C000000),
+    (0x6C600000, 3, 0x1200000000, 0x83800000),
+    (0x2F400000, 3, 0x1300000000, 0xEFE00000),
+]
+CUSA00917_CRASH_TAIL_VA = 0x1107800000
+
+
+def generate_cusa00917_crash_order_c() -> list[str]:
+    """Replay of the boot-CUSA00917.txt order (arenas, VideoOutOpen, audio allocation, no RegisterBuffers): the arena 2
+    tail must be FlexibleMemory-mapped from the arena map on (no pending deferred tail), and the audio allocation real
+    DirectMemory right below the 8 MB display buffer. The FlexibleMemory budget starts at the 0xf00000 the console
+    reported at the audio allocation (tail unmapped), and the replay prints what is left at the audio allocation."""
+    tag = "CUSA00917_0x120000000_v2.34_crash_order"
+    lines = [
+        f"    /* {tag}: boot-CUSA00917.txt order, no RegisterBuffers */",
+        "    {",
+        "        g_sim_neo = 0;",
+        '        apply_title_defaults_sim("CUSA00917");',
+        "        setup_plugin_load_early(0x120000000ULL, 0x20000LL);",
+        "        g_sim_flex_avail = 0xF00000u;",
+        "        size_t flex_boot = g_sim_flex_avail;",
+        f'        ASSERT_MSG(cusa04529_audio_fix() == 1, "{tag}", 1, g_cfg.audio_fix);',
+    ]
+    for i, (ln, ty, va, phys) in enumerate(CUSA00917_CRASH_ARENAS, 2):
+        lines += [
+            "        {",
+            f"            long p = 0; void *va = (void *)(uintptr_t){hex(va)}ULL;",
+            f"            int32_t r = sceKernelAllocateDirectMemory(0LL, 0x120000000LL, {hex(ln)}ULL, 0x200000ULL, {ty}, &p);",
+            f'            ASSERT_MSG(r == 0 && p == {hex(phys)}LL, "{tag}", {i}, p);',
+            f"            int32_t mr = sceKernelMapDirectMemory(&va, {hex(ln)}ULL, 0x33, 0x90, p, 0x200000ULL);",
+            f'            ASSERT_MSG(mr == 0 && va == (void *)(uintptr_t){hex(va)}ULL, "{tag}", {i}, (uintptr_t)va);',
+            "        }",
+        ]
+        if i == 3:
+            # Right after the arena 2 map: pre-shaved by AUDIO_FIX_TAIL and its tail already mapped at tail_va.
+            lines.append(
+                f'        ASSERT_MSG(g_shave_n == 1 && g_shaves[0].phys == 0x7c000000LL && g_shaves[0].orig_len == 0x7e00000ULL && g_shaves[0].real_len == 0x7800000ULL, "{tag}", 10, g_shaves[0].real_len);'
+            )
+            lines.append(
+                f'        ASSERT_MSG(g_c10249_tail_pending == 0 && g_shave_tail_mapped == 1 && sim_flex_covers((void *)(uintptr_t){hex(CUSA00917_CRASH_TAIL_VA)}ULL, AUDIO_FIX_TAIL), "{tag}", 11, g_c10249_tail_pending);'
+            )
+    lines += [
+        "        sceVideoOutOpen_hook(255, 0, 0, NULL);",
+        "        size_t flex_at_audio = 0;",
+        "        {",
+        "            long p = 0; void *va = NULL;",
+        "            int32_t r = sceKernelAllocateDirectMemory(0LL, 0x120000000LL, 0x600000ULL, 0x200000ULL, 0, &p);",
+        f'            ASSERT_MSG(r == 0 && p == 0x11f200000LL && sim_audio_kind(p) == 0, "{tag}", 20, p);',
+        "            flex_at_audio = g_sim_flex_avail;",
+        "            int fc = g_sim_map_flex_calls;",
+        "            int32_t mr = sceKernelMapDirectMemory(&va, 0x600000ULL, 0x2, 0, p, 0x200000ULL);",
+        f'            ASSERT_MSG(mr == 0 && va != NULL && g_sim_map_flex_calls == fc, "{tag}", 21, g_sim_map_flex_calls - fc);',
+        "        }",
+        # No RegisterBuffers ran, and the tail never was pending: it is mapped up to the end.
+        f'        ASSERT_MSG(g_c10249_first_reg_done == 0 && g_c10249_tail_pending == 0 && sim_flex_covers((void *)(uintptr_t){hex(CUSA00917_CRASH_TAIL_VA)}ULL, AUDIO_FIX_TAIL), "{tag}", 22, g_c10249_tail_pending);',
+        f'        ASSERT_MSG(g_pre_mem != NULL && g_pre_mem_phys == 0x11f800000LL && g_pre_size == 0x800000ULL && sim_dm_is_allocated_range(g_pre_mem_phys, g_pre_size), "{tag}", 23, g_pre_mem_phys);',
+        f'        ASSERT_MSG(flex_boot - flex_at_audio == AUDIO_FIX_TAIL, "{tag}", 24, flex_boot - flex_at_audio);',
+        f'        ASSERT_MSG(on_sub() >= 0, "{tag}", 1000, 0);',
+        '        printf("CUSA00917 crash-order replay (no RegisterBuffers): arena 2 tail mapped at the arena map (va=0x%llx), audio phys=0x11f200000 real, flex at the audio allocation 0x%zx of 0x%zx (tail 0x%zx)\\n",',
+        f"               (unsigned long long){hex(CUSA00917_CRASH_TAIL_VA)}ULL, flex_at_audio, flex_boot, (size_t)AUDIO_FIX_TAIL);",
+        "    }",
+    ]
+    return lines
 
 
 def generate_trace_c(traces: list[dict]) -> str:
@@ -940,6 +1446,33 @@ def generate_trace_c(traces: list[dict]) -> str:
         }
     }
     if (fixB_failures > 0) exit(1);
+    /* T21 Item 2 & Item 3:
+     * - Item 3: CUSA36848 must resolve to verified family CUSA36842 (same engine/region as CUSA36842/CUSA36843).
+     * - Item 2: CUSA04294 (g_known_game == 0, g_dbg_allocs == 75 -> cap_extra == 2, nm == 2) on both 1st launch
+     *   (two_buffer == 0) and 2nd launch (two_buffer == 1 loaded from adapt-CUSA04294.ini) must use g_pbuf offscreen
+     *   history (copy_122 == 0xFFFFu, copy_122 != show_121) and never deadlock WaitFlipDone(3) at flip #122. */
+    {
+        if (!(vcfg_in_family("CUSA36848", "CUSA36842") == 1 &&
+              strcmp(vcfg_title_family("CUSA36848"), "CUSA36842") == 0 &&
+              vcfg_is_verified_family("CUSA36848") == 1)) {
+            printf("TRACE ASSERT FAILED [CUSA36848 family CUSA36842]: in_fam=%d fam=%s ver=%d\\n",
+                   vcfg_in_family("CUSA36848", "CUSA36842"), vcfg_title_family("CUSA36848"), vcfg_is_verified_family("CUSA36848"));
+            exit(1);
+        }
+        for (int launch = 1; launch <= 2; launch++) {
+            apply_title_defaults_sim("CUSA04294");
+            g_cfg.two_buffer = (launch == 2) ? 1 : 0;
+            setup_plugin_load_early(0x13ca00000ULL, 0x200000LL);
+            g_dbg_allocs = 75u;
+            replay_register_buffers(0, 2, 1920u, 1080u, 1920u);
+            uint32_t show_121 = 0, copy_121 = 0, show_122 = 0, copy_122 = 0;
+            uint64_t P_121 = 0, dst_121 = 0, P_122 = 0, dst_122 = 0;
+            sim_step_2buf_frame(121u, 0u, 1u, &show_121, &copy_121, &P_121, &dst_121);
+            sim_step_2buf_frame(122u, 1u, 0u, &show_122, &copy_122, &P_122, &dst_122);
+            ASSERT_MSG(g_known_game == 0 && g_mbuf_state == 1 && g_mbase == 2 && g_nbuf == 4 && g_nmid == 2, "CUSA04294_launch", launch, g_nbuf);
+            ASSERT_MSG(g_pbuf != NULL && copy_122 == 0xFFFFu && copy_122 != show_121 && P_122 == (uint64_t)(uintptr_t)g_pbuf, "CUSA04294_launch", launch, copy_122);
+        }
+    }
     /* NEGATIVE HARDWARE EXAMPLE (owner-test-234b/boot-CUSA10249.prev.txt, saved in tools/tests/negative_cusa10249_arena2_preshave_sigbus_boot.txt):
      * Pre-shaving CUSA10249 Arena 2 (len=0x15800000, type=0, phys=0x8e400000) by 0x600000 with an immediate FlexibleMemory tail (7afdb16)
      * consumes 6 MB of FlexibleMemory at t=2.437s BEFORE the game's FlexibleMemory check at t=2.479s (eboot.bin+0x6a224b, right after Arena 4 map),
@@ -1045,6 +1578,59 @@ def generate_trace_c(traces: list[dict]) -> str:
             exit(1);
         }
     }
+    /* Real trace: CUSA10249 neo=0 audio_fix=1 libkernel top-down sliding-window sequence (fc652ded39 / 68251a79b8 / b857187bb8):
+     * 1) Two 0x400000 type=3 blocks at top (0x136e00000, 0x136a00000) relocate g_pre_mem (0x800000) to 0x200000..0xa00000.
+     * 2) Four main arenas leave [0x136400000, 0x136a00000) = 0x600000 free in real DirectMemory.
+     * 3) Before RegisterBuffers, libkernel probes len=0x600000, align=0x200000, type=0 in 0x136c00000..0x137200000 (0x80020023),
+     *    then 0x136600000..0x137200000 (must return 0x80020023 without partial shaving!), then 0x135a00000..0x137200000 (succeeds
+     *    in 100% real DirectMemory at phys=0x136400000, mapped at va=0x40000000 with 0 unmapped deferred tail bytes).
+     * 4) After RegisterBuffers, when audio requests len=0x600000, type=0 in 0..0x137200000, it returns 0x80020023 so libkernel
+     *    releases 0x600000 at 0x136a00000..0x137000000 and retries, succeeding in 100% real DirectMemory at phys=0x136a00000. */
+    {
+        g_sim_neo = 0;
+        apply_title_defaults_sim("CUSA10249");
+        setup_plugin_load_early(0x137200000ULL, 0x200000LL);
+        g_sim_flex_avail = 0xE00000u;
+        long top1 = 0, top2 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, pw1 = 0, pw2 = 0, pw3 = 0, pa1 = 0, pa2 = 0;
+        void *va_top1 = (void *)(uintptr_t)0x200200000ULL;
+        void *va_top2 = (void *)(uintptr_t)0x200600000ULL;
+        void *va1 = (void *)(uintptr_t)0x1000000000ULL;
+        void *va2 = (void *)(uintptr_t)0x1100000000ULL;
+        void *va3 = (void *)(uintptr_t)0x1200000000ULL;
+        void *va4 = (void *)(uintptr_t)0x1300000000ULL;
+        void *va_main_dm = (void *)(uintptr_t)0x40000000ULL;
+        void *va_audio = NULL;
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0x136e00000LL, 0x137200000LL, 0x400000ULL, 0x200000ULL, 3, &top1) == 0 && top1 == 0x136e00000LL, "CUSA10249_fc652ded39", 1, top1);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va_top1, 0x400000ULL, 0x33, 0, top1, 0x200000ULL) == 0, "CUSA10249_fc652ded39", 1, (uintptr_t)va_top1);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0x136a00000LL, 0x137200000LL, 0x400000ULL, 0x200000ULL, 3, &top2) == 0 && top2 == 0x136a00000LL, "CUSA10249_fc652ded39", 2, top2);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va_top2, 0x400000ULL, 0x33, 0, top2, 0x200000ULL) == 0, "CUSA10249_fc652ded39", 2, (uintptr_t)va_top2);
+        ASSERT_MSG(g_pre_mem != NULL && g_pre_mem_phys == 0x200000LL && g_pre_size == 0x800000ULL, "CUSA10249_fc652ded39", 3, g_pre_mem_phys);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x8e200000ULL, 0x200000ULL, 0, &p1) == 0 && p1 == 0xa00000LL, "CUSA10249_fc652ded39", 4, p1);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va1, 0x8e200000ULL, 0x33, 0x90, p1, 0x200000ULL) == 0, "CUSA10249_fc652ded39", 4, (uintptr_t)va1);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x15800000ULL, 0x200000ULL, 0, &p2) == 0 && p2 == 0x8ec00000LL, "CUSA10249_fc652ded39", 5, p2);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va2, 0x15800000ULL, 0x33, 0x90, p2, 0x200000ULL) == 0, "CUSA10249_fc652ded39", 5, (uintptr_t)va2);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x68e00000ULL, 0x200000ULL, 3, &p3) == 0 && p3 == 0xa3e00000LL, "CUSA10249_fc652ded39", 6, p3);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va3, 0x68e00000ULL, 0x33, 0x90, p3, 0x200000ULL) == 0, "CUSA10249_fc652ded39", 6, (uintptr_t)va3);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x2a000000ULL, 0x200000ULL, 3, &p4) == 0 && p4 == 0x10cc00000LL, "CUSA10249_fc652ded39", 7, p4);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va4, 0x2a000000ULL, 0x33, 0x90, p4, 0x200000ULL) == 0, "CUSA10249_fc652ded39", 7, (uintptr_t)va4);
+        ASSERT_MSG(g_shave_n == 2 && g_sim_map_flex_calls == 0, "CUSA10249_fc652ded39", 8, g_shave_n);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0x136c00000LL, 0x137200000LL, 0x600000ULL, 0x200000ULL, 0, &pw1) == (int32_t)0x80020023u, "CUSA10249_fc652ded39", 9, pw1);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0x136600000LL, 0x137200000LL, 0x600000ULL, 0x200000ULL, 0, &pw2) == (int32_t)0x80020023u, "CUSA10249_fc652ded39", 10, pw2);
+        ASSERT_MSG(g_shave_n == 2, "CUSA10249_fc652ded39", 11, g_shave_n);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0x135a00000LL, 0x137200000LL, 0x600000ULL, 0x200000ULL, 0, &pw3) == 0 && pw3 == 0x136400000LL, "CUSA10249_fc652ded39", 12, pw3);
+        ASSERT_MSG(sim_dm_is_allocated_range((uint64_t)pw3, 0x600000ULL) && sim_audio_kind(pw3) == 0 && g_shave_n == 2, "CUSA10249_fc652ded39", 13, pw3);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va_main_dm, 0x600000ULL, 0x33, 0, pw3, 0x200000ULL) == 0 && va_main_dm != NULL, "CUSA10249_fc652ded39", 14, (uintptr_t)va_main_dm);
+        replay_register_buffers(0, 2, 1920u, 1080u, 1920u);
+        ASSERT_MSG(g_mbuf_state == 1 && g_c10249_first_reg_done == 1 && g_c10249_tail_pending == 0, "CUSA10249_fc652ded39", 15, g_mbuf_state);
+        g_flips = 152u;
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x600000ULL, 0x200000ULL, 0, &pa1) == (int32_t)0x80020023u, "CUSA10249_fc652ded39", 16, pa1);
+        ASSERT_MSG(sceKernelReleaseDirectMemory(0x136a00000LL, 0x200000ULL) == 0, "CUSA10249_fc652ded39", 17, 0x200000ULL);
+        ASSERT_MSG(sceKernelReleaseDirectMemory(0x136c00000LL, 0x200000ULL) == 0, "CUSA10249_fc652ded39", 18, 0x200000ULL);
+        ASSERT_MSG(sceKernelReleaseDirectMemory(0x136e00000LL, 0x200000ULL) == 0, "CUSA10249_fc652ded39", 19, 0x200000ULL);
+        ASSERT_MSG(sceKernelAllocateDirectMemory(0LL, 0x137200000LL, 0x600000ULL, 0x200000ULL, 0, &pa2) == 0 && pa2 == 0x136a00000LL, "CUSA10249_fc652ded39", 20, pa2);
+        ASSERT_MSG(sim_dm_is_allocated_range((uint64_t)pa2, 0x600000ULL) && sim_audio_kind(pa2) == 0, "CUSA10249_fc652ded39", 21, pa2);
+        ASSERT_MSG(sceKernelMapDirectMemory(&va_audio, 0x600000ULL, 0x2, 0, pa2, 0x200000ULL) == 0 && va_audio != NULL, "CUSA10249_fc652ded39", 22, (uintptr_t)va_audio);
+    }
     /* Real trace: owner-test-234/trace-CUSA13323.txt:192-195 (HDR10 format switch at start=2 num=2 fmt=0x88740000 + LATENCY FG off check) */
     {
         apply_title_defaults_sim("CUSA13323");
@@ -1091,6 +1677,7 @@ def generate_trace_c(traces: list[dict]) -> str:
         pre_occ = tr["pre_occupied_low"]
         lines.append(f"    /* Trace {idx + 1}: {tkey} (v{tr['log_version']}) */")
         lines.append("    {")
+        lines.append(f"        g_sim_neo = {int(tr.get('neo', 1 if int(dm_sz, 16) > 0x137200000 else 0))};")
         lines.append(f'        apply_title_defaults_sim("{tid}");')
         if "shave_mode" in tr:
             lines.append(f'        g_cfg.shave_mode = {int(tr["shave_mode"])};')
@@ -1149,8 +1736,9 @@ def generate_trace_c(traces: list[dict]) -> str:
                     lines.append(f"            if (r == 0) sceKernelReleaseDirectMemory(p, {elen}ULL);")
                     lines.append("        }")
         if tid in ("CUSA07820", "CUSA00341", "CUSA07737"):
+            # Only tail-only (synthetic) shaves, except the audio_fix pre-shave (exactly AUDIO_FIX_TAIL).
             lines.append(
-                f'        for (int si = 0; si < g_shave_n; si++) ASSERT_MSG(g_shaves[si].real_len == 0, "{tkey}", 999, g_shaves[si].orig_len);'
+                f'        for (int si = 0; si < g_shave_n; si++) ASSERT_MSG(g_shaves[si].real_len == 0 || (cusa04529_audio_fix() != 0 && g_shaves[si].orig_len == g_af_preshave_len && g_shaves[si].orig_len - g_shaves[si].real_len == AUDIO_FIX_TAIL), "{tkey}", 999, g_shaves[si].orig_len);'
             )
         if tid in ("CUSA13323", "CUSA11456"):
             lines.append(
@@ -1163,6 +1751,10 @@ def generate_trace_c(traces: list[dict]) -> str:
         if tkey == "CUSA10249_0x137200000":
             lines.append(
                 f'        ASSERT_MSG(g_pbuf == NULL && g_pre_mem != NULL && g_pre_size == 0x800000ULL && g_shave_n == 1 && g_shaves[0].orig_len == 0x15800000ULL && g_shaves[0].real_len == 0x15200000ULL && id_phys[5] == 0x136400000LL && sim_dm_is_allocated_range((uint64_t)id_phys[5], 0x600000ULL), "{tkey}", 997, id_phys[5]);'
+            )
+        if tkey == "CUSA10249_0x15f200000":
+            lines.append(
+                f'        ASSERT_MSG(cusa04529_audio_fix() == 1 && g_pbuf == NULL && g_pre_mem != NULL && g_pre_size == 0x800000ULL && g_shave_n == 1 && g_shaves[0].orig_len == 0x15800000ULL && g_shaves[0].real_len == 0x15200000ULL && g_sim_map_flex_calls == 0, "{tkey}", 997, g_shave_n);'
             )
         if tkey == "CUSA13323_0x164a00000":
             lines.append(f'        ASSERT_MSG((g_pre_mem != NULL || dm_avail(0x200000u) >= 0x800000u) && g_pbuf == NULL && g_vq_on == 0 && g_dbg_alloc_fail == 0, "{tkey}", 997, g_dbg_alloc_fail);')
@@ -1246,6 +1838,10 @@ def generate_trace_c(traces: list[dict]) -> str:
                     lines.append(f'        ASSERT_MSG(g_pbuf != NULL && g_pbuf_ycocg == 1 && g_shave_n == 1, "{tkey}_af0", 997, g_pbuf_sz);')
                 lines.append(f'        ASSERT_MSG(on_sub() >= 0, "{tkey}_af{extra_af}", 1000, 0);')
                 lines.append("    }")
+    lines.extend(generate_family_audio_c(traces))
+    if HAS_FAMILY_AUDIO_FIX:
+        lines.extend(generate_cusa00917_crash_order_c())
+    lines.extend(generate_cusa02299_pool_c(traces))
     lines.append('    printf("real hardware traces replay: %d/%d CUSAxxxxx boot traces passed 100%%\\n", passed, passed);')
     lines.append("    return 0;")
     lines.append("}")
@@ -1286,6 +1882,8 @@ def main() -> None:
         + HOOKS_CORE
         + "\n"
         + MAIN_ALLOC_PART2
+        + "\n"
+        + BATCH_HARNESS_C
         + "\n"
         + replay_c
         + "\n"

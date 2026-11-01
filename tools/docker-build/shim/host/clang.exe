@@ -1,0 +1,4 @@
+#!/bin/sh
+# ADAPTED shim: retargets the test bitcode from x86_64-pc-windows-msvc to the Linux host triple so lli can call glibc.
+for a; do shift; [ "$a" = "--target=x86_64-pc-windows-msvc" ] && a=--target=x86_64-pc-linux-gnu; set -- "$@" "$a"; done
+exec clang "$@"

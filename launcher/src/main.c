@@ -505,6 +505,28 @@ static int extract_third_party_prx(const char *cs, char *out, size_t cap)
     }
     return 0;
 }
+// Find key in t; for "inert" / "inert:", ignore matches on "options effective:" lines unless framegen itself is inert.
+static const char *strstr_trace_key(const char *t, const char *key)
+{
+    if (!t || !key || !*key) return NULL;
+    int is_inert_key = (strcmp(key, "inert") == 0 || strcmp(key, "inert:") == 0);
+    size_t klen = strlen(key);
+    const char *h;
+    for (const char *p = t; (h = strstr(p, key)) != NULL; p = h + klen) {
+        if (is_inert_key) {
+            const char *b = h;
+            while (b > t && b[-1] != '\n') b--;
+            size_t l = strcspn(b, "\n");
+            const char *opt = strstr(b, "options effective:");
+            if (opt && (size_t)(opt - b) < l) {
+                const char *fgi = strstr(b, "framegen=on(inert");
+                if (!fgi || (size_t)(fgi - b) >= l) continue;
+            }
+        }
+        return h;
+    }
+    return NULL;
+}
 static void refresh_dev_status(Game *g)
 {
     char path[96]; size_t n = 0, an = 0, bn = 0, tn = 0;
@@ -608,6 +630,8 @@ static void refresh_dev_status(Game *g)
     unsigned missed_vb = (unsigned)kv_uint_after(ts, "missed ", 0);
     int fg_ran         = (strstr(ts, "mode4 #") != NULL || strstr(ts, "vout fg #") != NULL ||
                           strstr(bs, "gnm #100") != NULL || strstr(bs, "flip #100") != NULL);
+    // alloc_dm logs a FAILED line for each range it tries; only a failure gpu_init never recovered from is OOM.
+    int alloc_dm_oom   = (strstr(bs, "alloc_dm FAIL") != NULL && strstr(bs, "gpu_init ok") == NULL);
 
     if (cb) {
         const char *sig = strstr(cs, "SIGBUS") ? "SIGBUS" :
@@ -748,7 +772,7 @@ static void refresh_dev_status(Game *g)
                  rec_shave_label(d->rec_shave_mode));
         snprintf(d->step2, sizeof(d->step2), "2. Or press TRIANGLE to restore AUTO (ALGORITHM).");
         snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch and test.");
-    } else if (has_safe_mem || strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory") || strstr(ts, "work memory: none") || strstr(bs, "alloc_dm FAIL")) {
+    } else if (has_safe_mem || strstr(bs, "dmem_FAIL") || strstr(ts, "gpu_init: no memory") || strstr(ts, "work memory: none") || alloc_dm_oom) {
         d->diag_kind      = DIAG_OOM_BOOT;
         d->rec_manual     = 1;
         d->rec_eng_sel    = SEL_ALT;
@@ -768,7 +792,7 @@ static void refresh_dev_status(Game *g)
         snprintf(d->step2, sizeof(d->step2), "2. Enables MID ONLY post target to save memory.");
         snprintf(d->step3, sizeof(d->step3), "3. Re-launch with SQUARE.");
     } else if (is_2b_log && !fg_ran &&
-               (strstr(ts, "inert") || strstr(ts, "no mid") || strstr(bs, "pcopy=0") || strstr(bs, "want_pcopy=0") || strstr(bs, "two_buffer=0"))) {
+               (strstr_trace_key(ts, "inert") || strstr(ts, "no mid") || strstr(bs, "pcopy=0") || strstr(bs, "want_pcopy=0") || strstr(bs, "two_buffer=0"))) {
         d->diag_kind      = DIAG_2BUF_NEEDED;
         d->rec_manual     = 1;
         d->rec_eng_sel    = auto_alt(g->id) ? SEL_ALT : SEL_CLASSIC;
@@ -807,6 +831,17 @@ static void refresh_dev_status(Game *g)
             snprintf(d->step1, sizeof(d->step1), "1. Press R2 to apply %s + TOP GROUP + MID ONLY.",
                      d->rec_pace_order == 3 ? "TIMER (PAIR)" : "POST-SUBMIT");
             snprintf(d->step2, sizeof(d->step2), "2. Eliminates flip queue contention on loading/cutscenes.");
+            snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch.");
+        } else if (strstr(ts, "CADENCE") == NULL) {
+            d->diag_kind = DIAG_NONE;
+            snprintf(d->diag_cause, sizeof(d->diag_cause), "TRACE LOG TRUNCATED (QUIETLOG)");
+            snprintf(d->diag_stage, sizeof(d->diag_stage), "NO CADENCE LINES IN TRACE");
+            snprintf(d->diag_advice, sizeof(d->diag_advice), "REMOVE QUIETLOG FOR CADENCE DIAG");
+            snprintf(d->diag_detail, sizeof(d->diag_detail),
+                     "Trace log for %s has no CADENCE lines (quietlog active or short run); cadence diagnostics are unavailable.",
+                     g->id);
+            snprintf(d->step1, sizeof(d->step1), "1. Remove quietlog_%s to restore CADENCE logging.", g->id);
+            snprintf(d->step2, sizeof(d->step2), "2. Or press R2 to sync the AUTO profile.");
             snprintf(d->step3, sizeof(d->step3), "3. Press SQUARE to launch.");
         } else {
             d->diag_kind = DIAG_OK;
@@ -933,7 +968,8 @@ static void load_settings(App *a)
     size_t n; char path[96];
     unsigned char *l = read_all(CFGDIR "/vcfg_launcher.ini", &n);
     const char *t = l ? (const char *)l : "";
-    a->defaults = (Settings){ ini_int(t, "fg", 1), ini_int(t, "preset", 0), ini_int(t, "sharp", 40), ini_int(t, "enhance", 1), ini_int(t, "overlay", 0) };
+    a->defaults = (Settings){ ini_int(t, "fg", 1), ini_int(t, "preset", 0), ini_int(t, "sharp", 40), ini_int(t, "enhance", 1), ini_int(t, "overlay", 0),
+                              ini_int(t, "below30", 0) != 0, ini_int(t, "shallow_queue", 0) != 0 };
     a->overlay_pos = ini_int(t, "overlay_pos", 4); a->overlay_opacity = ini_int(t, "overlay_opacity", 80);
     a->menu_combo = menu_combo_sanitize((uint32_t)ini_int(t, "menu_combo", (int)MENU_COMBO_DEFAULT));   // preset or recorded mask, else L3 + R3
     a->dark_theme = ini_int(t, "dark_theme", 1);
@@ -995,7 +1031,7 @@ static void load_settings(App *a)
             unsigned char *b = read_all(CFGDIR "/vcfg.ini", &n);
             if (b) {
                 const char *s = (const char *)b;
-                g->s = (Settings){ ini_int(s, "enabled", 1), ini_int(s, "preset", 0), ini_int(s, "sharp", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
+                g->s = (Settings){ ini_int(s, "enabled", 1), ini_int(s, "preset", 0), ini_int(s, "sharp", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0), 0, 0 };
                 free(b);
             }
         } else {
@@ -1003,8 +1039,11 @@ static void load_settings(App *a)
             unsigned char *b = read_all(path, &n);
             if (b) {
                 const char *s = (const char *)b;
-                g->s = (Settings){ ini_int(s, "framegen", g->experimental ? 0 : 1), ini_int(s, "preset", 0), ini_int(s, "sharpness", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0) };
+                g->s = (Settings){ ini_int(s, "framegen", g->experimental ? 0 : 1), ini_int(s, "preset", 0), ini_int(s, "sharpness", 40), ini_int(s, "enhance", 1), ini_int(s, "overlay", 0),
+                                   ini_int(s, "below30", 0) != 0, ini_int(s, "shallow_queue", 0) != 0 };   // absent = plugin default
                 int mm = ini_int(s, "manual_mode", 0);
+                int pm = ini_int(s, "post_mid", 0);
+                if (pm == 3) g->dev.post_mid = 3;
                 if (mm > 0) g->dev.manual_mode = 1;
                 if (g->dev.manual_mode) {
                     int sm = ini_int(s, "shave_mode", 0);
@@ -1012,7 +1051,7 @@ static void load_settings(App *a)
                     if (sm > g->dev.shave_mode) g->dev.shave_mode = sm;
                     int rm = ini_int(s, "reg_mode", 0);   if (rm > g->dev.reg_mode)   g->dev.reg_mode   = rm;
                     int po = ini_int(s, "pace_order", 0); if (po > 0) g->dev.pace_order = po;
-                    int pm = ini_int(s, "post_mid", 0);   if (pm > 0) g->dev.post_mid   = pm;
+                    if (pm > 0) g->dev.post_mid = pm;
                     g->dev.fps_lock   = lock_to_dev(ini_int(s, "fps_lock", 30));
                     g->dev.tile_mode  = tile_to_dev(ini_int(s, "tile_idx", -1));
                 }
@@ -1036,9 +1075,11 @@ static void save_settings(App *a)
     sceKernelMkdir(CFGDIR, 0777);
     const unsigned combo = menu_combo_sanitize(a->menu_combo);   // validated mask, written to every file the plugins read
     snprintf(buf, sizeof(buf),
-             "fg=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\noverlay_pos=%d\noverlay_opacity=%d\nmenu_combo=%u\n"
+             "fg=%d\npreset=%d\nsharp=%d\nenhance=%d\noverlay=%d\nbelow30=%d\nshallow_queue=%d\n"
+             "overlay_pos=%d\noverlay_opacity=%d\nmenu_combo=%u\n"
              "dark_theme=%d\nauto_send=%d\ntelemetry_host=%s\ntelemetry_port=%d\n",
              a->defaults.fg, a->defaults.preset, a->defaults.sharp, a->defaults.enhance, a->defaults.overlay,
+             a->defaults.b30, a->defaults.shq,
              a->overlay_pos, a->overlay_opacity, combo, a->dark_theme,
              a->net_telemetry, a->telemetry_host, a->telemetry_port > 0 ? a->telemetry_port : 8765);
     write_all(CFGDIR "/vcfg_launcher.ini", buf, strlen(buf));
@@ -1075,15 +1116,27 @@ static void save_settings(App *a)
             int sm = d->manual_mode ? d->shave_mode : 0;
             int rm = d->manual_mode ? d->reg_mode   : 0;
             int po = d->manual_mode ? d->pace_order : 0;
-            int pm = d->manual_mode ? d->post_mid   : 0;
+            int pm = (d->manual_mode || d->post_mid == 3) ? d->post_mid : 0;
             int lk = d->manual_mode ? k_dev_locks[d->fps_lock >= 0 && d->fps_lock < 4 ? d->fps_lock : 0] : 30;
             int ti = d->manual_mode ? k_dev_tiles[d->tile_mode >= 0 && d->tile_mode < 7 ? d->tile_mode : 0] : -1;
             snprintf(path, sizeof(path), CFGDIR "/config-%s.ini", g->id);
+            if (!d->manual_mode && pm == 0) {
+                size_t cn = 0;
+                unsigned char *cb = read_all(path, &cn);
+                if (cb) {
+                    if (ini_int((const char *)cb, "post_mid", 0) == 3) {
+                        pm = 3;
+                        d->post_mid = 3;
+                    }
+                    free(cb);
+                }
+            }
             snprintf(buf, sizeof(buf),
                      "framegen=%d\npreset=%d\nsharpness=%d\nenhance=%d\noverlay=%d\nmenu_opacity=%d\nmenu_combo=%u\n"
-                     "manual_mode=%d\ntwo_buffer=%d\npresent_copy=%d\nshave_mode=%d\nreg_mode=%d\npace_order=%d\npost_mid=%d\nfps_lock=%d\ntile_idx=%d\n",
+                     "manual_mode=%d\ntwo_buffer=%d\npresent_copy=%d\nshave_mode=%d\nreg_mode=%d\npace_order=%d\npost_mid=%d\nfps_lock=%d\ntile_idx=%d\n"
+                     "below30=%d\nshallow_queue=%d\n",
                      s->fg, s->preset, s->sharp, s->enhance, s->overlay, a->overlay_opacity, combo,
-                     d->manual_mode, bmode == BUF_2BUF, pcopy, sm, rm, po, pm, lk, ti);
+                     d->manual_mode, bmode == BUF_2BUF, pcopy, sm, rm, po, pm, lk, ti, s->b30, s->shq);
             write_all(path, buf, strlen(buf));
             snprintf(path, sizeof(path), CFGDIR "/tile_%s", g->id);
             if (ti >= 0) { char tb[16]; snprintf(tb, sizeof(tb), "%d\n", ti); write_all(path, tb, strlen(tb)); }
@@ -1112,7 +1165,10 @@ static void do_reset_dev(App *a)
     char path[96];
     g->eng_sel = SEL_AUTO;
     g->buf_sel = BUF_AUTO;
+    g->s.b30   = 0;
+    g->s.shq   = 0;
     memset(&g->dev, 0, sizeof(g->dev));
+    snprintf(path, sizeof(path), CFGDIR "/config-%s.ini", g->id); remove(path);
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id); remove(path);
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.boot", g->id);  remove(path);
     snprintf(path, sizeof(path), CFGDIR "/adapt-%s.ini", g->id);  remove(path);
@@ -1137,7 +1193,7 @@ static void do_apply_advice(App *a)
     DevCfg *d = &g->dev;
     char path[96];
     refresh_dev_status(g);
-    if (d->rec_applied && g->s.fg && !d->has_adapt) {
+    if (d->rec_applied && g->s.fg && !d->has_adapt && !g->s.b30 && !g->s.shq) {
         snprintf(a->status, sizeof(a->status), "ADVISOR PROFILE ALREADY ACTIVE FOR %s (NO CHANGES)", g->id);
         addlog(a, a->status);
         return;
@@ -1152,7 +1208,12 @@ static void do_apply_advice(App *a)
     d->post_mid    = d->rec_post_mid;
     d->fps_lock    = d->rec_fps_lock;
     d->tile_mode   = d->rec_tile_mode;
-    g->s.fg = 1;
+    g->s.fg  = 1;
+    g->s.b30 = 0;
+    g->s.shq = 0;
+    if (!d->manual_mode && d->post_mid == 0) {
+        snprintf(path, sizeof(path), CFGDIR "/config-%s.ini", g->id); remove(path);
+    }
     if (focus_row >= 1 && focus_row <= 7) a->row = focus_row;
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.state", g->id); remove(path);
     snprintf(path, sizeof(path), CFGDIR "/safe-%s.boot", g->id);  remove(path);
@@ -1335,7 +1396,9 @@ static void do_install(App *a)
     // Clear stale self-adapt / safe-watchdog / legacy experiment files from previous plugin versions on install/update:
     static const char *const stale_pfx[] = {
         "adapt-", "safe-", "state-", "vcfg_ver_", "tile_",
-        "cut_blocks_", "postfix_", "gridmix_", "bench_capture", "a20_"
+        "cut_blocks_", "postfix_", "gridmix_", "bench_capture", "a20_",
+        "shave14_", "monev_", "iolazy_", "nospin_", "tracelite_", "quietlog_",
+        "pace_timer_", "post_mid_only_"
     };
     clean_dir(CFGDIR, stale_pfx, (int)(sizeof(stale_pfx) / sizeof(stale_pfx[0])), NULL);
     remove(ENGFILE);
@@ -1402,7 +1465,7 @@ static void do_clean(App *a)
     a->turned_off = 1;
     snprintf(a->status, sizeof(a->status), "VCFG IS TURNED OFF - PRESS CROSS ON 04 PLUGIN TO ENABLE");
     a->debug_log = 0;
-    a->defaults = (Settings){ 1, 0, 40, 1, 0 };
+    a->defaults = SETTINGS_DEFAULT;
     a->overlay_pos = 4;
     a->overlay_opacity = 80;
     a->menu_combo = MENU_COMBO_DEFAULT;
@@ -1484,9 +1547,11 @@ static void bfile(Buf *r, const char *title, const char *path, size_t tail)
 // One paragraph per trace: how far the game start got, whether FG ran, the first refusal / failure lines, the end.
 static const char *find_line(const char *t, const char *key, char *out, size_t on)
 {
-    const char *h = strstr(t, key); if (!h) return NULL;
+    const char *h = strstr_trace_key(t, key); if (!h) return NULL;
     const char *b = h; while (b > t && b[-1] != '\n') b--;
-    size_t l = strcspn(b, "\n"); if (l >= on) l = on - 1;
+    size_t l = strcspn(b, "\n");
+    while (l > 0 && (b[l - 1] == ' ' || b[l - 1] == '\r')) l--;
+    if (l >= on) l = on - 1;
     memcpy(out, b, l); out[l] = 0; return out;
 }
 static void summarize(Buf *r, const char *id, const char *which, const char *t)
@@ -1497,7 +1562,7 @@ static void summarize(Buf *r, const char *id, const char *which, const char *t)
     int gpu = strstr(t, "gpu_init: ok") || strstr(t, "A20_ALLOC");
     int post = strstr(t, "inject #") != NULL || strstr(t, "vout inject #") != NULL;
     int fg = strstr(t, "mode4 #") || strstr(t, "vout fg #") || strstr(t, "kind=1") ||
-             (post && !strstr(t, "inert:") && !strstr(t, "INERT:") && !strstr(t, "framegen=0") && strstr(t, "extra buffer(s)"));
+             (post && !strstr_trace_key(t, "inert:") && !strstr(t, "INERT:") && !strstr(t, "framegen=0") && strstr(t, "extra buffer(s)"));
     int menu = strstr(t, "menu opened") || strstr(t, "A20_MENU open=1");
     bprintf(r, "%s, %s: %s | %s | first frame %s, GPU memory %s, FG frames %s, OSD/post injects %s, menu used %s\n", id, which, v, secs,
             frame ? "yes" : "NO", gpu ? "yes" : "no", fg ? "yes" : "no", post ? "yes" : "no", menu ? "yes" : "no");

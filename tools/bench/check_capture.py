@@ -154,7 +154,7 @@ static int g_opt_phase, g_opt_marker, g_opt_nocf, g_opt_nofgk, g_opt_noanc, g_op
 static int g_opt_notex, g_opt_notpg, g_opt_sharp, g_opt_nostr;
 static int g_bench_enabled=1, g_bench_offscreen, g_gpu_state=1, g_sh8_ok=1;
 static uint32_t g_bench_pack_off=0x17000, g_bw=1920,g_bh=1080,g_pitch=1920,g_ema_frame_us=16683;
-static int g_fmt_supported=1,g_handle=1,g_ngame=3,g_inject_on;
+static int g_fmt_supported=1,g_handle=1,g_ngame=3,g_runtime_2buf=0,g_inject_on;
 static uint32_t g_osd_real_fps_x10=600;
 static uint64_t g_buf[16]={0x210000000ull,0x210800000ull,0x211000000ull};
 static char g_title_id[16]="CUSA00557";
@@ -179,11 +179,11 @@ static int test_submit(uint32_t count, void **d, uint32_t *z, void **c, uint32_t
 struct = re.search(r'typedef struct \{.*?\} fg_config_t;', text, re.S)[0]
 attr = re.search(r'typedef struct \{\s*uint32_t format,.*?\} VoAttr;', text, re.S)[0]
 pieces = [prefix, struct, attr, 'static fg_config_t g_cfg; static VoAttr g_attr;',
-          '#include "shaders.h"', '#include "bench_shaders.h"', '#include "fg_res.h"', '#include "fg8_table.h"',
+          '#include "title_families.h"', '#include "shaders.h"', '#include "bench_shaders.h"', '#include "fg_res.h"', '#include "fg8_table.h"',
           'const uint8_t *vov_pal_ptr(void) {return NULL;} const uint8_t *vov_pix_ptr(void){return NULL;}']
 pieces += [define(n) for n in ['SLOT0', 'SLOT_SZ', 'STATS_OFF', 'WORK_SZ', 'DUMP_DONE_OFF', 'DCB8_OFF', 'DCB8_SZ',
                               'PKT3', 'TS_EOP', 'TS2', 'PASS_BARRIER', 'SET_PASS']]
-pieces += [function('calc_rcas_params'), function('build_dcb_flow8'), '#include "bench_capture.h"']
+pieces += [function('calc_rcas_params'), function('real_aa_on'), function('rcas_static_flag'), function('rcas_precise_flag'), function('build_dcb_flow8'), '#include "bench_capture.h"']
 pieces += [r'''
 #ifndef BENCH_SEQ_STEP_BYTES
 #define BENCH_SEQ_STEP_BYTES 0x10000u

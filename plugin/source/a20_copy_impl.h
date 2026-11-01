@@ -361,7 +361,7 @@ static void a21_parse_key(const char *line,int *enabled)
 {
     int v;
     if (sscanf(line,"enabled=%d",&v)==1) *enabled=v==1;
-    else if (sscanf(line,"preset=%d",&v)==1 && v>=0 && v<=1) a21_preset=(unsigned)v;
+    else if (sscanf(line,"preset=%d",&v)==1) a21_preset = v < 0 ? 0 : (v > 2 ? 2 : v);
     else if (sscanf(line,"sharp=%d",&v)==1 && v>=0 && v<=100) a21_sharp=(unsigned)v;
     else if (sscanf(line,"enhance=%d",&v)==1 && v>=0 && v<=2) a21_enhance=(unsigned)v;
     else if (sscanf(line,"overlay=%d",&v)==1 && v>=0 && v<=8) a21_overlay=(unsigned)v;
@@ -409,7 +409,8 @@ static void a21_menu_adjust(unsigned row,int dir,int cross)
         __atomic_store_n(&a20_enabled,cross?!on:dir>0,__ATOMIC_RELEASE);
     } else if (row==1) {
 #if A21_SCHED
-        __atomic_fetch_xor(&a21_preset,1u,__ATOMIC_ACQ_REL);
+        int right = cross || dir > 0;
+        a21_preset = (a21_preset + (right ? 1 : 2)) % 3;
         __atomic_store_n(&a21_sched_reset,1,__ATOMIC_RELEASE);
 #else
         return; // FAST needs the scheduler stage.
@@ -516,7 +517,9 @@ static void a20_build_menu(uint32_t *tb,uint8_t *sb)
     m.sel=(int)__atomic_load_n(&a21_menu_sel,__ATOMIC_ACQUIRE);
     vov_cpy(m.status,"FG paused while the menu is open",sizeof(m.status));
     a21_vov_row(&m,"Frame generation",VOV_TOGGLE,enabled,0,"");
-    a21_vov_row(&m,"Mode",VOV_TEXT,0,0,!A21_SCHED?"Quality":__atomic_load_n(&a21_preset,__ATOMIC_ACQUIRE)?"Fast":"Quality");
+    unsigned pr=__atomic_load_n(&a21_preset,__ATOMIC_ACQUIRE);
+    if (m.sel == 1 && pr == 1u) vov_cpy(m.status,"Lower input lag, holds 60 below 30 FPS",sizeof(m.status));
+    a21_vov_row(&m,"Mode",VOV_TEXT,0,0,!A21_SCHED?"Quality":(pr==2u?"Sharp":(pr==1u?"Fast":"Quality")));
     a21_vov_row(&m,"Sharpness",VOV_SEGMENTS,0,(int)__atomic_load_n(&a21_sharp,__ATOMIC_ACQUIRE),"");
     a21_vov_row(&m,"Anti-aliasing",VOV_TEXT,0,0,en==2?"Strong":en==1?"Light":"Off");
     a21_vov_row(&m,"FPS counter",VOV_TEXT,0,0,overlay_label((int)__atomic_load_n(&a21_overlay,__ATOMIC_ACQUIRE)));
@@ -543,8 +546,9 @@ static void a20_build_menu(uint32_t *tb,uint8_t *sb)
     osd_set_row(styles,grid,0,1,32,0,0,line);
     snprintf(line,sizeof(line)," FRAME GENERATION: %s",enabled?"ON":"OFF");
     osd_set_row(styles,grid,1,sel==0?2u:0u,32,0,0,line);
+    unsigned pr=__atomic_load_n(&a21_preset,__ATOMIC_ACQUIRE);
     snprintf(line,sizeof(line)," MODE: %s",!A21_SCHED?"QUALITY 2X (FAST: N/A)":
-        __atomic_load_n(&a21_preset,__ATOMIC_ACQUIRE)?"FAST (TARGET 60)":"QUALITY 2X");
+        (pr==2u?"SHARP 2X":(pr==1u?"FAST (TARGET 60)":"QUALITY 2X")));
     osd_set_row(styles,grid,2,sel==1?2u:0u,32,0,0,line);
     snprintf(line,sizeof(line)," SHARPNESS: %u%%%s",__atomic_load_n(&a21_sharp,__ATOMIC_ACQUIRE),A21_POST?"":" (N/A)");
     osd_set_row(styles,grid,3,sel==2?2u:0u,32,0,0,line);
@@ -1395,6 +1399,9 @@ static int a20_try_submit(uint32_t count,void **dcb,uint32_t *sizes,void **ccb,u
 #if A21_POST
     {   // Generated surfaces; the native frame C is post-processed below, after the FG passes have read it.
         unsigned sharp=__atomic_load_n(&a21_sharp,__ATOMIC_ACQUIRE),en=__atomic_load_n(&a21_enhance,__ATOMIC_ACQUIRE);
+        if (a21_preset == 2) {
+            sharp = (sharp > 0u) ? ((sharp + 35u > 100u) ? 100u : (sharp + 35u)) : 50u;
+        }
         if (sharp || en) {
             a21_emit_post(&p,sb+A21_POST_TB,(uint64_t)(uintptr_t)a20_image,sharp,en);
 #if A21_FAST540
@@ -1408,6 +1415,9 @@ static int a20_try_submit(uint32_t count,void **dcb,uint32_t *sizes,void **ccb,u
 #if A21_POST
     if (!menu) { // native frame C gets the same AA / sharpening as the mids (after the FG passes read it)
         unsigned sharp=__atomic_load_n(&a21_sharp,__ATOMIC_ACQUIRE),en=__atomic_load_n(&a21_enhance,__ATOMIC_ACQUIRE);
+        if (a21_preset == 2) {
+            sharp = (sharp > 0u) ? ((sharp + 35u > 100u) ? 100u : (sharp + 35u)) : 50u;
+        }
         if (sharp || en) a21_emit_post_wh(&p,sb+A21_POSTC_TB,current,g_bw,g_bh,g_pitch,g_attr.tilingMode==0?10:8,sharp,en);
     }
 #endif

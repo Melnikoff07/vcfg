@@ -60,6 +60,10 @@ class TestTriageLogsR20(unittest.TestCase):
         self.assertTrue(is_sup_alias2)
         self.assertEqual(canon_alias2, "CUSA08519")
 
+        canon_alias3, is_sup_alias3 = triage_logs.resolve_family("CUSA36848", self.verified, self.aliases)
+        self.assertTrue(is_sup_alias3)
+        self.assertEqual(canon_alias3, "CUSA36842")
+
         # Unlisted title ID
         canon_new, is_sup_new = triage_logs.resolve_family("CUSA99901", self.verified, self.aliases)
         self.assertFalse(is_sup_new)
@@ -354,6 +358,32 @@ class TestTriageLogsR20(unittest.TestCase):
             self.assertIn('{ "CUSA99910", "vcfg_classic51.prx", ENGINE_CLASSIC, 0 },', md_text)
             self.assertIn("needs auto_2buf", md_text)
             self.assertTrue(triage_logs.verify_no_game_names(md_text))
+
+    def test_options_effective_line_does_not_false_positive_inert(self) -> None:
+        """Verify options effective lines with ready/non-FG inert tokens do not block BUCKET_5, while framegen=on(inert: no mbuf) is caught."""
+        log_healthy_with_opt = (
+            f"plugin_load enter: title=CUSA99911 version=v{self.cur_ver} dm=0x128000000\n"
+            "options effective: framegen=on(ready: starting) preset=quality below30=on(inert: no 2nd buffer) "
+            "shallow_queue=on(inert: no timer pacing) game_vectors=on(ready: fg starting) hud_protect=1(ready: fg starting) | init\n"
+            "options effective: framegen=on(active) preset=quality below30=on(inert: no 2nd buffer) "
+            "shallow_queue=on(inert: no timer pacing) game_vectors=on(active) hud_protect=1(active: no hud file) | framegen ready->active\n"
+            "[VCFG] rt_match: ngame=3 w=1920 h=1080\n"
+            "[VCFG] Present #450: real flips/s: 30.0 mids_shown=420\n"
+        )
+        rec_ok = triage_logs.analyze_report_text(
+            "opt_ok.txt", log_healthy_with_opt, self.cur_ver, self.verified, self.aliases
+        )
+        self.assertEqual(rec_ok["bucket"], "BUCKET_5_NEW_SUPPORTED_CANDIDATE")
+
+        log_fg_inert_no_mbuf = (
+            f"plugin_load enter: title=CUSA00552 version=v{self.cur_ver} dm=0x128000000\n"
+            "options effective: framegen=on(inert: no mbuf) preset=quality | frame 120\n"
+        )
+        rec_inert = triage_logs.analyze_report_text(
+            "opt_inert.txt", log_fg_inert_no_mbuf, self.cur_ver, self.verified, self.aliases
+        )
+        self.assertEqual(rec_inert["bucket"], "BUCKET_4_VERIFIED_REGRESSION")
+        self.assertEqual(rec_inert["crash"], "INERT_NO_MBUF")
 
 
 if __name__ == "__main__":

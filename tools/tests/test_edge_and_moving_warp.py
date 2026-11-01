@@ -373,16 +373,18 @@ class EdgeAndMovingWarpTest(unittest.TestCase):
         warp8_ll_text = (ROOT / "classic" / "shaders" / "warp8.ll").read_text(encoding="utf-8")
         idx_main = warp8_ll_text.index("define amdgpu_cs void @main")
         ir_body = warp8_ll_text[:idx_main]
-        target_triple = "x86_64-pc-windows-msvc" if sys.platform == "win32" else "aarch64-unknown-linux-gnu"
+        use_win_triple = (sys.platform == "win32" or clang_bin.endswith(".exe"))
+        target_triple = "x86_64-pc-windows-msvc" if use_win_triple else "aarch64-unknown-linux-gnu"
         ir_body = ir_body.replace('target triple = "amdgcn--"', f'target triple = "{target_triple}"')
         ir_body = ir_body.replace(
             "declare <4 x float> @llvm.amdgcn.image.sample.lz.2d.v4f32.f32(i32 immarg, float, float, <8 x i32>, <4 x i32>, i1 immarg, i32 immarg, i32 immarg)",
             "",
         )
         ir_body = ir_body.replace("@llvm.amdgcn.image.sample.lz.2d.v4f32.f32", "@sim_sample_lz")
+        ir_body = ir_body.replace("@llvm.amdgcn.fmad.ftz.f32", "@sim_fmad_ftz_f32")
         ir_clean = "\n".join(
             ln for ln in ir_body.splitlines()
-            if not ln.startswith("declare ") or "@llvm.amdgcn." not in ln
+            if not ln.startswith("declare ") or ("@llvm.amdgcn." not in ln and "@sim_" not in ln)
         )
 
         vx_val = float(Fp[1, 0, 0])
@@ -402,6 +404,12 @@ class EdgeAndMovingWarpTest(unittest.TestCase):
             img_to_llvm_global("g_bp", Bp),
             '@fmt = private unnamed_addr constant [26 x i8] c"%.9g %.9g %.9g %.9g %.9g\\0A\\00"',
             "declare i32 @printf(ptr, ...)",
+            "",
+            "define float @sim_fmad_ftz_f32(float %a, float %b, float %c) {",
+            "  %m = fmul float %a, %b",
+            "  %r = fadd float %m, %c",
+            "  ret float %r",
+            "}",
             "",
             "define <4 x float> @sim_sample_lz(i32 %dm, float %u, float %v, <8 x i32> %t, <4 x i32> %sm, i1 %un, i32 %c1, i32 %c2) {",
             "  %t0 = extractelement <8 x i32> %t, i32 0",
@@ -485,7 +493,7 @@ class EdgeAndMovingWarpTest(unittest.TestCase):
                 [clang_bin, f"--target={target_triple}", "-O0", "-Wno-override-module", "-emit-llvm", "-c", str(ll_f), "-o", str(bc_f)],
                 check=True,
             )
-            lli_cmd = [lli_bin, "--dlopen=msvcrt.dll", str(bc_f)] if sys.platform == "win32" else [lli_bin, str(bc_f)]
+            lli_cmd = [lli_bin, "--dlopen=msvcrt.dll", str(bc_f)] if use_win_triple else [lli_bin, str(bc_f)]
             res = subprocess.run(lli_cmd, capture_output=True, text=True, check=True)
 
         rows = [[float(v) for v in ln.strip().split()] for ln in res.stdout.strip().splitlines()]

@@ -4,7 +4,7 @@ target triple = "amdgcn--"
 declare i32 @llvm.amdgcn.raw.buffer.load.i32(<4 x i32>, i32, i32, i32 immarg)
 declare void @llvm.amdgcn.raw.buffer.store.i32(i32, <4 x i32>, i32, i32, i32 immarg)
 
-define amdgpu_cs void @main(<4 x i32> inreg %a, <4 x i32> inreg %b, <4 x i32> inreg %o, i32 inreg %gid, i32 %tid) {
+define amdgpu_cs void @main(<4 x i32> inreg %a, <4 x i32> inreg %b, <4 x i32> inreg %o, i32 inreg %gid, i32 %tid) #0 {
   %g = shl i32 %gid, 6
   %i = add i32 %g, %tid
   %off = shl i32 %i, 2
@@ -21,3 +21,5 @@ define amdgpu_cs void @main(<4 x i32> inreg %a, <4 x i32> inreg %b, <4 x i32> in
   call void @llvm.amdgcn.raw.buffer.store.i32(i32 %r, <4 x i32> %o, i32 %off, i32 0, i32 0)
   ret void
 }
+
+attributes #0 = { "denormal-fp-math-f32"="preserve-sign,preserve-sign" }

@@ -13,6 +13,8 @@ declare void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float>, i32 immarg, i32,
 declare <2 x float> @llvm.amdgcn.raw.buffer.load.v2f32(<4 x i32>, i32, i32, i32 immarg)
 declare <2 x i32> @llvm.amdgcn.raw.buffer.load.v2i32(<4 x i32>, i32, i32, i32 immarg)
 declare i32 @llvm.amdgcn.raw.buffer.load.i32(<4 x i32>, i32, i32, i32 immarg)
+declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
+declare float @llvm.amdgcn.rcp.f32(float)
 declare i32 @llvm.smax.i32(i32, i32)
 declare i32 @llvm.smin.i32(i32, i32)
 declare float @llvm.floor.f32(float)
@@ -30,18 +32,25 @@ define internal { <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x 
                            <4 x float> %sp, <4 x float> %sc, float %es, i1 %str_en,
                            float %rx0, float %rx1, float %ry0, float %ry1,
                            float %w_occ, float %div_b, float %vmn) alwaysinline {
-  %px = fmul float %vx, %t
-  %py = fmul float %vy, %t
-  %cx = fmul float %vx, %tc1
-  %cy = fmul float %vy, %tc1
-  %up = fadd float %u, %px
-  %vp = fadd float %v, %py
-  %uc = fsub float %u, %cx
-  %vc = fsub float %v, %cy
-  %ups = fmul float %up, %s
-  %vps = fmul float %vp, %s
-  %ucs = fmul float %uc, %s
-  %vcs = fmul float %vc, %s
+  %r = call { <4 x float>, float } @taps_xy(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %vx, float %vy, float %t, float %tc1, float %s, float %s, <4 x float> %sp, <4 x float> %sc, float %es, i1 %str_en, float %rx0, float %rx1, float %ry0, float %ry1, float %w_occ, float %div_b, float %vmn)
+  ret { <4 x float>, float } %r
+}
+
+define internal { <4 x float>, float } @taps_xy(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v,
+                           float %vx, float %vy, float %t, float %tc1, float %sx, float %sy,
+                           <4 x float> %sp, <4 x float> %sc, float %es, i1 %str_en,
+                           float %rx0, float %rx1, float %ry0, float %ry1,
+                           float %w_occ, float %div_b, float %vmn) alwaysinline {
+  %up = call float @llvm.amdgcn.fmad.ftz.f32(float %vx, float %t, float %u)
+  %vp = call float @llvm.amdgcn.fmad.ftz.f32(float %vy, float %t, float %v)
+  %mz.n1 = fneg float %vx
+  %uc = call float @llvm.amdgcn.fmad.ftz.f32(float %mz.n1, float %tc1, float %u)
+  %mz.n2 = fneg float %vy
+  %vc = call float @llvm.amdgcn.fmad.ftz.f32(float %mz.n2, float %tc1, float %v)
+  %ups = fmul float %up, %sx
+  %vps = fmul float %vp, %sy
+  %ucs = fmul float %uc, %sx
+  %vcs = fmul float %vc, %sy
   %a = call <4 x float> @llvm.amdgcn.image.sample.lz.2d.v4f32.f32(i32 15, float %ups, float %vps, <8 x i32> %tp, <4 x i32> %sm, i1 false, i32 0, i32 0)
   %b = call <4 x float> @llvm.amdgcn.image.sample.lz.2d.v4f32.f32(i32 15, float %ucs, float %vcs, <8 x i32> %tc, <4 x i32> %sm, i1 false, i32 0, i32 0)
   %dpl = fsub float 0.5, %up
@@ -102,8 +111,9 @@ define internal { <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x 
   %spen = select i1 %st_on, float %ed2, float 0.0
   %vm_d = fsub float %vmag, %vmn
   %v_ex = call float @llvm.maxnum.f32(float %vm_d, float 0.0)
-  %dv0 = fmul float %v_ex, 0.25
-  %dv1 = fsub float 1.0, %dv0
+
+  %mz.n3 = fneg float %v_ex
+  %dv1 = call float @llvm.amdgcn.fmad.ftz.f32(float %mz.n3, float 0.25, float 1.0)
   %dv_g = call float @sat(float %dv1)
   %eo0 = fsub float %eb, 0x3FE19999A0000000 ; 0.55
   %eo1 = fmul float %eo0, 4.0
@@ -131,18 +141,23 @@ define internal { <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x 
 define internal { <4 x float>, <4 x float>, float } @tapsq(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v,
                            float %vx, float %vy, float %t, float %tc1, float %s,
                            float %csh, float %rx0, float %rx1, float %ry0, float %ry1) alwaysinline {
-  %px = fmul float %vx, %t
-  %py = fmul float %vy, %t
-  %cx = fmul float %vx, %tc1
-  %cy = fmul float %vy, %tc1
-  %up = fadd float %u, %px
-  %vp = fadd float %v, %py
-  %uc = fsub float %u, %cx
-  %vc = fsub float %v, %cy
-  %ups = fmul float %up, %s
-  %vps = fmul float %vp, %s
-  %ucs = fmul float %uc, %s
-  %vcs = fmul float %vc, %s
+  %r = call { <4 x float>, <4 x float>, float } @tapsq_xy(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v, float %vx, float %vy, float %t, float %tc1, float %s, float %s, float %csh, float %rx0, float %rx1, float %ry0, float %ry1)
+  ret { <4 x float>, <4 x float>, float } %r
+}
+
+define internal { <4 x float>, <4 x float>, float } @tapsq_xy(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u, float %v,
+                           float %vx, float %vy, float %t, float %tc1, float %sx, float %sy,
+                           float %csh, float %rx0, float %rx1, float %ry0, float %ry1) alwaysinline {
+  %up = call float @llvm.amdgcn.fmad.ftz.f32(float %vx, float %t, float %u)
+  %vp = call float @llvm.amdgcn.fmad.ftz.f32(float %vy, float %t, float %v)
+  %mz.n4 = fneg float %vx
+  %uc = call float @llvm.amdgcn.fmad.ftz.f32(float %mz.n4, float %tc1, float %u)
+  %mz.n5 = fneg float %vy
+  %vc = call float @llvm.amdgcn.fmad.ftz.f32(float %mz.n5, float %tc1, float %v)
+  %ups = fmul float %up, %sx
+  %vps = fmul float %vp, %sy
+  %ucs = fmul float %uc, %sx
+  %vcs = fmul float %vc, %sy
   %dpl = fsub float 0.5, %up
   %dpr = fsub float %up, 1919.5
   %dpt = fsub float 0.5, %vp
@@ -200,8 +215,8 @@ define internal { <4 x float>, <4 x float>, float } @tapsq(<8 x i32> %tp, <8 x i
   %hla_c = select i1 %aw, float %hla_s, float %hla
   %hlb_c = select i1 %bw, float %hlb_s, float %hlb
   %hl_mx = call float @llvm.maxnum.f32(float %hla_c, float %hlb_c)
-  %hl_s = fmul float %hl_mx, 4.0
-  %hl_d = fadd float %hl_s, 1.0
+
+  %hl_d = call float @llvm.amdgcn.fmad.ftz.f32(float %hl_mx, float 4.0, float 1.0)
   %e0 = fdiv arcp afn float %e0_r, %hl_d
   %e_pen = fmul float %w_one, 0x3F947AE140000000 ; 0.02
   %e = fadd float %e0, %e_pen
@@ -218,24 +233,26 @@ define internal { <4 x float>, <4 x float>, float } @tapsq(<8 x i32> %tp, <8 x i
 define internal <4 x float> @crw(float %f, float %c) alwaysinline {
   %f2 = fmul float %f, %f
   %f3 = fmul float %f2, %f
-  %a0 = fmul float %f2, 2.0
-  %a1 = fsub float %a0, %f
+
+  %mz.n6 = fneg float %f
+  %a1 = call float @llvm.amdgcn.fmad.ftz.f32(float %f2, float 2.0, float %mz.n6)
   %a2 = fsub float %a1, %f3
   %w0 = fmul float %a2, %c
   %c3 = fsub float %c, 3.0
   %c2 = fsub float 2.0, %c
-  %b1 = fmul float %f2, %c3
+
   %b2 = fmul float %f3, %c2
-  %b3 = fadd float %b1, %b2
+  %b3 = call float @llvm.amdgcn.fmad.ftz.f32(float %f2, float %c3, float %b2)
   %w1 = fadd float %b3, 1.0
-  %d1 = fmul float %f, %c
-  %cc2 = fmul float %c, 2.0
-  %d2c = fsub float 3.0, %cc2
+
+
+  %mz.n7 = fneg float %c
+  %d2c = call float @llvm.amdgcn.fmad.ftz.f32(float %mz.n7, float 2.0, float 3.0)
   %d2 = fmul float %f2, %d2c
   %d3c = fsub float %c, 2.0
-  %d3 = fmul float %f3, %d3c
-  %d12 = fadd float %d1, %d2
-  %w2 = fadd float %d12, %d3
+
+  %d12 = call float @llvm.amdgcn.fmad.ftz.f32(float %f, float %c, float %d2)
+  %w2 = call float @llvm.amdgcn.fmad.ftz.f32(float %f3, float %d3c, float %d12)
   %e1 = fsub float %f3, %f2
   %w3a = fmul float %e1, %c
   %w12 = fadd float %w1, %w2
@@ -399,19 +416,22 @@ define internal { <4 x float>, float, float } @accum({ <4 x float>, float, float
   %e_s1 = call float @llvm.maxnum.f32(float %e_s0, float 0.0)
   %e = select i1 %fg_bst, float %e_s1, float %e0
   %em1 = call float @llvm.minnum.f32(float %em, float %e)
-  %d0 = fsub float %em1, %em
-  %k0 = fmul float %d0, 8.0
-  %sc = call float @llvm.exp2.f32(float %k0)
-  %d1 = fsub float %em1, %e
-  %k1 = fmul float %d1, 8.0
-  %x1 = call float @llvm.exp2.f32(float %k1)
+  ; exp2(8 (em1 - em)) and exp2(8 (em1 - e)): one of them is exp2(0) = 1 and the other equals exp2(-8 |em - e|) bit
+  ; for bit (fl(a - b) == -fl(b - a), 8 a power of two), so one quarter-rate v_exp_f32 per candidate instead of two
+  %d0 = fsub float %em, %e
+  %ad0 = call float @llvm.fabs.f32(float %d0)
+  %k0 = fmul float %ad0, -8.0
+  %z = call float @llvm.exp2.f32(float %k0)
+  %lo = fcmp olt float %e, %em
+  %sc = select i1 %lo, float %z, float 1.0
+  %x1 = select i1 %lo, float 1.0, float %z
   %w5 = fadd float %w_eff, 0x3FB47AE140000000; 0.08
   %om = fmul float %w5, %x1
   %acs = call <4 x float> @scale4(<4 x float> %acc, float %sc)
   %mo = call <4 x float> @scale4(<4 x float> %m, float %om)
   %acc1 = fadd <4 x float> %acs, %mo
-  %sws = fmul float %sw, %sc
-  %sw1 = fadd float %sws, %om
+
+  %sw1 = call float @llvm.amdgcn.fmad.ftz.f32(float %sw, float %sc, float %om)
   %r0 = insertvalue { <4 x float>, float, float } undef, <4 x float> %acc1, 0
   %r1 = insertvalue { <4 x float>, float, float } %r0, float %sw1, 1
   %r2 = insertvalue { <4 x float>, float, float } %r1, float %em1, 2
@@ -439,9 +459,9 @@ define internal float @diff3_k(<4 x float> %a, <4 x float> %b) alwaysinline {
   %ex_hi = call float @llvm.maxnum.f32(float %ex_hi0, float 0.0)
   %ex_lo0 = fsub float %l_lo, 0x3FECCCCCC0000000 ; 0.90
   %ex_lo = call float @llvm.maxnum.f32(float %ex_lo0, float 0.0)
-  %k_hi = fmul float %ex_hi, 1.25
+
   %k_lo = fmul float %ex_lo, 0.75
-  %k_sum = fadd float %k_hi, %k_lo
+  %k_sum = call float @llvm.amdgcn.fmad.ftz.f32(float %ex_hi, float 1.25, float %k_lo)
   %den = fadd float 1.0, %k_sum
   %e = fdiv arcp afn float %e_raw, %den
   ret float %e
@@ -451,8 +471,27 @@ define internal <4 x float> @lerp4(<4 x float> %a, <4 x float> %b, float %t) alw
   %t0 = insertelement <4 x float> undef, float %t, i32 0
   %tv = shufflevector <4 x float> %t0, <4 x float> undef, <4 x i32> zeroinitializer
   %d = fsub <4 x float> %b, %a
-  %m = fmul <4 x float> %d, %tv
-  %r = fadd <4 x float> %a, %m
+
+  %mz.v8a = extractelement <4 x float> %d, i32 0
+  %mz.v8b = extractelement <4 x float> %tv, i32 0
+  %mz.v8c = extractelement <4 x float> %a, i32 0
+  %mz.v8r = call float @llvm.amdgcn.fmad.ftz.f32(float %mz.v8a, float %mz.v8b, float %mz.v8c)
+  %mz.v8i = insertelement <4 x float> poison, float %mz.v8r, i32 0
+  %mz.v9a = extractelement <4 x float> %d, i32 1
+  %mz.v9b = extractelement <4 x float> %tv, i32 1
+  %mz.v9c = extractelement <4 x float> %a, i32 1
+  %mz.v9r = call float @llvm.amdgcn.fmad.ftz.f32(float %mz.v9a, float %mz.v9b, float %mz.v9c)
+  %mz.v9i = insertelement <4 x float> %mz.v8i, float %mz.v9r, i32 1
+  %mz.v10a = extractelement <4 x float> %d, i32 2
+  %mz.v10b = extractelement <4 x float> %tv, i32 2
+  %mz.v10c = extractelement <4 x float> %a, i32 2
+  %mz.v10r = call float @llvm.amdgcn.fmad.ftz.f32(float %mz.v10a, float %mz.v10b, float %mz.v10c)
+  %mz.v10i = insertelement <4 x float> %mz.v9i, float %mz.v10r, i32 2
+  %mz.v11a = extractelement <4 x float> %d, i32 3
+  %mz.v11b = extractelement <4 x float> %tv, i32 3
+  %mz.v11c = extractelement <4 x float> %a, i32 3
+  %mz.v11r = call float @llvm.amdgcn.fmad.ftz.f32(float %mz.v11a, float %mz.v11b, float %mz.v11c)
+  %r = insertelement <4 x float> %mz.v10i, float %mz.v11r, i32 3
   ret <4 x float> %r
 }
 
@@ -509,17 +548,17 @@ define internal { <4 x float>, float } @side_lerp(<4 x float> %a2, <4 x float> %
   %em0 = fsub float %e0, 0x3F947AE140000000
   %em1 = fmul float %em0, 6.0
   %g_em = call float @sat(float %em1)
-  %t0 = fmul float %d_min, 0x3FD51EB860000000
+
   %t1 = fmul float %d_cr, 0x3FB1EB8520000000
-  %t2 = fmul float %d_sf, 0x3FC1EB8520000000
+
   %t3 = fmul float %d_lu, 0x3FA47AE140000000
-  %s01 = fadd float %t0, %t1
-  %s23 = fadd float %t2, %t3
+  %s01 = call float @llvm.amdgcn.fmad.ftz.f32(float %d_min, float 0x3FD51EB860000000, float %t1)
+  %s23 = call float @llvm.amdgcn.fmad.ftz.f32(float %d_sf, float 0x3FC1EB8520000000, float %t3)
   %raw0 = fadd float %s01, %s23
-  %o12 = fmul float %s01, 1.625
-  %o_sum = fadd float %o12, %div_b
-  %o_term = fmul float %w_occ, %o_sum
-  %raw = fadd float %raw0, %o_term
+
+  %o_sum = call float @llvm.amdgcn.fmad.ftz.f32(float %s01, float 1.625, float %div_b)
+
+  %raw = call float @llvm.amdgcn.fmad.ftz.f32(float %w_occ, float %o_sum, float %raw0)
   %graw = fmul float %g_em, %raw
   %b_occ = fmul float %w_occ, 0x3FDB851EC0000000 ; 0.43
   %b_hi = fadd float %b_occ, 0x3FB1EB8520000000 ; 0.07 + 0.43 * w_occ
@@ -536,108 +575,108 @@ define internal { <4 x float>, float } @side_lerp(<4 x float> %a2, <4 x float> %
 
 define internal float @mlp_cw(float %x0, float %x1, float %x2, float %x3, float %x4, float %x5, float %x6) alwaysinline {
   %acc0 = fadd float 0.0, 0x3FA0F414A0000000
-  %u0_0 = fmul float %x0, 0x3FC3F44680000000
-  %s0_0 = fadd float %u0_0, 0x3FAA7194A0000000
-  %u0_1 = fmul float %x1, 0xBFB065BB20000000
-  %s0_1 = fadd float %s0_0, %u0_1
-  %u0_2 = fmul float %x2, 0x3FCC696560000000
-  %s0_2 = fadd float %s0_1, %u0_2
-  %u0_3 = fmul float %x3, 0xBFCD760280000000
-  %s0_3 = fadd float %s0_2, %u0_3
-  %u0_4 = fmul float %x4, 0x3FCA876A80000000
-  %s0_4 = fadd float %s0_3, %u0_4
-  %u0_5 = fmul float %x5, 0x3F91AA4D20000000
-  %s0_5 = fadd float %s0_4, %u0_5
-  %u0_6 = fmul float %x6, 0x3F9C0450A0000000
-  %s0_6 = fadd float %s0_5, %u0_6
+
+  %s0_0 = call float @llvm.amdgcn.fmad.ftz.f32(float %x0, float 0x3FC3F44680000000, float 0x3FAA7194A0000000)
+
+  %s0_1 = call float @llvm.amdgcn.fmad.ftz.f32(float %x1, float 0xBFB065BB20000000, float %s0_0)
+
+  %s0_2 = call float @llvm.amdgcn.fmad.ftz.f32(float %x2, float 0x3FCC696560000000, float %s0_1)
+
+  %s0_3 = call float @llvm.amdgcn.fmad.ftz.f32(float %x3, float 0xBFCD760280000000, float %s0_2)
+
+  %s0_4 = call float @llvm.amdgcn.fmad.ftz.f32(float %x4, float 0x3FCA876A80000000, float %s0_3)
+
+  %s0_5 = call float @llvm.amdgcn.fmad.ftz.f32(float %x5, float 0x3F91AA4D20000000, float %s0_4)
+
+  %s0_6 = call float @llvm.amdgcn.fmad.ftz.f32(float %x6, float 0x3F9C0450A0000000, float %s0_5)
   %h0 = call float @sat(float %s0_6)
-  %p0 = fmul float %h0, 0x3FC5607260000000
-  %acc1 = fadd float %acc0, %p0
-  %u1_0 = fmul float %x0, 0x3FB7DEC400000000
-  %s1_0 = fadd float %u1_0, 0x3FB502A940000000
-  %u1_1 = fmul float %x1, 0xBFCE7815E0000000
-  %s1_1 = fadd float %s1_0, %u1_1
-  %u1_2 = fmul float %x2, 0x3FB3174D20000000
-  %s1_2 = fadd float %s1_1, %u1_2
-  %u1_3 = fmul float %x3, 0x3FE3445960000000
-  %s1_3 = fadd float %s1_2, %u1_3
-  %u1_4 = fmul float %x4, 0x3F8D88B180000000
-  %s1_4 = fadd float %s1_3, %u1_4
-  %u1_5 = fmul float %x5, 0xBFA1481FA0000000
-  %s1_5 = fadd float %s1_4, %u1_5
-  %u1_6 = fmul float %x6, 0x3F9858A580000000
-  %s1_6 = fadd float %s1_5, %u1_6
+
+  %acc1 = call float @llvm.amdgcn.fmad.ftz.f32(float %h0, float 0x3FC5607260000000, float %acc0)
+
+  %s1_0 = call float @llvm.amdgcn.fmad.ftz.f32(float %x0, float 0x3FB7DEC400000000, float 0x3FB502A940000000)
+
+  %s1_1 = call float @llvm.amdgcn.fmad.ftz.f32(float %x1, float 0xBFCE7815E0000000, float %s1_0)
+
+  %s1_2 = call float @llvm.amdgcn.fmad.ftz.f32(float %x2, float 0x3FB3174D20000000, float %s1_1)
+
+  %s1_3 = call float @llvm.amdgcn.fmad.ftz.f32(float %x3, float 0x3FE3445960000000, float %s1_2)
+
+  %s1_4 = call float @llvm.amdgcn.fmad.ftz.f32(float %x4, float 0x3F8D88B180000000, float %s1_3)
+
+  %s1_5 = call float @llvm.amdgcn.fmad.ftz.f32(float %x5, float 0xBFA1481FA0000000, float %s1_4)
+
+  %s1_6 = call float @llvm.amdgcn.fmad.ftz.f32(float %x6, float 0x3F9858A580000000, float %s1_5)
   %h1 = call float @sat(float %s1_6)
-  %p1 = fmul float %h1, 0xBFBEEB9EA0000000
-  %acc2 = fadd float %acc1, %p1
-  %u2_0 = fmul float %x0, 0x3FA57A3F20000000
-  %s2_0 = fadd float %u2_0, 0x3FB1FFCAE0000000
-  %u2_1 = fmul float %x1, 0xBFBD902FC0000000
-  %s2_1 = fadd float %s2_0, %u2_1
-  %u2_2 = fmul float %x2, 0x3FBC89F040000000
-  %s2_2 = fadd float %s2_1, %u2_2
-  %u2_3 = fmul float %x3, 0x3FE3C65A20000000
-  %s2_3 = fadd float %s2_2, %u2_3
-  %u2_4 = fmul float %x4, 0xBFB5D25000000000
-  %s2_4 = fadd float %s2_3, %u2_4
-  %u2_5 = fmul float %x5, 0xBF8994F1E0000000
-  %s2_5 = fadd float %s2_4, %u2_5
-  %u2_6 = fmul float %x6, 0xBF949280A0000000
-  %s2_6 = fadd float %s2_5, %u2_6
+
+  %acc2 = call float @llvm.amdgcn.fmad.ftz.f32(float %h1, float 0xBFBEEB9EA0000000, float %acc1)
+
+  %s2_0 = call float @llvm.amdgcn.fmad.ftz.f32(float %x0, float 0x3FA57A3F20000000, float 0x3FB1FFCAE0000000)
+
+  %s2_1 = call float @llvm.amdgcn.fmad.ftz.f32(float %x1, float 0xBFBD902FC0000000, float %s2_0)
+
+  %s2_2 = call float @llvm.amdgcn.fmad.ftz.f32(float %x2, float 0x3FBC89F040000000, float %s2_1)
+
+  %s2_3 = call float @llvm.amdgcn.fmad.ftz.f32(float %x3, float 0x3FE3C65A20000000, float %s2_2)
+
+  %s2_4 = call float @llvm.amdgcn.fmad.ftz.f32(float %x4, float 0xBFB5D25000000000, float %s2_3)
+
+  %s2_5 = call float @llvm.amdgcn.fmad.ftz.f32(float %x5, float 0xBF8994F1E0000000, float %s2_4)
+
+  %s2_6 = call float @llvm.amdgcn.fmad.ftz.f32(float %x6, float 0xBF949280A0000000, float %s2_5)
   %h2 = call float @sat(float %s2_6)
-  %p2 = fmul float %h2, 0xBFC311BD60000000
-  %acc3 = fadd float %acc2, %p2
-  %u3_0 = fmul float %x0, 0xBFB118CFE0000000
-  %s3_0 = fadd float %u3_0, 0x3FB5F7C1A0000000
-  %u3_1 = fmul float %x1, 0xBFC6C64040000000
-  %s3_1 = fadd float %s3_0, %u3_1
-  %u3_2 = fmul float %x2, 0xBF75439B40000000
-  %s3_2 = fadd float %s3_1, %u3_2
-  %u3_3 = fmul float %x3, 0x3FE5C938E0000000
-  %s3_3 = fadd float %s3_2, %u3_3
-  %u3_4 = fmul float %x4, 0xBFBD267DC0000000
-  %s3_4 = fadd float %s3_3, %u3_4
-  %u3_5 = fmul float %x5, 0xBF8AD32C60000000
-  %s3_5 = fadd float %s3_4, %u3_5
-  %u3_6 = fmul float %x6, 0xBF957503E0000000
-  %s3_6 = fadd float %s3_5, %u3_6
+
+  %acc3 = call float @llvm.amdgcn.fmad.ftz.f32(float %h2, float 0xBFC311BD60000000, float %acc2)
+
+  %s3_0 = call float @llvm.amdgcn.fmad.ftz.f32(float %x0, float 0xBFB118CFE0000000, float 0x3FB5F7C1A0000000)
+
+  %s3_1 = call float @llvm.amdgcn.fmad.ftz.f32(float %x1, float 0xBFC6C64040000000, float %s3_0)
+
+  %s3_2 = call float @llvm.amdgcn.fmad.ftz.f32(float %x2, float 0xBF75439B40000000, float %s3_1)
+
+  %s3_3 = call float @llvm.amdgcn.fmad.ftz.f32(float %x3, float 0x3FE5C938E0000000, float %s3_2)
+
+  %s3_4 = call float @llvm.amdgcn.fmad.ftz.f32(float %x4, float 0xBFBD267DC0000000, float %s3_3)
+
+  %s3_5 = call float @llvm.amdgcn.fmad.ftz.f32(float %x5, float 0xBF8AD32C60000000, float %s3_4)
+
+  %s3_6 = call float @llvm.amdgcn.fmad.ftz.f32(float %x6, float 0xBF957503E0000000, float %s3_5)
   %h3 = call float @sat(float %s3_6)
-  %p3 = fmul float %h3, 0xBFC9E87220000000
-  %acc4 = fadd float %acc3, %p3
-  %u4_0 = fmul float %x0, 0x3FB8A754A0000000
-  %s4_0 = fadd float %u4_0, 0x3FA75E5680000000
-  %u4_1 = fmul float %x1, 0xBFD45CA740000000
-  %s4_1 = fadd float %s4_0, %u4_1
-  %u4_2 = fmul float %x2, 0xBFC288DB80000000
-  %s4_2 = fadd float %s4_1, %u4_2
-  %u4_3 = fmul float %x3, 0x3FE207A9E0000000
-  %s4_3 = fadd float %s4_2, %u4_3
-  %u4_4 = fmul float %x4, 0x3FBB9C1E00000000
-  %s4_4 = fadd float %s4_3, %u4_4
-  %u4_5 = fmul float %x5, 0xBF973F9A40000000
-  %s4_5 = fadd float %s4_4, %u4_5
-  %u4_6 = fmul float %x6, 0x3F725395C0000000
-  %s4_6 = fadd float %s4_5, %u4_6
+
+  %acc4 = call float @llvm.amdgcn.fmad.ftz.f32(float %h3, float 0xBFC9E87220000000, float %acc3)
+
+  %s4_0 = call float @llvm.amdgcn.fmad.ftz.f32(float %x0, float 0x3FB8A754A0000000, float 0x3FA75E5680000000)
+
+  %s4_1 = call float @llvm.amdgcn.fmad.ftz.f32(float %x1, float 0xBFD45CA740000000, float %s4_0)
+
+  %s4_2 = call float @llvm.amdgcn.fmad.ftz.f32(float %x2, float 0xBFC288DB80000000, float %s4_1)
+
+  %s4_3 = call float @llvm.amdgcn.fmad.ftz.f32(float %x3, float 0x3FE207A9E0000000, float %s4_2)
+
+  %s4_4 = call float @llvm.amdgcn.fmad.ftz.f32(float %x4, float 0x3FBB9C1E00000000, float %s4_3)
+
+  %s4_5 = call float @llvm.amdgcn.fmad.ftz.f32(float %x5, float 0xBF973F9A40000000, float %s4_4)
+
+  %s4_6 = call float @llvm.amdgcn.fmad.ftz.f32(float %x6, float 0x3F725395C0000000, float %s4_5)
   %h4 = call float @sat(float %s4_6)
-  %p4 = fmul float %h4, 0xBFB4C43480000000
-  %acc5 = fadd float %acc4, %p4
-  %u5_0 = fmul float %x0, 0x3FC2543F20000000
-  %s5_0 = fadd float %u5_0, 0x3FB94845C0000000
-  %u5_1 = fmul float %x1, 0xBFC28ECE00000000
-  %s5_1 = fadd float %s5_0, %u5_1
-  %u5_2 = fmul float %x2, 0x3FC7A203E0000000
-  %s5_2 = fadd float %s5_1, %u5_2
-  %u5_3 = fmul float %x3, 0x3F9AF58FC0000000
-  %s5_3 = fadd float %s5_2, %u5_3
-  %u5_4 = fmul float %x4, 0x3FB81CA580000000
-  %s5_4 = fadd float %s5_3, %u5_4
-  %u5_5 = fmul float %x5, 0x3F88B067A0000000
-  %s5_5 = fadd float %s5_4, %u5_5
-  %u5_6 = fmul float %x6, 0x3F8FB664A0000000
-  %s5_6 = fadd float %s5_5, %u5_6
+
+  %acc5 = call float @llvm.amdgcn.fmad.ftz.f32(float %h4, float 0xBFB4C43480000000, float %acc4)
+
+  %s5_0 = call float @llvm.amdgcn.fmad.ftz.f32(float %x0, float 0x3FC2543F20000000, float 0x3FB94845C0000000)
+
+  %s5_1 = call float @llvm.amdgcn.fmad.ftz.f32(float %x1, float 0xBFC28ECE00000000, float %s5_0)
+
+  %s5_2 = call float @llvm.amdgcn.fmad.ftz.f32(float %x2, float 0x3FC7A203E0000000, float %s5_1)
+
+  %s5_3 = call float @llvm.amdgcn.fmad.ftz.f32(float %x3, float 0x3F9AF58FC0000000, float %s5_2)
+
+  %s5_4 = call float @llvm.amdgcn.fmad.ftz.f32(float %x4, float 0x3FB81CA580000000, float %s5_3)
+
+  %s5_5 = call float @llvm.amdgcn.fmad.ftz.f32(float %x5, float 0x3F88B067A0000000, float %s5_4)
+
+  %s5_6 = call float @llvm.amdgcn.fmad.ftz.f32(float %x6, float 0x3F8FB664A0000000, float %s5_5)
   %h5 = call float @sat(float %s5_6)
-  %p5 = fmul float %h5, 0x3FC2CAC0E0000000
-  %acc6 = fadd float %acc5, %p5
+
+  %acc6 = call float @llvm.amdgcn.fmad.ftz.f32(float %h5, float 0x3FC2CAC0E0000000, float %acc5)
   ret float %acc6
 }
 
@@ -684,26 +723,56 @@ entry:
   %vm = load <4 x i32>, ptr addrspace(4) %pm, align 16, !invariant.load !0
   %to2 = extractelement <8 x i32> %to, i32 2
   %wm1 = and i32 %to2, 16383
+  %hm1_sh = lshr i32 %to2, 14
+  %hm1 = and i32 %hm1_sh, 16383
+  %wi = add i32 %wm1, 1
+  %hi = add i32 %hm1, 1
+  %wf = uitofp i32 %wi to float
+  %hf = uitofp i32 %hi to float
+  %sx_gf = fmul float %wf, 0x3F41111120000000
+  %sy_gf = fmul float %hf, 0x3F4E573AC0000000
+  %rcp_w = call float @llvm.amdgcn.rcp.f32(float %wf)
+  %rcp_h = call float @llvm.amdgcn.rcp.f32(float %hf)
+  %isx_gf = fmul float %rcp_w, 1920.0
+  %isy_gf = fmul float %rcp_h, 1080.0
+  %sx_gi0 = bitcast float %sx_gf to i32
+  %sy_gi0 = bitcast float %sy_gf to i32
+  %isx_gi0 = bitcast float %isx_gf to i32
+  %isy_gi0 = bitcast float %isy_gf to i32
+  %sx_gi = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %sx_gi0)
+  %sy_gi = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %sy_gi0)
+  %isx_gi = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %isx_gi0)
+  %isy_gi = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %isy_gi0)
+  %is1080 = icmp eq i32 %wm1, 1919
   %is4k = icmp eq i32 %wm1, 3839
   %is1440 = icmp eq i32 %wm1, 2559
   %is900 = icmp eq i32 %wm1, 1599
   %is720 = icmp eq i32 %wm1, 1279
-  %s0 = select i1 %is720, float 0x3FE5555560000000, float 1.0
-  %s1 = select i1 %is900, float 0x3FEAAAAA00000000, float %s0
-  %s2 = select i1 %is1440, float 0x3FF5555560000000, float %s1
-  %s = select i1 %is4k, float 2.0, float %s2
-  %is0 = select i1 %is720, float 1.5, float 1.0
-  %is1 = select i1 %is900, float 0x3FF3333340000000, float %is0
-  %is2 = select i1 %is1440, float 0.75, float %is1
-  %inv_s = select i1 %is4k, float 0.5, float %is2
-  %oxf0_s = fmul float %oxf0, %inv_s
-  %oyf0_s = fmul float %oyf0, %inv_s
-  %oxf1_s = fmul float %oxf1, %inv_s
-  %oyf1_s = fmul float %oyf1, %inv_s
-  %oxm2 = fsub float %oxf0_s, 3.0
-  %oym2 = fsub float %oyf0_s, 3.0
-  %oxp2 = fadd float %oxf1_s, 3.0
-  %oyp2 = fadd float %oyf1_s, 3.0
+  %s_d = select i1 %is1080, i32 1065353216, i32 %sx_gi
+  %s0 = select i1 %is720, i32 1059760811, i32 %s_d
+  %s1 = select i1 %is900, i32 1062557008, i32 %s0
+  %s2 = select i1 %is1440, i32 1068149419, i32 %s1
+  %sx_si = select i1 %is4k, i32 1073741824, i32 %s2
+  %is_d = select i1 %is1080, i32 1065353216, i32 %isx_gi
+  %is0 = select i1 %is720, i32 1069547520, i32 %is_d
+  %is1 = select i1 %is900, i32 1067030938, i32 %is0
+  %is2 = select i1 %is1440, i32 1061158912, i32 %is1
+  %isx_si = select i1 %is4k, i32 1056964608, i32 %is2
+  %w9 = mul i32 %wi, 9
+  %h16 = shl i32 %hi, 4
+  %is_16_9 = icmp eq i32 %w9, %h16
+  %sy_si = select i1 %is_16_9, i32 %sx_si, i32 %sy_gi
+  %isy_si = select i1 %is_16_9, i32 %isx_si, i32 %isy_gi
+  %sx = bitcast i32 %sx_si to float
+  %sy = bitcast i32 %sy_si to float
+  %inv_sx = bitcast i32 %isx_si to float
+  %inv_sy = bitcast i32 %isy_si to float
+  %mz.n12 = fneg float 3.0
+  %oxm2 = call float @llvm.amdgcn.fmad.ftz.f32(float %oxf0, float %inv_sx, float %mz.n12)
+  %mz.n13 = fneg float 3.0
+  %oym2 = call float @llvm.amdgcn.fmad.ftz.f32(float %oyf0, float %inv_sy, float %mz.n13)
+  %oxp2 = call float @llvm.amdgcn.fmad.ftz.f32(float %oxf1, float %inv_sx, float 3.0)
+  %oyp2 = call float @llvm.amdgcn.fmad.ftz.f32(float %oyf1, float %inv_sy, float 3.0)
   %rx0_s = select i1 %oon, float %oxm2, float -1000.0
   %rx1_s = select i1 %oon, float %oxp2, float -1000.0
   %ry0_s = select i1 %oon, float %oym2, float -1000.0
@@ -718,8 +787,8 @@ entry:
   %yf = uitofp i32 %y to float
   %u_nat = fadd float %xf, 0.5
   %v_nat = fadd float %yf, 0.5
-  %u = fmul float %u_nat, %inv_s
-  %v = fmul float %v_nat, %inv_s
+  %u = fmul float %u_nat, %inv_sx
+  %v = fmul float %v_nat, %inv_sy
   %xf1080 = fsub float %u, 0.5
   %yf1080 = fsub float %v, 0.5
   %ubx0 = fmul float %u, 0.0625
@@ -738,10 +807,15 @@ entry:
   ; kernel sharpness (inject letter S -> flags bit 10): cubic C 0.5 (Catmull-Rom) or 0.75
   %pcs = getelementptr i8, ptr addrspace(4) %tbl, i64 112
   %cns = load <4 x i32>, ptr addrspace(4) %pcs, align 16, !invariant.load !0
-  %fls = extractelement <4 x i32> %cns, i32 2
-  %shb = and i32 %fls, 1024
-  %shn = icmp ne i32 %shb, 0
-  %csh = select i1 %shn, float 0.75, float 0.5
+  %flags = extractelement <4 x i32> %cns, i32 2
+  %shb = and i32 %flags, 1024
+  %sh_on = icmp ne i32 %shb, 0
+  %fwb = and i32 %flags, 32768
+  %fwn = icmp ne i32 %fwb, 0
+  %csh0 = select i1 %sh_on, float 0.75, float 0.5
+  %csh = select i1 %fwn, float 0.0, float %csh0
+  %vmd_p = select i1 %sh_on, float 5.000000e-01, float 1.000000e+00
+  %vmd = fneg float %vmd_p
   ; fractional phase advection on the t=0.5 mid-grid F + second-order quadratic trajectory offset
   %fc0 = call <2 x float> @ldF(<4 x i32> %vf, i32 %cbx, i32 %cby)
   %fcx = extractelement <2 x float> %fc0, i32 0
@@ -763,9 +837,9 @@ entry:
   %fpy = extractelement <2 x float> %fp0, i32 1
   %ax_q = fsub float %fcx, %fpx
   %ay_q = fsub float %fcy, %fpy
-  %dot_x = fmul float %fcx, %fpx
+
   %dot_y = fmul float %fcy, %fpy
-  %dot_v = fadd float %dot_x, %dot_y
+  %dot_v = call float @llvm.amdgcn.fmad.ftz.f32(float %fcx, float %fpx, float %dot_y)
   %afcx = call float @llvm.fabs.f32(float %fcx)
   %afcy = call float @llvm.fabs.f32(float %fcy)
   %vm_c = fadd float %afcx, %afcy
@@ -806,10 +880,12 @@ entry:
   %u_q = fadd float %u, 0.0
   %v_q = fadd float %v, 0.0
   ; ---- 4 nearest block centres (blocks of 16 px in 1080p space, centres at 16 i + 8)
-  %fbx0 = fmul float %xfs, 0.0625
-  %fbx = fsub float %fbx0, 0.46875
-  %fby0 = fmul float %yfs, 0.0625
-  %fby = fsub float %fby0, 0.46875
+
+  %mz.n14 = fneg float 0.46875
+  %fbx = call float @llvm.amdgcn.fmad.ftz.f32(float %xfs, float 0.0625, float %mz.n14)
+
+  %mz.n15 = fneg float 0.46875
+  %fby = call float @llvm.amdgcn.fmad.ftz.f32(float %yfs, float 0.0625, float %mz.n15)
   %flx = call float @llvm.floor.f32(float %fbx)
   %fly = call float @llvm.floor.f32(float %fby)
   %wx = fsub float %fbx, %flx
@@ -854,10 +930,10 @@ entry:
   %bo = or i32 %bo0, %bo1
   %bm = and i32 %bo, 15
   %any_split = icmp ne i32 %bm, 0
-  %fx8_0 = fmul float %wx, 2.0
-  %fx8 = fadd float %fx8_0, 0.5
-  %fy8_0 = fmul float %wy, 2.0
-  %fy8 = fadd float %fy8_0, 0.5
+
+  %fx8 = call float @llvm.amdgcn.fmad.ftz.f32(float %wx, float 2.0, float 0.5)
+
+  %fy8 = call float @llvm.amdgcn.fmad.ftz.f32(float %wy, float 2.0, float 0.5)
   %flx8 = call float @llvm.floor.f32(float %fx8)
   %fly8 = call float @llvm.floor.f32(float %fy8)
   %wx8 = fsub float %fx8, %flx8
@@ -945,19 +1021,19 @@ entry:
   br i1 %coh, label %fast, label %slow
 
 fast:
-  %a0 = fmul float %x00, %w00
+
   %a1 = fmul float %x10, %w10
-  %a2 = fmul float %x01, %w01
+
   %a3 = fmul float %x11, %w11
-  %a01 = fadd float %a0, %a1
-  %a23 = fadd float %a2, %a3
+  %a01 = call float @llvm.amdgcn.fmad.ftz.f32(float %x00, float %w00, float %a1)
+  %a23 = call float @llvm.amdgcn.fmad.ftz.f32(float %x01, float %w01, float %a3)
   %vbx = fadd float %a01, %a23
-  %b0 = fmul float %y00, %w00
+
   %b1 = fmul float %y10, %w10
-  %b2 = fmul float %y01, %w01
+
   %b3 = fmul float %y11, %w11
-  %b01 = fadd float %b0, %b1
-  %b23 = fadd float %b2, %b3
+  %b01 = call float @llvm.amdgcn.fmad.ftz.f32(float %y00, float %w00, float %b1)
+  %b23 = call float @llvm.amdgcn.fmad.ftz.f32(float %y01, float %w01, float %b3)
   %vby = fadd float %b01, %b23
   %vabx = call float @llvm.fabs.f32(float %vbx)
   %vaby = call float @llvm.fabs.f32(float %vby)
@@ -974,9 +1050,9 @@ fastmove:
   %vm0 = fsub float %vmb, 12.0
   %vm1 = fmul float %vm0, 0x3FC1EB8520000000
   %vms = call float @sat(float %vm1)
-  %csc = fsub float 1.0, %vms
+  %csc = call float @llvm.amdgcn.fmad.ftz.f32(float %vms, float %vmd, float 1.0)
   %csh_e = fmul float %csh, %csc
-  %cf = call { <4 x float>, <4 x float>, float } @tapsq(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u_q, float %v_q, float %vbx, float %vby, float %t, float %tc1, float %s, float %csh_e, float %rx0_s, float %rx1_s, float %ry0_s, float %ry1_s)
+  %cf = call { <4 x float>, <4 x float>, float } @tapsq_xy(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u_q, float %v_q, float %vbx, float %vby, float %t, float %tc1, float %sx, float %sy, float %csh_e, float %rx0_s, float %rx1_s, float %ry0_s, float %ry1_s)
   %fa = extractvalue { <4 x float>, <4 x float>, float } %cf, 0
   %fb = extractvalue { <4 x float>, <4 x float>, float } %cf, 1
   %fe = extractvalue { <4 x float>, <4 x float>, float } %cf, 2
@@ -1018,12 +1094,12 @@ slow:
   %dxq0 = fsub float %x10, %x00
   %dxq1 = fsub float %x11, %x01
   %dxqs = fadd float %dxq0, %dxq1
-  %dxq = fmul float %dxqs, 0.5
+
   %dyq0 = fsub float %y01, %y00
   %dyq1 = fsub float %y11, %y10
   %dyqs = fadd float %dyq0, %dyq1
   %dyq = fmul float %dyqs, 0.5
-  %div = fadd float %dxq, %dyq
+  %div = call float @llvm.amdgcn.fmad.ftz.f32(float %dxqs, float 0.5, float %dyq)
   %div_s = fmul float %div, 0xBFB70A3D80000000 ; -0.09
   %div_c0 = call float @llvm.maxnum.f32(float %div_s, float 0xBFE19999A0000000) ; -0.55
   %div_b_s = call float @llvm.minnum.f32(float %div_c0, float 0x3FE19999A0000000) ; 0.55
@@ -1052,15 +1128,15 @@ slow:
   %se0 = and i1 %nofgs, %nson
   %se1 = and i1 %se0, %has_sl
   %str_en = and i1 %se1, %es_ok
-  %c0 = call { <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u_q, float %v_q, float %x00, float %y00, float %t, float %tc1, float %s, <4 x float> %sp, <4 x float> %sc, float %es, i1 %str_en, float %rx0_s, float %rx1_s, float %ry0_s, float %ry1_s, float %w_occ_s, float %div_b_s, float %vmn)
+  %c0 = call { <4 x float>, float } @taps_xy(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u_q, float %v_q, float %x00, float %y00, float %t, float %tc1, float %sx, float %sy, <4 x float> %sp, <4 x float> %sc, float %es, i1 %str_en, float %rx0_s, float %rx1_s, float %ry0_s, float %ry1_s, float %w_occ_s, float %div_b_s, float %vmn)
   %e0 = extractvalue { <4 x float>, float } %c0, 1
   %st0 = insertvalue { <4 x float>, float, float } zeroinitializer, float %e0, 2
   %st1 = call { <4 x float>, float, float } @accum({ <4 x float>, float, float } %st0, { <4 x float>, float } %c0, float %w00)
-  %c1 = call { <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u_q, float %v_q, float %x10, float %y10, float %t, float %tc1, float %s, <4 x float> %sp, <4 x float> %sc, float %es, i1 %str_en, float %rx0_s, float %rx1_s, float %ry0_s, float %ry1_s, float %w_occ_s, float %div_b_s, float %vmn)
+  %c1 = call { <4 x float>, float } @taps_xy(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u_q, float %v_q, float %x10, float %y10, float %t, float %tc1, float %sx, float %sy, <4 x float> %sp, <4 x float> %sc, float %es, i1 %str_en, float %rx0_s, float %rx1_s, float %ry0_s, float %ry1_s, float %w_occ_s, float %div_b_s, float %vmn)
   %st2 = call { <4 x float>, float, float } @accum({ <4 x float>, float, float } %st1, { <4 x float>, float } %c1, float %w10)
-  %c2 = call { <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u_q, float %v_q, float %x01, float %y01, float %t, float %tc1, float %s, <4 x float> %sp, <4 x float> %sc, float %es, i1 %str_en, float %rx0_s, float %rx1_s, float %ry0_s, float %ry1_s, float %w_occ_s, float %div_b_s, float %vmn)
+  %c2 = call { <4 x float>, float } @taps_xy(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u_q, float %v_q, float %x01, float %y01, float %t, float %tc1, float %sx, float %sy, <4 x float> %sp, <4 x float> %sc, float %es, i1 %str_en, float %rx0_s, float %rx1_s, float %ry0_s, float %ry1_s, float %w_occ_s, float %div_b_s, float %vmn)
   %st3 = call { <4 x float>, float, float } @accum({ <4 x float>, float, float } %st2, { <4 x float>, float } %c2, float %w01)
-  %c3 = call { <4 x float>, float } @taps(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u_q, float %v_q, float %x11, float %y11, float %t, float %tc1, float %s, <4 x float> %sp, <4 x float> %sc, float %es, i1 %str_en, float %rx0_s, float %rx1_s, float %ry0_s, float %ry1_s, float %w_occ_s, float %div_b_s, float %vmn)
+  %c3 = call { <4 x float>, float } @taps_xy(<8 x i32> %tp, <8 x i32> %tc, <4 x i32> %sm, float %u_q, float %v_q, float %x11, float %y11, float %t, float %tc1, float %sx, float %sy, <4 x float> %sp, <4 x float> %sc, float %es, i1 %str_en, float %rx0_s, float %rx1_s, float %ry0_s, float %ry1_s, float %w_occ_s, float %div_b_s, float %vmn)
   %st4 = call { <4 x float>, float, float } @accum({ <4 x float>, float, float } %st3, { <4 x float>, float } %c3, float %w11)
   %qs = extractvalue { <4 x float>, float, float } %st4, 0
   %os = extractvalue { <4 x float>, float, float } %st4, 1
@@ -1076,17 +1152,6 @@ merge:
   %vmg = phi float [ %vmb, %fastzero ], [ %vmb, %fastside ], [ 0.0, %slow ]
   %hl_mov = extractelement <4 x float> %mov, i32 3
   %is_wire_fol = fcmp oge float %hl_mov, 4.0
-  %wom0 = fsub float %spr, 12.0
-  %wom1 = fmul float %wom0, 0.5
-  %w_om_s = call float @sat(float %wom1)
-  %wom_es0 = fsub float %es, 0x3FE99999A0000000 ; 0.80
-  %wom_es1 = fmul float %wom_es0, 4.0
-  %w_om_es = call float @sat(float %wom_es1)
-  %wom_em0 = fsub float 0x3FD3D70A40000000, %emov ; 0.31
-  %wom_em1 = fmul float %wom_em0, 4.0
-  %w_om_em = call float @sat(float %wom_em1)
-  %w_om01 = fmul float %w_om_s, %w_om_es
-  %w_occ_m = fmul float %w_om01, %w_om_em
   %stat = call <4 x float> @lerp4(<4 x float> %sp, <4 x float> %sc, float %t)
   %l_mov = call float @sum3(<4 x float> %mov)
   %l_stat = call float @sum3(<4 x float> %stat)
@@ -1098,8 +1163,9 @@ merge:
   %d_sm2 = extractelement <4 x float> %d_sm, i32 2
   %mx_c0 = call float @llvm.maxnum.f32(float %d_sm0, float %d_sm1)
   %mx_ch = call float @llvm.maxnum.f32(float %mx_c0, float %d_sm2)
-  %mx_ch3 = fmul float %mx_ch, 3.0
-  %ch_ex0 = fsub float %mx_ch3, %dl_s
+
+  %mz.n16 = fneg float %dl_s
+  %ch_ex0 = call float @llvm.amdgcn.fmad.ftz.f32(float %mx_ch, float 3.0, float %mz.n16)
   %ch_ex = fsub float %ch_ex0, 0x3FE3333340000000 ; 0.60
   %wh_ex = fsub float %l_stat, 0x40047AE140000000 ; 2.56
   %pos_c = call float @llvm.maxnum.f32(float %wh_ex, float %ch_ex)
@@ -1143,7 +1209,7 @@ merge:
   %nfgk = xor i1 %hud_kill, true
   %w_hud = select i1 %nfgk, float %w_hud0, float 0.0
   %vmp_k = fmul float %vm_p, 0x3FEE147AE0000000
-  %vmg_e = call float @llvm.maxnum.f32(float %vm_c, float %vmp_k)
+  %vmg_e = call float @llvm.maxnum.f32(float %vm4, float %vmp_k)
   %wv0 = fsub float %vmg_e, 4.0
   %wv1 = fmul float %wv0, 0x3FC5555560000000
   %w_vel = call float @sat(float %wv1)
@@ -1168,6 +1234,31 @@ merge:
   %fl0b = extractelement <4 x i32> %cn0, i32 2
   %nocfb = and i32 %fl0b, 8
   %nocf = icmp ne i32 %nocfb, 0
+  ; fill weight: cw is exactly 0 when emov <= 0.025 (residual and every base term off), when emov <= es
+  ; (gcw = 0), on hl_act, under the full foreground kill (ws_keep = 0) or with the no-fill flag; then movc = mov
+  ; and the wave skips the fill block
+  %cwa = fcmp ogt float %emov, 0x3F999999A0000000 ; 0.025
+  %cwg = fcmp ogt float %emov, %es
+  %cwl0 = and i1 %cwa, %cwg
+  %nhlact = xor i1 %hl_act, true
+  %wsk_pos = fcmp ogt float %ws_keep, 0.0
+  %nfgkill = and i1 %nhlact, %wsk_pos
+  %nnocf = xor i1 %nocf, true
+  %cwl1 = and i1 %cwl0, %nfgkill
+  %cw_live = and i1 %cwl1, %nnocf
+  br i1 %cw_live, label %fill, label %fdone
+fill:
+  %wom0 = fsub float %spr, 12.0
+  %wom1 = fmul float %wom0, 0.5
+  %w_om_s = call float @sat(float %wom1)
+  %wom_es0 = fsub float %es, 0x3FE99999A0000000 ; 0.80
+  %wom_es1 = fmul float %wom_es0, 4.0
+  %w_om_es = call float @sat(float %wom_es1)
+  %wom_em0 = fsub float 0x3FD3D70A40000000, %emov ; 0.31
+  %wom_em1 = fmul float %wom_em0, 4.0
+  %w_om_em = call float @sat(float %wom_em1)
+  %w_om01 = fmul float %w_om_s, %w_om_es
+  %w_occ_m = fmul float %w_om01, %w_om_em
   %dmp = call float @diff3_k(<4 x float> %mov, <4 x float> %sp)
   %dmc = call float @diff3_k(<4 x float> %mov, <4 x float> %sc)
   %dmv = call float @diff3_k(<4 x float> %mov, <4 x float> %stat)
@@ -1219,8 +1310,8 @@ merge:
   %act0 = fsub float %emov, 0x3F999999A0000000
   %act1 = fmul float %act0, 10.0
   %act = call float @sat(float %act1)
-  %dcw = fmul float %act, %res_cw
-  %cw4 = fadd float %cw_base, %dcw
+
+  %cw4 = call float @llvm.amdgcn.fmad.ftz.f32(float %act, float %res_cw, float %cw_base)
   %cw3_0 = call float @sat(float %cw4)
   %gcw0 = fsub float %emov, %es
   %gcw1 = fmul float %gcw0, 4.0
@@ -1272,7 +1363,10 @@ merge:
   %cw3_s = fmul float %cw3_1, %ws_keep
   %cw3 = select i1 %hl_act, float 0.0, float %cw3_s
   %cw = select i1 %nocf, float 0.0, float %cw3
-  %movc = call <4 x float> @lerp4(<4 x float> %mov, <4 x float> %fillc, float %cw)
+  %movf = call <4 x float> @lerp4(<4 x float> %mov, <4 x float> %fillc, float %cw)
+  br label %fdone
+fdone:
+  %movc = phi <4 x float> [ %mov, %merge ], [ %movf, %fill ]
   %out0 = call <4 x float> @lerp4(<4 x float> %movc, <4 x float> %stat, float %ws)
   ; scene change: > 68 % unmatched blocks -> per-pixel fallback only where both motion and static samples disagree
   ; per-title scene-change threshold: consts flags bits 16..31 = blocks / 8 (0 = default 5600 of 8160)
@@ -1293,13 +1387,18 @@ merge:
   %out1 = select i1 %cut, <4 x float> %cut_px, <4 x float> %out0
   %pcn = getelementptr i8, ptr addrspace(4) %tbl, i64 112
   %cn = load <4 x i32>, ptr addrspace(4) %pcn, align 16, !invariant.load !0
-  %flags = extractelement <4 x i32> %cn, i32 2
-  %fm4 = and i32 %flags, 4
+  %flags_m = extractelement <4 x i32> %cn, i32 2
+  %fm4 = and i32 %flags_m, 4
   %mk0 = icmp ne i32 %fm4, 0
   %mxy = or i32 %x, %y
   %mk1 = icmp ult i32 %mxy, 32
   %mk = and i1 %mk0, %mk1
   %hudw = extractelement <4 x i32> %cn, i32 3
+  ; HUD rectangle (hud file): uniform skip of the per-lane rectangle test when no rectangle is set (hudw == 0)
+  %hnz = icmp ne i32 %hudw, 0
+  br i1 %hnz, label %hud_rect, label %hud_done
+
+hud_rect:
   %hb0 = and i32 %hudw, 255
   %hb1a = lshr i32 %hudw, 8
   %hb1 = and i32 %hb1a, 255
@@ -1328,11 +1427,16 @@ merge:
   %cin = icmp ule i32 %cd2, %crr
   %iscirc = icmp eq i32 %hy1, 0
   %hcsel = select i1 %iscirc, i1 %cin, i1 %hcx
-  %hnz = icmp ne i32 %hudw, 0
-  %inhud = and i1 %hcsel, %hnz
+  br label %hud_done
+
+hud_done:
+  %inhud = phi i1 [ %hcsel, %hud_rect ], [ false, %fdone ]
   %out1h = select i1 %inhud, <4 x float> %sc, <4 x float> %out1
   %out2 = select i1 %mk, <4 x float> <float 1.0, float 0.0, float 1.0, float 1.0>, <4 x float> %out1h
-  %alpha = extractelement <4 x float> %sc, i32 3
+  ; alpha = static-pixel flag for rcas8 (P == C in RGB at this pixel, es == 0): 1.0 static, 254/255 otherwise.
+  ; Only the scanout and osd8 (pass-through) see the mid's alpha; rcas8 skips the AA where the flag is set.
+  %st_px = fcmp oeq float %es, 0.0
+  %alpha = select i1 %st_px, float 1.0, float 0x3FEFDFDFE0000000 ; 254/255
   %out = insertelement <4 x float> %out2, float %alpha, i32 3
   call void @llvm.amdgcn.image.store.2d.v4f32.i32(<4 x float> %out, i32 15, i32 %x, i32 %y, <8 x i32> %to, i32 0, i32 0)
   ret void
@@ -1340,3 +1444,10 @@ merge:
 
 attributes #0 = { "amdgpu-flat-work-group-size"="64,64" }
 !0 = !{}
+
+; v_mad_f32 without declaring the fp32 denormal mode (it costs warp8 65-71 VGPRs, tools/tests/test_denormal_mode_attribute.py):
+; every single-use fmul feeding an fadd/fsub of the same block is llvm.amdgcn.fmad.ftz (fsub through an exact fneg).
+; FLOAT_MODE 0xc0 flushes fp32 denormals, and v_mad_f32 rounds the product and then the sum like v_mul_f32 + v_add_f32
+; (LLVM ISD::FMAD), the identity the 21 shaders that declare the preserve-sign fp32 denormal mode already rely on.
+; tools/tests/test_warp8_fmad_ftz.py
+declare float @llvm.amdgcn.fmad.ftz.f32(float, float, float) nounwind readnone speculatable
