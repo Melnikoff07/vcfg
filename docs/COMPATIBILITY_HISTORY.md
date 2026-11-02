@@ -2,6 +2,8 @@
 
 Audit: 2 November 2026. This is an archive index, **not a v2.36 support list**. See [current runtime evidence](COMPATIBILITY.md).
 
+For v2.35 specifically, see the [full v2.35 audit](COMPATIBILITY_v2.35.md) with version-specific verdicts and evidence.
+
 Only the newest explicit older plugin version for each exact CUSA is summarized below. FG means generated presentations were logged, not a visual or stability certification. Crash/inactive flags can come from different launches/configurations. A report can contain both current and previous starts. Original content hashes are retained in the private audit archive.
 
 | CUSA | Latest historical plugin version | Observed evidence | Reference |

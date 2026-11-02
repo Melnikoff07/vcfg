@@ -87,6 +87,8 @@ Trace elapsed time below is time since startup in the strongest positive trace, 
 
 ## Historical archive
 
+A separate [v2.35 compatibility audit](COMPATIBILITY_v2.35.md) covers 237 exact CUSA IDs using the same evidence rules.
+
 [Historical runtime index](COMPATIBILITY_HISTORY.md) covers CUSA IDs with explicit older-version evidence. These results are **not current compatibility claims**. Current release fixes and historical successful starts do not replace a v2.36 retest.
 
 ## Report or correct a result
