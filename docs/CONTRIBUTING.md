@@ -1,24 +1,22 @@
 # Contributing
 
-## Game reports (no coding needed)
+## Current-release reports
 
-1. Build or download `vcfg_discovery.prx` and install it for all games:
-   `python -I tools/console.py default build/vcfg_discovery/vcfg_discovery.prx`.
-   Games that have their own `[CUSAxxxxx]` section in `plugins.ini` are skipped by the plugin itself.
-2. Play each game for 5 minutes (reach gameplay). If a game crashes at start, exclude it:
-   `python -I tools/console.py exclude CUSAxxxxx` and report that too.
-3. `python -I tools/console.py logs` then `python -I tools/analyze.py logs > report.md`; open an issue with the report,
-   the game name, region and patch version.
+1. Install [v2.36](https://github.com/Melnikoff07/vcfg/releases/tag/v2.36). Keep only one VCFG plugin active.
+2. In the launcher, **04 PLUGIN → Triangle → DEBUG LOG ON**.
+3. Start the title, reach gameplay if possible and reproduce the issue.
+4. Reopen VCFG, **04 PLUGIN → Circle → save report**.
+5. Attach `vcfg_report.txt` from USB or `/data/vcfg_report.txt` over FTP to a [bug report](https://github.com/Melnikoff07/vcfg/issues/new?template=bug_report.md).
 
-## VCFG test reports
+Include VCFG version, CUSA ID and game update, console/firmware/GoldHEN, output resolution/HDR, Quality/Fast/Sharp and settings, reproduction steps, other plugins and whether it also happens with FG disabled. Use CUSA IDs rather than game names. A video helps for visual artifacts. Save a report before wiping settings.
 
-Same as above with the VCFG plugin set for that title. Please say what you saw (smooth / flicker / artifacts /
-colours) and attach `report.md`. The plugin writes why a frame was not generated; that is what we need.
+## Code changes
 
-## Code
+- Keep changes focused and distinguish trace/host results from PS4 validation.
+- Follow `AGENTS.md`: before committing, both `python tools/tests/test_lowmem_valve.py` and `python tools/tests/test_real_traces.py` must pass.
+- Shader changes go through IR → generated arrays; run `python tools/elf_arrays.py`.
+- Do not text-replace generated shader machine code or overwrite a PRX that a running title may have loaded.
+- Memory release/unregistration requires proof that GPU, command and scanout work have retired.
+- Describe target CUSA, evidence, settings and validation limits in the change.
 
-- One variable per change; keep a CUSA07439 run in your report.
-- Shader changes go through IR → `plugin/build_shader.py` → header; `tools/elf_arrays.py` must pass.
-- Do not add hooks to `scePadRead*` (they hung game start before); the pad is polled.
-- Keep the safety rules from the README. A change that frees or unregisters memory must explain how GPU, command and
-  scanout retirement are proven first.
+Build instructions: [Windows](../README.md#build), [Linux/macOS Docker](../tools/docker-build/README.md).

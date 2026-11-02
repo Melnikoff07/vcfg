@@ -1,16 +1,26 @@
 # VCFG
 
-**Current release: [v2.35](https://github.com/Melnikoff07/vcfg/releases/tag/v2.35) (27 October 2026).** For install and update details, use the release notes for the PKG you actually installed.
+**Current release: [v2.36](https://github.com/Melnikoff07/vcfg/releases/tag/v2.36) (1 November 2026).** For install and update details, use the release notes for the PKG you actually installed.
 
 VCFG (vibe coded frame generator): optical-flow frame generation for games on PS4 consoles running the
 GoldHEN homebrew enabler, as a GoldHEN plugin. The plugin hooks the game's frame
 submission, builds a motion field between the previous and the current game frame on the GPU, synthesises an
 in-between image and presents it before the real frame: a 30 fps game is shown at 60 Hz.
 
-**Status: experimental.** Verified on hardware (base console, GoldHEN): CUSA07439 (new engine), CUSA08519,
-CUSA00411 and CUSA00207 (classic engine): 30 → 60, in-game menu, FPS counter, anti-aliasing and sharpening.
-Any other installed game can be switched on in the app as EXPERIMENTAL (classic engine, may not work or may crash).
-See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). Use at your own risk.
+**Status: experimental.** Compatibility depends on the CUSA ID, game update, console model and output mode.
+See [compatibility and known issues](docs/COMPATIBILITY.md) before enabling FG for a title.
+
+## New in v2.36
+
+- **Quality** keeps the existing quality path. **Fast** reduces the present queue and uses timer pacing for lower latency; **Sharp** applies stronger sharpening to the real frame before generation.
+- Reduced repeating-texture shimmer and thin-object flicker, improved contour and screen-edge warping, and support for 3200×1800 and non-16:9 frames in the warp pass.
+- Audio, memory and crash fixes for multiple CUSA families; menus show effective option states (ACTIVE / READY / INERT / LIMITED).
+- Linux/macOS builds via [Docker](tools/docker-build/README.md).
+
+Install **VCFG_v2.36.pkg** from [the release](https://github.com/Melnikoff07/vcfg/releases/tag/v2.36).
+Existing `config-<TITLE>.ini` settings remain valid; per-title `adapt-*` data resets on first run.
+Keep only one VCFG plugin active. Disable VCFG for **CUSA10237**, which is currently unsupported.
+See the release notes for the full change list and limitations.
 
 Русское описание: [README_RU.md](README_RU.md).
 
@@ -20,15 +30,11 @@ referred to by their title IDs. No game code or assets are included.*
 
 ## How it works
 
-1. **Observe.** For the first ~600 flips the plugin only watches: game buffers, pixel format, free DirectMemory.
-2. **Decide.** It allocates its GPU slab, one 1280×720 generated surface and work buffers (≈5 MiB) at the top of the
-   highest free DirectMemory range, registers the surface with VideoOut right after the game's buffers, and checks
-   every frame (flip tail form, buffer sizes, compute-register state). Any mismatch → that frame is shown natively.
-3. **Generate.** GPU passes appended to the game's own flip submit: luma pyramids → hierarchical motion search
-   (me3/me2/me1) → filtering → phase → warp to 720p → optional post (RCAS sharpening / AA) → flip the generated image,
-   then flip the real frame with the same flip argument.
+1. **Observe and admit.** Inspect game buffers, pixel format, command submissions and available DirectMemory before enabling generation.
+2. **Generate.** GPU motion estimation and warping synthesize an intermediate image from consecutive game frames. Memory and presentation paths depend on the engine and title profile.
+3. **Present.** Quality, Fast and Sharp choose different pacing or sharpening behavior. When a runtime safety gate rejects a frame, it falls back to native presentation.
 
-Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Measured hardware facts: [docs/FINDINGS.md](docs/FINDINGS.md).
+Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Layout
 
@@ -50,8 +56,8 @@ AMDGPU target for shaders.
 ```powershell
 copy config.example.json config.json                                   # paths and console IP
 powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1          # new engine -> build/vcfg/vcfg.prx
-sh classic/build.sh                                                    # classic engine -> build/classic/vcfg_classic.prx
-powershell -NoProfile -ExecutionPolicy Bypass -File launcher/build_pkg.ps1 -Version 2.35   # -> build/launcher/VCFG_v2.35.pkg
+powershell -NoProfile -ExecutionPolicy Bypass -File classic/build.ps1  # classic engine -> build/classic/vcfg_classic.prx
+powershell -NoProfile -ExecutionPolicy Bypass -File launcher/build_pkg.ps1 -Version 2.36   # -> build/launcher/VCFG_v2.36.pkg
 python -I overlay/preview.py build/preview/vov                         # overlay preview PNGs (after building the DLL, see the script)
 ```
 
@@ -72,7 +78,7 @@ regenerates `classic/source/shaders.h` on every build.
    option that can be inert shows what it does now (ACTIVE, READY, INERT or LIMITED) and the header gives the reason of
    the selected row; `probe.log` gets an `options effective:` line at start, at each change and when a state changes.
 
-**Disable / clean reset (v2.34):** in **04 PLUGIN**, Square (**TURN OFF**) and R2 twice (**WIPE ALL**) both remove
+**Disable / clean reset:** in **04 PLUGIN**, Square (**TURN OFF**) and R2 twice (**WIPE ALL**) both remove
 VCFG plugin files, VCFG `plugins.ini` entries/backups, and VCFG settings, adaptation and profiles. They keep logs in
 `/data/bb_probe/` and leave third-party plugins alone. A red **VCFG IS TURNED OFF** banner remains until you press
 Cross (**INSTALL**) in **04 PLUGIN**. Fully restart the game after changing plugin state. Save a report before cleaning
@@ -96,8 +102,8 @@ each game start) is always on, so even a report saved with the debug log off sho
 
 ## Contributing
 
-The most useful contribution right now is **data**: run the discovery plugin in your games and send the reports.
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md), [docs/ROADMAP.md](docs/ROADMAP.md) and [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md).
+The most useful contribution right now is a reproducible current-version report with `vcfg_report.txt`.
+See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md), [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Rules that keep consoles and saves safe
 

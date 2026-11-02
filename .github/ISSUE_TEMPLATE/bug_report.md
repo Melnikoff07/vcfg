@@ -14,8 +14,12 @@ labels: bug
    `/data/vcfg_report.txt` over FTP.
 5. Switch the debug log off again with triangle if you like.
 
+- VCFG version (current release: 2.36):
 - Console model / firmware / GoldHEN version:
 - Game title ID / game update version:
+- Output resolution / HDR:
+- FG mode (Quality / Fast / Sharp) and settings:
+- Steps to reproduce:
 - What happens (game closed, froze, whole console restarted, picture wrong):
 - How often:
 - With FG switched off in the app, does it still happen?
