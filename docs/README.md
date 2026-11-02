@@ -1,6 +1,8 @@
 # Documentation — VCFG v2.36
 
-- [Compatibility and known issues](COMPATIBILITY.md)
+- [Current compatibility audit and known issues](COMPATIBILITY.md)
+- [Historical runtime evidence](COMPATIBILITY_HISTORY.md)
+- [Current evidence index: report IDs and hashes](compatibility-evidence.json)
 - [Architecture and safety](ARCHITECTURE.md)
 - [Reports and contributions](CONTRIBUTING.md)
 - [Development priorities](ROADMAP.md)

@@ -1,0 +1,3087 @@
+{
+  "meta": {
+    "release": "2.36",
+    "audit_date_moscow": "2026-11-02",
+    "vps_cutoff_utc": "2026-11-02T11:46:07Z",
+    "discord_cutoff_utc": "2026-11-02T11:36:35Z",
+    "attachment_records": 4798,
+    "unique_originals": 4793,
+    "original_bytes": 624180386,
+    "source_epochs": {
+      "historical": 4381,
+      "mixed": 273,
+      "current": 138,
+      "unknown": 1
+    },
+    "deduplicated_section_snapshots": 14325,
+    "eligible_current_section_snapshots": 205,
+    "current_cusa_count": 49,
+    "all_versions_cusa_count": 629,
+    "status_counts": {
+      "MIXED": 11,
+      "SHORT FG TRACE": 7,
+      "FG OBSERVED": 7,
+      "FG INACTIVE": 11,
+      "INSUFFICIENT": 5,
+      "CRASH LOGGED": 7,
+      "UNSUPPORTED": 1
+    }
+  },
+  "titles": [
+    {
+      "title_id": "CUSA00191",
+      "status": "MIXED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 332s; crash marker in boot/trace; causality unproven; inert/safe/off observation",
+      "fg_trace_elapsed_s": 332,
+      "evidence": [
+        {
+          "key": "95590116a2062b80188eb1695cad2fa2e72c400ef93a7c1a0975fa4e50e21a26",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 332,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 9600,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "af3d9309bd8a9c966902020c1e8de81ce75fdc4166647289852082eea4210c8a"
+          ],
+          "current_originals": [
+            "af3d9309bd8a9c966902020c1e8de81ce75fdc4166647289852082eea4210c8a"
+          ],
+          "report_ids": [
+            "1960FC"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 30.85,
+          "third_party_prx": null
+        },
+        {
+          "key": "6b0df7b234826179d1f29b52c053cdcaaef49e5dd6acfc0863180aacb866ec1e",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 336,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 10050,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "af3d9309bd8a9c966902020c1e8de81ce75fdc4166647289852082eea4210c8a"
+          ],
+          "current_originals": [
+            "af3d9309bd8a9c966902020c1e8de81ce75fdc4166647289852082eea4210c8a"
+          ],
+          "report_ids": [
+            "1960FC"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        },
+        {
+          "key": "de72f3985b6aaf5a8fa1e5d933760c5782d2a44e49765930103fce0deef5a872",
+          "kind": "trace",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 6,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 30,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "af3d9309bd8a9c966902020c1e8de81ce75fdc4166647289852082eea4210c8a"
+          ],
+          "current_originals": [
+            "af3d9309bd8a9c966902020c1e8de81ce75fdc4166647289852082eea4210c8a"
+          ],
+          "report_ids": [
+            "1960FC"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 60.43,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA00265",
+      "status": "SHORT FG TRACE",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 23s",
+      "fg_trace_elapsed_s": 23,
+      "evidence": [
+        {
+          "key": "7ea9550d4410f6659c9ae8ba0b4fa30ff8b8984c12232193d74b0586d1eeeba6",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 23,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 600,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "535b7875a4e42d8a1ddc60242ea08e2ccb7e6d76702ef9c324ddda635f12600b"
+          ],
+          "current_originals": [
+            "535b7875a4e42d8a1ddc60242ea08e2ccb7e6d76702ef9c324ddda635f12600b"
+          ],
+          "report_ids": [
+            "B60B4A"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 29.42,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA00359",
+      "status": "MIXED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 7s; crash marker in boot/trace; causality unproven",
+      "fg_trace_elapsed_s": 7,
+      "evidence": [
+        {
+          "key": "41ff8a5100b02e8aad0510f016a87751696430769493cc7fc0b34aebc37d591f",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 7,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 138,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "60b47e2ad41362a4c152ead5769505349d38635bfdc71100fe2b2dddca1611df"
+          ],
+          "current_originals": [
+            "60b47e2ad41362a4c152ead5769505349d38635bfdc71100fe2b2dddca1611df"
+          ],
+          "report_ids": [
+            "ED2D8C"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 34.67,
+          "third_party_prx": null
+        },
+        {
+          "key": "51547d872fd263690cd07ff659f119d5d685ac42f5833ea9d1ebd684812a87fb",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 10,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 249,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "60b47e2ad41362a4c152ead5769505349d38635bfdc71100fe2b2dddca1611df"
+          ],
+          "current_originals": [
+            "60b47e2ad41362a4c152ead5769505349d38635bfdc71100fe2b2dddca1611df"
+          ],
+          "report_ids": [
+            "ED2D8C"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA00411",
+      "status": "MIXED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 301s; crash marker in boot/trace; causality unproven",
+      "fg_trace_elapsed_s": 301,
+      "evidence": [
+        {
+          "key": "80442acc81382f196a02d7cd8f0b3286bf829d93bd3df9a90a8c36271689be76",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 301,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 8400,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "9eaedc53224a9cdb13bcc22f6c630b2dd3a7107052cb1b8f4e3214aea5e3c6a7",
+            "b7e48b855da3197291b338d721161c0b0120cdc061a05b6dc80442ad3fce8200"
+          ],
+          "current_originals": [
+            "9eaedc53224a9cdb13bcc22f6c630b2dd3a7107052cb1b8f4e3214aea5e3c6a7",
+            "b7e48b855da3197291b338d721161c0b0120cdc061a05b6dc80442ad3fce8200"
+          ],
+          "report_ids": [
+            "A8FD0C",
+            "C979FF"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 30.03,
+          "third_party_prx": null
+        },
+        {
+          "key": "a93bf6777927d78244167d8b49e6fa1bcabb68e1dee81d1597d35d069ef2526a",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 34,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 104,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "0a101c143c4ffb9f65a1e3e26d31764231e1df54ea77230241d0b4a6639c9b60"
+          ],
+          "current_originals": [
+            "0a101c143c4ffb9f65a1e3e26d31764231e1df54ea77230241d0b4a6639c9b60"
+          ],
+          "report_ids": [
+            "ED0A40"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA00419",
+      "status": "FG OBSERVED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "fast"
+      ],
+      "notes": "FG logged; trace reaches 288s",
+      "fg_trace_elapsed_s": 288,
+      "evidence": [
+        {
+          "key": "95ccfac5f5adacbfc2c8286abdedde16318f546f11df767dcbbedd4b69153eaa",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 288,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 8400,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "02ee4b7a155fb4000ed8fc5902e58359211915f4fa8eea93ecab6de15da8c207"
+          ],
+          "current_originals": [
+            "02ee4b7a155fb4000ed8fc5902e58359211915f4fa8eea93ecab6de15da8c207"
+          ],
+          "report_ids": [
+            "899A18"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 31.13,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA00462",
+      "status": "FG OBSERVED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "fast",
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 1110s",
+      "fg_trace_elapsed_s": 1110,
+      "evidence": [
+        {
+          "key": "8a123c3de55baf07b98db9ff6cb56414ce68f190565fd042d0c2609d201e9348",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 1110,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 31800,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "8517419b3235402c6b0d70bbbcd8978f06e43a26bf29f8e7fbc7f55860ebb7b9",
+            "d3793cf6c16dc1e3d3f857e6fee8ed38194e5045cae33413d1ca507020153bd0"
+          ],
+          "current_originals": [
+            "8517419b3235402c6b0d70bbbcd8978f06e43a26bf29f8e7fbc7f55860ebb7b9",
+            "d3793cf6c16dc1e3d3f857e6fee8ed38194e5045cae33413d1ca507020153bd0"
+          ],
+          "report_ids": [
+            "5A1A3B",
+            "6F766D"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 28.57,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA00744",
+      "status": "FG OBSERVED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 1034s",
+      "fg_trace_elapsed_s": 1034,
+      "evidence": [
+        {
+          "key": "e0e02aa3c68a13974bd7f78316baaee7ecf42e958e1a80a415befcba3f2bc16a",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 1034,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 30600,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "8517419b3235402c6b0d70bbbcd8978f06e43a26bf29f8e7fbc7f55860ebb7b9",
+            "d3793cf6c16dc1e3d3f857e6fee8ed38194e5045cae33413d1ca507020153bd0"
+          ],
+          "current_originals": [
+            "8517419b3235402c6b0d70bbbcd8978f06e43a26bf29f8e7fbc7f55860ebb7b9",
+            "d3793cf6c16dc1e3d3f857e6fee8ed38194e5045cae33413d1ca507020153bd0"
+          ],
+          "report_ids": [
+            "5A1A3B",
+            "6F766D"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 30.53,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA01015",
+      "status": "FG INACTIVE",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "inert/safe/off observation; telemetry symptom flag: LOW_FPS_LOCK",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "f77c66c12fec4b72d75648ef5f82f69c266005dcd759241ea6b9b46d917062a6",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 284,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 16800,
+          "max_mids": null,
+          "max_cadence_mids": 0,
+          "objects": [
+            "8fef7398b27033cc730c0c7b346c9c1520f4ac1d6b38110de5102eb6e6f74b53"
+          ],
+          "current_originals": [
+            "8fef7398b27033cc730c0c7b346c9c1520f4ac1d6b38110de5102eb6e6f74b53"
+          ],
+          "report_ids": [
+            "D07DD6"
+          ],
+          "discord_links": [],
+          "symptoms": [
+            "SYMPTOM_LOW_FPS_LOCK"
+          ],
+          "real_fps": 59.94,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA03041",
+      "status": "MIXED",
+      "hardware": "Pro",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 1082s; inert/safe/off observation",
+      "fg_trace_elapsed_s": 1082,
+      "evidence": [
+        {
+          "key": "ab1163b820308e3011c9ff67706d25d424df58a318dfebbfc2160940a64ac5f5",
+          "kind": "trace",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 1082,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 61800,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "current_originals": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "report_ids": [
+            "EF1FC9"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 36.73,
+          "third_party_prx": null
+        },
+        {
+          "key": "658eb05b353af3bd06d38be36e600dbca63dfe859c470108e72b533953ca1ded",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 127,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 131,
+          "max_mids": null,
+          "max_cadence_mids": 6,
+          "objects": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "current_originals": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "report_ids": [
+            "EF1FC9"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 12.45,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA04488",
+      "status": "INSUFFICIENT",
+      "hardware": "unknown",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [],
+      "notes": "startup/trace only; no generated output proven",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "b3321162b215bfbba955de405f455872e62a9b67feddfc702aa16abb9f6534f6",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INSUFFICIENT",
+          "duration_s": 0,
+          "engine": "classic",
+          "neo": null,
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 0,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "daf7c33cdfa8d2ee6929f003aa3581e912162bd5ebd13888a935557419287f1f",
+            "ffbd4f4a89509b1a303b1737f44cd499daa9a3f4f3833689328d375f47f998ef"
+          ],
+          "current_originals": [
+            "daf7c33cdfa8d2ee6929f003aa3581e912162bd5ebd13888a935557419287f1f",
+            "ffbd4f4a89509b1a303b1737f44cd499daa9a3f4f3833689328d375f47f998ef"
+          ],
+          "report_ids": [
+            "58870A",
+            "61A97F"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA07319",
+      "status": "SHORT FG TRACE",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 22s",
+      "fg_trace_elapsed_s": 22,
+      "evidence": [
+        {
+          "key": "ca1d3f4b6febb312a6889791ab3080d86c69d94f8f62938833943f2129eace07",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 22,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 606,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "52fd96a39d929cf884a3c22e573147332cca6bb2d9f418b7639238cba7b23123"
+          ],
+          "current_originals": [
+            "52fd96a39d929cf884a3c22e573147332cca6bb2d9f418b7639238cba7b23123"
+          ],
+          "report_ids": [
+            "2347CC"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 35.02,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA07820",
+      "status": "MIXED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic",
+        "new"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 118s; crash marker in boot/trace; causality unproven; inert/safe/off observation",
+      "fg_trace_elapsed_s": 118,
+      "evidence": [
+        {
+          "key": "768b55610c753cff6494518dc75b10324fc63f3021958778e8ab7ceadf6a4729",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 118,
+          "engine": "unknown",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 3000,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "1e4da52b0890c0fcc493a1479ded0c7bab4b768b2c2898fdb177136e952c12e0",
+            "4040663ff3148e7e5fb0cbddf22226af97f0efeb5850630c9b6ac6e0c225ec04",
+            "e3985826665745c3afbbc9cb2d388e0d960ba286e026d4d4e9e759c8bd628fe4",
+            "fe66428a15030e12e3c4ceb0df1875530cfce7733e7c6714cc93fd918aaa5c60"
+          ],
+          "current_originals": [
+            "1e4da52b0890c0fcc493a1479ded0c7bab4b768b2c2898fdb177136e952c12e0",
+            "4040663ff3148e7e5fb0cbddf22226af97f0efeb5850630c9b6ac6e0c225ec04",
+            "e3985826665745c3afbbc9cb2d388e0d960ba286e026d4d4e9e759c8bd628fe4",
+            "fe66428a15030e12e3c4ceb0df1875530cfce7733e7c6714cc93fd918aaa5c60"
+          ],
+          "report_ids": [
+            "166190",
+            "46A7AC",
+            "BB2FCD",
+            "DF69A1"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 30.77,
+          "third_party_prx": null
+        },
+        {
+          "key": "666a5269dbafdbf0a437d237511148e1ca287f5dbf172b4030d94599bf824f01",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 2,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [],
+          "max_present": 0,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "040b7efa51075b8c0d9886d2feefef6fa220e4592b288dd9854b4bea75eb187e"
+          ],
+          "current_originals": [
+            "040b7efa51075b8c0d9886d2feefef6fa220e4592b288dd9854b4bea75eb187e"
+          ],
+          "report_ids": [
+            "BA9D26"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        },
+        {
+          "key": "96fb11e52f0bc9c85995d401cde8fdd22f36660953dc75bad52f2c2e228db8a1",
+          "kind": "trace",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 70,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 30,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "1e4da52b0890c0fcc493a1479ded0c7bab4b768b2c2898fdb177136e952c12e0",
+            "233c4e89a5f5b39f5cd1c3861acb3abf8a0102ca68594120fa3749d0442d9822",
+            "4040663ff3148e7e5fb0cbddf22226af97f0efeb5850630c9b6ac6e0c225ec04",
+            "a26de96c09254f21cfd0900a179f0422eeb0fb68f79454f7d752f3752a10ea78",
+            "e3985826665745c3afbbc9cb2d388e0d960ba286e026d4d4e9e759c8bd628fe4",
+            "fe66428a15030e12e3c4ceb0df1875530cfce7733e7c6714cc93fd918aaa5c60"
+          ],
+          "current_originals": [
+            "1e4da52b0890c0fcc493a1479ded0c7bab4b768b2c2898fdb177136e952c12e0",
+            "233c4e89a5f5b39f5cd1c3861acb3abf8a0102ca68594120fa3749d0442d9822",
+            "4040663ff3148e7e5fb0cbddf22226af97f0efeb5850630c9b6ac6e0c225ec04",
+            "a26de96c09254f21cfd0900a179f0422eeb0fb68f79454f7d752f3752a10ea78",
+            "e3985826665745c3afbbc9cb2d388e0d960ba286e026d4d4e9e759c8bd628fe4",
+            "fe66428a15030e12e3c4ceb0df1875530cfce7733e7c6714cc93fd918aaa5c60"
+          ],
+          "report_ids": [
+            "166190",
+            "42074A",
+            "46A7AC",
+            "BB2FCD",
+            "C94D1C",
+            "DF69A1"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 29.81,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA07875",
+      "status": "MIXED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "fast"
+      ],
+      "notes": "FG logged; trace reaches 50s; crash marker in boot/trace; causality unproven",
+      "fg_trace_elapsed_s": 50,
+      "evidence": [
+        {
+          "key": "a99d22d91eb08158fdc9b312e46edaf29704eff33ff862557051f35007e82baf",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 50,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 600,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "4b19f384847ae31788ba154b916e837028167c63013854af76a6dda3f0afcfa8"
+          ],
+          "current_originals": [
+            "4b19f384847ae31788ba154b916e837028167c63013854af76a6dda3f0afcfa8"
+          ],
+          "report_ids": [
+            "6E70CE"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 27.55,
+          "third_party_prx": null
+        },
+        {
+          "key": "b7e2ea2277e996b4844e646b9b3adb4f461b94561f5dcf0b4ab2687f29043836",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 38,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 1102,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "4b19f384847ae31788ba154b916e837028167c63013854af76a6dda3f0afcfa8"
+          ],
+          "current_originals": [
+            "4b19f384847ae31788ba154b916e837028167c63013854af76a6dda3f0afcfa8"
+          ],
+          "report_ids": [
+            "6E70CE"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA07990",
+      "status": "INSUFFICIENT",
+      "hardware": "unknown",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [],
+      "notes": "startup/trace only; no generated output proven",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "57fe361789cabe908f36b8477fb1a41d031e50a2226919efe7d3780d731f2d85",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INSUFFICIENT",
+          "duration_s": 0,
+          "engine": "classic",
+          "neo": null,
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 0,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "3cdf0fcb9713acc867e756cef0d83ef96b4683db90c20865e8fc345802631013"
+          ],
+          "current_originals": [
+            "3cdf0fcb9713acc867e756cef0d83ef96b4683db90c20865e8fc345802631013"
+          ],
+          "report_ids": [
+            "8B1496"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA08519",
+      "status": "FG INACTIVE",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "fast"
+      ],
+      "notes": "inert/safe/off observation",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "747f13f2038b18a8c703361ed4fe4aa1acab67585089834526799b7386226f49",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 28,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 311,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "12a7f411f709285d64943534f2e8fb2aeced37ebc457cd3ad2dc931f0540ee9c",
+            "38bb32543440024c38a4181a130fdf4d5d587078fc534bc2bbc47665dcaa452c",
+            "795692c13ed54c867403013b5fb1bd0e12bed9cd36bb9b899249555eb1d867ac"
+          ],
+          "current_originals": [
+            "12a7f411f709285d64943534f2e8fb2aeced37ebc457cd3ad2dc931f0540ee9c",
+            "38bb32543440024c38a4181a130fdf4d5d587078fc534bc2bbc47665dcaa452c",
+            "795692c13ed54c867403013b5fb1bd0e12bed9cd36bb9b899249555eb1d867ac"
+          ],
+          "report_ids": [
+            "4F5071",
+            "710086",
+            "9B22E5"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 57.16,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA09249",
+      "status": "FG INACTIVE",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "fast"
+      ],
+      "notes": "inert/safe/off observation",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "bc1a10d2e508ece559a4e6b20fdaee715a6b8dda9492329c6d4a9e60140e7065",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 8,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 30,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "1e9ab342a8bf7c27b2eb258756000ee6117aa8b2238dd24efdd9ca68b141aa16"
+          ],
+          "current_originals": [
+            "1e9ab342a8bf7c27b2eb258756000ee6117aa8b2238dd24efdd9ca68b141aa16"
+          ],
+          "report_ids": [
+            "2BFB41"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 60.3,
+          "third_party_prx": null
+        },
+        {
+          "key": "b196daee6f5b5be60795183fd682efb8a7834253a48a6d01ddfd76af9041a72c",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INSUFFICIENT",
+          "duration_s": 4,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 120,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "1e9ab342a8bf7c27b2eb258756000ee6117aa8b2238dd24efdd9ca68b141aa16"
+          ],
+          "current_originals": [
+            "1e9ab342a8bf7c27b2eb258756000ee6117aa8b2238dd24efdd9ca68b141aa16"
+          ],
+          "report_ids": [
+            "2BFB41"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA10212",
+      "status": "CRASH LOGGED",
+      "hardware": "Pro",
+      "resolutions": [
+        "3840x2160"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [],
+      "notes": "crash marker in boot/trace; causality unproven",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "8226d7f2bbf6e1ee4137c7276a0168ce5b8918efaafb6077f0a98a8993c75f35",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 2,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "3840x2160"
+          ],
+          "max_present": 1,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "53d56fcc1b4944a9bb868a987dc2bcccb78e2dfd6c16f0776202b39e20ec6db8"
+          ],
+          "current_originals": [
+            "53d56fcc1b4944a9bb868a987dc2bcccb78e2dfd6c16f0776202b39e20ec6db8"
+          ],
+          "report_ids": [
+            "9100DC"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA10213",
+      "status": "CRASH LOGGED",
+      "hardware": "Pro",
+      "resolutions": [
+        "3840x2160"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "crash marker in boot/trace; causality unproven; inert/safe/off observation",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "339f22345d50e953a123fc0e36fe36c8962026f63367f7bfc4466f1628de930f",
+          "kind": "boot",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 2,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "3840x2160"
+          ],
+          "max_present": 1,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "0be435b08953d06727cc69968185df19733c5074743e7299760089a5669e9b14",
+            "205fafdcf130f5d0d1e3ba20e2c22cd3745d84d4ac457240563c0f48d39b7788"
+          ],
+          "current_originals": [
+            "0be435b08953d06727cc69968185df19733c5074743e7299760089a5669e9b14",
+            "205fafdcf130f5d0d1e3ba20e2c22cd3745d84d4ac457240563c0f48d39b7788"
+          ],
+          "report_ids": [
+            "646E39",
+            "A9449F"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        },
+        {
+          "key": "7ae1db734c3a413583481c1980f1d6f0db339aea082486192433ca9502816542",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 9,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "3840x2160"
+          ],
+          "max_present": 152,
+          "max_mids": null,
+          "max_cadence_mids": 0,
+          "objects": [
+            "0be435b08953d06727cc69968185df19733c5074743e7299760089a5669e9b14"
+          ],
+          "current_originals": [
+            "0be435b08953d06727cc69968185df19733c5074743e7299760089a5669e9b14"
+          ],
+          "report_ids": [
+            "646E39"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 53.62,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA10237",
+      "status": "UNSUPPORTED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "disabled per v2.36 release notes; short FG telemetry does not override the known crash",
+      "fg_trace_elapsed_s": 15,
+      "evidence": [
+        {
+          "key": "ca147f2500f435f5fcebe2ad26c3cf94d9b5e4fc130761d1edd2648a4415e514",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 15,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 367,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "4f87368e074434c29023c0482973a7775a306079ede656c44f26fff77d578f85"
+          ],
+          "current_originals": [
+            "4f87368e074434c29023c0482973a7775a306079ede656c44f26fff77d578f85"
+          ],
+          "report_ids": [
+            "2DE659"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 27.58,
+          "third_party_prx": null
+        },
+        {
+          "key": "f1075c99030f0cfb976d537facd8aec4f8405a80e18a6316b3dbad9bf006bd25",
+          "kind": "trace",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 9,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 299,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "040909f45d49f565bbb7ecfc26c506d6d7c8bc3381a0789257cf6c197d09fa89",
+            "e563dd1593ac17dfaccb7d07c46547ad339e7cf182fee30b251c979a0260a961"
+          ],
+          "current_originals": [
+            "040909f45d49f565bbb7ecfc26c506d6d7c8bc3381a0789257cf6c197d09fa89",
+            "e563dd1593ac17dfaccb7d07c46547ad339e7cf182fee30b251c979a0260a961"
+          ],
+          "report_ids": [
+            "10295D",
+            "5D4E98"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 40.05,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA10326",
+      "status": "FG OBSERVED",
+      "hardware": "Pro",
+      "resolutions": [
+        "2560x1440"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 181s",
+      "fg_trace_elapsed_s": 181,
+      "evidence": [
+        {
+          "key": "7850d6b895dc8a9ee36d9504535bd176713aaf8483a894658b4fc8ae81d408f3",
+          "kind": "trace",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 181,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "2560x1440"
+          ],
+          "max_present": 600,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "current_originals": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "report_ids": [
+            "EF1FC9"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 33.21,
+          "third_party_prx": null
+        },
+        {
+          "key": "a2a7fde2fff85e0008bd4040f5e37497e5ab14cfbe3fcaf83e8594252d37a9fc",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 69,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "2560x1440"
+          ],
+          "max_present": 1200,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "current_originals": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "report_ids": [
+            "EF1FC9"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 28.41,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA11456",
+      "status": "MIXED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "fast",
+        "quality",
+        "sharp"
+      ],
+      "notes": "FG logged; trace reaches 496s; crash marker in boot/trace; causality unproven; inert/safe/off observation",
+      "fg_trace_elapsed_s": 496,
+      "evidence": [
+        {
+          "key": "1938194f20cd3b04415c790e4074ee88147c122411539501a69e60cb0d6da817",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 496,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 14400,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "23cf5ce5cf51770a73230bec44409e86576f26eb87f0810aadc03ab06321f75c"
+          ],
+          "current_originals": [
+            "23cf5ce5cf51770a73230bec44409e86576f26eb87f0810aadc03ab06321f75c"
+          ],
+          "report_ids": [
+            "AD98C9"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 29.41,
+          "third_party_prx": null
+        },
+        {
+          "key": "e0ab77b901c672dadb6b44e98b08cc5ef4ede1056c9eb62c84bde27c35e59442",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 3,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 0,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "26d8d2e20b991a2656782b330e0c72f1ce8e513c2f18c42d6412bc0e5ebac23b"
+          ],
+          "current_originals": [
+            "26d8d2e20b991a2656782b330e0c72f1ce8e513c2f18c42d6412bc0e5ebac23b"
+          ],
+          "report_ids": [
+            "4CDABA"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        },
+        {
+          "key": "a851ac508e14b392b55a6c772cdff6623376f845dcc299a467665b7984221119",
+          "kind": "trace",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 37,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 30,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "4faa1fbf84e86773126a568e23604864485c2d596de65e757cf4841837388a00"
+          ],
+          "current_originals": [
+            "4faa1fbf84e86773126a568e23604864485c2d596de65e757cf4841837388a00"
+          ],
+          "report_ids": [
+            "7E9166"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 28.06,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA11995",
+      "status": "INSUFFICIENT",
+      "hardware": "Pro",
+      "resolutions": [
+        "3840x2160"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "startup/trace only; no generated output proven",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "2a89c1526b366dcf7de9ec765713b82930c47b980aedcc7318becda04ddb4f14",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INSUFFICIENT",
+          "duration_s": 33,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "3840x2160"
+          ],
+          "max_present": 600,
+          "max_mids": null,
+          "max_cadence_mids": 19,
+          "objects": [
+            "79a6c7d24e62b801ac2b83d739f5897162dc1ccc77e9b3af5e45f2e1e3482c75"
+          ],
+          "current_originals": [
+            "79a6c7d24e62b801ac2b83d739f5897162dc1ccc77e9b3af5e45f2e1e3482c75"
+          ],
+          "report_ids": [
+            "06A49F"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 28.66,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA12771",
+      "status": "FG INACTIVE",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "inert/safe/off observation",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "315d77642d6f8c04e61cd96190b77544660b92c216d639e8c8596df40dfaacce",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 485,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 17753,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "4908f45fb3ce1435dd3cb128c28410c79416e06c6828da4bc115f6694138e33c",
+            "4cce0e4455aa37e77f399ef46df835ad3beb880e39cd6b7c368cc131fdf7a993",
+            "8f817dea5f24f309d6399fa89cc5387df1625ce1e623ac806966d48e18c2080f",
+            "bffa35a3e5d0cdfd3b7d0932a5af15b7a25392fb141855c51cd88060906531a6"
+          ],
+          "current_originals": [
+            "4908f45fb3ce1435dd3cb128c28410c79416e06c6828da4bc115f6694138e33c",
+            "4cce0e4455aa37e77f399ef46df835ad3beb880e39cd6b7c368cc131fdf7a993",
+            "8f817dea5f24f309d6399fa89cc5387df1625ce1e623ac806966d48e18c2080f",
+            "bffa35a3e5d0cdfd3b7d0932a5af15b7a25392fb141855c51cd88060906531a6"
+          ],
+          "report_ids": [
+            "730C8B",
+            "95B810",
+            "FF5C7A"
+          ],
+          "discord_links": [
+            "https://discord.com/channels/1561812282273431703/1566651768656625785/1566651768656625785"
+          ],
+          "symptoms": [],
+          "real_fps": 48.96,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA13323",
+      "status": "MIXED",
+      "hardware": "Base/Slim/Pro",
+      "resolutions": [
+        "1920x1080",
+        "3840x2160"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "fast",
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 331s; crash marker in boot/trace; causality unproven; inert/safe/off observation",
+      "fg_trace_elapsed_s": 331,
+      "evidence": [
+        {
+          "key": "1ce47084d39002ad3b27da312b4a2c7389420e75a0e7640116b8b819f8b05e19",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 331,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 9000,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "8e3ffaac327db92fd599a6c31a6c6fd09124431154c25aa89cb748ee8d836dd4"
+          ],
+          "current_originals": [
+            "8e3ffaac327db92fd599a6c31a6c6fd09124431154c25aa89cb748ee8d836dd4"
+          ],
+          "report_ids": [
+            "FBDAE3"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 27.94,
+          "third_party_prx": null
+        },
+        {
+          "key": "ae8d05dd6830c3aa04cfc3da94bb982fe784707ceb95604da7144ffa20d6303c",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 3,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "3840x2160"
+          ],
+          "max_present": 0,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "64887edb9f54cdd7124567510a4a457c6a32f12b680537183a2980d521fa584d"
+          ],
+          "current_originals": [
+            "64887edb9f54cdd7124567510a4a457c6a32f12b680537183a2980d521fa584d"
+          ],
+          "report_ids": [
+            "E57A63"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        },
+        {
+          "key": "3cf089dd68ea90a2ec611dacb681a3c1afc1dbe1a51dc55fc765a7d973d4a5e1",
+          "kind": "trace",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 91,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "3840x2160"
+          ],
+          "max_present": 30,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "64887edb9f54cdd7124567510a4a457c6a32f12b680537183a2980d521fa584d"
+          ],
+          "current_originals": [
+            "64887edb9f54cdd7124567510a4a457c6a32f12b680537183a2980d521fa584d"
+          ],
+          "report_ids": [
+            "E57A63"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 28.9,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA14655",
+      "status": "FG INACTIVE",
+      "hardware": "Pro",
+      "resolutions": [
+        "3840x2160"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "inert/safe/off observation",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "5673af46fbbdef9b9f7083d2d85cbc02796524807580311ec415647e6f0fc6d6",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 114,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "3840x2160"
+          ],
+          "max_present": 913,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "current_originals": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "report_ids": [
+            "EF1FC9"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 26.72,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA15633",
+      "status": "MIXED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 132s; inert/safe/off observation; telemetry symptom flag: LOW_FPS_LOCK",
+      "fg_trace_elapsed_s": 132,
+      "evidence": [
+        {
+          "key": "374619b3a28e116a2242eb99304800a1e5cdcb2ae4b4d61cc9d668ca831ca67a",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 132,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 3600,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "7235bc589bb4df687735c2963b7ab77de50e5cf1e66ee50946bc14ee141d65e6"
+          ],
+          "current_originals": [
+            "7235bc589bb4df687735c2963b7ab77de50e5cf1e66ee50946bc14ee141d65e6"
+          ],
+          "report_ids": [
+            "BF88B8"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 36.45,
+          "third_party_prx": null
+        },
+        {
+          "key": "fec67ff45299c315d37e682932501193fc4c11c4f7bb0e6a69ca1904cdf5e06b",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 133,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 3600,
+          "max_mids": null,
+          "max_cadence_mids": 0,
+          "objects": [
+            "5be2901e8d184cfc371440b810f955dbee52ae6ea72b0f0974fccffab7431d9a",
+            "a55ceccca12cdc22e9e62767935a0bf172a5af5a68ff88b261a856619a817e8d",
+            "ddb456bc5d2276c3246e5efbf63447c2730f2a1727c12e38ef4efe2bd3749a6e",
+            "fc033e2eb3a12181234fb286ddebdea2d1b59681c51a03eb82c1d9e9edbefd99"
+          ],
+          "current_originals": [
+            "5be2901e8d184cfc371440b810f955dbee52ae6ea72b0f0974fccffab7431d9a",
+            "a55ceccca12cdc22e9e62767935a0bf172a5af5a68ff88b261a856619a817e8d",
+            "ddb456bc5d2276c3246e5efbf63447c2730f2a1727c12e38ef4efe2bd3749a6e",
+            "fc033e2eb3a12181234fb286ddebdea2d1b59681c51a03eb82c1d9e9edbefd99"
+          ],
+          "report_ids": [
+            "B54EF8",
+            "CA9827",
+            "DD07C2",
+            "DEB443"
+          ],
+          "discord_links": [],
+          "symptoms": [
+            "SYMPTOM_LOW_FPS_LOCK"
+          ],
+          "real_fps": 36.0,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA18097",
+      "status": "FG INACTIVE",
+      "hardware": "Pro",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "inert/safe/off observation; current community report: menu hotkey does not open overlay",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "ea20ee7dde256b8efa46ac104fdbc7de44c82e295dca07efecbb90e60f88d18e",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 84,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 4771,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "current_originals": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "report_ids": [
+            "EF1FC9"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 57.21,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA18676",
+      "status": "CRASH LOGGED",
+      "hardware": "Base/Slim",
+      "resolutions": [],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [],
+      "notes": "crash marker in boot/trace; causality unproven",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "919c1a0300de628c1f6b72600b5282cc556c002a773a0a8c2a96efcff6028fde",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 3,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [],
+          "max_present": 0,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "95f009ff09ae77eec8affa4467279603b457c06636c73e81e92e25398b37d89b"
+          ],
+          "current_originals": [
+            "95f009ff09ae77eec8affa4467279603b457c06636c73e81e92e25398b37d89b"
+          ],
+          "report_ids": [
+            "752535"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA18723",
+      "status": "CRASH LOGGED",
+      "hardware": "Pro",
+      "resolutions": [
+        "3200x1800"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [],
+      "notes": "crash marker in boot/trace; causality unproven",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "9f285203089dede15061706b5bd204b154c0b7378b446b9afdb952efba6c3180",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 66,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "3200x1800"
+          ],
+          "max_present": 1715,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "fde4aeae60963a2dfc340c20651c06602e21d1c17ccaf2d0bea5df41df44c600"
+          ],
+          "current_originals": [
+            "fde4aeae60963a2dfc340c20651c06602e21d1c17ccaf2d0bea5df41df44c600"
+          ],
+          "report_ids": [
+            "997848"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA18740",
+      "status": "CRASH LOGGED",
+      "hardware": "Base/Slim/Pro",
+      "resolutions": [
+        "1920x1080",
+        "3840x2160"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality",
+        "sharp"
+      ],
+      "notes": "crash marker in boot/trace; causality unproven; inert/safe/off observation",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "5ae7248ded816d50a07a6512549d1ebb0a807fb86cec87df15da46b0267a61a8",
+          "kind": "boot",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 2,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [],
+          "max_present": 0,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "01981f2f100a0eb7ee360fc6bfba472186582d8ac85e84ec5d1d294d1cd4b7f1",
+            "3b180ba85ebf531f4bb34212253d8a3eb90e4d0d0c47fc515bdcc375ccd77cd8",
+            "84b4c51c78a09405be2aad01f242b5e5f149c7877ac1a326c174f4be43f032f8"
+          ],
+          "current_originals": [
+            "01981f2f100a0eb7ee360fc6bfba472186582d8ac85e84ec5d1d294d1cd4b7f1",
+            "3b180ba85ebf531f4bb34212253d8a3eb90e4d0d0c47fc515bdcc375ccd77cd8",
+            "84b4c51c78a09405be2aad01f242b5e5f149c7877ac1a326c174f4be43f032f8"
+          ],
+          "report_ids": [
+            "3CF4F3",
+            "761D46",
+            "96A3F4"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        },
+        {
+          "key": "ec823fb858accd14847089857e496990056a77b778bb3d5972b01cd48febcac1",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 1890,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 102897,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "01981f2f100a0eb7ee360fc6bfba472186582d8ac85e84ec5d1d294d1cd4b7f1",
+            "3b180ba85ebf531f4bb34212253d8a3eb90e4d0d0c47fc515bdcc375ccd77cd8",
+            "84b4c51c78a09405be2aad01f242b5e5f149c7877ac1a326c174f4be43f032f8"
+          ],
+          "current_originals": [
+            "01981f2f100a0eb7ee360fc6bfba472186582d8ac85e84ec5d1d294d1cd4b7f1",
+            "3b180ba85ebf531f4bb34212253d8a3eb90e4d0d0c47fc515bdcc375ccd77cd8",
+            "84b4c51c78a09405be2aad01f242b5e5f149c7877ac1a326c174f4be43f032f8"
+          ],
+          "report_ids": [
+            "3CF4F3",
+            "761D46",
+            "96A3F4"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 55.7,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA24705",
+      "status": "SHORT FG TRACE",
+      "hardware": "Pro",
+      "resolutions": [
+        "3200x1800"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 37s",
+      "fg_trace_elapsed_s": 37,
+      "evidence": [
+        {
+          "key": "cdcb4ffca27cb56d23d9a649c79c097c66a82f585cc6ec231ecb2a85968cb274",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 37,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "3200x1800"
+          ],
+          "max_present": 1200,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "9311549c8360b747cdcf4017c5cb0ff37deb9519468c2edf45bf4c384e2a48e0"
+          ],
+          "current_originals": [
+            "9311549c8360b747cdcf4017c5cb0ff37deb9519468c2edf45bf4c384e2a48e0"
+          ],
+          "report_ids": [
+            "F52488"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 40.23,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA26347",
+      "status": "SHORT FG TRACE",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 25s",
+      "fg_trace_elapsed_s": 25,
+      "evidence": [
+        {
+          "key": "33392dda3dc08962c68a8d95a0fb6ac17fec38b40eaf01c92201d7822a70b142",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 25,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 131,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "8325a7dd062c527c158680f39329d9a2ae541653a53275beacd69937117c83ca",
+            "ccafe3de9c7e15d8c8da459f9c838c6353bdb4607e9a4582a0188a0485fdc933"
+          ],
+          "current_originals": [
+            "8325a7dd062c527c158680f39329d9a2ae541653a53275beacd69937117c83ca",
+            "ccafe3de9c7e15d8c8da459f9c838c6353bdb4607e9a4582a0188a0485fdc933"
+          ],
+          "report_ids": [
+            "682E90",
+            "9586BB"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 18.1,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA26506",
+      "status": "SHORT FG TRACE",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 39s",
+      "fg_trace_elapsed_s": 39,
+      "evidence": [
+        {
+          "key": "405c3ad08e9a60ee6ee488e537c9796f8f84338fd3329223be7105bc333d3bae",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 39,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 453,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "c8877eaca7195613ce0300731ba4262b4236bd322d38b41198563bd8ec89dfa6"
+          ],
+          "current_originals": [
+            "c8877eaca7195613ce0300731ba4262b4236bd322d38b41198563bd8ec89dfa6"
+          ],
+          "report_ids": [
+            "19A88A"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 28.57,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA26619",
+      "status": "FG INACTIVE",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "inert/safe/off observation",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "94dbf1b567aacbbc888ed729709ec80bb890af2c28d005d30efee6b22f018d8e",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 28,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 30,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "8fef7398b27033cc730c0c7b346c9c1520f4ac1d6b38110de5102eb6e6f74b53"
+          ],
+          "current_originals": [
+            "8fef7398b27033cc730c0c7b346c9c1520f4ac1d6b38110de5102eb6e6f74b53"
+          ],
+          "report_ids": [
+            "D07DD6"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 24.9,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA28561",
+      "status": "MIXED",
+      "hardware": "Base/Slim/Pro",
+      "resolutions": [
+        "1920x1080",
+        "3200x1800"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 44s; crash marker in boot/trace; causality unproven; telemetry symptom flag: AUDIO_DM_STARVATION",
+      "fg_trace_elapsed_s": 44,
+      "evidence": [
+        {
+          "key": "65bee0b0d84ff19884b344b1074cf8a9e2fe7f6e7c447c320ae431f57de25d8d",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 44,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "3200x1800"
+          ],
+          "max_present": 1200,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "3f10156d84ba4ec821e59b2f9e09f63eaae395649f76a4f4f00bb5d62e90f59a"
+          ],
+          "current_originals": [
+            "3f10156d84ba4ec821e59b2f9e09f63eaae395649f76a4f4f00bb5d62e90f59a"
+          ],
+          "report_ids": [
+            "40596A"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 29.05,
+          "third_party_prx": null
+        },
+        {
+          "key": "c058aad4218aba3847ee22b0cf5676fa62f5933d55b567d48ef5463b4c04ab93",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 70,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 1829,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "d2fcf56cbd2a7fdebfde98039820cfbd16d361ea13a641b65b061ec17c04dc59"
+          ],
+          "current_originals": [
+            "d2fcf56cbd2a7fdebfde98039820cfbd16d361ea13a641b65b061ec17c04dc59"
+          ],
+          "report_ids": [
+            "0A8A2C"
+          ],
+          "discord_links": [],
+          "symptoms": [
+            "SYMPTOM_AUDIO_DM_STARVATION"
+          ],
+          "real_fps": null,
+          "third_party_prx": null
+        },
+        {
+          "key": "45c85864922d92a86031ea3e7888a3529960cbff74eee7283d7037a985ebc922",
+          "kind": "boot",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "INSUFFICIENT",
+          "duration_s": 13,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "3200x1800"
+          ],
+          "max_present": 160,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "3f10156d84ba4ec821e59b2f9e09f63eaae395649f76a4f4f00bb5d62e90f59a"
+          ],
+          "current_originals": [
+            "3f10156d84ba4ec821e59b2f9e09f63eaae395649f76a4f4f00bb5d62e90f59a"
+          ],
+          "report_ids": [
+            "40596A"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA28863",
+      "status": "FG INACTIVE",
+      "hardware": "Pro",
+      "resolutions": [
+        "3200x1800"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "inert/safe/off observation",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "c6dc4fff1917d572ac6cd2307eb0491d8b6a0236fe29f81448305c66c0134b09",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 63,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "3200x1800"
+          ],
+          "max_present": 2837,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "current_originals": [
+            "5aaa73ce0e474f27d97224c5c4d27b45f195e10e187a3319479155ba4a2117fc"
+          ],
+          "report_ids": [
+            "EF1FC9"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 47.46,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA31695",
+      "status": "SHORT FG TRACE",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 20s",
+      "fg_trace_elapsed_s": 20,
+      "evidence": [
+        {
+          "key": "465ffd5c130d6283c6ede1380024c22ae6ad56c7e0ff4082fbe2ae8dab2bb919",
+          "kind": "trace",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 20,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 153,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "ea1abbfbd26107045a7c6c97499ffac19312314188b28f377b3e922541c58f5d"
+          ],
+          "current_originals": [
+            "ea1abbfbd26107045a7c6c97499ffac19312314188b28f377b3e922541c58f5d"
+          ],
+          "report_ids": [
+            "2FC876"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 28.78,
+          "third_party_prx": null
+        },
+        {
+          "key": "bfe64a1889267db981fc2711bc7a65c1546d7b0d7270c2dc4343a0f01b1c51fb",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 19,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 154,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "ea1abbfbd26107045a7c6c97499ffac19312314188b28f377b3e922541c58f5d"
+          ],
+          "current_originals": [
+            "ea1abbfbd26107045a7c6c97499ffac19312314188b28f377b3e922541c58f5d"
+          ],
+          "report_ids": [
+            "2FC876"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 28.68,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA33151",
+      "status": "FG OBSERVED",
+      "hardware": "Base/Slim/Pro",
+      "resolutions": [
+        "1920x1080",
+        "2560x1440"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 323s",
+      "fg_trace_elapsed_s": 323,
+      "evidence": [
+        {
+          "key": "cc8fd5ed968c9dec8173b6017077ecd3f3fbd417a44986397943e7581dba33a0",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 323,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 9000,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "3b2d555e8f4fb0c5fced6f210c60393d3e2c4dc5f3113c0840fbbbbba4c2a182",
+            "74f313c4b7fd7f8b769f2c424bc2e8aa6846ab064f5c8b8513063bb69640d921"
+          ],
+          "current_originals": [
+            "3b2d555e8f4fb0c5fced6f210c60393d3e2c4dc5f3113c0840fbbbbba4c2a182",
+            "74f313c4b7fd7f8b769f2c424bc2e8aa6846ab064f5c8b8513063bb69640d921"
+          ],
+          "report_ids": [
+            "4F26A5",
+            "8EC4C8"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 28.73,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA33387",
+      "status": "CRASH LOGGED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [],
+      "notes": "crash marker in boot/trace; causality unproven",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "9b91b7748ba6db26c4786757df22dcfb2c12b4cdc56231c86168c858c4763416",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 15,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 10911,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "7ea0847362cea86d0b6f9dd9c534684d008e716ee9d832b8c11f8dc21f9d229d"
+          ],
+          "current_originals": [
+            "7ea0847362cea86d0b6f9dd9c534684d008e716ee9d832b8c11f8dc21f9d229d"
+          ],
+          "report_ids": [
+            "EB48B6"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA33388",
+      "status": "FG OBSERVED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1280x720",
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 121s",
+      "fg_trace_elapsed_s": 121,
+      "evidence": [
+        {
+          "key": "1ed14170de86625aa1b8faf91204ff76ee2bb90e9621f06492d0568dd12579be",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 121,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 4800,
+          "max_mids": null,
+          "max_cadence_mids": 40,
+          "objects": [
+            "4fbddba54372694dbd430a8ce2201a7a19be60e1115721eadc823a50b65c31f0"
+          ],
+          "current_originals": [
+            "4fbddba54372694dbd430a8ce2201a7a19be60e1115721eadc823a50b65c31f0"
+          ],
+          "report_ids": [
+            "79C111"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 40.12,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA34016",
+      "status": "FG INACTIVE",
+      "hardware": "Pro",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "inert/safe/off observation",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "c24c5b2c15efd83a3b4eabf604900bb33dbbadd1e0a22ae00f73ed60295d9bd1",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 819,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 1813,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "9eaedc53224a9cdb13bcc22f6c630b2dd3a7107052cb1b8f4e3214aea5e3c6a7"
+          ],
+          "current_originals": [
+            "9eaedc53224a9cdb13bcc22f6c630b2dd3a7107052cb1b8f4e3214aea5e3c6a7"
+          ],
+          "report_ids": [
+            "A8FD0C"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 31.4,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA36843",
+      "status": "FG OBSERVED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 970s",
+      "fg_trace_elapsed_s": 970,
+      "evidence": [
+        {
+          "key": "cbecd88d835b823643c5246ecea0b80b6bb235f41536cc827ab922e6bf83e498",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 970,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 28200,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "8fef7398b27033cc730c0c7b346c9c1520f4ac1d6b38110de5102eb6e6f74b53"
+          ],
+          "current_originals": [
+            "8fef7398b27033cc730c0c7b346c9c1520f4ac1d6b38110de5102eb6e6f74b53"
+          ],
+          "report_ids": [
+            "D07DD6"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 30.44,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA42378",
+      "status": "INSUFFICIENT",
+      "hardware": "Pro",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "startup/trace only; no generated output proven",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "4f806a1fcba7a281568f5c4ce763de9ac690165c41ebf6ba52c80a176429cf7f",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INSUFFICIENT",
+          "duration_s": 18,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 121,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "bacb3de7d3926e472a2105db9daeb725e54cf5a9917b7fa0acd45a61c91500d4"
+          ],
+          "current_originals": [
+            "bacb3de7d3926e472a2105db9daeb725e54cf5a9917b7fa0acd45a61c91500d4"
+          ],
+          "report_ids": [
+            "ED24E7"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 1.07,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA43772",
+      "status": "SHORT FG TRACE",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 18s",
+      "fg_trace_elapsed_s": 18,
+      "evidence": [
+        {
+          "key": "d8ff99ebdb0f20f03c6315e3a4badcfdc157e3578f5113ac5f1392c26db97877",
+          "kind": "trace",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 18,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 155,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "7d5b964827a97db726bd0384101299e46b96913fc702ff5fe513671d3473a1aa"
+          ],
+          "current_originals": [
+            "7d5b964827a97db726bd0384101299e46b96913fc702ff5fe513671d3473a1aa"
+          ],
+          "report_ids": [
+            "9CC47B"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 29.64,
+          "third_party_prx": null
+        },
+        {
+          "key": "ebd40cfa2283e04da8c5c14a4d5b31fb5c8e68e9d1730ec743a1611201f781c7",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 17,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 155,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "7d5b964827a97db726bd0384101299e46b96913fc702ff5fe513671d3473a1aa",
+            "f40287034925d6a730a7ff7a8fa7146b508ccde4e6c2d8d705e52e102f973a97"
+          ],
+          "current_originals": [
+            "7d5b964827a97db726bd0384101299e46b96913fc702ff5fe513671d3473a1aa",
+            "f40287034925d6a730a7ff7a8fa7146b508ccde4e6c2d8d705e52e102f973a97"
+          ],
+          "report_ids": [
+            "04F9F0",
+            "9CC47B"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 29.68,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA43932",
+      "status": "CRASH LOGGED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [],
+      "notes": "crash marker in boot/trace; causality unproven",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "c9c60bf5743633f7ba61c1f49caf61de053086074536f06ebd83130fe183d9ad",
+          "kind": "boot",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "CRASH",
+          "duration_s": 15721,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 457985,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "68918392d6e645410ee056fa7be536a08c2bfc761ddd743d44adfc221d701068"
+          ],
+          "current_originals": [
+            "68918392d6e645410ee056fa7be536a08c2bfc761ddd743d44adfc221d701068"
+          ],
+          "report_ids": [
+            "55A4CC"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA44372",
+      "status": "FG INACTIVE",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "inert/safe/off observation; telemetry symptom flag: LOW_FPS_LOCK",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "fa61c8fd4254ef64e411539527f1e2ce58d7580fe0278f1a479f7309761affe4",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 275,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 8470,
+          "max_mids": null,
+          "max_cadence_mids": 0,
+          "objects": [
+            "02ee4b7a155fb4000ed8fc5902e58359211915f4fa8eea93ecab6de15da8c207"
+          ],
+          "current_originals": [
+            "02ee4b7a155fb4000ed8fc5902e58359211915f4fa8eea93ecab6de15da8c207"
+          ],
+          "report_ids": [
+            "899A18"
+          ],
+          "discord_links": [],
+          "symptoms": [
+            "SYMPTOM_LOW_FPS_LOCK"
+          ],
+          "real_fps": 53.14,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA44878",
+      "status": "FG INACTIVE",
+      "hardware": "Pro",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "inert/safe/off observation",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "3ca5f13e0e250e4867d57599fc5a561a02ca8dd1d45dae97f430124866c8a502",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 10,
+          "engine": "classic",
+          "neo": "1",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 121,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "de1ef35d08a87b7ccea88794769c7a716f228c04b7b64f22cbefe0f1212c6fc1"
+          ],
+          "current_originals": [
+            "de1ef35d08a87b7ccea88794769c7a716f228c04b7b64f22cbefe0f1212c6fc1"
+          ],
+          "report_ids": [
+            "880803"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 17.65,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA57220",
+      "status": "MIXED",
+      "hardware": "Base/Slim",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [
+        "quality"
+      ],
+      "notes": "FG logged; trace reaches 79s; inert/safe/off observation; telemetry symptom flag: LOW_FPS_LOCK",
+      "fg_trace_elapsed_s": 79,
+      "evidence": [
+        {
+          "key": "ef6213609db1f776b7ad8704cf54934f415739f52a1ff7d1a048dd2f6d1bbba5",
+          "kind": "trace",
+          "slot": "prev",
+          "version": "2.36",
+          "status": "FG_OBSERVED",
+          "duration_s": 79,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 1800,
+          "max_mids": null,
+          "max_cadence_mids": 60,
+          "objects": [
+            "8fef7398b27033cc730c0c7b346c9c1520f4ac1d6b38110de5102eb6e6f74b53"
+          ],
+          "current_originals": [
+            "8fef7398b27033cc730c0c7b346c9c1520f4ac1d6b38110de5102eb6e6f74b53"
+          ],
+          "report_ids": [
+            "D07DD6"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": 45.69,
+          "third_party_prx": null
+        },
+        {
+          "key": "83e354fc8e3696a6983070bc14e321772862bbc58b93caba575d893364dad348",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INERT",
+          "duration_s": 444,
+          "engine": "classic",
+          "neo": "0",
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 23814,
+          "max_mids": null,
+          "max_cadence_mids": 0,
+          "objects": [
+            "02ee4b7a155fb4000ed8fc5902e58359211915f4fa8eea93ecab6de15da8c207"
+          ],
+          "current_originals": [
+            "02ee4b7a155fb4000ed8fc5902e58359211915f4fa8eea93ecab6de15da8c207"
+          ],
+          "report_ids": [
+            "899A18"
+          ],
+          "discord_links": [],
+          "symptoms": [
+            "SYMPTOM_LOW_FPS_LOCK"
+          ],
+          "real_fps": 56.91,
+          "third_party_prx": null
+        }
+      ]
+    },
+    {
+      "title_id": "CUSA81396",
+      "status": "INSUFFICIENT",
+      "hardware": "unknown",
+      "resolutions": [
+        "1920x1080"
+      ],
+      "engines": [
+        "classic"
+      ],
+      "observed_modes": [],
+      "notes": "startup/trace only; no generated output proven",
+      "fg_trace_elapsed_s": 0,
+      "evidence": [
+        {
+          "key": "21339fd9f034485cb7e6339d856d4e74b1a53fc598a011073d93e6ae83c29074",
+          "kind": "trace",
+          "slot": "curr",
+          "version": "2.36",
+          "status": "INSUFFICIENT",
+          "duration_s": 0,
+          "engine": "classic",
+          "neo": null,
+          "resolution": [
+            "1920x1080"
+          ],
+          "max_present": 0,
+          "max_mids": null,
+          "max_cadence_mids": null,
+          "objects": [
+            "54971cb8ee9e7a17875b899b74c516c2461bb63b7c1e7382205e9cfca0700943"
+          ],
+          "current_originals": [
+            "54971cb8ee9e7a17875b899b74c516c2461bb63b7c1e7382205e9cfca0700943"
+          ],
+          "report_ids": [
+            "66EF5E"
+          ],
+          "discord_links": [],
+          "symptoms": [],
+          "real_fps": null,
+          "third_party_prx": null
+        }
+      ]
+    }
+  ]
+}
