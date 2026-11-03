@@ -69,6 +69,8 @@ class TestT19PartA(unittest.TestCase):
 typedef struct {{ int preset, sharpness, upscale; }} fg_config_t;
 static fg_config_t g_cfg;
 static uint32_t g_sh8_off[16] = {{ [14] = 0x18D00u }};
+static volatile int g_pb_level = 0;   /* post budget level (post_budget.h): 0 = the player's settings */
+static void pb_eff(int level, int sharp, int enh, int *so, int *eo) {{ (void)level; *so = sharp; *eo = enh; }}
 {fn_src}
 int main(void) {{
     g_cfg.preset = 1;
