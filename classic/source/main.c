@@ -467,7 +467,7 @@ static volatile uint32_t *g_mon = NULL;
 static uint32_t g_sh8_off[17];         // code offsets in g_gpu: 0..9 pyr8..mf8, 10..13 gv8..gvz8, 14 rcas8, 15 osd8, 16 pcopy8
 #define STATS_OFF 0x960u
 #define CUT_BLOCKS 5600u
-static uint32_t g_st_n = 0, g_st_cut_max = 0, g_st_cuts = 0, g_st_fgf = 0, g_st_fades = 0;
+static uint32_t g_st_n = 0, g_st_cut_max = 0, g_st_cuts = 0, g_st_fgf = 0, g_st_fades = 0, g_st_fades_hi = 0;
 static uint64_t g_st_cut_sum = 0, g_st_fg_sum = 0;
 static int32_t g_st_gmx = 0, g_st_gmy = 0;
 static uint64_t g_pyr_last_cur_base = 0;
@@ -567,6 +567,9 @@ static volatile int g_st_fg_on = 0;          // more than half of the last ~0.25
 static volatile int g_st_shq_on = 0, g_st_pace_timer = 0;
 static volatile uint32_t g_st_gv_frames = 0, g_st_gv_hits = 0;   // real frames / of them with warp8g (game vectors applied)
 static volatile int g_st_gv_active = 0;      // more than half of the last ~0.25 s window (io thread)
+// Option fade_hi (config-<TITLE>.ini, default 1): me1 also takes a frame luma-sum change above 8 % as a fade while the
+// camera vector moves (consts.flags bit 13, FG8_FLAG_FADE_HI); the FRAMES line counts those frames as fade_hi frames.
+static volatile int g_fade_hi = 1;
 static void opt_state_now(const fg_config_t *c, OptState *s);
 static void opt_log_effective(const char *why);
 
@@ -1652,7 +1655,7 @@ static uint32_t build_dcb_flow8(uint32_t *p0, uint64_t P, uint64_t C, uint64_t M
                         | (g_opt_notp ? 64u : 0u) | (g_opt_nomf ? 128u : 0u) | (g_opt_notex ? 256u : 0u)
                         | (g_opt_notpg ? 512u : 0u) | (g_opt_sharp ? 1024u : 0u) | (g_opt_nostr ? 2048u : 0u)
                         | (pyr_warm ? FG8_FLAG_PYR_WARM : 0u)
-                        | ((g_opt_fast || g_cfg.preset == 1) ? FG8_FLAG_FAST : 0u)
+                        | ((g_opt_fast || g_cfg.preset == 1) ? FG8_FLAG_FAST : 0u) | (g_fade_hi ? FG8_FLAG_FADE_HI : 0u)
                         | (cut_blocks8() << 16);
     uint32_t mid1_packed = (mid1_idx & 0x7FFFu) | ((t1_q16 & 0xFFFFu) << 16);
     // History copy on a 3-buffer ring (CUSA18723 only for now): the game flips its buffers strictly in turn, so the
@@ -1973,6 +1976,7 @@ static void cfg_apply_title_defaults(fg_config_t *c)
 static void cfg_defaults(fg_config_t *c)
 {
     c->framegen       = (g_known_game && !g_detected_60fps) ? 1 : 0;
+    g_fade_hi         = 1;   // option fade_hi: the same, a file without the key means on
     c->mode           = 8;
     c->preset         = 0;
     c->sharpness      = 40;
@@ -2050,6 +2054,7 @@ static int parse_ini_file_ex(const char *path, fg_config_t *c, uint32_t *hash_io
                 else if (strcmp(key, "game_vectors") == 0) c->game_vectors = (val != 0);
                 else if (strcmp(key, "tile_idx") == 0) g_tile_override = val < 0 ? -1 : (val > 31 ? 31 : val);
                 else if (strcmp(key, "tile_sweep") == 0) g_tile_sweep = val ? 1 : 0;
+                else if (strcmp(key, "fade_hi") == 0) g_fade_hi = (val != 0);
                 else if (strcmp(key, "t6_bit") == 0) g_t6_bit_override = val < 0 ? -1 : (val > 31 ? 31 : val);
                 else if (strcmp(key, "fps_lock") == 0) c->fps_lock = (val == 20 || val == 30 || val == 60) ? val : 0;
                 else if (strcmp(key, "below30") == 0) c->below30 = (val != 0);
@@ -2238,6 +2243,7 @@ static void cfg_apply_live(const fg_config_t *c, const char *reason)
            c->hud_protect, c->game_vectors, c->fps_lock, c->overlay, c->menu_opacity, c->below30, c->shallow_queue);
         if (c->dbg_mark_gen || c->dbg_rec_shift || strcmp(reason, "init") == 0 || strcmp(reason, "hot-reload") == 0)
             lg("debug rec (%s): dbg_mark_gen=%d dbg_rec_shift=%d\n", reason, c->dbg_mark_gen, c->dbg_rec_shift);
+        lg("fade_hi: %s (option fade_hi; FRAMES lines count its fades as fade_hi frames)\n", g_fade_hi ? "on" : "off");
         opt_log_effective(reason);
     }
 }
@@ -3575,6 +3581,7 @@ static void cfg_save_game_ini(void)
     fprintf(f, "fps_lock = %d\n", c.fps_lock);
     fprintf(f, "below30 = %d\n", c.below30);
     fprintf(f, "shallow_queue = %d\n", c.shallow_queue);
+    fprintf(f, "fade_hi = %d\n", g_fade_hi ? 1 : 0);
     fprintf(f, "menu_hold_ms = %d\n", c.menu_hold_ms);
     fprintf(f, "menu_opacity = %d\n", c.menu_opacity);
     fprintf(f, "overlay = %d\n", c.overlay);
@@ -4678,7 +4685,9 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                 uint32_t cb_thr = cut_blocks8() ? cut_blocks8() * 8u : CUT_BLOCKS;
                                 if (cn > cb_thr) g_st_cuts++;
                                 if (fgn) g_st_fgf++;
-                                if (stv[4] == 1u) g_st_fades++;
+                                // me1 fade flag: 1 = 2 % fade with a still camera, 2 = fade_hi only (option fade_hi)
+                                if (stv[4] == 1u || stv[4] == 2u) g_st_fades++;
+                                if (stv[4] == 2u) g_st_fades_hi++;
                                 g_st_gmx = (int32_t)stv[1]; g_st_gmy = (int32_t)stv[2];
                             }
                         }
@@ -4728,10 +4737,10 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                                 g_pp_split_n = 0; g_pp_g2_n = 0;
                                 if (g_st_n)
                                     lgd("FRAMES %u: unmatched blocks avg %.0f max %u, scene-cut frames %u, fade frames %u | foreground: "
-                                       "in %u frames, avg %.1f L2 blocks | camera %d,%d L2 px | log lines dropped %u\n", g_st_n,
+                                       "in %u frames, avg %.1f L2 blocks | camera %d,%d L2 px | log lines dropped %u | fade_hi frames %u\n", g_st_n,
                                        (double)g_st_cut_sum / g_st_n, g_st_cut_max, g_st_cuts, g_st_fades, g_st_fgf,
-                                       (double)g_st_fg_sum / g_st_n, g_st_gmx, g_st_gmy, g_lgq_drop);
-                                g_st_n = g_st_cut_max = g_st_cuts = g_st_fgf = g_st_fades = 0; g_st_cut_sum = g_st_fg_sum = 0;
+                                       (double)g_st_fg_sum / g_st_n, g_st_gmx, g_st_gmy, g_lgq_drop, g_st_fades_hi);
+                                g_st_n = g_st_cut_max = g_st_cuts = g_st_fgf = g_st_fades = g_st_fades_hi = 0; g_st_cut_sum = g_st_fg_sum = 0;
                             }
                             else
                                 lgd("GPU time of our passes: total %.2f ms = luma %.2f + search %.2f + refine %.2f + warp %.2f\n", tot, ms[0], ms[1], ms[2], ms[3]);

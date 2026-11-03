@@ -790,22 +790,34 @@ fin:
   %fsp = uitofp i32 %sump to float
   %fdif = fsub float %fsc, %fsp
   %fad = call float @llvm.fabs.f32(float %fdif)
-  %flim = fmul float %fsp, 0x3F947AE140000000 ; 0.02
-  %fade0 = fcmp ogt float %fad, %flim
-  ; 8.3: only while the camera (gm8) moves at most 1 L2 px (4 full-res px) per frame and fg_blocks <= 32.
+  ; 8.3: at 2 % only while the camera (gm8) moves at most 1 L2 px (4 full-res px) per frame and fg_blocks <= 32.
+  ; fade_hi (consts.flags bit 13): a change above 8 % is a fade whatever gm8 and the foreground count say (a dark
+  ; fade whose camera vector is noise). One threshold per frame: 2 % when slow (8 % implies 2 %), else 8 % with
+  ; bit 13, else no fade; with bit 13 clear this is the 8.3 rule exactly.
   %gax = call i32 @llvm.abs.i32(i32 %gmx, i1 false)
   %gay = call i32 @llvm.abs.i32(i32 %gmy, i1 false)
   %gaxy = call i32 @llvm.smax.i32(i32 %gax, i32 %gay)
   %slow1a = icmp sle i32 %gaxy, 1
   %slow1 = and i1 %slow1a, %fg_still
-  %fade = and i1 %fade0, %slow1
+  %fhflags = extractelement <4 x i32> %cn, i32 2
+  %fhbit = and i32 %fhflags, 8192
+  %fhon = icmp ne i32 %fhbit, 0
+  %fdok = or i1 %slow1, %fhon
+  %fki = select i1 %slow1, i32 1017370378, i32 1034147594 ; bits of 0.02f / 0.08f
+  %fk = bitcast i32 %fki to float
+  %flim = fmul float %fsp, %fk
+  %fade0 = fcmp ogt float %fad, %flim
+  %fade = and i1 %fade0, %fdok
   %zero = or i1 %zero0, %fade
-  ; block (0, 0) reports the fade decision in misc dword 7 (frame statistics for the log)
+  ; block (0, 0) reports the fade decision in misc dword 7 (frame statistics for the log): 1 = 2 % fade with a
+  ; still camera, 2 = fade_hi only (mf8 reads any non-zero value as a fade)
   %b00a = or i32 %bx, %gy
   %b00 = icmp eq i32 %b00a, 0
   br i1 %b00, label %rfade, label %fin2
 rfade:
-  %fadei = zext i1 %fade to i32
+  %fcl = and i1 %fade, %slow1
+  %fh2 = select i1 %fade, i32 2, i32 0
+  %fadei = select i1 %fcl, i32 1, i32 %fh2
   call void @llvm.amdgcn.raw.buffer.store.i32(i32 %fadei, <4 x i32> %vm, i32 28, i32 0, i32 0)
   br label %fin2
 fin2:

@@ -222,6 +222,7 @@ static int32_t insert_wait_flip_done(uint32_t *p, uint32_t n, int32_t h, uint32_
 #include "shaders.h"
 #include "fg_res.h"
 #include "fg8_table.h"
+static volatile int g_fade_hi = 1;   /* option fade_hi, default on (build_dcb_flow8 sets FG8_FLAG_FADE_HI) */
 {defines}
 {fns}
 

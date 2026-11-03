@@ -497,6 +497,7 @@ static void gv_fill_table(uint32_t *p, uint32_t s, uint32_t k) {{ (void)p; (void
 static int gv_pass_active(void) {{ return 0; }}
 static int gv_warp_active(void) {{ return 0; }}
 static int gv_viz_active(void) {{ return 0; }}
+static volatile int g_fade_hi = 1;   /* option fade_hi, default on (build_dcb_flow8 sets FG8_FLAG_FADE_HI) */
 
 static int g_mon_started_cnt = 0;
 static int g_gv_started_on = -1;
