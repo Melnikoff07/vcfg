@@ -986,7 +986,7 @@ static int snprintf(char *buf, size_t sz, const char *fmt, ...)
 
 static char g_title_id[16] = "CUSA06782";
 static int g_known_game = 1, g_detected_60fps = 0, g_is_neo = 0, g_boot_preset = 0;
-static int g_tile_override = -1, g_tile_sweep = 0, g_t6_bit_override = -1;
+static int g_tile_override = -1, g_tile_sweep = 0, g_t6_bit_override = -1, g_late_tail = 1;
 static volatile fg_config_t g_cfg;
 static volatile int g_fg_off = 0;
 static volatile uint32_t g_mem_hibernate_count = 0;

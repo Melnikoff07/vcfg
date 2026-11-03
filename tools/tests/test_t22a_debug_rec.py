@@ -186,6 +186,7 @@ static int32_t insert_wait_flip_done(uint32_t *p, uint32_t n, int32_t h, uint32_
 #include "shaders.h"
 #include "fg_res.h"
 #include "fg8_table.h"
+#include "late_tail.h"
 {defines}
 {fns}
 
