@@ -1402,17 +1402,13 @@ def generate_cusa00917_crash_order_c() -> list[str]:
     return lines
 
 
-# CUSA01967 (BUCKET_3, v2.36 hardware): the game ENOMEM'd on 0x80000 type=0 chunks at flip ~265 with our work+gpu+
-# registered-mid reserve held. Its unlogged parallel streamers (raw, unhooked allocations on hardware) had consumed
-# every free page down to a < 0x80000 scrap, and the step-2 work hibernation's 1.6 MB drip was re-consumed within the
-# same storm (13.843s release -> 13.852s ENOMEM retry). The scenario below models those streamers with raw (unhooked)
-# kernel calls, then requires the valve to recover every storm allocation: work hibernation first, then the step-2b
-# crisis release of the registered mid reserve (crisis_release_mid_reserve; FG stays native for the session).
+# CUSA01967 (v2.36 hardware): post-boot type=0 align<=0x4000 len<=0x200000 chunks are self-limiting cache-pool
+# probes (hundreds of harmless 0x80020023 calls even with 0 VCFG DM held). Those probes must pass through naturally
+# keeping g_work and mbufs intact for 60fps FG, while any critical non-cache failure (>0x200000, align>0x4000, or
+# type!=0) still retains full Step 2 work hibernation + Step 4b crisis_release_mid_reserve protection.
 CRISIS_KEY = "CUSA01967_0x14aa00000"
-CRISIS_PREAMBLE = """        /* CUSA01967 loading crisis setup: runtime state (gpu_init ok at frame 120 on hardware), our late group
-         * registered as its own attr slot 1, and the unlogged streamers eating the pool down to a 0x40000 scrap.
-         * The 13.06 hardware run showed the crisis firing with a TRANSIENT unregister refusal (0x80290009 at
-         * 14.138s): model one refused unregister call, then success on the in-call retry. */
+CRISIS_PREAMBLE = """        /* CUSA01967 runtime state (gpu_init ok at frame 120 on hardware), our late group registered as slot 1,
+         * transient 0x80290009 unregister refusal armed, and DM exhausted down to a <= 0x50000 scrap. */
         g_gpu_state = 1;
         g_handle = 1;
         g_ext_attr_slot = 1;
@@ -1430,29 +1426,25 @@ CRISIS_PREAMBLE = """        /* CUSA01967 loading crisis setup: runtime state (g
             }
             ASSERT_MSG(dm_avail(0x4000u) <= 0x50000u, "CUSA01967_0x14aa00000_crisis", 900, dm_avail(0x4000u));
         }"""
-CRISIS_RECONSUME = """        {   /* the streamers re-consume the freed work drip immediately (hardware: the retry after the 13.843s
-             * release still ENOMEM'd at 13.852s), so the next storm chunk must go through the step-2b crisis */
-            long p = 0;
-            for (int gi = 0; gi < 4096; gi++) {
-                size_t av = dm_avail(0x4000u);
-                if (av <= 0x40000u) break;
-                size_t take = av - 0x40000u;
-                g_own_alloc++;
-                int32_t ar = raw_sceKernelAllocateDirectMemory(0LL, (long)sceKernelGetDirectMemorySize(), take, 0x4000u, 0, &p);
-                g_own_alloc--;
-                if (ar != 0) break;
-            }
-            ASSERT_MSG(dm_avail(0x4000u) <= 0x50000u, "CUSA01967_0x14aa00000_crisis", 901, dm_avail(0x4000u));
-        }"""
-CRISIS_POSTCHECKS = """        /* step 4b handed the registered mid reserve back to the title despite the transient 0x80290009 refusal:
-         * the in-call retry succeeded, the valve holds nothing but g_pre_gpu, and FG stays native for the session */
+CRISIS_POSTCHECKS = """        /* 1. All 0x80000 type=0 align=0x4000 cache probes returned ENOMEM without sacrificing g_work or mbufs */
+        ASSERT_MSG(g_pre_mem != NULL && g_pre_work != NULL && g_mbuf_state == 1 &&
+                   g_mem_hibernate_count == 0u && g_crisis_release_done == 0,
+                   "CUSA01967_0x14aa00000_crisis", 949, g_mem_hibernate_count);
+        /* 2. A critical non-cache runtime failure (len=0x400000 > 0x200000) still fires Step 2 + Step 4b crisis
+         *    and recovers despite the transient 0x80290009 unregister refusal */
+        {
+            long cp = 0;
+            g_flips = 267u;
+            int32_t cr = sceKernelAllocateDirectMemory(0LL, 0x14aa00000LL, 0x400000ULL, 0x10000ULL, 0, &cp);
+            ASSERT_MSG(cr == 0, "CUSA01967_0x14aa00000_crisis", 950, (uint64_t)(uint32_t)cr);
+        }
         ASSERT_MSG(g_mbuf_state == -1 && g_pre_mem == NULL && g_pre_work == NULL,
-                   "CUSA01967_0x14aa00000_crisis", 950, g_mbuf_state);
+                   "CUSA01967_0x14aa00000_crisis", 951, g_mbuf_state);
         ASSERT_MSG(g_mem_hibernate_count >= 1u && g_crisis_release_done == 1 && g_crisis_release_attempts == 1 &&
                    g_crisis_release_busy == 0 && g_ext_attr_slot == -1 && g_sim_unregister_last == 0 &&
                    g_crisis_dbg_step == 5,
-                   "CUSA01967_0x14aa00000_crisis", 951, g_mem_hibernate_count);
-        ASSERT_MSG(g_pre_gpu != NULL, "CUSA01967_0x14aa00000_crisis", 952, 0);"""
+                   "CUSA01967_0x14aa00000_crisis", 952, g_mem_hibernate_count);
+        ASSERT_MSG(g_pre_gpu != NULL, "CUSA01967_0x14aa00000_crisis", 953, 0);"""
 
 
 def generate_trace_c(traces: list[dict]) -> str:
@@ -1774,7 +1766,6 @@ def generate_trace_c(traces: list[dict]) -> str:
         pre_occ = tr["pre_occupied_low"]
         crisis = tkey == CRISIS_KEY
         crisis_preamble_done = False
-        crisis_reconsume_done = False
         lines.append(f"    /* Trace {idx + 1}: {tkey} (v{tr['log_version']}) */")
         lines.append("    {")
         lines.append(f"        g_sim_neo = {int(tr.get('neo', 1 if int(dm_sz, 16) > 0x137200000 else 0))};")
@@ -1788,6 +1779,8 @@ def generate_trace_c(traces: list[dict]) -> str:
             lines.append("        g_sim_flex_avail = 0xE00000u;")
         elif tkey == "CUSA13323_0x164a00000":
             lines.append("        g_sim_flex_avail = 0x2000000u;")
+        elif crisis:
+            lines.append("        g_sim_flex_avail = 0x140000u;")
         lines.append("        long id_phys[256]; size_t id_len[256];")
         lines.append("        memset(id_phys, 0, sizeof(id_phys)); memset(id_len, 0, sizeof(id_len));")
         for step_i, ev in enumerate(tr["events"]):
@@ -1837,15 +1830,12 @@ def generate_trace_c(traces: list[dict]) -> str:
                         f"            int32_t r = sceKernelAllocateDirectMemory({s}LL, {e}LL, {elen}ULL, {align}ULL, {mtype}, &p);"
                     )
                     if crisis:
-                        # CUSA01967: the valve must recover every storm chunk (work hibernation, then the step-2b
-                        # crisis release). The stream blocks stay allocated, as on hardware.
-                        lines.append(f'            ASSERT_MSG(r == 0, "{tkey}_crisis", {step_i}, {elen}ULL);')
+                        # CUSA01967: 0x80000 type=0 align<=0x4000 cache probes pass through naturally as ENOMEM,
+                        # leaving g_work and mbufs intact for FG.
+                        lines.append(f'            ASSERT_MSG(r == (int32_t)0x80020023u, "{tkey}_crisis", {step_i}, (uint64_t)(uint32_t)r);')
                     else:
                         lines.append(f"            if (r == 0) sceKernelReleaseDirectMemory(p, {elen}ULL);")
                     lines.append("        }")
-                    if crisis and not crisis_reconsume_done:
-                        crisis_reconsume_done = True
-                        lines.append(CRISIS_RECONSUME)
         if tid in ("CUSA07820", "CUSA00341", "CUSA07737"):
             # Only tail-only (synthetic) shaves, except the audio_fix pre-shave (exactly AUDIO_FIX_TAIL).
             lines.append(

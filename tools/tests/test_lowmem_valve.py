@@ -515,9 +515,10 @@ static int32_t __attribute__((unused)) raw_sceKernelCheckedReleaseDirectMemory(l
     return raw_sceKernelReleaseDirectMemory(phys, len);
 }
 
+static void (*g_sim_usleep_cb)(uint32_t) = NULL;
 static int32_t sceKernelUsleep(uint32_t usec)
 {
-    (void)usec;
+    if (g_sim_usleep_cb) g_sim_usleep_cb(usec);
     return 0;
 }
 
@@ -1884,6 +1885,154 @@ static void test_crisis_release_guards(void)
     g_vo_unreg_fail_slot = -1;
 }
 
+static uint32_t g_sim_race_ticks = 0;
+static volatile uint32_t g_sim_race_done_label = 0;
+static void sim_race_usleep_cb(uint32_t usec)
+{
+    (void)usec;
+    g_sim_race_ticks++;
+    if (g_sim_race_ticks == 2u) {
+        // Render thread already inside fg_submit_try_enter() publishes g_last_seq=275 before leaving critical section.
+        __atomic_store_n(&g_last_seq, 275u, __ATOMIC_RELEASE);
+        fg_submit_leave();
+    } else if (g_sim_race_ticks == 4u) {
+        // GPU retires command buffer 275 after submit completed and drain started polling.
+        __atomic_store_n(&g_sim_race_done_label, 275u, __ATOMIC_RELEASE);
+    }
+}
+
+static void test_fg_submit_hibernation_race(void)
+{
+    sim_reset(0x40000000u);
+    g_flips = 275;
+    g_gpu_state = 1;
+    g_work = (uint8_t *)(uintptr_t)0x330080000000ULL;
+    g_sim_race_done_label = 274u;
+    g_done = &g_sim_race_done_label;
+    g_last_seq = 274u;
+    g_gpu_drain_waits = 0;
+    g_mem_hibernating = 0;
+    g_fg_submitting = 0;
+
+    // 1. Healthy state allows FG critical section enter/leave; after hibernation, wakes from pacing abort cleanly.
+    ASSERT(fg_submit_try_enter(1) == 1);
+    ASSERT(g_fg_submitting == 1);
+    fg_submit_leave();
+    ASSERT(g_fg_submitting == 0);
+
+    // 2. Render thread is mid-submission when valve_hibernate_and_drain_gpu() fires:
+    //    drain MUST wait for g_fg_submitting == 0 before inspecting g_last_seq / draining *g_done.
+    ASSERT(fg_submit_try_enter(1) == 1);
+    ASSERT(g_fg_submitting == 1);
+    g_sim_race_ticks = 0;
+    g_sim_usleep_cb = sim_race_usleep_cb;
+    valve_hibernate_and_drain_gpu();
+    g_sim_usleep_cb = NULL;
+    ASSERT(g_mem_hibernating == 1);
+    ASSERT(g_fg_submitting == 0);
+    ASSERT(g_last_seq == 275u);
+    ASSERT(g_sim_race_done_label == 275u);
+    ASSERT(g_gpu_drain_waits >= 1u);
+
+    // 3. Any FG frame waking up after g_mem_hibernating = 1 aborts FG submission without poisoning the GPU.
+    ASSERT(fg_submit_try_enter(1) == 0);
+    ASSERT(g_fg_submitting == 0);
+
+    // 4. release_early_work() clears g_work before unmapping; post-crisis post8 (needs_work == 0) still runs
+    //    once g_mem_hibernating is cleared, while needs_work == 1 stays safely refused.
+    g_mem_hibernating = 0;
+    g_pre_work = NULL;
+    g_pre_work_phys = -1L;
+    g_pre_work_sz = 0;
+    release_early_work();
+    ASSERT(g_work == NULL);
+    ASSERT(fg_submit_try_enter(1) == 0);
+    ASSERT(g_fg_submitting == 0);
+    ASSERT(fg_submit_try_enter(0) == 1);
+    ASSERT(g_fg_submitting == 1);
+    fg_submit_leave();
+    ASSERT(g_fg_submitting == 0);
+}
+
+static void drain_dm_to_empty(void)
+{
+    long p = 0;
+    long dm_end = (long)sceKernelGetDirectMemorySize();
+    for (int gi = 0; gi < 4096; gi++) {
+        size_t av = dm_avail(0x4000u);
+        if (av < 0x4000u) break;
+        if (raw_sceKernelAllocateDirectMemory(0, dm_end, av, 0x4000u, 0, &p) != 0) break;
+    }
+    ASSERT(dm_avail(0x4000u) < 0x4000u);
+}
+
+static void setup_cusa01967_runtime_full(void)
+{
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    for (int i = 0; i < 10; i++) g_title_id[i] = "CUSA01967"[i];
+    g_flips = 302;
+    g_gpu_state = 1;
+    g_mbuf_state = 1;
+    g_handle = 1;
+    g_ext_attr_slot = 1;
+    g_ngame = 2;
+    g_mbase = 2;
+    g_nbuf = 3;
+    g_work = g_pre_work;
+    g_sim_flex_avail = 0x140000u;
+    g_mem_hibernate_count = 0u;
+    g_mem_hibernating = 0;
+    g_crisis_release_done = 0;
+    g_crisis_release_attempts = 0;
+    g_crisis_release_busy = 0;
+    g_crisis_dbg_step = 0;
+    drain_dm_to_empty();
+}
+
+static void test_cusa01967_cache_probe_passthrough(void)
+{
+    long phys = 0;
+    long dm_end = (long)sceKernelGetDirectMemorySize();
+
+    // 1. Post-boot CUSA01967 type=0 align<=0x4000 0x4000<len<=0x200000 step-down probes return ENOMEM naturally
+    //    without triggering hibernate_work_dm, shave_game_alloc, or crisis_release_mid_reserve.
+    setup_cusa01967_runtime_full();
+    static const size_t probe_lens[6] = { 0x80000u, 0x40000u, 0x20000u, 0x10000u, 0x8000u, 0x200000u };
+    for (int i = 0; i < 6; i++) {
+        int32_t pr = sceKernelAllocateDirectMemory_hook(0, dm_end, probe_lens[i], 0x4000u, 0, &phys);
+        ASSERT(pr == (int32_t)0x80020023u);
+    }
+    ASSERT(g_pre_work != NULL && g_work != NULL && g_pre_mem != NULL && g_mbuf_state == 1);
+    ASSERT(g_mem_hibernate_count == 0u && g_crisis_release_done == 0 && g_shave_n == 0);
+
+    // 2. Fatal 0x4000 (16 KiB) floor: first failure triggers Step 2 hibernate_work_dm (keeps mbufs),
+    //    and once Flex is below 0x4000, next 0x4000 failure fires Step 4b crisis_release_mid_reserve.
+    ASSERT(sceKernelAllocateDirectMemory_hook(0, dm_end, 0x4000u, 0x4000u, 0, &phys) == 0);
+    ASSERT(g_mem_hibernate_count == 1u && g_pre_work == NULL && g_pre_mem != NULL && g_crisis_release_done == 0);
+    drain_dm_to_empty();
+    g_sim_flex_avail = 0x2000u;
+    ASSERT(sceKernelAllocateDirectMemory_hook(0, dm_end, 0x4000u, 0x4000u, 0, &phys) == 0);
+    ASSERT(g_crisis_release_done == 1 && g_pre_mem == NULL);
+
+    // 3. Non-cache boundary (type != 0): still invokes runtime recovery (Step 2 hibernate_work_dm) and succeeds.
+    setup_cusa01967_runtime_full();
+    ASSERT(sceKernelAllocateDirectMemory_hook(0, dm_end, 0x80000u, 0x4000u, 3, &phys) == 0);
+    ASSERT(g_mem_hibernate_count == 1u && g_pre_work == NULL);
+
+    // 4. Non-cache boundary (align > 0x4000): still invokes Step 2 + Step 4b crisis_release_mid_reserve and succeeds.
+    setup_cusa01967_runtime_full();
+    ASSERT(sceKernelAllocateDirectMemory_hook(0, dm_end, 0x200000u, 0x200000u, 0, &phys) == 0);
+    ASSERT(g_mem_hibernate_count >= 1u && g_crisis_release_done == 1 && g_pre_mem == NULL && g_pre_work == NULL);
+
+    // 5. Non-cache boundary (len > 0x200000): still invokes Step 2 + Step 4b crisis_release_mid_reserve and succeeds.
+    setup_cusa01967_runtime_full();
+    ASSERT(sceKernelAllocateDirectMemory_hook(0, dm_end, 0x400000u, 0x4000u, 0, &phys) == 0);
+    ASSERT(g_mem_hibernate_count >= 1u && g_crisis_release_done == 1 && g_pre_mem == NULL && g_pre_work == NULL);
+    g_title_id[0] = 0;
+}
+
 int main(void)
 {
     test_flex_gpu_fallback_and_alignment();
@@ -1894,13 +2043,23 @@ int main(void)
     test_avail_hook_and_late_alloc_mode2();
     test_runtime_streaming_and_batchmap_guards();
     test_crisis_release_guards();
-    printf("lowmem valve & alloc_flex_gpu unit tests: all 8 suites passed\n");
+    test_fg_submit_hibernation_race();
+    test_cusa01967_cache_probe_passthrough();
+    printf("lowmem valve & alloc_flex_gpu unit tests: all 10 suites passed\n");
     return 0;
 }
 """
 
 
 def main() -> None:
+    # Structural guard: both flip_inner_ex and sceVideoOutSubmitFlip_hook re-check fg_submit_try_enter after pre-pacing.
+    flip_body = extract_between(MAIN_C, "static int32_t flip_inner_ex(", "int32_t sceVideoOutSubmitFlip_hook(")
+    vout_body = extract_between(MAIN_C, "int32_t sceVideoOutSubmitFlip_hook(", "int32_t sceVideoOutRegisterBuffers_hook(")
+    for fn_name, body in (("flip_inner_ex", flip_body), ("sceVideoOutSubmitFlip_hook", vout_body)):
+        assert "fg_submit_try_enter(second_flip)" in body, f"{fn_name} missing fg_submit_try_enter"
+        assert "fg_submit_leave()" in body, f"{fn_name} missing fg_submit_leave"
+        assert body.index("fg_submit_try_enter(second_flip)") < body.index("fg_submit_leave()"), fn_name
+
     out = ROOT / "build" / "tests"
     out.mkdir(parents=True, exist_ok=True)
     source = out / "test_lowmem_valve.c"

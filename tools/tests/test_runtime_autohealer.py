@@ -68,6 +68,8 @@ def test_classic_adapt_ini_roundtrip() -> None:
         "load_early_adapt_cfg",
         "safe_path",
         "safe_state_read",
+        "vcfg_is_stream_3buf_title",
+        "vcfg_cap_extra_buffers",
         "sceVideoOutSetFlipRate_hook",
         "sceVideoOutRegisterBuffers_hook",
     ]

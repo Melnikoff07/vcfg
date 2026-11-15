@@ -710,8 +710,8 @@ static void release_early_mem(void)
 }
 static void release_early_work(void)
 {
+    __atomic_store_n(&g_work, (uint8_t *)NULL, __ATOMIC_RELEASE);
     free_dm_block(&g_pre_work, &g_pre_work_phys, &g_pre_work_sz, "work");
-    g_work = NULL;
     g_work_garlic = 0;
     pyr_cache_invalidate();
 }
@@ -1010,6 +1010,25 @@ static int on_sub_hibernation_gate(uint32_t cur_flips)
     if (try_recover_hibernated_work_at(cur_flips)) return 0;
     pyr_cache_invalidate();
     return 1;
+}
+
+// Enter the FG command-buffer submit critical section after pre-submit pacing. Returns 0 if hibernation started
+// or g_work was released while pacing (so the caller must pass through the untouched game submit).
+static int __attribute__((unused)) fg_submit_try_enter(int needs_work)
+{
+    __atomic_add_fetch(&g_fg_submitting, 1, __ATOMIC_SEQ_CST);
+    int hib = __atomic_load_n(&g_mem_hibernating, __ATOMIC_SEQ_CST);
+    int no_work = (needs_work && __atomic_load_n(&g_work, __ATOMIC_ACQUIRE) == NULL);
+    if (hib || no_work) {
+        __atomic_sub_fetch(&g_fg_submitting, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    return 1;
+}
+
+static void __attribute__((unused)) fg_submit_leave(void)
+{
+    __atomic_sub_fetch(&g_fg_submitting, 1, __ATOMIC_RELEASE);
 }
 
 // Fast-path FG submit entry helper used by the rendering hook and unit-test harness:
@@ -3020,6 +3039,31 @@ static int og2_game_reregistered(int32_t handle, const VoAttr *attr, int game_hi
     return 1;
 }
 
+static int vcfg_is_stream_3buf_title(int want_pcopy)
+{
+    return (!want_pcopy &&
+            ((!g_known_game && g_dbg_allocs >= 32u) ||
+             vcfg_in_family(g_title_id, "CUSA09311") ||
+             vcfg_in_family(g_title_id, "CUSA18534") ||
+             vcfg_in_family(g_title_id, "CUSA10123")));
+}
+
+static int vcfg_cap_extra_buffers(int want_pcopy, int hi_res, int stream_3buf)
+{
+    if (want_pcopy) {
+        if (vcfg_in_family(g_title_id, "CUSA11456") ||
+            vcfg_in_family(g_title_id, "CUSA10454") ||
+            vcfg_in_family(g_title_id, "CUSA01967") ||
+            vcfg_in_family(g_title_id, "CUSA02636") ||
+            is_cusa06782())
+            return 1;
+        if (!g_known_game && g_dbg_allocs >= 32u) return 2;
+        return hi_res ? 4 : 6;
+    }
+    if (stream_3buf) return 1;
+    return (hi_res || !g_known_game) ? 2 : 3;
+}
+
 // Called once on the game's flip thread at frame INJECT_AFTER_FLIPS, after the config was read.
 static void safe_try_activate(uint32_t handle)
 {
@@ -3041,11 +3085,7 @@ static void safe_try_activate(uint32_t handle)
     int hi = g_game_idx_hi > g_ngame ? g_game_idx_hi : g_ngame;
     int want_pcopy = (g_cfg.present_copy == 1) || (g_cfg.present_copy == 0 && g_ngame == 2);
     int hi_res = (g_bw > 1920 || g_bh > 1080);
-    int stream_3buf = (!want_pcopy &&
-                       ((!g_known_game && g_dbg_allocs >= 32u) ||
-                        vcfg_in_family(g_title_id, "CUSA09311") ||
-                        vcfg_in_family(g_title_id, "CUSA18534") ||
-                        vcfg_in_family(g_title_id, "CUSA10123")));
+    int stream_3buf = vcfg_is_stream_3buf_title(want_pcopy);
     // Find the highest contiguous range of unused buffer indices [free_base, free_end) in [g_ngame, 16).
     int free_base = hi < 16 ? hi : 16;
     int free_end = 16;
@@ -3060,7 +3100,7 @@ static void safe_try_activate(uint32_t handle)
         }
     }
     int avail_idx = free_end - free_base;
-    int want = want_pcopy ? (hi_res ? 4 : 6) : (stream_3buf ? 1 : (hi_res ? 2 : 3));
+    int want = vcfg_cap_extra_buffers(want_pcopy, hi_res, stream_3buf);
     if (want > avail_idx) want = avail_idx;
     if (want < 1) { safe_refuse("NO INDICES"); return; }
     // Allocate display buffers (m) FIRST before g_pre_gpu / g_pre_work so our 2MB-aligned scanout allocation never
@@ -5257,6 +5297,15 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     }
                     t_p1 = sceKernelGetProcessTime();
                 }
+                if (!fg_submit_try_enter(second_flip)) {
+                    pyr_cache_invalidate();
+                    uint64_t t_sub_hib = sceKernelGetProcessTime();
+                    g_last_submit_enter_t = t_sub_hib;
+                    lat_fifo_push(index, flipArg, t_hook_in, t_sub_hib, pace_pre ? (t_p1 - t_p0) : 0ull);
+                    int32_t rc_hib = gnm_submit_and_flip_raw(has_wl, workload, count, dcb, dcbSz, ccb, ccbSz, handle, index, flipMode, flipArg);
+                    g_rel_t = sceKernelGetProcessTime();
+                    return rc_hib;
+                }
                 uint64_t t_s1 = t_p1;
                 if (can_fg8 && want_fg && !g_fg_off && raw_dt_us <= 66667ull) {
                     if ((g_cfg.preset != 1 || !g_fast_pace) && !(VCFG_2BUF_TEST == 3 && tb_title() && g_pcopy_on)) {
@@ -5315,6 +5364,7 @@ static int32_t flip_inner_ex(int has_wl, uint32_t workload, uint32_t count, void
                     t_s2e = sceKernelGetProcessTime();
                     if (g_flips < INJECT_AFTER_FLIPS + 12) lg("mode4 #%u: gnm flip(mid idx %u)=0x%08x, gnm flip(cur idx %u)=0x%08x\n", g_flips, flip_idx, (unsigned)rc, index, (unsigned)r2);
                 }
+                fg_submit_leave();
                 if (!pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
@@ -5739,6 +5789,17 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                     }
                     vo_t_p1 = sceKernelGetProcessTime();
                 }
+                if (!fg_submit_try_enter(second_flip)) {
+                    pyr_cache_invalidate();
+                    uint64_t vo_t_hib = sceKernelGetProcessTime();
+                    g_vo_last_submit_enter_t = vo_t_hib;
+                    lat_fifo_push(u_idx, arg, t_hook_in, vo_t_hib, pace_pre ? (vo_t_p1 - vo_t_p0) : 0ull);
+                    int32_t vr_hib = HOOK_CONTINUE(sceVideoOutSubmitFlip, int32_t (*)(int32_t, int32_t, uint32_t, int64_t),
+                                                   handle, index, mode, arg);
+                    gv_frame_end();
+                    if (g_vt_hooked && g_vt_n >= VT_N) vt_dump();
+                    return vr_hib;
+                }
                 uint64_t vo_t_s1 = vo_t_p1;
                 if (can_fg8 && want_fg && !g_fg_off && raw_dt_us <= 66667ull) {
                     if (g_cfg.preset != 1) {
@@ -5777,6 +5838,7 @@ int32_t sceVideoOutSubmitFlip_hook(int32_t handle, int32_t index, uint32_t mode,
                         lg("vout fg #%u: flip(mid %u)=0x%08x flip(real %u)=0x%08x\n",
                            vf, flip_idx, (unsigned)vr1, show_idx, (unsigned)vr2);
                 }
+                fg_submit_leave();
                 if (!pace_pre) {
                     if (g_cfg.fps_lock == 20) pace_hz(20);
                     else if (g_cfg.fps_lock == 60 && !second_flip) pace_hz(60);
@@ -5998,19 +6060,8 @@ int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void
             uint8_t *m = NULL;
             int nm = 0;
             int max_extra = 16 - g_ngame;
-            int stream_3buf = (!want_pcopy &&
-                               ((!g_known_game && g_dbg_allocs >= 32u) ||
-                                vcfg_in_family(g_title_id, "CUSA09311") ||
-                                vcfg_in_family(g_title_id, "CUSA18534") ||
-                                vcfg_in_family(g_title_id, "CUSA10123")));
-            int cap_extra = want_pcopy
-                ? ((vcfg_in_family(g_title_id, "CUSA11456") ||
-                    vcfg_in_family(g_title_id, "CUSA10454") ||
-                    vcfg_in_family(g_title_id, "CUSA01967") ||
-                    vcfg_in_family(g_title_id, "CUSA02636") ||
-                    is_cusa06782())
-                   ? 1 : ((!g_known_game && g_dbg_allocs >= 32u) ? 2 : (hi_res ? 4 : 6)))
-                : (stream_3buf ? 1 : ((hi_res || !g_known_game) ? 2 : 3));
+            int stream_3buf = vcfg_is_stream_3buf_title(want_pcopy);
+            int cap_extra = vcfg_cap_extra_buffers(want_pcopy, hi_res, stream_3buf);
             if (max_extra > cap_extra) max_extra = cap_extra;
             if (one && g_pre_mem) {
                 nm = (int)(g_pre_size / one);
