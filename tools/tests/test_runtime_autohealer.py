@@ -70,6 +70,10 @@ def test_classic_adapt_ini_roundtrip() -> None:
         "safe_state_read",
         "vcfg_is_stream_3buf_title",
         "vcfg_cap_extra_buffers",
+        "c01967_log_res_entries",
+        "c01967_patch_res_table_at",
+        "c01967_find_eboot_base",
+        "c01967_patch_res_table_if_needed",
         "sceVideoOutSetFlipRate_hook",
         "sceVideoOutRegisterBuffers_hook",
     ]
@@ -122,6 +126,9 @@ extern char *strchr(const char *, int);
 extern size_t strlen(const char *);
 extern void *memcpy(void *, const void *, size_t);
 extern void *memset(void *, int, size_t);
+extern int memcmp(const void *, const void *, size_t);
+extern void *malloc(size_t);
+extern void free(void *);
 
 static int snprintf(char *buf, size_t sz, const char *fmt, ...)
 {{
@@ -136,8 +143,16 @@ static int snprintf(char *buf, size_t sz, const char *fmt, ...)
 #define LOG_DIR "/data/bb_probe"
 #define VCFG_TRACE_VERSION "2.36"
 #define INJECT_AFTER_FLIPS 120
+#define VM_PROT_ALL 0x07
 #define STAGE(...) do {{}} while (0)
 #define lg(...) do {{}} while (0)
+
+typedef struct {{
+    size_t size;
+    char name[256];
+    struct {{ void *address; size_t size; int prot; }} segmentInfo[4];
+    uint32_t segmentCount;
+}} OrbisKernelModuleInfo;
 
 typedef struct {{
     uint32_t format, tilingMode, aspectRatio, width, height, pitchInPixel, option;
@@ -215,7 +230,37 @@ static int g_sim_slot_nbuf[4];
 static int g_sim_sfr_calls = 0;
 static int g_sim_reject_extend_over_3 = 0;
 static int g_sim_fail_top_group = 0;
+static int g_c01967_res_patched = 0;
+static uintptr_t g_sim_eboot_base = 0;
+static int g_sim_dcb_ok = 1;
+static int32_t g_sim_mprotect_rc = 0;
+static uintptr_t g_sim_mprotect_addr = 0;
+static size_t g_sim_mprotect_len = 0;
+static int g_sim_mprotect_prot = 0;
 static struct {{ void *StubPtr; }} Detour_sceVideoOutSetFlipRate = {{ NULL }};
+
+static int dcb_mem_ok(uintptr_t a, size_t n) {{ (void)a; (void)n; return g_sim_dcb_ok; }}
+static int32_t sceKernelMprotect(void *addr, size_t len, int prot) {{
+    g_sim_mprotect_addr = (uintptr_t)addr;
+    g_sim_mprotect_len = len;
+    g_sim_mprotect_prot = prot;
+    return g_sim_mprotect_rc;
+}}
+static int32_t sceKernelGetModuleList(uint32_t *mods, size_t maxn, size_t *outn) {{
+    if (!g_sim_eboot_base || !mods || !outn || maxn < 1) return -1;
+    mods[0] = 1u;
+    *outn = 1u;
+    return 0;
+}}
+static int32_t sceKernelGetModuleInfo(uint32_t handle, OrbisKernelModuleInfo *info) {{
+    if (handle != 1u || !info || !g_sim_eboot_base) return -1;
+    memset(info, 0, sizeof(*info));
+    memcpy(info->name, "eboot.bin", 10);
+    info->segmentInfo[0].address = (void *)g_sim_eboot_base;
+    info->segmentInfo[0].size = 0x1f2474cu;
+    info->segmentCount = 1u;
+    return 0;
+}}
 
 static int32_t sceVideoOutUnregisterBuffers(int32_t handle, int32_t attrIdx) {{
     (void)handle;
@@ -344,6 +389,13 @@ static void reset_runtime_state(const char *tid) {{
     g_crash_nmods = 0;
     g_is_neo = 1;
     g_sim_fail_top_group = 0;
+    g_c01967_res_patched = 0;
+    g_sim_eboot_base = 0;
+    g_sim_dcb_ok = 1;
+    g_sim_mprotect_rc = 0;
+    g_sim_mprotect_addr = 0;
+    g_sim_mprotect_len = 0;
+    g_sim_mprotect_prot = 0;
     cfg_defaults((fg_config_t *)&g_cfg);
 }}
 
@@ -777,6 +829,52 @@ int main(void) {{
     if (sceVideoOutSetFlipRate_hook(1, 1) != 0) return 86;
     if (g_sim_sfr_calls != 0) return 87;
     Detour_sceVideoOutSetFlipRate.StubPtr = NULL;
+
+    // Test 20: CUSA01967 resolution preset table in-memory patch (mode 2..5 -> 1920x1080, keeps g_is_neo == 1):
+    uint8_t *fake_eboot = (uint8_t *)malloc(0x1c75000u);
+    if (!fake_eboot) return 95;
+    memset(fake_eboot, 0, 0x1c75000u);
+    static const uint32_t orig_modes[30] = {{
+        1920u, 1080u,    0u,    0u, 0u,
+        1920u, 1080u,    0u,    0u, 1u,
+        3840u, 2160u, 2432u, 1368u, 0u,
+        3840u, 2160u, 2432u, 1368u, 1u,
+        3840u, 2160u,    0u,    0u, 0u,
+        3840u, 2160u,    0u,    0u, 1u,
+    }};
+    static const uint32_t want_modes[30] = {{
+        1920u, 1080u,    0u,    0u, 0u,
+        1920u, 1080u,    0u,    0u, 1u,
+        1920u, 1080u, 1920u, 1080u, 0u,
+        1920u, 1080u, 1920u, 1080u, 1u,
+        1920u, 1080u,    0u,    0u, 0u,
+        1920u, 1080u,    0u,    0u, 1u,
+    }};
+    uint32_t *tbl = (uint32_t *)(fake_eboot + 0x1c72fc0u);
+    memcpy(tbl, orig_modes, sizeof(orig_modes));
+    // Non-CUSA01967 title must never patch:
+    reset_runtime_state("CUSA07439");
+    g_sim_eboot_base = (uintptr_t)fake_eboot;
+    c01967_patch_res_table_if_needed();
+    if (memcmp(tbl, orig_modes, sizeof(orig_modes)) != 0 || g_sim_mprotect_addr != 0) {{ free(fake_eboot); return 96; }}
+    // Unreadable / mprotect fail / signature mismatch guards:
+    reset_runtime_state("CUSA01967");
+    g_sim_eboot_base = (uintptr_t)fake_eboot;
+    g_sim_dcb_ok = 0;
+    if (c01967_patch_res_table_at(g_sim_eboot_base) != -2) {{ free(fake_eboot); return 97; }}
+    g_sim_dcb_ok = 1;
+    g_sim_mprotect_rc = -1;
+    if (c01967_patch_res_table_at(g_sim_eboot_base) != -4 || memcmp(tbl, orig_modes, sizeof(orig_modes)) != 0) {{ free(fake_eboot); return 98; }}
+    g_sim_mprotect_rc = 0;
+    tbl[10] = 1280u;
+    if (c01967_patch_res_table_at(g_sim_eboot_base) != -3) {{ free(fake_eboot); return 99; }}
+    tbl[10] = 3840u;
+    // Happy path on CUSA01967: patches mode 2..5, aligns mprotect to 16 KiB page, leaves mode 0..1 & g_is_neo == 1 intact:
+    c01967_patch_res_table_if_needed();
+    if (memcmp(tbl, want_modes, sizeof(want_modes)) != 0) {{ free(fake_eboot); return 100; }}
+    if ((g_sim_mprotect_addr & 0x3FFFull) != 0 || g_sim_mprotect_len < 0x4000u || g_sim_mprotect_prot != VM_PROT_ALL) {{ free(fake_eboot); return 101; }}
+    if (g_is_neo != 1) {{ free(fake_eboot); return 102; }}
+    free(fake_eboot);
 
     return 0;
 }}

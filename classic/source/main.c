@@ -4647,6 +4647,98 @@ static int og2_copy(void *dst, const void *src, size_t n)
     return 1;
 }
 
+static void c01967_log_res_entries(const char *tag, uintptr_t patch_addr, const uint32_t *w)
+{
+    const uint8_t *b = (const uint8_t *)patch_addr;
+    STAGE("CUSA01967 res-patch %s @%p b0..15=%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+          tag, (void *)patch_addr,
+          b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+          b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    STAGE("CUSA01967 res-patch %s m2=(%u,%u,%u,%u,%u) m3=(%u,%u,%u,%u,%u) m4=(%u,%u,%u,%u,%u) m5=(%u,%u,%u,%u,%u)",
+          tag,
+          w[0], w[1], w[2], w[3], w[4],
+          w[5], w[6], w[7], w[8], w[9],
+          w[10], w[11], w[12], w[13], w[14],
+          w[15], w[16], w[17], w[18], w[19]);
+}
+
+static int c01967_patch_res_table_at(uintptr_t eboot_base)
+{
+    if (!eboot_base) return -1;
+    static const uint32_t expected[30] = {
+        1920u, 1080u,    0u,    0u, 0u,
+        1920u, 1080u,    0u,    0u, 1u,
+        3840u, 2160u, 2432u, 1368u, 0u,
+        3840u, 2160u, 2432u, 1368u, 1u,
+        3840u, 2160u,    0u,    0u, 0u,
+        3840u, 2160u,    0u,    0u, 1u,
+    };
+    static const uint32_t replacement[20] = {
+        1920u, 1080u, 1920u, 1080u, 0u,
+        1920u, 1080u, 1920u, 1080u, 1u,
+        1920u, 1080u,    0u,    0u, 0u,
+        1920u, 1080u,    0u,    0u, 1u,
+    };
+    uintptr_t tbl_base = eboot_base + (uintptr_t)0x1c72fc0u;
+    uintptr_t patch_addr = eboot_base + (uintptr_t)0x1c72fe8u;
+    if (!dcb_mem_ok(tbl_base, sizeof(expected))) {
+        STAGE("CUSA01967 res-patch skipped: tbl=%p unreadable", (void *)tbl_base);
+        return -2;
+    }
+    if (memcmp((const void *)tbl_base, expected, sizeof(expected)) != 0) {
+        const uint32_t *w = (const uint32_t *)tbl_base;
+        STAGE("CUSA01967 res-patch skipped: mismatch @%p m0=(%u,%u,%u,%u,%u) m2=(%u,%u,%u,%u,%u)",
+              (void *)tbl_base, w[0], w[1], w[2], w[3], w[4], w[10], w[11], w[12], w[13], w[14]);
+        return -3;
+    }
+    c01967_log_res_entries("before", patch_addr, (const uint32_t *)patch_addr);
+    uintptr_t pg_start = patch_addr & ~(uintptr_t)0x3FFFull;
+    uintptr_t pg_end = (patch_addr + sizeof(replacement) + 0x3FFFull) & ~(uintptr_t)0x3FFFull;
+    int32_t mr = sceKernelMprotect((void *)pg_start, pg_end - pg_start, VM_PROT_ALL);
+    if (mr != 0) {
+        STAGE("CUSA01967 res-patch FAILED: mprotect(%p, 0x%zx)=0x%08x",
+              (void *)pg_start, (size_t)(pg_end - pg_start), (unsigned)mr);
+        return -4;
+    }
+    volatile uint32_t *dst = (volatile uint32_t *)patch_addr;
+    for (size_t i = 0; i < 20u; i++) dst[i] = replacement[i];
+    __sync_synchronize();
+    c01967_log_res_entries("after", patch_addr, (const uint32_t *)patch_addr);
+    return 0;
+}
+
+static uintptr_t c01967_find_eboot_base(void)
+{
+    uint32_t mods[256];
+    size_t nmods = 0;
+    if (sceKernelGetModuleList(mods, 256, &nmods) != 0 || nmods == 0) return 0;
+    if (nmods > 256) nmods = 256;
+    for (size_t i = 0; i < nmods; i++) {
+        OrbisKernelModuleInfo info;
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        if (sceKernelGetModuleInfo(mods[i], &info) != 0) continue;
+        if (strcmp(info.name, "eboot.bin") == 0) {
+            return (uintptr_t)info.segmentInfo[0].address;
+        }
+    }
+    return 0;
+}
+
+static int g_c01967_res_patched = 0;
+static void c01967_patch_res_table_if_needed(void)
+{
+    if (g_c01967_res_patched || strcmp(g_title_id, "CUSA01967") != 0) return;
+    g_c01967_res_patched = 1;
+    uintptr_t base = c01967_find_eboot_base();
+    if (!base) {
+        STAGE("CUSA01967 res-patch skipped: eboot.bin base not found");
+        return;
+    }
+    int rc = c01967_patch_res_table_at(base);
+    STAGE("CUSA01967 res-patch done: eboot_base=%p rc=%d (neo=%d)", (void *)base, rc, (int)g_is_neo);
+}
+
 #if VCFG_BENCH
 #include "bench_capture.h"
 #endif
@@ -5872,6 +5964,7 @@ int32_t sceVideoOutUnregisterBuffers(int32_t handle, int32_t attributeIndex);
 
 int32_t sceVideoOutRegisterBuffers_hook(int32_t handle, int32_t startIndex, void *const *addresses, int32_t bufferNum, const VoAttr *attr)
 {
+    c01967_patch_res_table_if_needed();
     cusa10249_apply_deferred_tail_if_needed();
     flush_map_run();
     if (g_dbg_hooks) crash_handlers_install();
@@ -6659,6 +6752,7 @@ s32 attr_public plugin_load(s32 argc, const char *argv[])
     STAGE("plugin_load enter: title=%s (family=%s) version=" VCFG_TRACE_VERSION " engine=classic neo=%d dm=0x%zx shave_mode=%d reg_mode=%d pace_order=%d post_mid=%d",
           g_title_id, vcfg_title_family(g_title_id), (int)g_is_neo, (size_t)sceKernelGetDirectMemorySize(),
           g_cfg.shave_mode, g_cfg.reg_mode, g_cfg.pace_order, g_cfg.post_mid);
+    c01967_patch_res_table_if_needed();
     if (cusa04529_audio_title()) {
         STAGE("audio_fix=%d", g_cfg.audio_fix);
     }
