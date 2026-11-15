@@ -14,6 +14,7 @@
 static volatile int g_boot_lines = 0;
 static volatile uint32_t g_boot_lock = 0;
 static volatile int g_in_crash = 0;
+static int g_boot_fd = -1;   // persistent handle: survives title-side fd exhaustion (per-line opens fail there)
 
 static void boot_stage(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void boot_stage(const char *fmt, ...)
@@ -48,12 +49,21 @@ static void boot_stage(const char *fmt, ...)
         sceKernelMkdir(LOG_DIR, 0777);
         sceKernelUnlink(prev);
         sceKernelRename(path, prev);
+        if (g_boot_fd >= 0) { sceKernelClose(g_boot_fd); g_boot_fd = -1; }
     }
-    int fd = sceKernelOpen(path, cur_line == 0 ? 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/ : 0x209 /*O_WRONLY|O_CREAT|O_APPEND*/, 0666);
-    if (fd >= 0) {
-        sceKernelWrite(fd, line, (size_t)n);
-        if (cur_line + 1 == BOOT_STAGE_MAX) sceKernelWrite(fd, "(boot stage limit reached)\n", 27);
-        sceKernelClose(fd);
+    // The handle is opened once per session and reused: a per-line sceKernelOpen silently loses the whole channel
+    // when the title's asset loader exhausts its fds (observed on CUSA01967: the boot log stopped mid-crisis at
+    // 15.04 while the klog/trace - both persistent handles - kept running). Kernel writes stay synchronous, so the
+    // crash-safe property (the last line shows how far the start got) is unchanged.
+    if (g_boot_fd < 0) g_boot_fd = sceKernelOpen(path, 0x601 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0666);
+    if (g_boot_fd >= 0) {
+        int wr = sceKernelWrite(g_boot_fd, line, (size_t)n);
+        if (wr < 0) {   // handle went bad: reopen in append mode once and retry this line
+            sceKernelClose(g_boot_fd);
+            g_boot_fd = sceKernelOpen(path, 0x209 /*O_WRONLY|O_CREAT|O_APPEND*/, 0666);
+            if (g_boot_fd >= 0) sceKernelWrite(g_boot_fd, line, (size_t)n);
+        }
+        if (cur_line + 1 == BOOT_STAGE_MAX) sceKernelWrite(g_boot_fd, "(boot stage limit reached)\n", 27);
     }
     if (got_lock) __atomic_store_n(&g_boot_lock, 0u, __ATOMIC_RELEASE);
 }

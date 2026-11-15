@@ -607,6 +607,160 @@ def detect_symptoms(
     return symptoms
 
 
+RE_RAW_OOM = re.compile(
+    r"AllocateDirectMemory\([^)]*\)\s*=\s*0x80020023|AllocDM\([^)]*\)\s*=\s*0x80020023|alloc_fail=[1-9]"
+)
+RE_OOM_RENDER_PROGRESS = re.compile(
+    r"(?:Present\s*(?:#\s*|\s*[:=]\s*)[1-9]\d*|\bgnm\s*#[1-9]\d*|\bmode4\s*#\d+|"
+    r"\bvout\s+(?:fg|inject)\s*#\d+|\bSubmitAndFlip\s*#\d+)",
+    re.I,
+)
+
+
+def _has_terminal_oom_burst(sec_text: str) -> bool:
+    """Return True when a log section ends with >=3 unrecovered 0x80020023 / alloc_fail events."""
+    tail_oom = 0
+    for ln in sec_text.splitlines():
+        if RE_RAW_OOM.search(ln):
+            tail_oom += 1
+        elif RE_OOM_RENDER_PROGRESS.search(ln):
+            tail_oom = 0
+    return tail_oom >= 3
+
+
+def _terminal_oom_max_flip(sec_text: str) -> int:
+    """Highest Present # (flip index) inside a section's trailing unrecovered OOM run, 0 when there is none."""
+    tail_oom = 0
+    max_flip = 0
+    for ln in sec_text.splitlines():
+        if RE_RAW_OOM.search(ln):
+            tail_oom += 1
+            m = re.search(r"f:(\d+)", ln)
+            if m:
+                max_flip = max(max_flip, int(m.group(1)))
+        elif RE_OOM_RENDER_PROGRESS.search(ln):
+            tail_oom = 0
+    return max_flip if tail_oom >= 3 else 0
+
+
+def _has_fatal_raw_oom(text: str, flips: int, l2_shave: bool) -> bool:
+    """Detect fatal raw DirectMemory OOM (early <120 flips without shave, or unrecovered terminal burst)."""
+    if not RE_RAW_OOM.search(text):
+        return False
+    if flips < 120 and not l2_shave:
+        return True
+    return any(_has_terminal_oom_burst(sec) for sec in _split_sections(text))
+
+
+def _split_sections(text: str) -> list[str]:
+    matches = list(SECTION_RE.finditer(text))
+    return (
+        [
+            text[m.end() : (matches[i + 1].start() if i + 1 < len(matches) else len(text))]
+            for i, m in enumerate(matches)
+        ]
+        if matches
+        else [text]
+    )
+
+
+# A terminal 0x80020023 burst in boot-<CUSA>.txt / vcfg_report.txt is NOT a crash when rendering demonstrably
+# continued past it (the paired probe.log / trace-<CUSA>.txt of the same run kept presenting to a much higher
+# flip index, e.g. CUSA01967: burst at f:2505 while probe.log reached flips=3829 with crash=NONE). The game's
+# own allocator absorbs these shortages mid-session; only a burst that ends the session is fatal.
+OOM_LIVE_MARGIN = 120  # one full INJECT window of flip progress past the burst proves the session lived on
+LIVE_SESSION_FILE_RE = re.compile(r"(?:^|/)probe(?:\.[a-z]+)?\.log$|(?:^|/)trace-[A-Za-z0-9_]+\.txt$")
+
+
+def _downgrade_live_oom(entries: list[dict[str, Any]]) -> None:
+    """Reclassify terminal-burst ENOMEM verdicts that a paired/own flip progression proves non-fatal (in place)."""
+    for e in entries:
+        if e.get("oom_reason") != "terminal_burst" or e.get("crash") != "ENOMEM":
+            continue
+        name = e.get("file", "")
+        if not (name.startswith("boot-") or name.startswith("vcfg_report")):
+            continue
+        burst = int(e.get("oom_burst_flip") or 0)
+        live = burst > 0 and e["flips"] >= burst + OOM_LIVE_MARGIN
+        if not live:
+            for s in entries:
+                if s is e or s.get("title_id") != e.get("title_id") or s.get("crash") != "NONE":
+                    continue
+                if not LIVE_SESSION_FILE_RE.search("/" + s.get("file", "")):
+                    continue
+                if s["flips"] >= e["flips"] + OOM_LIVE_MARGIN:
+                    live = True
+                    break
+        if live:
+            e["crash"] = "NONE"
+            e["oom_reason"] = ""
+            e["oom_burst_flip"] = 0
+            e["bucket"] = _assign_bucket(
+                is_old=e.get("is_old", False),
+                is_failure=False,
+                is_verified=e.get("verified", False),
+                has_inert_no_mbuf=e.get("inert_no_mbuf", False),
+                sig=e["crash"],
+                tid=e.get("title_id", ""),
+                flips=e.get("flips", 0),
+                mids_shown=e.get("mids_shown"),
+                fg_on=e.get("fg_on", False),
+                has_inert=e.get("inert", False),
+                symptoms=e.get("symptoms"),
+                crisis_released=e.get("crisis_released", False),
+            )
+
+
+def _demote_superseded_prev_candidates(entries: list[dict[str, Any]]) -> None:
+    """A report keeps the previous save as a `.prev` region; when the same report also contains a newer save of the
+    same title, the superseded `.prev` bundle must not mint a k_sup supported-candidate line (its embedded logs may
+    have rotated past the crisis evidence at save time - observed on CUSA01967: the newer save of the same session
+    shows the crisis-native state the stale bundle lacks). Demoted in place to BUCKET_2_L2_NO_CRASH."""
+    for e in entries:
+        if e.get("bucket") != "BUCKET_5_NEW_SUPPORTED_CANDIDATE":
+            continue
+        name = e.get("file", "")
+        if not (name.startswith("vcfg_report") and ".prev" in name):
+            continue
+        base = name.split(":")[0]
+        if any(o is not e and o.get("file") == base and o.get("title_id") == e.get("title_id") for o in entries):
+            e["bucket"] = "BUCKET_2_L2_NO_CRASH"
+            e["k_sup_line"] = ""
+
+
+def _assign_bucket(
+    is_old: bool,
+    is_failure: bool,
+    is_verified: bool,
+    has_inert_no_mbuf: bool,
+    sig: str,
+    tid: str,
+    flips: int,
+    mids_shown: int | None,
+    fg_on: bool,
+    has_inert: bool,
+    symptoms: list[str] | None,
+    crisis_released: bool = False,
+) -> str:
+    if is_old:
+        return "BUCKET_1_OLD_VERSION"
+    if is_failure:
+        return "BUCKET_4_VERIFIED_REGRESSION" if is_verified else "BUCKET_3_NEW_TITLE_CRASH"
+    if (
+        not is_verified
+        and CUSA_TOKEN_RE.fullmatch(tid) is not None
+        and flips >= 300
+        and ((mids_shown is not None and mids_shown >= 100) or fg_on)
+        and not has_inert
+        and not symptoms
+        and not crisis_released
+    ):
+        # crisis_released: a memory-valve crisis session runs FG-native after the release (the title keeps the pool),
+        # so its pre-release FG/mids evidence does not represent steady-state capability -> no k_sup candidate.
+        return "BUCKET_5_NEW_SUPPORTED_CANDIDATE"
+    return "BUCKET_2_L2_NO_CRASH"
+
+
 def analyze_report_text(
     name: str,
     text: str,
@@ -661,7 +815,7 @@ def analyze_report_text(
 
     l2_shave = bool(
         re.search(
-            r"L2\s*\(?LOWMEM\)?|LOWMEM|arena shave|memory valve:\s*(?:shrunk|relocated|trimmed)|shave=[1-9]|shaves=[1-9]",
+            r"L2\s*\(?LOWMEM\)?|LOWMEM|arena shave|memory valve:\s*(?:shrunk|relocated|trimmed)|memory valve \(crisis\)|shave=[1-9]|shaves=[1-9]",
             text,
             re.I,
         )
@@ -669,17 +823,22 @@ def analyze_report_text(
 
     # Check for fatal ENOMEM (unhandled 0x80020023 / ENOMEM where L2/shave did not sustain rendering)
     has_explicit_enomem = bool(re.search(r"\b(?:FATAL[_\s]+)?ENOMEM\b", text))
-    has_raw_oom_code = bool(
-        re.search(r"AllocateDirectMemory\([^)]*\)\s*=\s*0x80020023|AllocDM\([^)]*\)\s*=\s*0x80020023|alloc_fail=[1-9]", text)
-    )
     has_fatal_enomem = False
+    oom_reason = ""
+    oom_burst_flip = 0
     if not has_crash:
         if has_explicit_enomem and (flips < 300 or not l2_shave):
             has_fatal_enomem = True
             sig = "ENOMEM"
-        elif has_raw_oom_code and flips < 120 and not l2_shave:
+            oom_reason = "explicit"
+        elif _has_fatal_raw_oom(text, flips, l2_shave):
             has_fatal_enomem = True
             sig = "ENOMEM"
+            oom_reason = "terminal_burst"
+            oom_burst_flip = max(
+                (_terminal_oom_max_flip(sec) for sec in _split_sections(text) if _has_terminal_oom_burst(sec)),
+                default=0,
+            )
 
     has_inert_no_mbuf = "INERT: NO MBUF" in text or bool(
         re.search(r"options effective:\s+framegen=on\(inert:\s*no mbuf", text, re.I)
@@ -772,21 +931,31 @@ def analyze_report_text(
     if is_verified and has_inert_no_mbuf and sig == "NONE":
         sig = "INERT_NO_MBUF"
 
-    if is_old:
-        bucket = "BUCKET_1_OLD_VERSION"
-    elif is_failure:
-        bucket = "BUCKET_4_VERIFIED_REGRESSION" if is_verified else "BUCKET_3_NEW_TITLE_CRASH"
-    elif (
-        not is_verified
-        and CUSA_TOKEN_RE.fullmatch(tid) is not None
-        and flips >= 300
-        and ((mids_shown is not None and mids_shown >= 100) or fg_on)
-        and not has_inert
-        and not symptoms
-    ):
-        bucket = "BUCKET_5_NEW_SUPPORTED_CANDIDATE"
-    else:
-        bucket = "BUCKET_2_L2_NO_CRASH"
+    # Crisis-native session detection, rotation-proof: the boot log embedded in a report may have rotated past the
+    # "memory valve (crisis): released" line before the report was saved (observed on CUSA01967: the report's current
+    # section showed only post-crisis content and mined a false k_sup candidate). The post-crisis options-effective
+    # evidence survives the rotation: framegen=on(native: memory crisis), or a non-inert framegen=on(...) state with
+    # gen_buffers=0 (the crisis hands the mid reserve back, so no generated buffers exist for the session remainder).
+    crisis_released = bool(
+        re.search(r"memory valve \(crisis\): released", text)
+        or re.search(r"native: memory crisis", text)
+        or re.search(r"framegen=on\((?:active|ready|native)[^)]*\)[^\n]*gen_buffers=0\b", text)
+    )
+    is_old = ver != cur_ver
+    bucket = _assign_bucket(
+        is_old=is_old,
+        is_failure=is_failure,
+        is_verified=is_verified,
+        has_inert_no_mbuf=has_inert_no_mbuf,
+        sig=sig,
+        tid=tid,
+        flips=flips,
+        mids_shown=mids_shown,
+        fg_on=fg_on,
+        has_inert=has_inert,
+        symptoms=symptoms,
+        crisis_released=crisis_released,
+    )
 
     return {
         "file": name,
@@ -794,6 +963,11 @@ def analyze_report_text(
         "family": canon,
         "verified": is_verified,
         "version": ver,
+        "is_old": is_old,
+        "inert_no_mbuf": has_inert_no_mbuf,
+        "crisis_released": crisis_released,
+        "oom_reason": oom_reason,
+        "oom_burst_flip": oom_burst_flip,
         "crash": sig,
         "third_party_prx": third_party_prx,
         "flips": flips,
@@ -1024,11 +1198,12 @@ def triage_paths(
 
     newly_extracted: dict[str, dict[str, Any]] = {}
 
+    all_entries: list[dict[str, Any]] = []
     for name, text in iter_log_texts(paths):
         if not _has_telemetry_content(text):
             continue
         info = analyze_report_text(name, text, cur_ver, verified, aliases)
-        buckets[info["bucket"]].append(info)
+        all_entries.append(info)
 
         for tr in extract_all_boot_traces(text):
             k = tr["trace_key"]
@@ -1036,6 +1211,13 @@ def triage_paths(
             if not prev or len(tr["events"]) > len(prev["events"]):
                 extracted[k] = tr
                 newly_extracted[k] = tr
+
+    # Terminal 0x80020023 bursts in boot/report logs are not crashes when the paired session logs kept rendering
+    # well past the burst (see _downgrade_live_oom). Runs after classification, before bucket aggregation.
+    _downgrade_live_oom(all_entries)
+    _demote_superseded_prev_candidates(all_entries)
+    for info in all_entries:
+        buckets[info["bucket"]].append(info)
 
     if export_traces_path is not None:
         sorted_traces = [extracted[k] for k in sorted(extracted.keys())]

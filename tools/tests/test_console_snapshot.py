@@ -17,9 +17,10 @@ TEMP.mkdir(parents=True, exist_ok=True)
 
 
 class ReadOnlyFTP:
-    def __init__(self, missing=False):
+    def __init__(self, missing=False, extra_files=()):
         self.reads = []
         self.missing = missing
+        self.extra_files = tuple(extra_files)
 
     def __enter__(self):
         return self
@@ -29,7 +30,7 @@ class ReadOnlyFTP:
 
     def nlst(self, path):
         return [path + 'trace-CUSA05571.txt', path + 'config-CUSA05571.ini', path + 'dump_cur.rgba',
-                path + '../evil.txt', path + 'debug_log']
+                path + '../evil.txt', path + 'debug_log', *(path + f for f in self.extra_files)]
 
     def retrbinary(self, command, receive):
         if not command.startswith('RETR '):
@@ -50,9 +51,9 @@ class ReadOnlyFTP:
 
 
 class ConsoleSnapshotTest(unittest.TestCase):
-    def snapshot(self, missing=False):
+    def snapshot(self, missing=False, extra_files=()):
         with tempfile.TemporaryDirectory(dir=TEMP) as d:
-            ftp = ReadOnlyFTP(missing)
+            ftp = ReadOnlyFTP(missing, extra_files=extra_files)
             with patch.object(console, 'ROOT', pathlib.Path(d)), patch.object(console, 'connect', return_value=ftp), \
                     patch.object(console, 'opt', return_value='snapshot'), contextlib.redirect_stdout(io.StringIO()):
                 console.cmd_snapshot()
@@ -72,6 +73,15 @@ class ConsoleSnapshotTest(unittest.TestCase):
         self.assertIn('trace-CUSA05571.txt', manifest['errors'])
         self.assertNotIn('trace-CUSA05571.txt', names)
         self.assertNotIn('trace-CUSA05571.txt', manifest['files'])
+
+    def test_includes_boot_crash_and_adapt_logs(self):
+        extra = ('boot-CUSA01967.txt', 'boot-CUSA01967.prev.txt', 'crash-CUSA01967.txt', 'adapt-CUSA01967.ini')
+        manifest, reads, names = self.snapshot(extra_files=extra)
+        self.assertEqual(len(reads), 7)
+        self.assertEqual(
+            names,
+            {'plugins.ini', 'trace-CUSA05571.txt', 'config-CUSA05571.ini', 'snapshot.json', *extra},
+        )
 
 
 if __name__ == '__main__':

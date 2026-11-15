@@ -1021,6 +1021,162 @@ static int on_sub(void)
     return (g_work != NULL) ? 1 : 0;
 }
 
+// Attribute slot VideoOut returned for our own late group (see safe mode RegisterBuffers); -1 while ours share the
+// game's group or nothing of ours is registered. Declared beside the crisis release below so the whole runtime
+// give-back path lives in one place.
+static int g_ext_attr_slot = -1;
+
+// Last-resort runtime memory valve (loading crisis, e.g. CUSA01967 boot ENOMEM storm at flip ~265): the step-2 work
+// hibernation frees only the 1.6 MB work drip, and a title whose parallel streamers re-consume freed pages through
+// unhooked allocation paths stays at ENOMEM (the 13.843s release is followed by ENOMEM retries at 13.852s). While the
+// registered mid reserve (g_pre_mem, g_mbuf_state == 1) is held, every later valve step is gated off, so the game's
+// loader dies and the boot freezes. This hands the whole reserve back to the title:
+// 1) gate FG submission and drain in-flight GPU command buffers (valve_hibernate_and_drain_gpu);
+// 2) wait for scanout retirement BEFORE unregistering: with the FG gate on the next game flip moves scanout to the
+//    game's own buffers; read_flip_status returns the un-virtualized status, and the reserve is retired only once
+//    flipPendingNum == 0 and currentBuffer is outside our g_mbase..g_nbuf range (bounded ~2 flip periods);
+// 3) unregister our VideoOut attribute slot, retrying transiently on 0x80290009 / 0x80290010 (the kernel refuses a
+//    slot unregister while flips are pending or the group is busy - the og2 pending-slot path retries the same way
+//    across flips); a refused unregister keeps the block owned instead of leaking it;
+// 4) release the physical block only when both the unmap and the kernel release succeeded.
+// FG stays native for the session once released (g_mbuf_state = -1) and the hibernation gate is cleared on
+// finalization (released, or unregistrable-and-owned): with g_work == NULL and g_mbuf_state < 0, try_recover can
+// never lift the gate itself, and the gate would keep the submit hooks short-circuited so the native post8 path
+// (L3+R3 menu / OSD / RCAS-Enhance) would stay invisible for the whole session. Transient refusals do NOT consume
+// the attempt
+// budget: later storm allocations retry (bounded VCFG_CRISIS_MAX_ATTEMPTS across the storm, one attempt in flight at
+// a time via g_crisis_release_busy). If every attempt is refused, the reserve stays owned and registered and the
+// hibernation is left on its normal recovery path (the gate stays until try_recover can bring FG back - the reserve
+// and its registration are intact), and no further attempts run this boot. Returns 1 when the reserve was released
+// and the caller may retry the game's allocation.
+static volatile int g_crisis_release_busy = 0;     // in-progress lock: one storm allocation at a time
+static volatile int g_crisis_release_done = 0;     // permanent completion: released, or every attempt refused
+static volatile int g_crisis_release_attempts = 0; // transient refusals do not consume the budget; releases do
+#define VCFG_CRISIS_MAX_ATTEMPTS 3
+static volatile int g_crisis_dbg_step = 0;   // last completed crisis sub-step: 1 entry, 2 drain, 3 retire, 4 unregister, 5 release
+
+static int crisis_release_mid_reserve(void)
+{
+    if (__atomic_load_n(&g_crisis_release_done, __ATOMIC_ACQUIRE)) return 0;
+    if (g_mbuf_state != 1 || !g_pre_mem || g_pre_mem_phys < 0) return 0;
+    if (g_flips == 0 && g_gpu_state == 0) return 0;   // boot phase: the boot valve steps own this, never the crisis
+    if (__atomic_load_n(&g_crisis_release_attempts, __ATOMIC_ACQUIRE) >= VCFG_CRISIS_MAX_ATTEMPTS) {
+        if (__atomic_exchange_n(&g_crisis_release_done, 1, __ATOMIC_ACQ_REL) == 0)
+            STAGE("memory valve (crisis): all %d attempts refused (transient unregister errors) -> the mid reserve "
+                  "stays held and registered; hibernation stays on the normal recovery path, no further attempts",
+                  VCFG_CRISIS_MAX_ATTEMPTS);
+        return 0;
+    }
+    if (__atomic_test_and_set(&g_crisis_release_busy, __ATOMIC_ACQ_REL)) {
+        // A concurrent storm allocation is mid-attempt: skip silently in flow, but leave one breadcrumb so a stall
+        // here is visible (the 13.16 capture showed 10 ENOMEM exits with zero crisis lines - this line is how we
+        // would tell a held busy lock from a dead channel).
+        STAGE("memory valve (crisis): attempt %d in flight (busy) -> skipping this storm allocation", g_crisis_release_attempts);
+        return 0;
+    }
+    __atomic_add_fetch(&g_crisis_release_attempts, 1, __ATOMIC_ACQ_REL);
+    // Sub-step breadcrumbs (STAGE = boot log, lg = klog/probe.log): the klog twin survives even if the boot-log
+    // channel dies (per-line opens under title fd pressure), so a stall can always be localized to one step.
+    g_crisis_dbg_step = 1;
+    STAGE("memory valve (crisis): entry attempt %d/%d flips=%u fg_on=%d mbuf_state=%d pre_mem=0x%lx(0x%zx) "
+          "handle=%d slot=%d", g_crisis_release_attempts, VCFG_CRISIS_MAX_ATTEMPTS, g_flips, g_st_fg_on,
+          g_mbuf_state, g_pre_mem_phys, g_pre_size, g_handle, g_ext_attr_slot);
+    lg("memory valve (crisis): entry attempt %d flips=%u fg_on=%d\n", g_crisis_release_attempts, g_flips, g_st_fg_on);
+    valve_hibernate_and_drain_gpu();
+    g_crisis_dbg_step = 2;
+    STAGE("memory valve (crisis): FG gated + GPU drained (waits=%u)", g_gpu_drain_waits);
+    // Scanout retirement BEFORE unregistering (with the FG gate on, our buffer is never presented again). The
+    // hardware storm (CUSA01967, 13.16 run) showed the title's submit thread can stall while its loader wedges on
+    // ENOMEM - flip progress never came during the whole 67 ms window at a 30 fps title (retired=0) - so flip
+    // progress alone cannot prove retirement. read_flip_status returns the un-virtualized status and VideoOut
+    // drains its queue independently of the stalled game thread: poll it every iteration and retire once
+    // flipPendingNum == 0 and currentBuffer is outside our g_mbase..g_nbuf range.
+    int retired = (g_handle < 0);
+    int fs_buf = -2, fs_pending = -2;
+    for (int i = 0; i < 134 && !retired; i++) {   // up to ~67 ms: ~2 flip periods at 30 fps
+        VoFlipStatus fs;
+        if (read_flip_status(g_handle, &fs) == 0) {
+            fs_buf = fs.currentBuffer;
+            fs_pending = fs.flipPendingNum;
+            if (fs.flipPendingNum == 0 &&
+                !(g_mbuf_state == 1 && g_mbase > 0 && fs.currentBuffer >= g_mbase && fs.currentBuffer < g_nbuf))
+                retired = 1;
+        }
+        if (!retired) sceKernelUsleep(500);
+    }
+    g_crisis_dbg_step = 3;
+    STAGE("memory valve (crisis): scanout retired=%d (last status buf=%d pending=%d, g_mbase=%d)", retired, fs_buf,
+          fs_pending, g_mbase);
+    lg("memory valve (crisis): scanout retired=%d buf=%d pending=%d\n", retired, fs_buf, fs_pending);
+    // Unregister our slot; 0x80290009 / 0x80290010 are transient refusals - retry inside the call (4 x 2 ms).
+    int32_t ur = -1;
+    if (g_handle >= 0 && g_ext_attr_slot >= 0) {
+        for (int i = 0; i < 4; i++) {
+            ur = sceVideoOutUnregisterBuffers(g_handle, g_ext_attr_slot);
+            if (ur == 0 || ((uint32_t)ur != 0x80290009u && (uint32_t)ur != 0x80290010u)) break;
+            sceKernelUsleep(2000);
+        }
+    }
+    g_crisis_dbg_step = 4;
+    STAGE("memory valve (crisis): unregister(slot %d) = 0x%08x", g_ext_attr_slot, (unsigned)ur);
+    lg("memory valve (crisis): unregister(slot %d) = 0x%08x\n", g_ext_attr_slot, (unsigned)ur);
+    if (g_handle >= 0 && g_ext_attr_slot >= 0 && ur != 0) {
+        STAGE("memory valve (crisis): unregister refused (retired=%d, attempt %d/%d) -> transient refusal, "
+              "the mid reserve stays held for a retry on the next storm allocation",
+              retired, g_crisis_release_attempts, VCFG_CRISIS_MAX_ATTEMPTS);
+        __atomic_store_n(&g_crisis_release_busy, 0, __ATOMIC_RELEASE);
+        return 0;
+    }
+    if (ur == 0) g_ext_attr_slot = -1;
+    void *v = g_pre_mem;
+    long p = g_pre_mem_phys;
+    size_t sz = g_pre_size;
+    g_own_alloc++;
+    int um = sceKernelMunmap(v, sz);
+    int rr = um == 0 ? sceKernelReleaseDirectMemory(p, sz) : -1;
+    g_own_alloc--;
+    g_crisis_dbg_step = 5;
+    STAGE("memory valve (crisis): release va=%p phys=0x%lx len=0x%zx unmap=0x%08x release=0x%08x",
+          v, p, sz, (unsigned)um, (unsigned)rr);
+    if (um != 0 || rr != 0) {
+        STAGE("memory valve (crisis): kept the mid reserve va=%p phys=0x%lx len=0x%zx unmap=0x%08x release=0x%08x "
+              "(slot unregistered, FG stays off)", v, p, sz, (unsigned)um, (unsigned)rr);
+        g_mbuf_state = -1;   // our slot is unregistered: never present or remap this VA again
+        pyr_cache_invalidate();
+        // The crisis is finalized and FG can never resume (g_work == NULL, g_mbuf_state < 0 -> try_recover returns 0),
+        // so leaving the gate set would short-circuit the submit hooks forever and hide the native post8 path
+        // (L3+R3 menu / OSD / toast / RCAS-Enhance). GPU commands were drained and scanout retired before the
+        // unregister, so clearing the gate is safe; FG stays off via can_fg8 (g_work == NULL).
+        __atomic_store_n(&g_mem_hibernating, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_crisis_release_busy, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_crisis_release_done, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    g_pre_mem = NULL;
+    g_pre_mem_phys = 0;
+    g_pre_size = 0;
+    for (int i = 0; g_mbase + i < 16 && g_mbase + i < g_nbuf; i++)
+        if (g_mbase + i >= g_ngame) g_buf[g_mbase + i] = 0;
+    reset_mbuf_on_early_release();
+    g_mbuf_state = -1;
+    s14_reserve_now(0, "crisis release");
+    pyr_cache_invalidate();
+    __atomic_store_n(&g_crisis_release_busy, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_crisis_release_done, 1, __ATOMIC_RELEASE);
+    // Finalized: the reserve is gone and FG can never resume (g_work == NULL, g_mbuf_state < 0 -> try_recover
+    // returns 0), so clear the hibernation gate - keeping it set would short-circuit the submit hooks every frame
+    // and the native post8 path (L3+R3 menu / OSD / toast / RCAS-Enhance) would never run again. GPU commands were
+    // drained and scanout retired before the release, so nothing of ours is in flight; FG stays off via can_fg8.
+    __atomic_store_n(&g_mem_hibernating, 0, __ATOMIC_RELEASE);
+    STAGE("memory valve (crisis): released the registered mid reserve va=%p phys=0x%lx len=0x%zx unmap=0x%08x "
+          "release=0x%08x at flip %u (hibernated at %u, retired=%d, attempt %d) -> the title keeps its memory, "
+          "FG stays native, menu/OSD/RCAS (post8) stays available",
+          v, p, sz, (unsigned)um, (unsigned)rr, g_flips, g_hibernated_at_flip, retired, g_crisis_release_attempts);
+    lg("memory valve (crisis): released the registered mid reserve phys=0x%lx len=0x%zx (FG native for this session)\n",
+       p, sz);
+    return 1;
+}
+
 static void gpu_init(void)
 {
     STAGE("gpu_init enter pre_gpu=%p pre_work=%p", g_pre_gpu, g_pre_work);
@@ -2624,7 +2780,6 @@ static size_t safe_surface_stride(void)
 
 static void *g_ext_va[8];
 static int g_ext_nm = 0;
-static int g_ext_attr_slot = -1;
 static VoAttr g_ext_attr;
 
 // One display group (CUSA02299). With reg_mode = 2 the late activation at frame 120 registered our buffer as a group of
@@ -3192,6 +3347,17 @@ static void cc_window_log(uint64_t dt_us)
             (double)spin * k, pn ? (double)psum / pn : 0.0, pmax, pn, cc_per_s(shq, dt_us),
             trf - last_tr_flushes, cc_per_s(trb - last_tr_bytes, dt_us), cc_per_s(lines, dt_us), cc_per_s(kb, dt_us),
             g_cc_monev, g_cc_iolazy, g_cc_nospin, g_tr_lite, g_cc_quiet, (unsigned)g_cc_clk_rc, g_cpu_ema_us / 1000.0);
+        // Post-boot DirectMemory headroom trend (queries only, never an allocation): proves on hardware whether a
+        // 1-buffer mid reserve (0x2000000) + g_work (0x190000) + streaming margin ever free up after a memory-valve
+        // crisis handed the reserve back (e.g. CUSA01967 loads to a full pool through f:2275). ~10 s cadence.
+        static unsigned dm_log_div;
+        if (++dm_log_div >= 5) {
+            dm_log_div = 0;
+            lgd("DM_AVAIL dm2m=0x%zx dm4k=0x%zx crisis_done=%d fg_path=%d work=%d mbuf_state=%d\n",
+                dm_avail(0x200000u), dm_avail(0x10000u),
+                __atomic_load_n(&g_crisis_release_done, __ATOMIC_ACQUIRE),
+                __atomic_load_n(&g_st_fg_path, __ATOMIC_RELAXED), g_work != NULL, g_mbuf_state);
+        }
     }
     primed = 1;
     last_mon = mon; last_io = io; last_pad = pad; last_proc = proc; last_prof = prof; last_tr_flushes = trf; last_tr_bytes = trb;
@@ -3419,6 +3585,7 @@ static void opt_state_now(const fg_config_t *c, OptState *s)
     s->hud_protect = c->hud_protect; s->game_vectors = c->game_vectors; s->fps_lock = c->fps_lock; s->below30 = c->below30;
     s->shallow_queue = c->shallow_queue; s->post_mid = g_cfg.post_mid; s->present_copy = g_cfg.present_copy;
     s->started = g_flips >= INJECT_AFTER_FLIPS || g_vo_submit_flips >= INJECT_AFTER_FLIPS;
+    s->crisis_native = __atomic_load_n(&g_crisis_release_done, __ATOMIC_ACQUIRE) && g_mbuf_state < 0 && g_work == NULL;
     s->fg_path = __atomic_load_n(&g_st_fg_on, __ATOMIC_RELAXED) ? __atomic_load_n(&g_st_fg_path, __ATOMIC_RELAXED) : 0;
     char why[sizeof(g_inert_reason)];
     memcpy(why, g_inert_reason, sizeof(why)); why[sizeof(why) - 1] = 0;

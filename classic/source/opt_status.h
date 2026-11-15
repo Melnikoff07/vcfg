@@ -60,6 +60,8 @@ typedef struct {
         present_copy;
     // state the plugin's own decisions already computed (main.c copies them, never the other way round)
     int started;         // frame generation reached its first injected frame (flip 120)
+    int crisis_native;   // a memory-valve crisis finalized this session (reserve released, g_work == NULL): FG cannot
+                         // run again until the next boot, whatever the config says
     int fg_path;         // last real frame: 0 not generated, 1 SubmitAndFlip path, 2 VideoOutSubmitFlip path
     char fg_why[32];     // g_inert_reason, normalized (opt_norm_reason), "" when none
     int detected_60fps, mode8, nmid, mem_tight_b30, mem_tight, pace_timer, b30_on, shq_on, rcas_shader, mid_only,
@@ -86,6 +88,7 @@ static inline OptStat opt_fg(const OptState *s)
 {
     if (!s->framegen) return opt_stat(OPT_OFF, s->detected_60fps ? "60 fps game" : "");
     if (s->fg_why[0]) return opt_stat(OPT_INERT, s->fg_why);
+    if (s->crisis_native) return opt_stat(OPT_OFF, "native: memory crisis");
     if (s->detected_60fps && s->fps_lock != 30) return opt_stat(OPT_INERT, "60 fps game");
     if (!s->started) return opt_stat(OPT_READY, "starting");
     if (!s->fg_path) return opt_stat(OPT_READY, "waiting for buffers");
