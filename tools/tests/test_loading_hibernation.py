@@ -110,6 +110,36 @@ static int g_gpu_state = 0;
 static int g_mbuf_state = 0;
 static void *g_gpu = NULL, *g_mon = NULL;
 static int g_safe_never = 0, g_fg_off = 0;
+/* display/valve state referenced by crisis_release_mid_reserve (main.c) */
+static int32_t g_handle = -1;
+static volatile int g_st_fg_on = 0;   /* as g_st_fg_on in main.c: FG-active window flag (crisis entry breadcrumb) */
+static int g_ngame = 0;
+static int g_mbase = 16;
+static int g_nbuf = 0;
+static uint64_t g_buf[16];
+static int32_t sceVideoOutUnregisterBuffers(int32_t h, int32_t slot) { (void)h; (void)slot; return 0; }
+typedef struct {
+    uint64_t count, processTime, tsc;
+    int64_t flipArg;
+    uint64_t submitTsc, reserved0;
+    int32_t gcQueueNum, flipPendingNum, currentBuffer;
+    uint32_t reserved1;
+} VoFlipStatus;
+static int32_t read_flip_status(int32_t h, VoFlipStatus *st)   /* raw status: game buffer on screen, nothing pending */
+{
+    (void)h;
+    st->count = 100;
+    st->processTime = 0;
+    st->tsc = 0;
+    st->flipArg = 0;
+    st->submitTsc = 0;
+    st->reserved0 = 0;
+    st->gcQueueNum = 0;
+    st->flipPendingNum = 0;
+    st->currentBuffer = 0;
+    st->reserved1 = 0;
+    return 0;
+}
 static long g_low_sub2mb_end = 0;
 static size_t g_gpu_sz = GPU_SZ_BASE;
 static int g_work_garlic = 0;
@@ -133,6 +163,7 @@ static void api_ring_push(const char *fmt, ...) { (void)fmt; }
 static void stage_nop(const char *fmt, ...) { (void)fmt; }
 #define STAGE(...) stage_nop(__VA_ARGS__)
 #define klog(...)  stage_nop(__VA_ARGS__)
+#define lg(...)    stage_nop(__VA_ARGS__)
 
 #define MAX_DM_BLOCKS 256
 typedef struct {

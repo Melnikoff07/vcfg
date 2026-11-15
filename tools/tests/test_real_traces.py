@@ -588,6 +588,44 @@ static int32_t sceKernelMunmap(void *addr, size_t len)
 
 static int32_t raw_sceVideoOutOpen(int32_t u, int32_t bus, int32_t idx, const void *p) { (void)u; (void)bus; (void)idx; (void)p; return 1; }
 static int32_t raw_sceVideoOutClose(int32_t h) { (void)h; return 0; }
+static int32_t g_handle = -1;   /* the game's VideoOut handle, as g_handle in main.c (the sim never opens a real one) */
+static volatile int g_st_fg_on = 0;   /* as g_st_fg_on in main.c: FG-active window flag (crisis entry breadcrumb) */
+typedef struct {
+    uint64_t count, processTime, tsc;
+    int64_t flipArg;
+    uint64_t submitTsc, reserved0;
+    int32_t gcQueueNum, flipPendingNum, currentBuffer;
+    uint32_t reserved1;
+} VoFlipStatus;
+static uint32_t g_sim_unregister_fail_left = 0;   /* transient 0x80290009 refusals before the unregister succeeds */
+static int32_t g_sim_unregister_last = 0;
+static int32_t sceVideoOutUnregisterBuffers(int32_t h, int32_t slot)
+{
+    (void)h;
+    if (g_sim_unregister_fail_left > 0) {
+        g_sim_unregister_fail_left--;
+        g_sim_unregister_last = (int32_t)0x80290009u;
+        return g_sim_unregister_last;
+    }
+    g_sim_unregister_last = 0;
+    (void)slot;
+    return 0;
+}
+static int32_t read_flip_status(int32_t h, VoFlipStatus *st)   /* raw status: clean game buffer, nothing pending */
+{
+    (void)h;
+    st->count = 100;
+    st->processTime = 0;
+    st->tsc = 0;
+    st->flipArg = 0;
+    st->submitTsc = 0;
+    st->reserved0 = 0;
+    st->gcQueueNum = 0;
+    st->flipPendingNum = 0;
+    st->currentBuffer = 0;   /* outside g_mbase..g_nbuf: scanout is on the game's own buffer */
+    st->reserved1 = 0;
+    return 0;
+}
 
 #define HOOK_CONTINUE(sym, fn_t, ...) raw_##sym(__VA_ARGS__)
 
@@ -655,6 +693,12 @@ static void reset_shave_state(void)
     g_af_main_t0_len = 0;
     g_af_t3_arenas = 0;
     g_af_preshave_len = 0;
+    g_crisis_release_busy = 0;
+    g_crisis_release_done = 0;
+    g_crisis_release_attempts = 0;
+    g_crisis_dbg_step = 0;
+    g_sim_unregister_fail_left = 0;
+    g_sim_unregister_last = 0;
 }
 
 static void apply_title_defaults_sim(const char *tid)
@@ -1358,6 +1402,51 @@ def generate_cusa00917_crash_order_c() -> list[str]:
     return lines
 
 
+# CUSA01967 (v2.36 hardware): post-boot type=0 align<=0x4000 len<=0x200000 chunks are self-limiting cache-pool
+# probes (hundreds of harmless 0x80020023 calls even with 0 VCFG DM held). Those probes must pass through naturally
+# keeping g_work and mbufs intact for 60fps FG, while any critical non-cache failure (>0x200000, align>0x4000, or
+# type!=0) still retains full Step 2 work hibernation + Step 4b crisis_release_mid_reserve protection.
+CRISIS_KEY = "CUSA01967_0x14aa00000"
+CRISIS_PREAMBLE = """        /* CUSA01967 runtime state (gpu_init ok at frame 120 on hardware), our late group registered as slot 1,
+         * transient 0x80290009 unregister refusal armed, and DM exhausted down to a <= 0x50000 scrap. */
+        g_gpu_state = 1;
+        g_handle = 1;
+        g_ext_attr_slot = 1;
+        g_sim_unregister_fail_left = 1;
+        {
+            long p = 0;
+            for (int gi = 0; gi < 4096; gi++) {
+                size_t av = dm_avail(0x4000u);
+                if (av <= 0x40000u) break;
+                size_t take = av - 0x40000u;
+                g_own_alloc++;
+                int32_t ar = raw_sceKernelAllocateDirectMemory(0LL, (long)sceKernelGetDirectMemorySize(), take, 0x4000u, 0, &p);
+                g_own_alloc--;
+                if (ar != 0) break;
+            }
+            ASSERT_MSG(dm_avail(0x4000u) <= 0x50000u, "CUSA01967_0x14aa00000_crisis", 900, dm_avail(0x4000u));
+        }"""
+CRISIS_POSTCHECKS = """        /* 1. All 0x80000 type=0 align=0x4000 cache probes returned ENOMEM without sacrificing g_work or mbufs */
+        ASSERT_MSG(g_pre_mem != NULL && g_pre_work != NULL && g_mbuf_state == 1 &&
+                   g_mem_hibernate_count == 0u && g_crisis_release_done == 0,
+                   "CUSA01967_0x14aa00000_crisis", 949, g_mem_hibernate_count);
+        /* 2. A critical non-cache runtime failure (len=0x400000 > 0x200000) still fires Step 2 + Step 4b crisis
+         *    and recovers despite the transient 0x80290009 unregister refusal */
+        {
+            long cp = 0;
+            g_flips = 267u;
+            int32_t cr = sceKernelAllocateDirectMemory(0LL, 0x14aa00000LL, 0x400000ULL, 0x10000ULL, 0, &cp);
+            ASSERT_MSG(cr == 0, "CUSA01967_0x14aa00000_crisis", 950, (uint64_t)(uint32_t)cr);
+        }
+        ASSERT_MSG(g_mbuf_state == -1 && g_pre_mem == NULL && g_pre_work == NULL,
+                   "CUSA01967_0x14aa00000_crisis", 951, g_mbuf_state);
+        ASSERT_MSG(g_mem_hibernate_count >= 1u && g_crisis_release_done == 1 && g_crisis_release_attempts == 1 &&
+                   g_crisis_release_busy == 0 && g_ext_attr_slot == -1 && g_sim_unregister_last == 0 &&
+                   g_crisis_dbg_step == 5,
+                   "CUSA01967_0x14aa00000_crisis", 952, g_mem_hibernate_count);
+        ASSERT_MSG(g_pre_gpu != NULL, "CUSA01967_0x14aa00000_crisis", 953, 0);"""
+
+
 def generate_trace_c(traces: list[dict]) -> str:
     lines: list[str] = [
         "int main(void) {",
@@ -1675,6 +1764,8 @@ def generate_trace_c(traces: list[dict]) -> str:
         tid = tr["title_id"]
         dm_sz = tr["dm_size"]
         pre_occ = tr["pre_occupied_low"]
+        crisis = tkey == CRISIS_KEY
+        crisis_preamble_done = False
         lines.append(f"    /* Trace {idx + 1}: {tkey} (v{tr['log_version']}) */")
         lines.append("    {")
         lines.append(f"        g_sim_neo = {int(tr.get('neo', 1 if int(dm_sz, 16) > 0x137200000 else 0))};")
@@ -1688,6 +1779,8 @@ def generate_trace_c(traces: list[dict]) -> str:
             lines.append("        g_sim_flex_avail = 0xE00000u;")
         elif tkey == "CUSA13323_0x164a00000":
             lines.append("        g_sim_flex_avail = 0x2000000u;")
+        elif crisis:
+            lines.append("        g_sim_flex_avail = 0x140000u;")
         lines.append("        long id_phys[256]; size_t id_len[256];")
         lines.append("        memset(id_phys, 0, sizeof(id_phys)); memset(id_len, 0, sizeof(id_len));")
         for step_i, ev in enumerate(tr["events"]):
@@ -1728,12 +1821,20 @@ def generate_trace_c(traces: list[dict]) -> str:
                         lines.append(f"            id_phys[{aid}] = p; id_len[{aid}] = {elen}ULL;")
                     lines.append("        }")
                 else:
+                    if crisis and not crisis_preamble_done:
+                        crisis_preamble_done = True
+                        lines.append(CRISIS_PREAMBLE)
                     lines.append("        {")
                     lines.append("            long p = 0;")
                     lines.append(
                         f"            int32_t r = sceKernelAllocateDirectMemory({s}LL, {e}LL, {elen}ULL, {align}ULL, {mtype}, &p);"
                     )
-                    lines.append(f"            if (r == 0) sceKernelReleaseDirectMemory(p, {elen}ULL);")
+                    if crisis:
+                        # CUSA01967: 0x80000 type=0 align<=0x4000 cache probes pass through naturally as ENOMEM,
+                        # leaving g_work and mbufs intact for FG.
+                        lines.append(f'            ASSERT_MSG(r == (int32_t)0x80020023u, "{tkey}_crisis", {step_i}, (uint64_t)(uint32_t)r);')
+                    else:
+                        lines.append(f"            if (r == 0) sceKernelReleaseDirectMemory(p, {elen}ULL);")
                     lines.append("        }")
         if tid in ("CUSA07820", "CUSA00341", "CUSA07737"):
             # Only tail-only (synthetic) shaves, except the audio_fix pre-shave (exactly AUDIO_FIX_TAIL).
@@ -1758,6 +1859,8 @@ def generate_trace_c(traces: list[dict]) -> str:
             )
         if tkey == "CUSA13323_0x164a00000":
             lines.append(f'        ASSERT_MSG((g_pre_mem != NULL || dm_avail(0x200000u) >= 0x800000u) && g_pbuf == NULL && g_vq_on == 0 && g_dbg_alloc_fail == 0, "{tkey}", 997, g_dbg_alloc_fail);')
+        if crisis:
+            lines.append(CRISIS_POSTCHECKS)
         lines.append("        for (int bi = 0; bi < 16; bi++) {")
         lines.append("            if (g_mbuf_state != 1) {")
         lines.append(f'                ASSERT_MSG(!IS_MID(bi) && !sim_on_our_buf(bi), "{tkey}", 996, bi);')

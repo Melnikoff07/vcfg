@@ -196,9 +196,11 @@ static fg_config_t g_cfg;
 static VoAttr g_attr;
 static char g_title_id[16] = "CUSA08519";
 static int32_t g_handle = 1;
+static volatile int g_st_fg_on = 0;   /* as g_st_fg_on in main.c: FG-active window flag (crisis entry breadcrumb) */
 static int g_ngame = 2;
 static int g_mbase = 2;
 static int g_nbuf = 3;
+static int32_t sceVideoOutUnregisterBuffers(int32_t h, int32_t slot) {{ (void)h; (void)slot; return 0; }}
 static int g_pcopy_avail = 0, g_pcopy_k = 1;
 static volatile int g_pcopy_on = 0;
 static int g_mbuf_state = 1;

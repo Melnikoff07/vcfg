@@ -137,8 +137,8 @@ def cmd_snapshot():
     out = ROOT / opt('--out', 'logs/snapshot_' + time.strftime('%Y%m%d_%H%M%S'))
     out.mkdir(parents=True, exist_ok=True)
     manifest = {'captured_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'files': {}, 'errors': {}}
-    allowed = re.compile(r'(?:trace-CUSA\d{5}(?:\.prev)?\.txt|config-CUSA\d{5}\.ini|'
-                         r'probe(?:\.prev)?\.log|vcfg(?:_launcher)?\.ini|result-CUSA\d{5}\.ini)\Z')
+    allowed = re.compile(r'(?:(?:trace|boot|crash)-CUSA\d{5}(?:\.prev)?\.txt|(?:config|result|adapt)-CUSA\d{5}\.ini|'
+                         r'probe(?:\.prev)?\.log|vcfg(?:_launcher)?\.ini)\Z')
     with connect() as f:
         paths = [INI]
         paths += [LOGDIR + p.rsplit('/', 1)[-1] for p in f.nlst(LOGDIR)

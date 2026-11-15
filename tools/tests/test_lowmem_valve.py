@@ -125,6 +125,8 @@ static char g_title_id[16] = "CUSA13323";
 static int g_known_game = 1;
 static int g_safe_done = 0, g_safe_active = 0;
 static int32_t g_game_flip_rate = 0;
+static int32_t g_handle = -1;   /* the game's VideoOut handle, as g_handle in main.c (the sim never opens a real one) */
+static volatile int g_st_fg_on = 0;   /* as g_st_fg_on in main.c: FG-active window flag (crisis entry breadcrumb) */
 static uint32_t g_bw = 1920, g_bh = 1080, g_pitch = 1920;
 static VoAttr g_attr = { 0x80000000u };
 static int g_ngame = 2, g_game_idx_hi = 6, g_detected_60fps = 0, g_fmt_supported = 1;
@@ -178,10 +180,19 @@ static int32_t raw_sceVideoOutRegisterBuffers(int32_t h, int32_t s, void *const 
     vo_log(1, s, n, c, rc);
     return rc;
 }
+static int g_vo_unreg_fail_left = 0;    // transient 0x80290009 refusals (crisis in-call retry test) before success
+static uint32_t g_vo_unreg_calls = 0;   // total unregister calls (crisis retry assertions)
 static int32_t sceVideoOutUnregisterBuffers(int32_t h, int32_t idx)
 {
     (void)h;
-    int32_t rc = (idx == g_vo_unreg_fail_slot) ? (int32_t)0x80290009 : 0;
+    g_vo_unreg_calls++;
+    int32_t rc = 0;
+    if (g_vo_unreg_fail_left > 0) {
+        g_vo_unreg_fail_left--;
+        rc = (int32_t)0x80290009;   // transient: busy / pending flips, succeeds on a later call
+    } else if (idx == g_vo_unreg_fail_slot) {
+        rc = (int32_t)0x80290009;   // persistent refusal for this slot
+    }
     if (rc == 0 && idx >= 0 && idx < 32) g_vo_slots &= ~(1u << idx);
     vo_log(2, idx, 0, 0, rc);
     return rc;
@@ -504,9 +515,10 @@ static int32_t __attribute__((unused)) raw_sceKernelCheckedReleaseDirectMemory(l
     return raw_sceKernelReleaseDirectMemory(phys, len);
 }
 
+static void (*g_sim_usleep_cb)(uint32_t) = NULL;
 static int32_t sceKernelUsleep(uint32_t usec)
 {
-    (void)usec;
+    if (g_sim_usleep_cb) g_sim_usleep_cb(usec);
     return 0;
 }
 
@@ -1697,6 +1709,330 @@ static void test_runtime_streaming_and_batchmap_guards(void)
     }
 }
 
+// Step 4b guards (crisis_release_mid_reserve, CUSA01967 loading crisis): boot-phase requests never fire it, the
+// runtime crisis hands the registered mid reserve back exactly once, a transient 0x80290009 refusal is retried
+// inside the call without consuming the attempt budget, and a persistently refusing slot is retried across storm
+// calls (bounded) before the valve gives up with the reserve still owned and hibernation on its recovery path.
+static void test_crisis_release_guards(void)
+{
+    // 1. Boot phase (g_flips == 0, g_gpu_state == 0): the crisis must never fire, the reserve stays held, and the
+    //    attempt budget is untouched.
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    g_mbuf_state = 1;
+    g_handle = 1;
+    g_ext_attr_slot = 1;
+    g_ngame = 2;
+    g_mbase = 2;
+    g_nbuf = 3;
+    g_pre_work = NULL;
+    g_work = NULL;
+    g_pre_work_phys = 0;
+    g_pre_work_sz = 0;
+    g_mem_hibernate_count = 1;
+    g_flips = 0;
+    g_vo_unreg_calls = 0;
+    ASSERT(g_pre_mem != NULL && g_pre_mem_phys > 0);
+    ASSERT(crisis_release_mid_reserve() == 0);
+    ASSERT(g_pre_mem != NULL && g_mbuf_state == 1 && g_crisis_release_done == 0 && g_crisis_release_attempts == 0);
+    ASSERT(g_vo_unreg_calls == 0);
+
+    // 2. Runtime crisis fires once: the whole reserve goes back to the title, FG stays native for the session,
+    //    and the completion is permanent (no further attempts).
+    g_flips = 265;
+    g_gpu_state = 1;
+    ASSERT(crisis_release_mid_reserve() == 1);
+    ASSERT(g_pre_mem == NULL && g_pre_mem_phys == 0 && g_pre_size == 0);
+    ASSERT(g_mbuf_state == -1 && g_ext_attr_slot == -1);
+    ASSERT(g_crisis_release_done == 1 && g_crisis_release_attempts == 1 && g_crisis_release_busy == 0);
+    /* post-crisis native post8 availability: the hibernation gate is cleared (the submit hooks reach the inject
+     * block again -> menu/OSD/RCAS render natively) while FG stays permanently off (g_work == NULL -> can_fg8 == 0) */
+    ASSERT(g_mem_hibernating == 0 && g_work == NULL && g_mbuf_state == -1);
+    ASSERT(g_crisis_dbg_step == 5);   // all crisis sub-steps completed (entry, drain, retire, unregister, release)
+    ASSERT(crisis_release_mid_reserve() == 0);
+
+    // 3. Transient 0x80290009 refusal then success WITHIN the call (the 14.138s hardware refusal): the in-call
+    //    retry succeeds, the one-shot budget is not burned by the refusals, and the reserve is released.
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    g_mbuf_state = 1;
+    g_handle = 1;
+    g_ext_attr_slot = 1;
+    g_ngame = 2;
+    g_mbase = 2;
+    g_nbuf = 3;
+    g_pre_work = NULL;
+    g_work = NULL;
+    g_pre_work_phys = 0;
+    g_pre_work_sz = 0;
+    g_mem_hibernate_count = 1;
+    g_flips = 265;
+    g_gpu_state = 1;
+    g_crisis_release_done = 0;
+    g_crisis_release_attempts = 0;
+    g_crisis_release_busy = 0;
+    g_crisis_dbg_step = 0;
+    g_vo_unreg_fail_left = 2;   // two transient 0x80290009 refusals, then success on the third call
+    g_vo_unreg_calls = 0;
+    ASSERT(crisis_release_mid_reserve() == 1);
+    ASSERT(g_vo_unreg_calls == 3);   // refused twice in-call, retried, then unregistered
+    ASSERT(g_pre_mem == NULL && g_pre_mem_phys == 0 && g_pre_size == 0);
+    ASSERT(g_mbuf_state == -1 && g_ext_attr_slot == -1);
+    ASSERT(g_crisis_release_done == 1 && g_crisis_release_attempts == 1 && g_crisis_release_busy == 0);
+    /* post-crisis native post8 availability after a transient-refusal recovery as well */
+    ASSERT(g_mem_hibernating == 0 && g_work == NULL && g_mbuf_state == -1 && g_crisis_dbg_step == 5);
+
+    // 4. Scanout retirement via flip status WITHOUT any flip progress (the 13.16 hardware run: the title's submit
+    //    thread stalls while its loader wedges on ENOMEM, so g_flips never advances): read_flip_status itself is
+    //    the retirement proof - flipPendingNum == 0 and currentBuffer on the game's own buffer.
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    g_mbuf_state = 1;
+    g_handle = 1;
+    g_ext_attr_slot = 1;
+    g_ngame = 2;
+    g_mbase = 2;
+    g_nbuf = 3;
+    g_pre_work = NULL;
+    g_work = NULL;
+    g_pre_work_phys = 0;
+    g_pre_work_sz = 0;
+    g_mem_hibernate_count = 1;
+    g_flips = 265;
+    g_gpu_state = 1;
+    g_crisis_release_done = 0;
+    g_crisis_release_attempts = 0;
+    g_crisis_release_busy = 0;
+    g_crisis_dbg_step = 0;
+    g_fs_cur = 0;             // scanout on the game's own buffer, nothing pending
+    g_fs_pending_polls = 0;
+    g_vo_unreg_calls = 0;
+    uint32_t flips_before = g_flips;
+    ASSERT(crisis_release_mid_reserve() == 1);
+    ASSERT(g_flips == flips_before);   // no flip progress at all - retirement came from the status poll
+    ASSERT(g_pre_mem == NULL && g_mbuf_state == -1 && g_crisis_release_done == 1);
+
+    // 4b. Status never retires (scanout still on our buffer): the bounded wait times out and the unregister is
+    //     still attempted (transient refusals would retry in-call) - the release completes and FG goes native.
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    g_mbuf_state = 1;
+    g_handle = 1;
+    g_ext_attr_slot = 1;
+    g_ngame = 2;
+    g_mbase = 2;
+    g_nbuf = 3;
+    g_pre_work = NULL;
+    g_work = NULL;
+    g_pre_work_phys = 0;
+    g_pre_work_sz = 0;
+    g_mem_hibernate_count = 1;
+    g_flips = 265;
+    g_gpu_state = 1;
+    g_crisis_release_done = 0;
+    g_crisis_release_attempts = 0;
+    g_crisis_release_busy = 0;
+    g_crisis_dbg_step = 0;
+    g_fs_cur = 2;             // currentBuffer inside our g_mbase..g_nbuf range: the status never retires
+    g_fs_pending_polls = 0;
+    g_vo_unreg_calls = 0;
+    ASSERT(crisis_release_mid_reserve() == 1);   // timeout -> unregister attempted anyway -> released
+    ASSERT(g_vo_unreg_calls == 1);
+    ASSERT(g_pre_mem == NULL && g_mbuf_state == -1 && g_crisis_release_done == 1);
+
+    // 5. Persistently refusing slot: bounded retries across storm calls (the one-shot is NOT burned per refusal),
+    //    then permanent refusal with the reserve still owned, registered, and hibernation left on the recovery path.
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    g_mbuf_state = 1;
+    g_handle = 1;
+    g_ext_attr_slot = 1;
+    g_ngame = 2;
+    g_mbase = 2;
+    g_nbuf = 3;
+    g_pre_work = NULL;
+    g_work = NULL;
+    g_pre_work_phys = 0;
+    g_pre_work_sz = 0;
+    g_mem_hibernate_count = 1;
+    g_flips = 265;
+    g_gpu_state = 1;
+    g_crisis_release_done = 0;
+    g_crisis_release_attempts = 0;
+    g_crisis_release_busy = 0;
+    g_crisis_dbg_step = 0;
+    g_vo_unreg_fail_slot = 1;   // the kernel keeps refusing our slot
+    g_vo_unreg_calls = 0;
+    ASSERT(crisis_release_mid_reserve() == 0);   // attempt 1: refused, retryable
+    ASSERT(g_crisis_release_done == 0 && g_crisis_release_attempts == 1 && g_crisis_release_busy == 0);
+    ASSERT(g_pre_mem != NULL && g_mbuf_state == 1 && g_ext_attr_slot == 1);
+    ASSERT(g_mem_hibernating == 1);              // the gate stays: try_recover can still bring FG back
+    ASSERT(g_crisis_dbg_step == 4);              // breadcrumb trail: entry -> drain -> retire -> unregister(refused)
+    ASSERT(crisis_release_mid_reserve() == 0);   // attempt 2 (the next storm allocation)
+    ASSERT(crisis_release_mid_reserve() == 0);   // attempt 3
+    ASSERT(g_crisis_release_done == 0 && g_crisis_release_attempts == 3);
+    ASSERT(crisis_release_mid_reserve() == 0);   // budget exhausted -> permanent refusal
+    ASSERT(g_crisis_release_done == 1 && g_crisis_release_attempts == 3);
+    ASSERT(g_pre_mem != NULL && g_pre_mem_phys > 0 && g_pre_size > 0);   // no leak: the reserve stays owned
+    ASSERT(g_mbuf_state == 1 && g_ext_attr_slot == 1);                   // still registered for the recovery path
+    ASSERT(g_mem_hibernating == 1);
+    ASSERT(crisis_release_mid_reserve() == 0);   // permanently done: never retried again this boot
+    g_vo_unreg_fail_slot = -1;
+}
+
+static uint32_t g_sim_race_ticks = 0;
+static volatile uint32_t g_sim_race_done_label = 0;
+static void sim_race_usleep_cb(uint32_t usec)
+{
+    (void)usec;
+    g_sim_race_ticks++;
+    if (g_sim_race_ticks == 2u) {
+        // Render thread already inside fg_submit_try_enter() publishes g_last_seq=275 before leaving critical section.
+        __atomic_store_n(&g_last_seq, 275u, __ATOMIC_RELEASE);
+        fg_submit_leave();
+    } else if (g_sim_race_ticks == 4u) {
+        // GPU retires command buffer 275 after submit completed and drain started polling.
+        __atomic_store_n(&g_sim_race_done_label, 275u, __ATOMIC_RELEASE);
+    }
+}
+
+static void test_fg_submit_hibernation_race(void)
+{
+    sim_reset(0x40000000u);
+    g_flips = 275;
+    g_gpu_state = 1;
+    g_work = (uint8_t *)(uintptr_t)0x330080000000ULL;
+    g_sim_race_done_label = 274u;
+    g_done = &g_sim_race_done_label;
+    g_last_seq = 274u;
+    g_gpu_drain_waits = 0;
+    g_mem_hibernating = 0;
+    g_fg_submitting = 0;
+
+    // 1. Healthy state allows FG critical section enter/leave; after hibernation, wakes from pacing abort cleanly.
+    ASSERT(fg_submit_try_enter(1) == 1);
+    ASSERT(g_fg_submitting == 1);
+    fg_submit_leave();
+    ASSERT(g_fg_submitting == 0);
+
+    // 2. Render thread is mid-submission when valve_hibernate_and_drain_gpu() fires:
+    //    drain MUST wait for g_fg_submitting == 0 before inspecting g_last_seq / draining *g_done.
+    ASSERT(fg_submit_try_enter(1) == 1);
+    ASSERT(g_fg_submitting == 1);
+    g_sim_race_ticks = 0;
+    g_sim_usleep_cb = sim_race_usleep_cb;
+    valve_hibernate_and_drain_gpu();
+    g_sim_usleep_cb = NULL;
+    ASSERT(g_mem_hibernating == 1);
+    ASSERT(g_fg_submitting == 0);
+    ASSERT(g_last_seq == 275u);
+    ASSERT(g_sim_race_done_label == 275u);
+    ASSERT(g_gpu_drain_waits >= 1u);
+
+    // 3. Any FG frame waking up after g_mem_hibernating = 1 aborts FG submission without poisoning the GPU.
+    ASSERT(fg_submit_try_enter(1) == 0);
+    ASSERT(g_fg_submitting == 0);
+
+    // 4. release_early_work() clears g_work before unmapping; post-crisis post8 (needs_work == 0) still runs
+    //    once g_mem_hibernating is cleared, while needs_work == 1 stays safely refused.
+    g_mem_hibernating = 0;
+    g_pre_work = NULL;
+    g_pre_work_phys = -1L;
+    g_pre_work_sz = 0;
+    release_early_work();
+    ASSERT(g_work == NULL);
+    ASSERT(fg_submit_try_enter(1) == 0);
+    ASSERT(g_fg_submitting == 0);
+    ASSERT(fg_submit_try_enter(0) == 1);
+    ASSERT(g_fg_submitting == 1);
+    fg_submit_leave();
+    ASSERT(g_fg_submitting == 0);
+}
+
+static void drain_dm_to_empty(void)
+{
+    long p = 0;
+    long dm_end = (long)sceKernelGetDirectMemorySize();
+    for (int gi = 0; gi < 4096; gi++) {
+        size_t av = dm_avail(0x4000u);
+        if (av < 0x4000u) break;
+        if (raw_sceKernelAllocateDirectMemory(0, dm_end, av, 0x4000u, 0, &p) != 0) break;
+    }
+    ASSERT(dm_avail(0x4000u) < 0x4000u);
+}
+
+static void setup_cusa01967_runtime_full(void)
+{
+    sim_reset(0x40000000u);
+    reset_shave_state();
+    setup_early_buffers_top_first();
+    for (int i = 0; i < 10; i++) g_title_id[i] = "CUSA01967"[i];
+    g_flips = 302;
+    g_gpu_state = 1;
+    g_mbuf_state = 1;
+    g_handle = 1;
+    g_ext_attr_slot = 1;
+    g_ngame = 2;
+    g_mbase = 2;
+    g_nbuf = 3;
+    g_work = g_pre_work;
+    g_sim_flex_avail = 0x140000u;
+    g_mem_hibernate_count = 0u;
+    g_mem_hibernating = 0;
+    g_crisis_release_done = 0;
+    g_crisis_release_attempts = 0;
+    g_crisis_release_busy = 0;
+    g_crisis_dbg_step = 0;
+    drain_dm_to_empty();
+}
+
+static void test_cusa01967_cache_probe_passthrough(void)
+{
+    long phys = 0;
+    long dm_end = (long)sceKernelGetDirectMemorySize();
+
+    // 1. Post-boot CUSA01967 type=0 align<=0x4000 0x4000<len<=0x200000 step-down probes return ENOMEM naturally
+    //    without triggering hibernate_work_dm, shave_game_alloc, or crisis_release_mid_reserve.
+    setup_cusa01967_runtime_full();
+    static const size_t probe_lens[6] = { 0x80000u, 0x40000u, 0x20000u, 0x10000u, 0x8000u, 0x200000u };
+    for (int i = 0; i < 6; i++) {
+        int32_t pr = sceKernelAllocateDirectMemory_hook(0, dm_end, probe_lens[i], 0x4000u, 0, &phys);
+        ASSERT(pr == (int32_t)0x80020023u);
+    }
+    ASSERT(g_pre_work != NULL && g_work != NULL && g_pre_mem != NULL && g_mbuf_state == 1);
+    ASSERT(g_mem_hibernate_count == 0u && g_crisis_release_done == 0 && g_shave_n == 0);
+
+    // 2. Fatal 0x4000 (16 KiB) floor: first failure triggers Step 2 hibernate_work_dm (keeps mbufs),
+    //    and once Flex is below 0x4000, next 0x4000 failure fires Step 4b crisis_release_mid_reserve.
+    ASSERT(sceKernelAllocateDirectMemory_hook(0, dm_end, 0x4000u, 0x4000u, 0, &phys) == 0);
+    ASSERT(g_mem_hibernate_count == 1u && g_pre_work == NULL && g_pre_mem != NULL && g_crisis_release_done == 0);
+    drain_dm_to_empty();
+    g_sim_flex_avail = 0x2000u;
+    ASSERT(sceKernelAllocateDirectMemory_hook(0, dm_end, 0x4000u, 0x4000u, 0, &phys) == 0);
+    ASSERT(g_crisis_release_done == 1 && g_pre_mem == NULL);
+
+    // 3. Non-cache boundary (type != 0): still invokes runtime recovery (Step 2 hibernate_work_dm) and succeeds.
+    setup_cusa01967_runtime_full();
+    ASSERT(sceKernelAllocateDirectMemory_hook(0, dm_end, 0x80000u, 0x4000u, 3, &phys) == 0);
+    ASSERT(g_mem_hibernate_count == 1u && g_pre_work == NULL);
+
+    // 4. Non-cache boundary (align > 0x4000): still invokes Step 2 + Step 4b crisis_release_mid_reserve and succeeds.
+    setup_cusa01967_runtime_full();
+    ASSERT(sceKernelAllocateDirectMemory_hook(0, dm_end, 0x200000u, 0x200000u, 0, &phys) == 0);
+    ASSERT(g_mem_hibernate_count >= 1u && g_crisis_release_done == 1 && g_pre_mem == NULL && g_pre_work == NULL);
+
+    // 5. Non-cache boundary (len > 0x200000): still invokes Step 2 + Step 4b crisis_release_mid_reserve and succeeds.
+    setup_cusa01967_runtime_full();
+    ASSERT(sceKernelAllocateDirectMemory_hook(0, dm_end, 0x400000u, 0x4000u, 0, &phys) == 0);
+    ASSERT(g_mem_hibernate_count >= 1u && g_crisis_release_done == 1 && g_pre_mem == NULL && g_pre_work == NULL);
+    g_title_id[0] = 0;
+}
+
 int main(void)
 {
     test_flex_gpu_fallback_and_alignment();
@@ -1706,13 +2042,24 @@ int main(void)
     test_range_constrained_relocation();
     test_avail_hook_and_late_alloc_mode2();
     test_runtime_streaming_and_batchmap_guards();
-    printf("lowmem valve & alloc_flex_gpu unit tests: all 7 suites passed\n");
+    test_crisis_release_guards();
+    test_fg_submit_hibernation_race();
+    test_cusa01967_cache_probe_passthrough();
+    printf("lowmem valve & alloc_flex_gpu unit tests: all 10 suites passed\n");
     return 0;
 }
 """
 
 
 def main() -> None:
+    # Structural guard: both flip_inner_ex and sceVideoOutSubmitFlip_hook re-check fg_submit_try_enter after pre-pacing.
+    flip_body = extract_between(MAIN_C, "static int32_t flip_inner_ex(", "int32_t sceVideoOutSubmitFlip_hook(")
+    vout_body = extract_between(MAIN_C, "int32_t sceVideoOutSubmitFlip_hook(", "int32_t sceVideoOutRegisterBuffers_hook(")
+    for fn_name, body in (("flip_inner_ex", flip_body), ("sceVideoOutSubmitFlip_hook", vout_body)):
+        assert "fg_submit_try_enter(second_flip)" in body, f"{fn_name} missing fg_submit_try_enter"
+        assert "fg_submit_leave()" in body, f"{fn_name} missing fg_submit_leave"
+        assert body.index("fg_submit_try_enter(second_flip)") < body.index("fg_submit_leave()"), fn_name
+
     out = ROOT / "build" / "tests"
     out.mkdir(parents=True, exist_ok=True)
     source = out / "test_lowmem_valve.c"

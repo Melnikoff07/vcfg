@@ -385,6 +385,265 @@ class TestTriageLogsR20(unittest.TestCase):
         self.assertEqual(rec_inert["bucket"], "BUCKET_4_VERIFIED_REGRESSION")
         self.assertEqual(rec_inert["crash"], "INERT_NO_MBUF")
 
+    def test_terminal_raw_oom_burst_vs_recovered_probe(self) -> None:
+        """Terminal >=3 raw 0x80020023 burst classifies as fatal ENOMEM even past 120 flips; recovered probes stay BUCKET_2."""
+        boot_fatal = (
+            f"plugin_load enter: title=CUSA99912 version=v{self.cur_ver} dm=0x14aa00000\n"
+            "13.843 [t:101941 f:265] memory valve (step 2 hibernation): released g_work_phys at flip 265\n"
+            "13.852 [t:101941 f:265] game AllocateDirectMemory(len=0x80000 align=0x4000 type=0 range=0x0..0x14aa00000) = 0x80020023 phys=0x0\n"
+            "13.853 [t:101941 f:265] game AllocateDirectMemory(len=0x80000 align=0x4000 type=0 range=0x0..0x14aa00000) = 0x80020023 phys=0x0\n"
+            "14.117 [t:101941 f:266] game AllocateDirectMemory(len=0x80000 align=0x4000 type=0 range=0x0..0x14aa00000) = 0x80020023 phys=0x0\n"
+        )
+        rec_fatal = triage_logs.analyze_report_text(
+            "boot-CUSA99912.txt", boot_fatal, self.cur_ver, self.verified, self.aliases
+        )
+        self.assertEqual(rec_fatal["bucket"], "BUCKET_3_NEW_TITLE_CRASH")
+        self.assertEqual(rec_fatal["crash"], "ENOMEM")
+
+        bundled_report = (
+            f"VCFG bug report\napp version: {self.cur_ver}\n\n"
+            "==== flight recorder (/data/bb_probe/trace-CUSA99912.txt) ====\n"
+            f"title: CUSA99912\nversion: {self.cur_ver}\nmode4 #131\n\n"
+            "==== early start stages (/data/bb_probe/boot-CUSA99912.txt) ====\n"
+            + boot_fatal
+            + "\n==== plugin log (/data/bb_probe/probe.log) ====\nmode4 #131\n"
+        )
+        rec_bundle = triage_logs.analyze_report_text(
+            "vcfg_report.txt", bundled_report, self.cur_ver, self.verified, self.aliases
+        )
+        self.assertEqual(rec_bundle["bucket"], "BUCKET_3_NEW_TITLE_CRASH")
+        self.assertEqual(rec_bundle["crash"], "ENOMEM")
+
+        recovered_probe = (
+            f"plugin_load enter: title=CUSA99912 version=v{self.cur_ver} dm=0x14aa00000\n"
+            "2.000 [t:100100 f:0] game AllocateDirectMemory(len=0x80000 align=0x4000 type=0 range=0x0..0x14aa00000) = 0x80020023 phys=0x0\n"
+            "2.001 [t:100100 f:0] game AllocateDirectMemory(len=0x80000 align=0x4000 type=0 range=0x0..0x14aa00000) = 0x80020023 phys=0x0\n"
+            "2.002 [t:100100 f:0] game AllocateDirectMemory(len=0x80000 align=0x4000 type=0 range=0x0..0x14aa00000) = 0x80020023 phys=0x0\n"
+            "[VCFG] Present #150: real flips/s: 30.0 mids_shown=140\n"
+        )
+        rec_ok = triage_logs.analyze_report_text(
+            "recovered.txt", recovered_probe, self.cur_ver, self.verified, self.aliases
+        )
+        self.assertEqual(rec_ok["bucket"], "BUCKET_2_L2_NO_CRASH")
+        self.assertEqual(rec_ok["crash"], "NONE")
+
+    # ---- CUSA01967: a terminal 0x80020023 burst in boot/report logs is not a crash when the session kept rendering
+    def _cusa01967_boot_tail(self, last_flip: int = 2505) -> str:
+        """Boot-log tail mirroring the live CUSA01967 session: hibernation + crisis + a terminal OOM burst at f:2505."""
+        lines = [
+            f"plugin_load enter: title=CUSA01967 version=v{self.cur_ver} dm=0x14aa00000 neo=1 shave_mode=2 reg_mode=2",
+            "9.031 [t:101670 f:120] mbufs ok: len=0x2000000 phys=0x148a00000 va=881400000",
+            "13.821 [t:102689 f:264] memory valve (step 2 hibernation): drained GPU (waits=0) and released g_work_phys at flip 264",
+            "13.834 [t:102689 f:264] memory valve (crisis): released the registered mid reserve va=881400000 phys=0x148a00000 "
+            "len=0x2000000 unmap=0x00000000 release=0x00000000 at flip 264 (hibernated at 264, retired=1, attempt 1)",
+        ]
+        for i, f in enumerate((2499, 2499, 2500, 2501, 2503, last_flip, last_flip)):
+            lines.append(
+                f"54.{900 + i:03d} [t:102690 f:{f}] game AllocateDirectMemory(len=0x80000 align=0x4000 type=0 "
+                f"range=0x0..0x14aa00000) = 0x80020023 phys=0x0 caller=60a6d5"
+            )
+        return "\n".join(lines) + "\n"
+
+    def _cusa01967_probe(self, flips: int) -> str:
+        """Paired live session log: crash-free rendering well past the boot log's last flip."""
+        return (
+            f"plugin_load enter: title=CUSA01967 version=v{self.cur_ver} dm=0x14aa00000 neo=1 shave_mode=2 reg_mode=2\n"
+            f"11.31 memory valve (crisis): released the registered mid reserve phys=0x148a00000 len=0x2000000 "
+            f"(FG native for this session)\n"
+            f"[VCFG] Present #{flips}: real flips/s: 30.0\n"
+        )
+
+    def test_boot_oom_burst_downgraded_when_probe_kept_rendering(self) -> None:
+        """boot-<CUSA>.txt ends on an OOM burst at f:2505 but probe.log of the same run reached flips=3829 crash-free:
+        the burst is the game's own mid-session allocator management, not a crash -> BUCKET_2."""
+        boot = triage_logs.analyze_report_text(
+            "boot-CUSA01967.txt", self._cusa01967_boot_tail(), self.cur_ver, self.verified, self.aliases
+        )
+        self.assertEqual(boot["crash"], "ENOMEM")
+        self.assertEqual(boot["oom_reason"], "terminal_burst")
+        self.assertEqual(boot["oom_burst_flip"], 2505)
+        self.assertEqual(boot["bucket"], "BUCKET_3_NEW_TITLE_CRASH")
+
+        probe = triage_logs.analyze_report_text(
+            "probe.log", self._cusa01967_probe(3829), self.cur_ver, self.verified, self.aliases
+        )
+        self.assertEqual(probe["crash"], "NONE")
+        self.assertEqual(probe["flips"], 3829)
+
+        triage_logs._downgrade_live_oom([boot, probe])
+        self.assertEqual(boot["crash"], "NONE")
+        self.assertEqual(boot["bucket"], "BUCKET_2_L2_NO_CRASH")
+
+    def test_report_oom_burst_downgraded_by_own_flip_progression(self) -> None:
+        """vcfg_report.txt embeds a boot-log section ending on the f:2505 burst while a later section's flip counter
+        reached 3829: the within-file progression across sections proves the session lived on -> BUCKET_2."""
+        report = (
+            "==== boot log ====\n"
+            + self._cusa01967_boot_tail()
+            + "==== summary ====\n"
+            + f"[VCFG] Present #3829: real flips/s: 30.0\n"
+        )
+        rec = triage_logs.analyze_report_text(
+            "vcfg_report.txt", report, self.cur_ver, self.verified, self.aliases
+        )
+        self.assertEqual(rec["crash"], "ENOMEM")
+        self.assertEqual(rec["oom_reason"], "terminal_burst")
+        self.assertEqual(rec["oom_burst_flip"], 2505)
+        self.assertEqual(rec["flips"], 3829)
+        triage_logs._downgrade_live_oom([rec])
+        self.assertEqual(rec["crash"], "NONE")
+        self.assertEqual(rec["bucket"], "BUCKET_2_L2_NO_CRASH")
+
+    def test_boot_oom_burst_stays_bucket_3_without_live_sibling(self) -> None:
+        """Negative control: the same boot log with no probe/trace sibling and no own progression stays a real crash."""
+        boot = triage_logs.analyze_report_text(
+            "boot-CUSA01967.txt", self._cusa01967_boot_tail(), self.cur_ver, self.verified, self.aliases
+        )
+        triage_logs._downgrade_live_oom([boot])
+        self.assertEqual(boot["crash"], "ENOMEM")
+        self.assertEqual(boot["bucket"], "BUCKET_3_NEW_TITLE_CRASH")
+
+    def test_boot_oom_burst_stays_bucket_3_when_sibling_margin_too_small(self) -> None:
+        """Negative control: a sibling only marginally past the burst (< 120 flips) does not prove liveness."""
+        boot = triage_logs.analyze_report_text(
+            "boot-CUSA01967.txt", self._cusa01967_boot_tail(), self.cur_ver, self.verified, self.aliases
+        )
+        probe = triage_logs.analyze_report_text(
+            "probe.log", self._cusa01967_probe(2505 + 119), self.cur_ver, self.verified, self.aliases
+        )
+        triage_logs._downgrade_live_oom([boot, probe])
+        self.assertEqual(boot["crash"], "ENOMEM")
+        self.assertEqual(boot["bucket"], "BUCKET_3_NEW_TITLE_CRASH")
+
+    def test_explicit_crash_tag_never_downgraded(self) -> None:
+        """Negative control: a real [CRASH] tag is a crash regardless of any live sibling."""
+        boot = self._cusa01967_boot_tail() + "[CRASH] SIGSEGV\n"
+        rec = triage_logs.analyze_report_text(
+            "boot-CUSA01967.txt", boot, self.cur_ver, self.verified, self.aliases
+        )
+        self.assertEqual(rec["oom_reason"], "")
+        probe = triage_logs.analyze_report_text(
+            "probe.log", self._cusa01967_probe(3829), self.cur_ver, self.verified, self.aliases
+        )
+        triage_logs._downgrade_live_oom([rec, probe])
+        self.assertNotEqual(rec["bucket"], "BUCKET_2_L2_NO_CRASH")
+        self.assertIn("SIGSEGV", rec["crash"])
+
+    # ---- CUSA01967: a crisis-release session must not mine a k_sup supported-candidate line
+    def _cusa01967_report_fg_evidence(self, with_crisis_line: bool = True) -> str:
+        """Report-shaped session with real FG evidence (options effective + mids), optionally with the crisis line."""
+        return (
+            f"plugin_load enter: title=CUSA01967 version=v{self.cur_ver} dm=0x14aa00000 neo=1 shave_mode=2 reg_mode=2\n"
+            "options effective: framegen=on(active) preset=quality below30=off shallow_queue=off sharpness=40"
+            "(applied: generated) enhance=light(applied: generated) gen_buffers=1 game_vectors=off "
+            "hud_protect=1(active: no hud file) fps_lock=30 | hot-reload\n"
+            "[VCFG] Present #400: real flips/s: 30.0 mids_shown=380\n"
+            + ("memory valve (crisis): released the registered mid reserve phys=0x148a00000 len=0x2000000 "
+               "(FG native for this session)\n" if with_crisis_line else "")
+            + "[VCFG] Present #5400: real flips/s: 30.0 mids_shown=0\n"
+        )
+
+    def test_crisis_release_session_not_a_supported_candidate(self) -> None:
+        """FG evidence from a crisis session predates the release (FG runs native for the whole remainder), so the
+        session must not mine a k_sup line even with flips >= 300 and mids_shown >= 100."""
+        rec = triage_logs.analyze_report_text(
+            "vcfg_report.txt", self._cusa01967_report_fg_evidence(), self.cur_ver, self.verified, self.aliases
+        )
+        self.assertTrue(rec["crisis_released"])
+        self.assertEqual(rec["crash"], "NONE")
+        self.assertEqual(rec["bucket"], "BUCKET_2_L2_NO_CRASH")
+        # k_sup candidates are mined from BUCKET_5 entries only; a BUCKET_2 crisis session contributes none.
+
+    def test_rotated_crisis_session_still_excluded_via_post_crisis_options(self) -> None:
+        """The boot section may rotate past the crisis line before the report is saved; the post-crisis
+        options-effective evidence (native: memory crisis / framegen=on with gen_buffers=0) must exclude the
+        session from BUCKET_5 all the same."""
+        rotated = self._cusa01967_report_fg_evidence(with_crisis_line=False)
+        rotated = rotated.replace(
+            "options effective: framegen=on(active) preset=quality below30=off shallow_queue=off sharpness=40"
+            "(applied: generated) enhance=light(applied: generated) gen_buffers=1 game_vectors=off "
+            "hud_protect=1(active: no hud file) fps_lock=30 | hot-reload\n",
+            "options effective: framegen=on(native: memory crisis) preset=quality below30=off shallow_queue=off "
+            "sharpness=40(applied: real) enhance=light(applied: real) gen_buffers=0 game_vectors=off "
+            "hud_protect=1(ready: fg starting) fps_lock=30(inert: fg not running) | runtime\n",
+        )
+        rec = triage_logs.analyze_report_text(
+            "vcfg_report.txt", rotated, self.cur_ver, self.verified, self.aliases
+        )
+        self.assertTrue(rec["crisis_released"])
+        self.assertEqual(rec["bucket"], "BUCKET_2_L2_NO_CRASH")
+
+        # variant: the transient post-crisis 'change' line (framegen=on(active) with gen_buffers=0)
+        rotated2 = self._cusa01967_report_fg_evidence(with_crisis_line=False).replace(
+            "gen_buffers=1 game_vectors=off", "gen_buffers=0 game_vectors=off", 1
+        )
+        rec2 = triage_logs.analyze_report_text(
+            "vcfg_report.txt", rotated2, self.cur_ver, self.verified, self.aliases
+        )
+        self.assertTrue(rec2["crisis_released"])
+        self.assertEqual(rec2["bucket"], "BUCKET_2_L2_NO_CRASH")
+
+    def test_same_fg_evidence_without_crisis_still_a_candidate(self) -> None:
+        """Control: identical FG evidence without a crisis release keeps BUCKET_5 candidacy (k_sup mined)."""
+        rec = triage_logs.analyze_report_text(
+            "vcfg_report.txt",
+            self._cusa01967_report_fg_evidence().replace(
+                "memory valve (crisis): released the registered mid reserve phys=0x148a00000 len=0x2000000 "
+                "(FG native for this session)\n",
+                "",
+            ),
+            self.cur_ver,
+            self.verified,
+            self.aliases,
+        )
+        self.assertFalse(rec["crisis_released"])
+        self.assertEqual(rec["bucket"], "BUCKET_5_NEW_SUPPORTED_CANDIDATE")
+        self.assertIn("CUSA01967", rec["k_sup_line"])
+
+    def test_superseded_prev_save_bundle_does_not_mint_candidate(self) -> None:
+        """A report's `.prev` region is the previous save; when a newer save of the same title exists in the same
+        report, the stale bundle must not mint a k_sup line (its embedded logs may have rotated past the crisis
+        evidence at save time - the CUSA01967 report split into exactly this pair)."""
+        current = triage_logs.analyze_report_text(
+            "vcfg_report.txt", self._cusa01967_report_fg_evidence(), self.cur_ver, self.verified, self.aliases
+        )
+        stale = triage_logs.analyze_report_text(
+            "vcfg_report.txt:CUSA01967.prev",
+            self._cusa01967_report_fg_evidence().replace(
+                "memory valve (crisis): released the registered mid reserve phys=0x148a00000 len=0x2000000 "
+                "(FG native for this session)\n",
+                "",
+            ),
+            self.cur_ver,
+            self.verified,
+            self.aliases,
+        )
+        self.assertEqual(stale["bucket"], "BUCKET_5_NEW_SUPPORTED_CANDIDATE")   # pre-demotion state
+        triage_logs._demote_superseded_prev_candidates([current, stale])
+        self.assertEqual(stale["bucket"], "BUCKET_2_L2_NO_CRASH")
+        self.assertEqual(stale["k_sup_line"], "")
+        self.assertEqual(current["bucket"], "BUCKET_2_L2_NO_CRASH")             # crisis session stays demoted
+
+    def test_prev_bundle_keeps_candidate_when_title_absent_from_newer_save(self) -> None:
+        """Control: if the newer save does not cover the title (title switch), the `.prev` bundle stays a candidate."""
+        stale = triage_logs.analyze_report_text(
+            "vcfg_report.txt:CUSA01967.prev",
+            self._cusa01967_report_fg_evidence().replace(
+                "memory valve (crisis): released the registered mid reserve phys=0x148a00000 len=0x2000000 "
+                "(FG native for this session)\n",
+                "",
+            ),
+            self.cur_ver,
+            self.verified,
+            self.aliases,
+        )
+        other = triage_logs.analyze_report_text(
+            "vcfg_report.txt", self._cusa01967_report_fg_evidence().replace("CUSA01967", "CUSA00552"),
+            self.cur_ver, self.verified, self.aliases,
+        )
+        triage_logs._demote_superseded_prev_candidates([stale, other])
+        self.assertEqual(stale["bucket"], "BUCKET_5_NEW_SUPPORTED_CANDIDATE")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

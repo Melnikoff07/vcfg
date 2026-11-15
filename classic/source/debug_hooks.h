@@ -65,6 +65,7 @@ static uint32_t g_hibernated_releases_base = 0;
 static volatile uint32_t *g_done = NULL;
 static volatile uint32_t g_last_seq = 0;
 static volatile uint32_t g_gpu_drain_waits = 0;
+static volatile int g_fg_submitting = 0;
 
 // ---- audio_fix deferred tail & helper state (the Variant C deferred tail is CUSA10249 only; see handle_game_map_inner) ----
 static int g_c10249_tail_pending = 0;
@@ -683,6 +684,7 @@ int32_t sceVideoOutClose_hook(int32_t h)
 }
 
 static int try_recover_hibernated_work(void);
+static int crisis_release_mid_reserve(void);
 
 // Atomically gate FG submission (g_mem_hibernating = 1) and wait up to 25 ms (50 x 500 us) for any
 // in-flight FG command buffer (*g_done != g_last_seq) to finish writing g_work / g_mid before
@@ -693,6 +695,12 @@ static void valve_hibernate_and_drain_gpu(void)
     __atomic_store_n(&g_hibernated_at_flip, tot_flips ? tot_flips : 1u, __ATOMIC_RELEASE);
     g_hibernated_releases_base = __atomic_load_n(&g_dbg_releases, __ATOMIC_ACQUIRE);
     __atomic_store_n(&g_mem_hibernating, 1, __ATOMIC_SEQ_CST);
+    // Wait for any render thread inside the FG submit critical section to finish publishing g_done/g_last_seq and
+    // queueing its command buffer before draining GPU work or unmapping g_work/g_pre_mem.
+    for (int sub_i = 0; sub_i < 160; sub_i++) {
+        if (__atomic_load_n(&g_fg_submitting, __ATOMIC_SEQ_CST) == 0) break;
+        sceKernelUsleep(500);
+    }
     if (tot_flips > 0 || g_gpu_state > 0) {
         for (int wait_i = 0; wait_i < 50; wait_i++) {
             volatile uint32_t *done_ptr = (volatile uint32_t *)__atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
@@ -1213,6 +1221,22 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
     if (!g_own_alloc && !g_safe_never && (uint32_t)r == 0x80020023u && e > s && (size_t)(e - s) >= len) {
         int boot_phase = (g_flips == 0 && g_gpu_state == 0);
         int pre_gpu_phase = (g_gpu_state == 0);
+        int work_hibernated_here = 0;
+        // CUSA01967 post-boot scatter-gather cache sub-allocator (type=0, align<=0x4000, 0x4000<len<=0x200000)
+        // steps down safely on ENOMEM (0x80020023). Passing those step-downs through keeps g_work and mbufs intact
+        // for FG while preserving full recovery (Step 2 -> Step 4b) at the fatal 0x4000 page floor or larger/aligned/type!=0 requests.
+        int c01967_cache_probe = (!boot_phase &&
+                                  strcmp(g_title_id, "CUSA01967") == 0 &&
+                                  type == 0 && align <= 0x4000u &&
+                                  len > 0x4000u && len <= 0x200000u);
+        if (c01967_cache_probe) {
+            static uint32_t s_c01967_cache_skip = 0;
+            uint32_t n = __atomic_add_fetch(&s_c01967_cache_skip, 1u, __ATOMIC_RELAXED);
+            if (n == 1u || (n % 256u) == 0u) {
+                STAGE("memory valve: CUSA01967 cache-probe pass-through #%u (len=0x%zx align=0x%zx type=%d flips=%u) -> keep work/mbufs",
+                      n, len, align, type, g_flips);
+            }
+        }
         if (pre_gpu_phase && g_dump_mem) {
             g_own_alloc++;
             release_early_dump();
@@ -1226,13 +1250,13 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
         // region [0, g_low_sub2mb_end) (where a 2MB-aligned allocation can never be placed by the kernel anyway).
         // When g_flips > 0 (!boot_phase), atomically gate on_sub (g_mem_hibernating = 1) and drain any in-flight GPU
         // command buffer (*g_done == g_last_seq, up to 25 ms) before releasing g_work_phys.
-        if (pre_gpu_phase && (uint32_t)r == 0x80020023u &&
+        if (pre_gpu_phase && !c01967_cache_probe && (uint32_t)r == 0x80020023u &&
             ((g_pre_work && g_pre_work_phys > 0) || (g_pre_gpu && g_pre_gpu_phys > 0) || (g_pbuf && g_pbuf_phys > 0))) {
             if (yield_early_dm_in_range(s, e, eff_align)) {
                 r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                                   s, e, len, align, type, phys);
             }
-        } else if (!boot_phase && (uint32_t)r == 0x80020023u && g_pre_work && g_pre_work_phys >= 0) {
+        } else if (!boot_phase && !c01967_cache_probe && (uint32_t)r == 0x80020023u && g_pre_work && g_pre_work_phys >= 0) {
             size_t cur_av = dm_avail_range(s, e, eff_align, NULL);
             int allow_work_hib = is_cusa06782()
                 ? (cur_av + 0x200000u >= len &&
@@ -1240,6 +1264,7 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
                 : (len < 0x10000000u || cur_av + 0x200000u >= len || g_cfg.shave_mode == 1 || g_cfg.shave_mode == 3);
             if (allow_work_hib) {
                 if (hibernate_work_dm(s, e, eff_align)) {
+                    work_hibernated_here = 1;
                     r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                                       s, e, len, align, type, phys);
                 }
@@ -1256,7 +1281,7 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
         // shrink g_pre_mem 32 MB -> 8 MB and retry unshaved FIRST so the arena succeeds 100% in real DirectMemory.
         // shave14 (opt-in, S14_KEEP in main.c): the first such shrink at boot keeps two buffers (16 MiB); the shave
         // below then takes the extra 8 MiB from the arena, or falls back (step 5 shrinks to 8 MiB as without it).
-        if ((uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && g_pre_mem && g_pre_size > 0x800000u &&
+        if ((uint32_t)r == 0x80020023u && !c01967_cache_probe && g_mbuf_state <= 0 && g_pre_mem && g_pre_size > 0x800000u &&
             (len < 0x40000000u || dm_avail_range(s, e, eff_align, NULL) + (g_pre_size - 0x800000u) >= len)) {
             size_t keep = 0x800000u;
             if (g_s14_on && g_s14_state == 0 && boot_phase && g_pre_size >= S14_KEEP) {
@@ -1276,12 +1301,13 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
                              g_shave_last_probe_s == s &&
                              g_shave_last_probe_e == e &&
                              g_shave_last_probe_len > len);
-        if ((uint32_t)r == 0x80020023u) {
+        if ((uint32_t)r == 0x80020023u && !c01967_cache_probe) {
             r = shave_game_alloc(s, e, len, align, type, phys, boot_phase, is_desc_probe);
             if ((uint32_t)r == 0x80020023u && !boot_phase && g_pre_work && g_pre_work_phys >= 0 &&
                 (!is_cusa06782() || (dm_avail_range(s, e, eff_align, NULL) + 0x200000u >= len &&
                                      (s == 0 || dm_avail_range(0, (long)sceKernelGetDirectMemorySize(), eff_align, NULL) < len)))) {
                 if (hibernate_work_dm(s, e, eff_align)) {
+                    work_hibernated_here = 1;
                     r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                                       s, e, len, align, type, phys);
                     if ((uint32_t)r == 0x80020023u)
@@ -1289,8 +1315,21 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
                 }
             }
         }
+        // Step 4b (runtime loading crisis, e.g. CUSA01967 non-cache ENOMEM storm): the step-2 work hibernation
+        // freed its 1.6 MB drip but the title's parallel streamers re-consume freed pages immediately through unhooked
+        // allocation paths, and while the registered mid reserve (g_pre_mem, g_mbuf_state == 1) is held every later
+        // valve step is gated off (and the arena shave could not serve the request either), so the game's loader dies
+        // on ENOMEM. Last resort after the shave: hand the whole reserve back to the title and retry once
+        // (crisis_release_mid_reserve; FG stays native for the session).
+        if (!boot_phase && !c01967_cache_probe && (uint32_t)r == 0x80020023u && g_mbuf_state == 1 && g_pre_mem &&
+            (work_hibernated_here || (!g_pre_work && g_mem_hibernate_count > 0))) {
+            if (crisis_release_mid_reserve()) {
+                r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
+                                  s, e, len, align, type, phys);
+            }
+        }
         // Step 5: Memory valve fallback if the allocation still failed.
-        if (pre_gpu_phase && (uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && g_pre_mem && g_pre_size > 0x800000u) {
+        if (pre_gpu_phase && !c01967_cache_probe && (uint32_t)r == 0x80020023u && g_mbuf_state <= 0 && g_pre_mem && g_pre_size > 0x800000u) {
             shrink_early_mem_to(0x800000u);
             r = HOOK_CONTINUE(sceKernelAllocateDirectMemory, int32_t (*)(long, long, size_t, size_t, int, long *),
                               s, e, len, align, type, phys);
@@ -1298,7 +1337,7 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
                 r = shave_game_alloc(s, e, len, align, type, phys, boot_phase, is_desc_probe);
         }
         int is_exact_fixed_range = (s > 0 && e > s && (size_t)(e - s) < len + 0x800000u);
-        if ((uint32_t)r == 0x80020023u && g_pre_mem &&
+        if ((uint32_t)r == 0x80020023u && g_pre_mem && !c01967_cache_probe &&
             !(is_cusa06782() && !boot_phase) &&
             (g_mbuf_state <= 0 ||
              (boot_phase && g_vo_submit_flips == 0 &&
@@ -1342,7 +1381,7 @@ int32_t sceKernelAllocateDirectMemory_hook(long s, long e, size_t len, size_t al
                                   s, e, len, align, type, phys);
             }
         }
-        if ((uint32_t)r == 0x80020023u) {
+        if ((uint32_t)r == 0x80020023u && !c01967_cache_probe) {
             g_shave_last_probe_s = s;
             g_shave_last_probe_e = e;
             g_shave_last_probe_len = len;
