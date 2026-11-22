@@ -4,7 +4,7 @@
 
 // Palette: 0 transparent, 1..7 solid colours, 16.. text blends (16 coverage levels per fg/bg pair).
 enum { C_NONE, C_CREAM, C_INK, C_YELLOW, C_RED, C_BLUE, C_GREY, C_SEL, C_N };
-static const uint32_t k_rgb[C_N] = { 0, 0xefeee8, 0x0b0b0b, 0xf5d23a, 0xf2502e, 0x4f86e6, 0x8c8a82, 0xe2e0d6 };
+static const uint32_t k_rgb[C_N] = { 0, 0xf1f3f5, 0x10141a, 0xf5d23a, 0xf2502e, 0x4f86e6, 0x69717d, 0xf5d23a };
 
 typedef struct { uint8_t *pix; uint32_t *pal; unsigned w, h; int npairs; uint8_t pf[15], pb[15]; } Canvas;
 
@@ -266,20 +266,20 @@ int vov_menu(const VovMenu *m, const uint8_t **pal, const uint8_t **pix, unsigne
     if (!g_hash[buf]) {
         canvas_begin(&c, buf, (unsigned)W, H);
         int bottom = HEAD + nrows * ROW + FOOT;
-        rect(&c, 0, 0, W, HEAD, C_YELLOW);
+        rect(&c, 0, 0, W, HEAD, C_INK);
         char line[64], t[44];
         upper(t, m->title[0] ? m->title : "GAME", sizeof(t));
-        int x = text(&c, &vov_mono20, PAD, 40, "VCFG · ", C_INK, C_YELLOW, 1, 0);
-        text(&c, &vov_mono20, x, 40, t, C_INK, C_YELLOW, 1, W - PAD - 70);
+        int x = text(&c, &vov_mono20, PAD, 40, "VCFG // ", C_CREAM, C_INK, 1, 0);
+        text(&c, &vov_mono20, x, 40, t, C_CREAM, C_INK, 1, W - PAD - 70);
         mark(&c, W - PAD - 56, 22, 14);
         fmt_x10(line, (m->out_fps_x10 + 5) / 10 * 10, 0);
-        x = text(&c, &vov_big84, PAD - 4, 134, line, C_INK, C_YELLOW, -2, 0);
+        x = text(&c, &vov_big84, PAD - 4, 134, line, C_YELLOW, C_INK, -2, 0);
         char from[24] = "FROM "; fmt_x10(from + 5, (m->game_fps_x10 + 5) / 10 * 10, 0);
-        text(&c, &vov_mono20, x + 12, 130, from, C_INK, C_YELLOW, 1, 0);
-        if (m->status[0]) { upper(t, m->status, sizeof(t)); text(&c, &vov_mono20, PAD, 158, t, C_INK, C_YELLOW, 0, W - PAD); }
+        text(&c, &vov_mono20, x + 12, 130, from, C_CREAM, C_INK, 1, 0);
+        if (m->status[0]) { upper(t, m->status, sizeof(t)); text(&c, &vov_mono20, PAD, 158, t, C_CREAM, C_INK, 0, W - PAD); }
         for (int i = 0; i < nrows; i++) {
             const VovRow *r = &m->rows[i];
-            int y = HEAD + i * ROW, sel = i == m->sel, bg = sel ? C_SEL : C_CREAM;
+            int y = HEAD + i * ROW, sel = i == m->sel, bg = sel ? C_YELLOW : C_CREAM;
             rect(&c, 0, y, W, ROW, bg);
             if (sel) rect(&c, 0, y, 6, ROW, C_INK);
             int ty = y + ROW / 2 + 9;
